@@ -6,12 +6,12 @@
 
 ## 1. Purpose
 
-A state-driven sequence engine for orchestrating multi-step workflows in OSRS via the RuneLite client. The engine sits **above** RuneLite's plugin system as a separate subsystem so that upstream RuneLite updates can be merged without touching engine code. It provides:
+A state-driven sequence engine for orchestrating multi-step workflows in OSRS via the RuneLite client. The engine is isolated from the Sequencer plugin UI but depends on RuneLite client APIs through adapter interfaces (`Observer`, `InputDispatcher`, action verbs that take RuneLite types like `WorldPoint`). Engine code lives in its own package so upstream RuneLite updates rarely touch it; complete decoupling from RuneLite is not a goal. It provides:
 
-- A library-grade engine where every major component is an interface (rip-and-replace at every layer).
+- A library-grade engine where every major subsystem is an interface (rip-and-replace at every layer).
 - A composable `Step` abstraction that supports linear sequences, parallel groups, selectors, and repetition.
 - Tick-driven execution with passive verification and explicit recovery semantics.
-- A single insertion point (`InputDispatcher`) for future humanization (active / tired / afk play styles).
+- A single seam (`InputDispatcher`) for alternative dispatch strategies (direct, recording, mock, and future humanized variants).
 - A sidebar UI panel for building, running, and observing sequences.
 
 ## 2. Scope
@@ -35,10 +35,10 @@ A state-driven sequence engine for orchestrating multi-step workflows in OSRS vi
 
 Two rules govern the whole system:
 
-1. **No concrete class crosses a module boundary.** Modules communicate through interfaces only. If a constructor or method signature anywhere in the engine references a concrete implementation class from another module, that is a bug.
+1. **Public subsystem APIs accept interfaces where polymorphism is needed.** Method parameters and return types use `Step`, `SequenceEngine`, `InputDispatcher`, etc. — not concrete classes. Concrete implementations are *constructed* freely at composition roots (`SequencerPlugin.startUp()`, factories, the UI panel, tests) — that is normal Java. The rule prohibits *passing through* concrete types where an interface should appear, not constructing them.
 2. **`SequenceManager` is the only concrete facade.** It owns the wiring of all subsystems and exposes a stable API to the UI panel and any plugin that wants to drive a sequence. Everything below it is pluggable.
 
-These two rules give the engine the rip-and-replace property at every layer.
+These two rules give the engine the rip-and-replace property at every layer without forcing over-abstraction.
 
 ## 4. Package layout
 
@@ -130,8 +130,8 @@ public interface Step {
 
 - `canStart(state, bb)` — pure predicate. Does this step's entry condition hold? No side effects.
 - `onStart(ctx)` — called exactly once when the engine activates the step. May queue actions via `ctx.actions()`.
-- `onEvent(event, ctx)` — called when a routed RuneLite event arrives while this step is active. May queue actions.
-- `tick(ctx)` — called every game tick while the step is active. May queue actions.
+- `onEvent(event, ctx)` — called when a routed RuneLite event arrives while this step is active. May queue actions on **primitive** steps only.
+- `tick(ctx)` — called every game tick **only on leaf (primitive) frames**. Composite steps (`LinearSequence`, `ParallelGroup`, `Selector`, `RepeatStep`) get a default no-op `tick()` and orchestrate their children through frame-lifecycle callbacks instead — they never queue actions directly. This prevents a parent and its child from competing for the same tick's `ActionBudget`.
 - `check(state, bb)` — **passive only**. Returns `Running`, `Succeeded(reason)`, or `Failed(reason)`. Must not mutate anything, must not call `ctx.actions()`. The single source of truth for completion.
 - `onFailure(failure, state, bb)` — invoked when `check` returns `Failed` or the step times out. Returns the desired `Recovery`.
 - `priority()` — used by the planner for selection and preemption.
@@ -152,10 +152,19 @@ public interface StepContext {
     Blackboard bb();
     WorldSnapshot snapshot();   // current tick's snapshot
     int currentTick();
-    String inputMode();         // dispatcher self-reports: "direct", "active", ...
+    InputMode inputMode();      // dispatcher self-reports
     void log(String msg);
 }
+
+public enum InputMode {
+    DIRECT,      // DirectInputDispatcher — no timing variance
+    HUMANIZED,   // any dispatcher that adds timing/mouse variance
+    RECORDING,   // capturing requests for replay/debug
+    MOCK         // tests
+}
 ```
+
+`InputMode` is intentionally coarse — fine-grained profile detail (e.g. "tired" vs "active") is not the engine's concern. A step that wants to adapt to humanization branches on `inputMode() == HUMANIZED` and that's the extent of its coupling.
 
 Passive reads in `canStart` and `check` use the `WorldSnapshot` argument those methods receive directly. `onStart`, `tick`, and `onEvent` use `ctx.snapshot()` if they need to inspect state before queueing actions.
 
@@ -234,8 +243,9 @@ snapshot = observer.snapshot(client)
 routeQueuedEvents(frameStack)            // top of stack (innermost) first,
                                           // then outward to root
 
-for each frame in frameStack (top-to-bottom):
-    frame.step.tick(ctx)                  // queues action requests
+for each LEAF frame (primitives only — one per active branch):
+    leaf.step.tick(ctx)                   // only primitives queue actions
+                                          // composites tick is a no-op
 
 executor.drainActionQueue(budget)         // arbitration + budget enforcement
                                           // delegates each request to InputDispatcher
@@ -264,8 +274,13 @@ else:
 
 - `check()` is the **only** completion path. Timeouts are translated into a synthetic `Failed` via `onFailure`.
 - `tick()`, `onStart()`, `onEvent()` are the **only** mutation paths. They go through `ctx.actions()`.
+- Only **leaf frames** receive `tick()`. Composites orchestrate their children via frame-lifecycle callbacks (a child popping with `Succeeded` advances `LinearSequence` to its next child; etc.) — they never queue actions themselves.
 - The planner runs only when the frame stack is empty or preemption is permitted.
 - Events route across the entire frame stack so composites can observe their children.
+
+### Active branches and ParallelGroup
+
+The frame stack is conceptually a tree, not a flat stack: `LinearSequence` and `Selector` have at most one active child, but `ParallelGroup` has multiple active children simultaneously. "Leaf frames" are the leaves of that tree — typically one per `ParallelGroup` branch and exactly one for purely linear sequences.
 
 ## 8. Composite steps
 
@@ -375,34 +390,31 @@ public interface InputDispatcher {
     void dispatch(ActionRequest req);
     void cancel(ActionRequest req);
     boolean isBusy();
+    InputMode mode();    // self-report; surfaced via StepContext.inputMode()
 }
 ```
 
-`InputDispatcher` is the **only** boundary between the engine and the game. The engine never knows about `Client.menuAction`, `MouseManager`, `Robot`, or any other RuneLite input mechanism.
+`InputDispatcher` is the **only** boundary between the engine and the game. The engine never knows about `Client.menuAction`, `MouseManager`, `Robot`, or any other RuneLite input mechanism. It supports alternative dispatch strategies — direct, recording, mock, and any future variant (humanized, replay, accessibility-driven, …) — without engine changes.
 
 ### Default implementation
 
-`DirectInputDispatcher` calls `client.menuAction(...)` inline. Zero humanization. Single file. ~80 lines.
+`DirectInputDispatcher` calls `client.menuAction(...)` inline. Reports `InputMode.DIRECT`. Single file, ~80 lines.
 
-### Future implementation
+### Other dispatchers (out of scope for this spec, designed-for)
 
-`HumanizedInputDispatcher` composes:
-- An `InputProfile` (timing parameters, click jitter, idle injection probability, mouse path style)
-- A seedable RNG
-- Mouse pathing utilities
-- Optionally `DirectInputDispatcher` underneath as a fallback
-
-When humanization lands, swapping is one line:
+Any future dispatcher implements the same three-method interface. Swap is one line on `SequenceManager`:
 
 ```java
-manager.setInputDispatcher(new HumanizedInputDispatcher(client, profile, rng));
+manager.setDispatcher(new RecordingInputDispatcher(real, "run-42.log"));
+manager.setDispatcher(new MockInputDispatcher());
+// ... or any future variant
 ```
 
-The engine, steps, planner, verifier, blackboard, telemetry, and panel all remain unchanged.
+The engine, steps, planner, blackboard, telemetry, and panel all remain unchanged.
 
 ### Adaptive steps
 
-`StepContext.inputMode()` returns a string the dispatcher self-reports (e.g. `"direct"`, `"active"`, `"tired"`, `"afk"`). Steps that want to adapt may branch on it; most ignore it. There is no type coupling between steps and humanization classes.
+Steps that want to adjust behavior based on dispatch strategy branch on `ctx.inputMode()`. Most steps ignore it entirely. There is no type coupling between steps and any specific dispatcher implementation.
 
 ## 13. Engine subsystem interfaces (defaults shipped)
 
@@ -413,7 +425,7 @@ The engine, steps, planner, verifier, blackboard, telemetry, and panel all remai
 | `Observer` | `ClientObserver` | `FixtureObserver` (tests) |
 | `Blackboard` | `ScopedBlackboard` | `PersistentBlackboard` |
 | `Telemetry` | `RingBufferTelemetry` | `JsonFileTelemetry`, `NoopTelemetry` |
-| `InputDispatcher` | `DirectInputDispatcher` | `HumanizedInputDispatcher` |
+| `InputDispatcher` | `DirectInputDispatcher` | `RecordingInputDispatcher`, `MockInputDispatcher`, future variants |
 | `Step` | `WalkStep`, composites | any further activities |
 
 The `Executor` (action queue drain + arbitration + budget enforcement) and the completion-detection logic that calls `step.check()` live **inside** `StateDrivenEngine` as engine-internal collaborators. They are not separately swappable — to change either, you swap the engine.
@@ -605,8 +617,7 @@ assertThat(disp.requests()).contains(walkTo(...));
 
 ## 20. Future work (out of scope for this spec)
 
-- Concrete play-style profiles (`ActiveProfile`, `TiredProfile`, `AfkProfile`).
-- Mouse path generation (bezier curves, overshoot, hover delays).
+- Additional `InputDispatcher` variants — recording for replay debug, humanized variants if/when desired, etc. The seam exists; the implementations are independent of the engine.
 - Persistence of sequences to disk; loading on startup.
 - A library of additional activities (`OpenBankStep`, `WithdrawStep`, `EatFoodStep`, `ChatCommandStep`, ...).
 - Conditional / branching composites beyond `Selector`.
