@@ -1820,8 +1820,10 @@ public final class StateDrivenEngine implements SequenceEngine {
         state = SequenceState.RUNNING;
         // onStart deferred to first advanceTick (so a real snapshot is available)
         telemetry.record(rec(frame, TelemetryRecord.Event.SELECTED, "priority=" + rootStep.priority()));
-        // Composites: also push first child (so the leaf is correct on first tick)
-        pushFirstChildIfComposite(frame, observer.snapshot(currentTick));
+        // Composites: also push first child top-down so the leaf is correct on first tick.
+        // pushFirstChildIfComposite doesn't use the snapshot — composite first-child push
+        // is unconditional (children's canStart is checked when they're activated as leaves).
+        pushFirstChildIfComposite(frame, null);
     }
 
     @Override public synchronized void pause()  { if (state == SequenceState.RUNNING) state = SequenceState.PAUSED; }
@@ -1989,9 +1991,12 @@ public final class StateDrivenEngine implements SequenceEngine {
         blackboard.clear(BlackboardScope.STEP);
 
         if (frames.isEmpty()) {
-            // Root finished. Check if a suspended chain should resume.
-            if (status instanceof Completion.Failed) state = SequenceState.FAILED;
-            blackboard.clear(BlackboardScope.SEQUENCE);
+            // Root finished. Suspended-chain resumption happens in advanceTick step 3.
+            if (status instanceof Completion.Failed) {
+                failRun();
+            } else {
+                blackboard.clear(BlackboardScope.SEQUENCE);
+            }
             return;
         }
 
@@ -2056,9 +2061,7 @@ public final class StateDrivenEngine implements SequenceEngine {
                 if (frames.size() == 1) {
                     // Skip at root = fail run
                     frames.pop();
-                    blackboard.clear(BlackboardScope.STEP);
-                    blackboard.clear(BlackboardScope.SEQUENCE);
-                    state = SequenceState.FAILED;
+                    failRun();
                 } else {
                     popAndOrchestrate(frame, synthetic, snap);
                 }
@@ -2066,9 +2069,7 @@ public final class StateDrivenEngine implements SequenceEngine {
             case Recovery.Abort a -> {
                 while (!frames.isEmpty()) frames.pop();
                 suspended.clear();
-                blackboard.clear(BlackboardScope.STEP);
-                blackboard.clear(BlackboardScope.SEQUENCE);
-                state = SequenceState.FAILED;
+                failRun();
             }
             case Recovery.JumpToAnchor j -> resolveJumpToAnchor(frame, j, snap);
         }
@@ -2107,6 +2108,17 @@ public final class StateDrivenEngine implements SequenceEngine {
             applyRecovery(frame, new Recovery.Abort(t.getClass().getSimpleName() + ": " + t.getMessage()),
                 observer.snapshot(currentTick));
         }
+    }
+
+    /** Centralized terminal-failure cleanup. Used by Skip-at-root, Abort, and
+     *  any other path that ends a run with FAILED. Clears all scopes so the
+     *  engine is fully reset before sitting in FAILED state. */
+    private void failRun() {
+        suspended.clear();
+        blackboard.clear(BlackboardScope.STEP);
+        blackboard.clear(BlackboardScope.SEQUENCE);
+        blackboard.clear(BlackboardScope.RUN);
+        state = SequenceState.FAILED;
     }
 
     private DefaultStepContext makeCtx(WorldSnapshot snap, StepFrame frame) {
@@ -2327,7 +2339,6 @@ public class LinearSequenceTest {
 
     @Test
     public void runsTwoChildrenInOrder() {
-        var snap = (WorldSnapshot) () -> 0;
         WorldSnapshot fixed = new WorldSnapshot() {
             public int tick() { return 0; }
             public PlayerView player() { return null; }
@@ -2924,9 +2935,11 @@ public class WalkStepTest {
     @Test
     public void factoryBuildsStepFromArgs() {
         WalkStepFactory f = new WalkStepFactory();
-        Step s = f.build(Map.of("target", new WorldPoint(3208, 3219, 0), "arrivalRadius", 2));
+        WorldPoint target = new WorldPoint(3208, 3219, 0);
+        Step s = f.build(Map.of("target", target, "arrivalRadius", 2));
         assertTrue(s instanceof WalkStep);
-        assertEquals("WalkTo (3208, 3219, 0)", s.name());
+        assertEquals(target, ((WalkStep) s).target());
+        assertEquals(2, ((WalkStep) s).arrivalRadius());
     }
 
     private static WorldSnapshot snapshotAt(WorldPoint p) {
