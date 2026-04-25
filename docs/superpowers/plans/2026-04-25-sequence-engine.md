@@ -890,7 +890,9 @@ git commit -m "sequence: add Step and StepContext interfaces"
 - Create: `runelite-client/src/main/java/net/runelite/client/sequence/internal/FrameStack.java`
 - Test: `runelite-client/src/test/java/net/runelite/client/sequence/internal/FrameStackTest.java`
 
-- [ ] **Step 1: Create StepFrame (mutable, package-private accessors)**
+- [ ] **Step 1: Create StepFrame**
+
+Lombok note: `@Setter` cannot be applied at class level when any field is `final`. We mark only the mutable fields with `@Setter` and use plain `@Getter` for everything.
 
 ```java
 package net.runelite.client.sequence.internal;
@@ -900,16 +902,17 @@ import lombok.Setter;
 import net.runelite.client.sequence.Completion;
 import net.runelite.client.sequence.Step;
 
-@Getter @Setter
+@Getter
 public class StepFrame {
     private static final java.util.concurrent.atomic.AtomicInteger ID = new java.util.concurrent.atomic.AtomicInteger();
 
     private final int id = ID.incrementAndGet();
     private final Step step;
     private final int depth;       // distance from root frame; 0 = root
-    private int startedTick;
-    private int retryCount;
-    private Completion status = new Completion.Running();
+    @Setter private int startedTick;
+    @Setter private int retryCount;
+    @Setter private Completion status = new Completion.Running();
+    @Setter private boolean started;   // false until onStart() has run
 
     public StepFrame(Step step, int depth) {
         this.step = step;
@@ -917,7 +920,7 @@ public class StepFrame {
     }
 
     public boolean timedOut(int currentTick) {
-        return currentTick - startedTick >= step.timeoutTicks();
+        return started && currentTick - startedTick >= step.timeoutTicks();
     }
 }
 ```
@@ -1533,8 +1536,7 @@ git commit -m "sequence: add Executor with action budget arbitration"
 package net.runelite.client.sequence;
 
 public interface SequenceEngine {
-    /** Start a new run with the given root step. Idempotent — calling twice
-     *  before stop() throws. */
+    /** Start a new run with the given root step. Calling twice before stop() throws. */
     void start(Step rootStep);
 
     /** Pause execution; no ticks consumed until resume(). */
@@ -1549,6 +1551,19 @@ public interface SequenceEngine {
     /** Register an always-on reactive step considered each tick by the planner. */
     void registerReactive(Step reactive);
     void unregisterReactive(Step reactive);
+
+    /** Drive one tick of the loop. Production: invoked by SequencerPlugin.onGameTick.
+     *  Tests may call this directly to drive the engine synchronously. */
+    void advanceTick();
+
+    /** Convenience: drive {@code n} ticks back-to-back. Used by tests in lieu of
+     *  a separate LinearEngine class — the spec mentions one but in this codebase
+     *  StateDrivenEngine itself is synchronous-friendly. */
+    default void advanceTicks(int n) { for (int i = 0; i < n; i++) advanceTick(); }
+
+    /** Offer a RuneLite event to be routed to active frames on the next tick.
+     *  Plugins call this from their @Subscribe handlers. */
+    void offerEvent(Object event);
 
     SequenceState state();
 }
@@ -1571,11 +1586,55 @@ git commit -m "sequence: add SequenceEngine interface"
 ### Task 16: StateDrivenEngine — production engine
 
 **Files:**
+- Create: `runelite-client/src/main/java/net/runelite/client/sequence/composite/CompositeStep.java`
 - Create: `runelite-client/src/main/java/net/runelite/client/sequence/internal/StateDrivenEngine.java`
 - Create: `runelite-client/src/main/java/net/runelite/client/sequence/internal/DefaultStepContext.java`
 - Test: `runelite-client/src/test/java/net/runelite/client/sequence/internal/StateDrivenEngineTest.java`
 
-- [ ] **Step 1: Create DefaultStepContext**
+The engine needs `CompositeStep` (the abstract base) to exist so it can recognize composite frames. The concrete composites (`LinearSequence`, `Selector`, `RepeatStep`) are added in Tasks 17–19, which extend the engine's per-composite branches.
+
+- [ ] **Step 1a: Create CompositeStep base**
+
+```java
+package net.runelite.client.sequence.composite;
+
+import net.runelite.client.sequence.*;
+import net.runelite.client.sequence.blackboard.Blackboard;
+
+/** Composite steps wrap children and orchestrate them through the engine.
+ *  They never tick or queue actions themselves — leaf primitives do that. */
+public abstract class CompositeStep implements Step {
+
+    /** Engine calls a frame-aware overload on each concrete composite. The
+     *  abstract overload here exists so the engine can fall back if a
+     *  composite type is registered but no engine branch handles it. */
+    public abstract NextAction onChildPopped(Step child, Completion status,
+                                             WorldSnapshot state, Blackboard bb);
+
+    public sealed interface NextAction permits PushChild, FinishWithSuccess, FinishWithFailure {}
+    public record PushChild(Step child) implements NextAction {}
+    public record FinishWithSuccess(String reason) implements NextAction {}
+    public record FinishWithFailure(String reason) implements NextAction {}
+
+    // Composites never tick themselves and never queue actions
+    @Override public final void tick(StepContext ctx) { /* no-op */ }
+    @Override public void onEvent(Object e, StepContext ctx) { /* default */ }
+    @Override public int timeoutTicks() { return Integer.MAX_VALUE; }
+    @Override public PreemptionPolicy preemptionPolicy() { return PreemptionPolicy.WHEN_SAFE; }
+    @Override public boolean isSafeToPause(WorldSnapshot s, Blackboard b) { return true; }
+    @Override public boolean canStart(WorldSnapshot s, Blackboard b) { return true; }
+    @Override public void onStart(StepContext ctx) { /* default */ }
+
+    /** Composites stay RUNNING until the engine pops them via orchestration. */
+    @Override public Completion check(WorldSnapshot s, Blackboard b) { return new Completion.Running(); }
+
+    @Override public Recovery onFailure(Failure f, WorldSnapshot s, Blackboard b) {
+        return new Recovery.Abort(f.reason());
+    }
+}
+```
+
+- [ ] **Step 1b: Create DefaultStepContext**
 
 ```java
 package net.runelite.client.sequence.internal;
@@ -1694,6 +1753,15 @@ Expected: FAIL — `StateDrivenEngine` does not exist.
 
 - [ ] **Step 4: Implement StateDrivenEngine**
 
+The engine implements:
+- The 5-step tick loop from spec §7 (events → check/pop → orchestrate → planner+preempt → tick → drain).
+- Event routing — events are queued via `offerEvent()` and delivered to all active frames at tick-start.
+- Preemption with suspension — when a higher-priority reactive becomes eligible and the active frame allows preemption, the current frame chain is suspended; on the reactive's completion, the suspended chain is restored.
+- Recovery propagation — `Skip` / `Retry`-exhaustion / `Failed` propagates to the parent composite via the same orchestration callback used for `Succeeded`. Roots without a parent fail the run.
+- `JumpToAnchor` — resolved by walking outward through the frame stack to find an enclosing `LinearSequence` with the named anchor; restarts from that index.
+- Scope cleanup — `STEP` scope is cleared on every frame pop; `SEQUENCE` scope is cleared when the root frame finishes; `RUN` is cleared on `stop()`.
+- Defensive try/catch — exceptions from `tick()`, `onStart()`, `onEvent()` produce a synthetic `Failed`, never propagate out of the engine.
+
 ```java
 package net.runelite.client.sequence.internal;
 
@@ -1701,11 +1769,17 @@ import lombok.extern.slf4j.Slf4j;
 import net.runelite.client.sequence.*;
 import net.runelite.client.sequence.blackboard.Blackboard;
 import net.runelite.client.sequence.blackboard.BlackboardScope;
+import net.runelite.client.sequence.composite.CompositeStep;
 import net.runelite.client.sequence.dispatch.InputDispatcher;
 import net.runelite.client.sequence.telemetry.Telemetry;
 import net.runelite.client.sequence.telemetry.TelemetryRecord;
 
+import java.util.ArrayDeque;
+import java.util.ArrayList;
+import java.util.Deque;
+import java.util.HashSet;
 import java.util.LinkedHashSet;
+import java.util.List;
 import java.util.Set;
 
 @Slf4j
@@ -1718,9 +1792,12 @@ public final class StateDrivenEngine implements SequenceEngine {
     private final Blackboard blackboard;
 
     private final FrameStack frames = new FrameStack();
+    /** Stack of suspended frame chains. Topmost is restored when current chain empties. */
+    private final Deque<List<StepFrame>> suspended = new ArrayDeque<>();
     private final Set<Step> reactives = new LinkedHashSet<>();
     private final DirectActions.Sink sink = new DirectActions.Sink();
     private final Executor executor;
+    private final Deque<Object> eventQueue = new ArrayDeque<>();
 
     private SequenceState state = SequenceState.IDLE;
     private int currentTick = 0;
@@ -1738,14 +1815,13 @@ public final class StateDrivenEngine implements SequenceEngine {
     @Override
     public synchronized void start(Step rootStep) {
         if (state != SequenceState.IDLE) throw new IllegalStateException("engine not idle");
-        StepFrame frame = new StepFrame(rootStep, 0);
+        StepFrame frame = makeFrame(rootStep, 0);
         frames.push(frame);
         state = SequenceState.RUNNING;
-        // onStart will be called on the first advance tick (when we have a snapshot)
-        rootStep.onStart(makeCtx(observer.snapshot(currentTick), frame));
-        telemetry.record(rec(currentTick, frame, TelemetryRecord.Event.SELECTED, "priority=" + rootStep.priority()));
-        telemetry.record(rec(currentTick, frame, TelemetryRecord.Event.STARTED, ""));
-        frame.setStartedTick(currentTick);
+        // onStart deferred to first advanceTick (so a real snapshot is available)
+        telemetry.record(rec(frame, TelemetryRecord.Event.SELECTED, "priority=" + rootStep.priority()));
+        // Composites: also push first child (so the leaf is correct on first tick)
+        pushFirstChildIfComposite(frame, observer.snapshot(currentTick));
     }
 
     @Override public synchronized void pause()  { if (state == SequenceState.RUNNING) state = SequenceState.PAUSED; }
@@ -1753,95 +1829,283 @@ public final class StateDrivenEngine implements SequenceEngine {
 
     @Override
     public synchronized void stop() {
-        frames.all().forEach(f -> {});
         while (!frames.isEmpty()) frames.pop();
+        suspended.clear();
+        eventQueue.clear();
         blackboard.clear(BlackboardScope.RUN);
+        blackboard.clear(BlackboardScope.SEQUENCE);
+        blackboard.clear(BlackboardScope.STEP);
         state = SequenceState.IDLE;
     }
 
     @Override public synchronized void registerReactive(Step r)   { reactives.add(r); }
     @Override public synchronized void unregisterReactive(Step r) { reactives.remove(r); }
     @Override public synchronized SequenceState state() { return state; }
+    @Override public synchronized void offerEvent(Object event)   { eventQueue.add(event); }
 
-    /** Drives one tick of the loop. Production wiring calls this from @Subscribe onGameTick. */
+    @Override
     public synchronized void advanceTick() {
         if (state != SequenceState.RUNNING) return;
         currentTick++;
         WorldSnapshot snap = observer.snapshot(currentTick);
 
-        // 1. Verify and pop completed/failed leaves
-        for (StepFrame leaf : new java.util.ArrayList<>(frames.leaves())) {
-            Completion c = leaf.getStep().check(snap, blackboard);
-            telemetry.record(rec(currentTick, leaf, TelemetryRecord.Event.CHECK, completionDesc(c)));
+        // Drain pending events to all active frames
+        drainEventsTo(frames.all(), snap);
+
+        // Run pending onStarts (deferred from start() / push)
+        for (StepFrame f : new ArrayList<>(frames.all())) {
+            if (!f.isStarted()) {
+                f.setStartedTick(currentTick);
+                f.setStarted(true);
+                guarded(f, () -> f.getStep().onStart(makeCtx(snap, f)));
+                telemetry.record(rec(f, TelemetryRecord.Event.STARTED, ""));
+            }
+        }
+
+        // 1. Verify and pop completed/failed leaves (orchestration interleaves via popAndOrchestrate)
+        for (StepFrame leaf : new ArrayList<>(frames.leaves())) {
+            if (!frames.all().contains(leaf)) continue;   // popped by recursion already
+            Completion c;
+            try {
+                c = leaf.getStep().check(snap, blackboard);
+            } catch (Throwable t) {
+                c = new Completion.Failed(t.getClass().getSimpleName() + ": " + t.getMessage());
+            }
+            telemetry.record(rec(leaf, TelemetryRecord.Event.CHECK, completionDesc(c)));
             switch (c) {
                 case Completion.Succeeded s -> {
                     leaf.setStatus(s);
-                    telemetry.record(rec(currentTick, leaf, TelemetryRecord.Event.SUCCEEDED, s.reason()));
-                    frames.pop();
+                    telemetry.record(rec(leaf, TelemetryRecord.Event.SUCCEEDED, s.reason()));
+                    popAndOrchestrate(leaf, s, snap);
                 }
                 case Completion.Failed f -> {
-                    Recovery r = leaf.getStep().onFailure(
-                        Failure.fromCheck(f.reason(), currentTick - leaf.getStartedTick()),
-                        snap, blackboard);
-                    applyRecovery(leaf, r);
+                    int elapsed = currentTick - leaf.getStartedTick();
+                    Recovery r;
+                    try {
+                        r = leaf.getStep().onFailure(Failure.fromCheck(f.reason(), elapsed), snap, blackboard);
+                    } catch (Throwable t) {
+                        r = new Recovery.Abort("onFailure threw: " + t.getMessage());
+                    }
+                    applyRecovery(leaf, r, snap);
                 }
                 case Completion.Running r -> {
                     if (leaf.timedOut(currentTick)) {
-                        Recovery rec = leaf.getStep().onFailure(
-                            Failure.timeout(currentTick - leaf.getStartedTick()), snap, blackboard);
-                        applyRecovery(leaf, rec);
+                        int elapsed = currentTick - leaf.getStartedTick();
+                        Recovery rec;
+                        try {
+                            rec = leaf.getStep().onFailure(Failure.timeout(elapsed), snap, blackboard);
+                        } catch (Throwable t) {
+                            rec = new Recovery.Abort("onFailure threw: " + t.getMessage());
+                        }
+                        applyRecovery(leaf, rec, snap);
                     }
                 }
             }
         }
 
-        // 2. Composite orchestration is performed by composite onChildPopped hooks
-        //    once composites are introduced (later tasks). v1 has no composites.
-
-        // 3. Planner / preemption
+        // 3. Planner & preemption
         if (frames.isEmpty()) {
-            Step next = planner.select(snap, blackboard, reactives);
-            if (next != null) {
-                StepFrame f = new StepFrame(next, 0);
-                frames.push(f);
-                f.setStartedTick(currentTick);
-                next.onStart(makeCtx(snap, f));
-                telemetry.record(rec(currentTick, f, TelemetryRecord.Event.SELECTED, "priority=" + next.priority()));
-                telemetry.record(rec(currentTick, f, TelemetryRecord.Event.STARTED, ""));
+            // Try to resume a suspended chain first
+            if (!suspended.isEmpty()) {
+                List<StepFrame> resumed = suspended.pop();
+                for (StepFrame f : resumed) frames.push(f);
+                telemetry.record(rec(frames.top(), TelemetryRecord.Event.RESUMED, ""));
             } else {
-                state = SequenceState.IDLE;
+                Step next = planner.select(snap, blackboard, eligibleReactives());
+                if (next != null) {
+                    StepFrame f = makeFrame(next, 0);
+                    frames.push(f);
+                    telemetry.record(rec(f, TelemetryRecord.Event.SELECTED, "priority=" + next.priority()));
+                    pushFirstChildIfComposite(f, snap);
+                } else {
+                    state = SequenceState.IDLE;
+                    blackboard.clear(BlackboardScope.RUN);
+                    blackboard.clear(BlackboardScope.SEQUENCE);
+                }
             }
+        } else {
+            tryPreempt(snap);
         }
 
         // 4. Tick leaves
         for (StepFrame leaf : frames.leaves()) {
-            leaf.getStep().tick(makeCtx(snap, leaf));
+            try {
+                leaf.getStep().tick(makeCtx(snap, leaf));
+            } catch (Throwable t) {
+                Recovery r = new Recovery.Abort("tick threw: " + t.getMessage());
+                applyRecovery(leaf, r, snap);
+            }
         }
 
-        // 5. Drain queued actions
+        // 5. Drain action queue
         executor.drain(sink);
     }
 
-    private void applyRecovery(StepFrame frame, Recovery r) {
-        telemetry.record(rec(currentTick, frame, TelemetryRecord.Event.RECOVERY, r.toString()));
+    // ---- helpers ----
+
+    private void drainEventsTo(List<StepFrame> targets, WorldSnapshot snap) {
+        if (eventQueue.isEmpty() || targets.isEmpty()) { eventQueue.clear(); return; }
+        // Innermost first per spec §7
+        List<StepFrame> reversed = new ArrayList<>(targets);
+        java.util.Collections.reverse(reversed);
+        Object ev;
+        while ((ev = eventQueue.poll()) != null) {
+            for (StepFrame f : reversed) {
+                final Object evf = ev;
+                guarded(f, () -> f.getStep().onEvent(evf, makeCtx(snap, f)));
+                telemetry.record(rec(f, TelemetryRecord.Event.EVENT, ev.getClass().getSimpleName()));
+            }
+        }
+    }
+
+    private Set<Step> eligibleReactives() {
+        Set<Step> onStack = new HashSet<>();
+        for (StepFrame f : frames.all()) onStack.add(f.getStep());
+        Set<Step> out = new LinkedHashSet<>(reactives);
+        out.removeAll(onStack);
+        return out;
+    }
+
+    private void tryPreempt(WorldSnapshot snap) {
+        StepFrame top = frames.top();
+        if (top.getStep().preemptionPolicy() == PreemptionPolicy.NEVER) return;
+        if (!top.getStep().isSafeToPause(snap, blackboard)) return;
+        Step candidate = planner.select(snap, blackboard, eligibleReactives());
+        if (candidate == null || candidate.priority() <= top.getStep().priority()) return;
+
+        // Suspend whole chain, push reactive at depth 0
+        List<StepFrame> chain = new ArrayList<>(frames.all());
+        suspended.push(chain);
+        while (!frames.isEmpty()) frames.pop();
+        StepFrame f = makeFrame(candidate, 0);
+        frames.push(f);
+        telemetry.record(rec(top, TelemetryRecord.Event.PREEMPTED, "by " + candidate.name()));
+        telemetry.record(rec(f, TelemetryRecord.Event.SELECTED, "preempting"));
+        pushFirstChildIfComposite(f, snap);
+    }
+
+    private void popAndOrchestrate(StepFrame popped, Completion status, WorldSnapshot snap) {
+        frames.pop();
+        blackboard.clear(BlackboardScope.STEP);
+
+        if (frames.isEmpty()) {
+            // Root finished. Check if a suspended chain should resume.
+            if (status instanceof Completion.Failed) state = SequenceState.FAILED;
+            blackboard.clear(BlackboardScope.SEQUENCE);
+            return;
+        }
+
+        StepFrame parent = frames.top();
+        if (!(parent.getStep() instanceof CompositeStep)) return;   // shouldn't happen
+        CompositeStep.NextAction next = invokeOrchestration(parent, popped, status, snap);
+
+        switch (next) {
+            case CompositeStep.PushChild pc -> {
+                StepFrame child = makeFrame(pc.child(), parent.getDepth() + 1);
+                frames.push(child);
+                telemetry.record(rec(child, TelemetryRecord.Event.SELECTED, "child of " + parent.getStep().name()));
+                pushFirstChildIfComposite(child, snap);
+            }
+            case CompositeStep.FinishWithSuccess fs -> {
+                Completion.Succeeded ps = new Completion.Succeeded(fs.reason());
+                parent.setStatus(ps);
+                telemetry.record(rec(parent, TelemetryRecord.Event.SUCCEEDED, fs.reason()));
+                popAndOrchestrate(parent, ps, snap);
+            }
+            case CompositeStep.FinishWithFailure ff -> {
+                int elapsed = currentTick - parent.getStartedTick();
+                Recovery r;
+                try {
+                    r = parent.getStep().onFailure(Failure.fromCheck(ff.reason(), elapsed), snap, blackboard);
+                } catch (Throwable t) {
+                    r = new Recovery.Abort("onFailure threw: " + t.getMessage());
+                }
+                applyRecovery(parent, r, snap);
+            }
+        }
+    }
+
+    /** Type-dispatch onto the composite's frame-aware orchestration overload.
+     *  Tasks 17–19 add per-composite branches via incremental edits. */
+    private CompositeStep.NextAction invokeOrchestration(
+        StepFrame parent, StepFrame popped, Completion status, WorldSnapshot snap) {
+        // [LinearSequence branch added in Task 17]
+        // [Selector branch added in Task 18]
+        // [RepeatStep branch added in Task 19]
+        return new CompositeStep.FinishWithFailure(
+            "unknown composite type " + parent.getStep().getClass().getSimpleName());
+    }
+
+    private void applyRecovery(StepFrame frame, Recovery r, WorldSnapshot snap) {
+        telemetry.record(rec(frame, TelemetryRecord.Event.RECOVERY, r.toString()));
         switch (r) {
             case Recovery.Retry retry -> {
                 frame.setRetryCount(frame.getRetryCount() + 1);
                 if (frame.getRetryCount() >= retry.maxAttempts()) {
-                    frames.pop();
-                    state = SequenceState.FAILED;
+                    // Exhausted — propagate Failed to parent (or fail run if root)
+                    Completion.Failed propagated = new Completion.Failed("retry exhausted");
+                    frame.setStatus(propagated);
+                    popAndOrchestrate(frame, propagated, snap);
                 } else {
                     frame.setStartedTick(currentTick);
-                    frame.getStep().onStart(makeCtx(observer.snapshot(currentTick), frame));
+                    frame.setStarted(false);   // onStart will re-fire at tick start of next advance
                 }
             }
-            case Recovery.Skip s -> { frames.pop(); }
-            case Recovery.Abort a -> { while (!frames.isEmpty()) frames.pop(); state = SequenceState.FAILED; }
-            case Recovery.JumpToAnchor j -> {
-                // Composite-aware resolution comes with composite tasks. v1 = abort.
+            case Recovery.Skip s -> {
+                Completion.Succeeded synthetic = new Completion.Succeeded("skipped: " + s.reason());
+                if (frames.size() == 1) {
+                    // Skip at root = fail run
+                    frames.pop();
+                    blackboard.clear(BlackboardScope.STEP);
+                    blackboard.clear(BlackboardScope.SEQUENCE);
+                    state = SequenceState.FAILED;
+                } else {
+                    popAndOrchestrate(frame, synthetic, snap);
+                }
+            }
+            case Recovery.Abort a -> {
                 while (!frames.isEmpty()) frames.pop();
+                suspended.clear();
+                blackboard.clear(BlackboardScope.STEP);
+                blackboard.clear(BlackboardScope.SEQUENCE);
                 state = SequenceState.FAILED;
             }
+            case Recovery.JumpToAnchor j -> resolveJumpToAnchor(frame, j, snap);
+        }
+    }
+
+    /** Walks outward through the frame stack to find an enclosing composite that
+     *  declared the named anchor. The body is filled in by Task 17 (LinearSequence
+     *  is the only composite that supports anchors). */
+    private void resolveJumpToAnchor(StepFrame failed, Recovery.JumpToAnchor j, WorldSnapshot snap) {
+        // [LinearSequence anchor walk added in Task 17]
+        applyRecovery(failed, new Recovery.Abort("anchor '" + j.anchorName() + "' not resolvable"), snap);
+    }
+
+    /** When a composite frame is pushed, we push its first eligible child too,
+     *  recursing in case the child is itself a composite. Per-composite branches
+     *  are added in Tasks 17–19. */
+    private void pushFirstChildIfComposite(StepFrame composite, WorldSnapshot snap) {
+        // [LinearSequence first-child push added in Task 17]
+        // [Selector first-child push added in Task 18]
+        // [RepeatStep first-child push added in Task 19]
+    }
+
+    /** Choose the right StepFrame subclass for a Step. Tasks 17–19 add their
+     *  per-composite branches. */
+    private StepFrame makeFrame(Step s, int depth) {
+        // [LinearSequence -> LinearSequenceFrame added in Task 17]
+        // [Selector -> SelectorFrame added in Task 18]
+        // [RepeatStep -> RepeatStepFrame added in Task 19]
+        return new StepFrame(s, depth);
+    }
+
+    private void guarded(StepFrame frame, Runnable r) {
+        try { r.run(); }
+        catch (Throwable t) {
+            log.warn("step {} threw: {}", frame.getStep().name(), t.toString());
+            applyRecovery(frame, new Recovery.Abort(t.getClass().getSimpleName() + ": " + t.getMessage()),
+                observer.snapshot(currentTick));
         }
     }
 
@@ -1850,8 +2114,8 @@ public final class StateDrivenEngine implements SequenceEngine {
         return new DefaultStepContext(actions, blackboard, snap, currentTick, dispatcher.mode());
     }
 
-    private static TelemetryRecord rec(int tick, StepFrame frame, TelemetryRecord.Event ev, String payload) {
-        return new TelemetryRecord(tick, frame.getDepth(), frame.getStep().name(), ev, payload);
+    private TelemetryRecord rec(StepFrame frame, TelemetryRecord.Event ev, String payload) {
+        return new TelemetryRecord(currentTick, frame.getDepth(), frame.getStep().name(), ev, payload);
     }
 
     private static String completionDesc(Completion c) {
@@ -1863,6 +2127,16 @@ public final class StateDrivenEngine implements SequenceEngine {
     }
 }
 ```
+
+This file is large (~250 lines). To stay buildable as a single commit, follow this implementation order:
+1. Skeleton with fields + start/stop/pause/resume/state
+2. `advanceTick` with leaf check/pop only (no composites)
+3. `popAndOrchestrate` + `invokeOrchestration` (composites land in later tasks)
+4. `applyRecovery` (Retry/Skip/Abort branches)
+5. `resolveJumpToAnchor`
+6. `tryPreempt` + `eligibleReactives`
+7. `drainEventsTo`
+8. `guarded`, `makeCtx`, telemetry helpers
 
 - [ ] **Step 5: Run tests**
 
@@ -1880,52 +2154,15 @@ git commit -m "sequence: add StateDrivenEngine with primitive-step execution"
 
 ## Phase 5 — Composite Steps
 
-### Task 17: LinearSequence + LinearSequenceFrame + composite hook
+### Task 17: LinearSequence + LinearSequenceFrame + engine wiring
 
 **Files:**
 - Create: `runelite-client/src/main/java/net/runelite/client/sequence/composite/LinearSequence.java`
 - Create: `runelite-client/src/main/java/net/runelite/client/sequence/composite/LinearSequenceFrame.java`
-- Create: `runelite-client/src/main/java/net/runelite/client/sequence/composite/CompositeStep.java`
-- Modify: `runelite-client/src/main/java/net/runelite/client/sequence/internal/StateDrivenEngine.java` — wire composite hooks
+- Modify: `runelite-client/src/main/java/net/runelite/client/sequence/internal/StateDrivenEngine.java` — add LinearSequence branches to the four extension points (`makeFrame`, `pushFirstChildIfComposite`, `invokeOrchestration`, `resolveJumpToAnchor`)
 - Test: `runelite-client/src/test/java/net/runelite/client/sequence/composite/LinearSequenceTest.java`
 
-- [ ] **Step 1: Create CompositeStep base**
-
-```java
-package net.runelite.client.sequence.composite;
-
-import net.runelite.client.sequence.*;
-import net.runelite.client.sequence.blackboard.Blackboard;
-
-/** Marker base — composites are leaves' parents in the frame tree. The engine
- *  recognizes them via instanceof and routes onChildPopped accordingly. */
-public abstract class CompositeStep implements Step {
-    /** Engine calls this when one of this composite's child frames has popped.
-     *  Returns the next child to push, or null if the composite itself is done
-     *  (engine then pops the composite frame using composite.lastStatus). */
-    public abstract NextAction onChildPopped(Step child, Completion status,
-                                             WorldSnapshot state, Blackboard bb);
-
-    public abstract sealed interface NextAction
-        permits PushChild, FinishWithSuccess, FinishWithFailure {}
-    public record PushChild(Step child) implements NextAction {}
-    public record FinishWithSuccess(String reason) implements NextAction {}
-    public record FinishWithFailure(String reason) implements NextAction {}
-
-    // Composites never tick themselves
-    @Override public final void tick(StepContext ctx) { /* no-op */ }
-    @Override public void onEvent(Object e, StepContext ctx) { /* default */ }
-    @Override public int timeoutTicks() { return Integer.MAX_VALUE; }
-    @Override public PreemptionPolicy preemptionPolicy() { return PreemptionPolicy.WHEN_SAFE; }
-    @Override public boolean isSafeToPause(WorldSnapshot s, Blackboard b) { return true; }
-    @Override public boolean canStart(WorldSnapshot s, Blackboard b) { return true; }
-    @Override public void onStart(StepContext ctx) { /* default */ }
-    @Override public Completion check(WorldSnapshot s, Blackboard b) { return Completion.RUNNING; }
-    @Override public Recovery onFailure(Failure f, WorldSnapshot s, Blackboard b) { return new Recovery.Abort(f.reason()); }
-}
-```
-
-- [ ] **Step 2: Create LinearSequence + LinearSequenceFrame**
+- [ ] **Step 1: Create LinearSequence + LinearSequenceFrame**
 
 ```java
 package net.runelite.client.sequence.composite;
@@ -1987,133 +2224,89 @@ import lombok.Getter;
 import lombok.Setter;
 import net.runelite.client.sequence.internal.StepFrame;
 
-@Getter @Setter
 public final class LinearSequenceFrame extends StepFrame {
-    private int currentChildIndex = 0;
+    @Getter @Setter private int currentChildIndex = 0;
     public LinearSequenceFrame(LinearSequence step, int depth) { super(step, depth); }
 }
 ```
 
-- [ ] **Step 3: Update FrameStack.leaves to descend through composites**
+- [ ] **Step 2: Wire LinearSequence into StateDrivenEngine extension points**
 
-Edit `FrameStack.java`:
+Edit `StateDrivenEngine.java` to add LinearSequence-specific branches at the four extension points marked with `[LinearSequence ... added in Task 17]`. Final state of each method:
 
+`makeFrame`:
 ```java
-public List<StepFrame> leaves() {
-    if (frames.isEmpty()) return List.of();
-    StepFrame top = frames.get(frames.size() - 1);
-    // For v1, the top frame IS the leaf (no ParallelGroup yet).
-    // ParallelGroup will override by being a "leaf parent" returning its multiple children.
-    return List.of(top);
-}
-```
-
-(The above is already what we have; the comment update reflects that composites push their child as the new top, so the top remains the current leaf.)
-
-- [ ] **Step 4: Wire composite child-pop into StateDrivenEngine**
-
-In `StateDrivenEngine.advanceTick()`, replace the popping logic in section 1 with:
-
-```java
-// 1. Verify and pop completed/failed leaves
-for (StepFrame leaf : new java.util.ArrayList<>(frames.leaves())) {
-    Completion c = leaf.getStep().check(snap, blackboard);
-    telemetry.record(rec(currentTick, leaf, TelemetryRecord.Event.CHECK, completionDesc(c)));
-    switch (c) {
-        case Completion.Succeeded s -> {
-            leaf.setStatus(s);
-            telemetry.record(rec(currentTick, leaf, TelemetryRecord.Event.SUCCEEDED, s.reason()));
-            popAndOrchestrate(leaf, s, snap);
-        }
-        case Completion.Failed f -> {
-            Recovery r = leaf.getStep().onFailure(
-                Failure.fromCheck(f.reason(), currentTick - leaf.getStartedTick()),
-                snap, blackboard);
-            applyRecovery(leaf, r);
-        }
-        case Completion.Running r -> {
-            if (leaf.timedOut(currentTick)) {
-                Recovery rec = leaf.getStep().onFailure(
-                    Failure.timeout(currentTick - leaf.getStartedTick()), snap, blackboard);
-                applyRecovery(leaf, rec);
-            }
-        }
-    }
-}
-```
-
-Add helper:
-
-```java
-private void popAndOrchestrate(StepFrame popped, Completion status, WorldSnapshot snap) {
-    frames.pop();
-    if (frames.isEmpty()) return;
-
-    StepFrame parent = frames.top();
-    if (parent instanceof net.runelite.client.sequence.composite.LinearSequenceFrame lsf
-        && parent.getStep() instanceof net.runelite.client.sequence.composite.LinearSequence ls) {
-        var next = ls.onChildPopped(lsf, status);
-        switch (next) {
-            case net.runelite.client.sequence.composite.CompositeStep.PushChild pc -> {
-                StepFrame child = new StepFrame(pc.child(), parent.getDepth() + 1);
-                frames.push(child);
-                child.setStartedTick(currentTick);
-                pc.child().onStart(makeCtx(snap, child));
-                telemetry.record(rec(currentTick, child, TelemetryRecord.Event.SELECTED, "child of " + parent.getStep().name()));
-                telemetry.record(rec(currentTick, child, TelemetryRecord.Event.STARTED, ""));
-            }
-            case net.runelite.client.sequence.composite.CompositeStep.FinishWithSuccess fs -> {
-                parent.setStatus(new Completion.Succeeded(fs.reason()));
-                telemetry.record(rec(currentTick, parent, TelemetryRecord.Event.SUCCEEDED, fs.reason()));
-                popAndOrchestrate(parent, parent.getStatus(), snap);
-            }
-            case net.runelite.client.sequence.composite.CompositeStep.FinishWithFailure ff -> {
-                applyRecovery(parent, parent.getStep().onFailure(
-                    Failure.fromCheck(ff.reason(), 0), snap, blackboard));
-            }
-        }
-    }
-    // Selector / ParallelGroup / RepeatStep added in later tasks
-}
-```
-
-Also update `start(...)` to push composite frames as `LinearSequenceFrame` when applicable:
-
-```java
-@Override
-public synchronized void start(Step rootStep) {
-    if (state != SequenceState.IDLE) throw new IllegalStateException("engine not idle");
-    StepFrame frame = makeFrame(rootStep, 0);
-    frames.push(frame);
-    state = SequenceState.RUNNING;
-    frame.setStartedTick(currentTick);
-    rootStep.onStart(makeCtx(observer.snapshot(currentTick), frame));
-    telemetry.record(rec(currentTick, frame, TelemetryRecord.Event.SELECTED, "priority=" + rootStep.priority()));
-    telemetry.record(rec(currentTick, frame, TelemetryRecord.Event.STARTED, ""));
-
-    // If the root is a composite, immediately push its first child
-    if (rootStep instanceof net.runelite.client.sequence.composite.LinearSequence ls
-        && frame instanceof net.runelite.client.sequence.composite.LinearSequenceFrame lsf
-        && !ls.getChildren().isEmpty()) {
-        Step first = ls.getChildren().get(0);
-        StepFrame child = makeFrame(first, 1);
-        frames.push(child);
-        child.setStartedTick(currentTick);
-        first.onStart(makeCtx(observer.snapshot(currentTick), child));
-        telemetry.record(rec(currentTick, child, TelemetryRecord.Event.SELECTED, "child #0"));
-        telemetry.record(rec(currentTick, child, TelemetryRecord.Event.STARTED, ""));
-    }
-}
-
 private StepFrame makeFrame(Step s, int depth) {
     if (s instanceof net.runelite.client.sequence.composite.LinearSequence ls) {
         return new net.runelite.client.sequence.composite.LinearSequenceFrame(ls, depth);
     }
+    // [Selector branch added in Task 18]
+    // [RepeatStep branch added in Task 19]
     return new StepFrame(s, depth);
 }
 ```
 
-- [ ] **Step 5: Write LinearSequence test**
+`pushFirstChildIfComposite`:
+```java
+private void pushFirstChildIfComposite(StepFrame composite, WorldSnapshot snap) {
+    Step s = composite.getStep();
+    if (s instanceof net.runelite.client.sequence.composite.LinearSequence ls
+        && !ls.getChildren().isEmpty()) {
+        StepFrame child = makeFrame(ls.getChildren().get(0), composite.getDepth() + 1);
+        frames.push(child);
+        telemetry.record(rec(child, TelemetryRecord.Event.SELECTED, "child #0"));
+        pushFirstChildIfComposite(child, snap);
+        return;
+    }
+    // [Selector branch added in Task 18]
+    // [RepeatStep branch added in Task 19]
+}
+```
+
+`invokeOrchestration`:
+```java
+private CompositeStep.NextAction invokeOrchestration(
+    StepFrame parent, StepFrame popped, Completion status, WorldSnapshot snap) {
+    Step parentStep = parent.getStep();
+    if (parentStep instanceof net.runelite.client.sequence.composite.LinearSequence ls
+        && parent instanceof net.runelite.client.sequence.composite.LinearSequenceFrame lsf) {
+        return ls.onChildPopped(lsf, status);
+    }
+    // [Selector branch added in Task 18]
+    // [RepeatStep branch added in Task 19]
+    return new CompositeStep.FinishWithFailure(
+        "unknown composite type " + parentStep.getClass().getSimpleName());
+}
+```
+
+`resolveJumpToAnchor`:
+```java
+private void resolveJumpToAnchor(StepFrame failed, Recovery.JumpToAnchor j, WorldSnapshot snap) {
+    List<StepFrame> all = new ArrayList<>(frames.all());
+    for (int i = all.size() - 1; i >= 0; i--) {
+        StepFrame f = all.get(i);
+        if (f.getStep() instanceof net.runelite.client.sequence.composite.LinearSequence ls
+            && f instanceof net.runelite.client.sequence.composite.LinearSequenceFrame lsf) {
+            int idx = ls.anchorIndex(j.anchorName());
+            if (idx >= 0) {
+                while (frames.size() > i + 1) frames.pop();
+                blackboard.clear(net.runelite.client.sequence.blackboard.BlackboardScope.STEP);
+                lsf.setCurrentChildIndex(idx);
+                Step child = ls.getChildren().get(idx);
+                StepFrame childFrame = makeFrame(child, lsf.getDepth() + 1);
+                frames.push(childFrame);
+                telemetry.record(rec(childFrame, TelemetryRecord.Event.SELECTED,
+                    "jump to " + j.anchorName()));
+                pushFirstChildIfComposite(childFrame, snap);
+                return;
+            }
+        }
+    }
+    applyRecovery(failed, new Recovery.Abort("anchor '" + j.anchorName() + "' not found"), snap);
+}
+```
+
+- [ ] **Step 3: Write LinearSequence test**
 
 ```java
 package net.runelite.client.sequence.composite;
@@ -2177,12 +2370,12 @@ public class LinearSequenceTest {
 }
 ```
 
-- [ ] **Step 6: Run tests**
+- [ ] **Step 4: Run tests**
 
 Run: `./gradlew :runelite-client:test --tests 'net.runelite.client.sequence.composite.LinearSequenceTest' --tests 'net.runelite.client.sequence.internal.StateDrivenEngineTest'`
 Expected: PASS — engine test still green; new linear test green.
 
-- [ ] **Step 7: Commit**
+- [ ] **Step 5: Commit**
 
 ```bash
 git add runelite-client/src/main/java/net/runelite/client/sequence/composite/ runelite-client/src/test/java/net/runelite/client/sequence/composite/ runelite-client/src/main/java/net/runelite/client/sequence/internal/StateDrivenEngine.java
@@ -2251,16 +2444,15 @@ import lombok.Getter;
 import lombok.Setter;
 import net.runelite.client.sequence.internal.StepFrame;
 
-@Getter @Setter
 public final class SelectorFrame extends StepFrame {
-    private int nextChildIndex = 1;  // 0 was pushed at start
+    @Getter @Setter private int nextChildIndex = 1;  // 0 was pushed at start
     public SelectorFrame(Selector s, int depth) { super(s, depth); }
 }
 ```
 
-- [ ] **Step 3: Wire Selector in engine**
+- [ ] **Step 3: Add Selector branches to engine extension points**
 
-Add to `StateDrivenEngine.makeFrame`:
+Edit `StateDrivenEngine.java`. Add to `makeFrame`:
 
 ```java
 if (s instanceof net.runelite.client.sequence.composite.Selector sel) {
@@ -2268,46 +2460,24 @@ if (s instanceof net.runelite.client.sequence.composite.Selector sel) {
 }
 ```
 
-Add to `StateDrivenEngine.start(...)` (after the LinearSequence push):
+Add to `pushFirstChildIfComposite`:
 
 ```java
-if (rootStep instanceof net.runelite.client.sequence.composite.Selector sel
-    && !sel.children().isEmpty()) {
-    Step first = sel.children().get(0);
-    StepFrame child = makeFrame(first, 1);
+if (s instanceof net.runelite.client.sequence.composite.Selector sel && !sel.children().isEmpty()) {
+    StepFrame child = makeFrame(sel.children().get(0), composite.getDepth() + 1);
     frames.push(child);
-    child.setStartedTick(currentTick);
-    first.onStart(makeCtx(observer.snapshot(currentTick), child));
-    telemetry.record(rec(currentTick, child, TelemetryRecord.Event.SELECTED, "selector option #0"));
-    telemetry.record(rec(currentTick, child, TelemetryRecord.Event.STARTED, ""));
+    telemetry.record(rec(child, TelemetryRecord.Event.SELECTED, "selector option #0"));
+    pushFirstChildIfComposite(child, snap);
+    return;
 }
 ```
 
-Add Selector branch to `popAndOrchestrate`:
+Add to `invokeOrchestration`:
 
 ```java
-else if (parent instanceof net.runelite.client.sequence.composite.SelectorFrame sf
-         && parent.getStep() instanceof net.runelite.client.sequence.composite.Selector sel) {
-    var next = sel.onChildPopped(sf, status, snap, blackboard);
-    switch (next) {
-        case net.runelite.client.sequence.composite.CompositeStep.PushChild pc -> {
-            StepFrame child = makeFrame(pc.child(), parent.getDepth() + 1);
-            frames.push(child);
-            child.setStartedTick(currentTick);
-            pc.child().onStart(makeCtx(snap, child));
-            telemetry.record(rec(currentTick, child, TelemetryRecord.Event.SELECTED, "selector fallback"));
-            telemetry.record(rec(currentTick, child, TelemetryRecord.Event.STARTED, ""));
-        }
-        case net.runelite.client.sequence.composite.CompositeStep.FinishWithSuccess fs -> {
-            parent.setStatus(new Completion.Succeeded(fs.reason()));
-            telemetry.record(rec(currentTick, parent, TelemetryRecord.Event.SUCCEEDED, fs.reason()));
-            popAndOrchestrate(parent, parent.getStatus(), snap);
-        }
-        case net.runelite.client.sequence.composite.CompositeStep.FinishWithFailure ff -> {
-            applyRecovery(parent, parent.getStep().onFailure(
-                Failure.fromCheck(ff.reason(), 0), snap, blackboard));
-        }
-    }
+if (parentStep instanceof net.runelite.client.sequence.composite.Selector sel
+    && parent instanceof net.runelite.client.sequence.composite.SelectorFrame sf) {
+    return sel.onChildPopped(sf, status, snap, blackboard);
 }
 ```
 
@@ -2440,16 +2610,15 @@ import lombok.Getter;
 import lombok.Setter;
 import net.runelite.client.sequence.internal.StepFrame;
 
-@Getter @Setter
 public final class RepeatStepFrame extends StepFrame {
-    private int iterationsCompleted = 0;
+    @Getter @Setter private int iterationsCompleted = 0;
     public RepeatStepFrame(RepeatStep s, int depth) { super(s, depth); }
 }
 ```
 
-- [ ] **Step 3: Wire Repeat in engine** (parallel to Task 18 wiring)
+- [ ] **Step 3: Add RepeatStep branches to engine extension points**
 
-Add to `makeFrame`:
+Edit `StateDrivenEngine.java`. Add to `makeFrame`:
 
 ```java
 if (s instanceof net.runelite.client.sequence.composite.RepeatStep rs) {
@@ -2457,7 +2626,26 @@ if (s instanceof net.runelite.client.sequence.composite.RepeatStep rs) {
 }
 ```
 
-Add to `start(...)` to push the body as the first child if root is `RepeatStep`. Add to `popAndOrchestrate` an `else if` branch that delegates to `RepeatStep.onChildPopped(frame, status)`. Pattern is identical to LinearSequence. (Replicate the LinearSequence branch with type substitution.)
+Add to `pushFirstChildIfComposite`:
+
+```java
+if (s instanceof net.runelite.client.sequence.composite.RepeatStep rs) {
+    StepFrame child = makeFrame(rs.body(), composite.getDepth() + 1);
+    frames.push(child);
+    telemetry.record(rec(child, TelemetryRecord.Event.SELECTED, "repeat body"));
+    pushFirstChildIfComposite(child, snap);
+    return;
+}
+```
+
+Add to `invokeOrchestration`:
+
+```java
+if (parentStep instanceof net.runelite.client.sequence.composite.RepeatStep rs
+    && parent instanceof net.runelite.client.sequence.composite.RepeatStepFrame rsf) {
+    return rs.onChildPopped(rsf, status);
+}
+```
 
 - [ ] **Step 4: Write RepeatStep test**
 
@@ -2823,9 +3011,33 @@ public final class WalkStep implements Step {
     @Override public void onEvent(Object e, StepContext ctx) { /* unused */ }
 
     private void clickToward(StepContext ctx) {
-        // v1: click directly toward target. DirectInputDispatcher handles
-        // out-of-scene targets by no-oping; tick() will retry on next idle.
-        ctx.actions().walkTo(target);
+        WorldPoint waypoint = pickReachableWaypointToward(target, ctx.snapshot());
+        if (waypoint != null) ctx.actions().walkTo(waypoint);
+    }
+
+    /**
+     * Spec §16: pick the loaded scene tile closest to {@code target} that is
+     * inside the current scene. The dispatcher only converts via
+     * {@code LocalPoint.fromWorld}, which returns null for off-scene targets —
+     * so we bound the click to a tile we know is in-scene. Successive scene
+     * loads make new tiles reachable; tick() re-clicks each idle frame.
+     */
+    static WorldPoint pickReachableWaypointToward(WorldPoint target, WorldSnapshot snap) {
+        if (snap.player() == null) return null;
+        WorldPoint pos = snap.player().worldLocation();
+        if (pos == null) return null;
+
+        // If target is in-scene already, click it directly. We approximate
+        // "in-scene" by distance-to-player; full check requires Client.
+        int dist = pos.distanceTo(target);
+        if (dist <= 50) return target;   // well inside the 104-tile scene
+
+        // Otherwise pick the point along the straight line toward target that
+        // is ~50 tiles from the player, clamped to scene plane.
+        int dx = Math.signum((float) (target.getX() - pos.getX())) > 0 ? 50 : -50;
+        int dy = Math.signum((float) (target.getY() - pos.getY())) > 0 ? 50 : -50;
+        // Stay on the same plane; cross-plane walks are not supported in v1.
+        return new WorldPoint(pos.getX() + dx, pos.getY() + dy, pos.getPlane());
     }
 }
 ```
@@ -2908,12 +3120,10 @@ public class SequenceManagerTest {
         mgr.setDispatcher(mock);
 
         mgr.run(new WalkStep(target));
-        // tick 1: onStart queues walk, drained -> mock receives 1 request
-        mgr.engine().advanceTick();
+        // tick 1: onStart deferred → fires on first advance, queues walk, drained → mock receives ≥1 request
         // tick 2: still walking
-        mgr.engine().advanceTick();
-        // tick 3: arrived
-        mgr.engine().advanceTick();
+        // tick 3: arrived → SUCCEEDED, frame popped, engine becomes IDLE
+        mgr.getEngine().advanceTicks(3);
 
         assertFalse(mock.getRequests().isEmpty());
         assertEquals(SequenceState.IDLE, mgr.state());
@@ -2943,6 +3153,8 @@ Expected: FAIL — `SequenceManager` does not exist.
 
 - [ ] **Step 3: Implement SequenceManager**
 
+`SequenceManager` accepts and exposes `SequenceEngine` via the interface — never the concrete `StateDrivenEngine`. This honors spec §3 principle 1 ("public APIs accept interfaces") and lets a test swap in `LinearEngine` (Task 16b) without changes.
+
 ```java
 package net.runelite.client.sequence;
 
@@ -2959,7 +3171,7 @@ import net.runelite.client.sequence.telemetry.TelemetryRecord;
 import java.util.function.Consumer;
 
 public final class SequenceManager {
-    @Getter private StateDrivenEngine engine;
+    @Getter private SequenceEngine engine;
     @Getter private InputDispatcher dispatcher;
     @Getter private Telemetry telemetry;
     @Getter private Observer observer;
@@ -2979,17 +3191,18 @@ public final class SequenceManager {
         return m;
     }
 
-    public void setEngine(StateDrivenEngine e) { this.engine = e; }
-    public void setDispatcher(InputDispatcher d) {
-        this.dispatcher = d;
-        rebuildEngineIfReady();
-    }
+    /** Override the engine entirely (e.g. tests use LinearEngine). Otherwise
+     *  defaults wire up StateDrivenEngine when all subsystems are set. */
+    public void setEngine(SequenceEngine e) { this.engine = e; }
+
+    public void setDispatcher(InputDispatcher d) { this.dispatcher = d; rebuildEngineIfReady(); }
     public void setTelemetry(Telemetry t) { this.telemetry = t; rebuildEngineIfReady(); }
     public void setObserver(Observer o) { this.observer = o; rebuildEngineIfReady(); }
     public void setPlanner(Planner p) { this.planner = p; rebuildEngineIfReady(); }
     public void setBlackboard(Blackboard b) { this.blackboard = b; rebuildEngineIfReady(); }
 
     private void rebuildEngineIfReady() {
+        if (engine != null) return;   // explicit setEngine takes precedence
         if (observer != null && dispatcher != null && planner != null
             && telemetry != null && blackboard != null) {
             engine = new StateDrivenEngine(observer, planner, dispatcher, telemetry, blackboard);
@@ -3004,6 +3217,9 @@ public final class SequenceManager {
 
     public void register(Step reactive)   { engine.registerReactive(reactive); }
     public void unregister(Step reactive) { engine.unregisterReactive(reactive); }
+
+    /** Plugins forward RuneLite events here; the engine routes them on the next tick. */
+    public void offerEvent(Object event) { if (engine != null) engine.offerEvent(event); }
 
     public void subscribe(Consumer<TelemetryRecord> listener)   { telemetry.subscribe(listener); }
     public void unsubscribe(Consumer<TelemetryRecord> listener) { telemetry.unsubscribe(listener); }
@@ -3104,6 +3320,17 @@ public class SequencerPlugin extends Plugin {
         }
     }
 
+    // Forward a curated set of RuneLite events to the engine. Steps that care
+    // about specific event types narrow via instanceof in their onEvent.
+
+    @Subscribe public void onItemContainerChanged(net.runelite.api.events.ItemContainerChanged e) { offer(e); }
+    @Subscribe public void onAnimationChanged(net.runelite.api.events.AnimationChanged e)         { offer(e); }
+    @Subscribe public void onChatMessage(net.runelite.api.events.ChatMessage e)                   { offer(e); }
+    @Subscribe public void onMenuOptionClicked(net.runelite.api.events.MenuOptionClicked e)       { offer(e); }
+    @Subscribe public void onGameStateChanged(net.runelite.api.events.GameStateChanged e)         { offer(e); }
+
+    private void offer(Object event) { if (manager != null) manager.offerEvent(event); }
+
     public SequenceManager manager() { return manager; }
 }
 ```
@@ -3163,9 +3390,14 @@ public final class SequencerPanel extends PluginPanel {
     private final DefaultListModel<String> logModel = new DefaultListModel<>();
     private final JList<String> logList = new JList<>(logModel);
 
+    private final DefaultListModel<StepRow> reactiveListModel = new DefaultListModel<>();
+    private final JList<StepRow> reactiveList = new JList<>(reactiveListModel);
+
     private final JButton runBtn = new JButton("Run");
+    private final JButton pauseBtn = new JButton("Pause");
     private final JButton stopBtn = new JButton("Stop");
     private final JButton addBtn = new JButton("+ Add step");
+    private final JButton addReactiveBtn = new JButton("+ Add reactive");
 
     public SequencerPanel(SequenceManager manager) {
         super(false);
@@ -3177,13 +3409,17 @@ public final class SequencerPanel extends PluginPanel {
         add(Box.createVerticalStrut(6));
         add(buildSequenceSection());
         add(Box.createVerticalStrut(6));
+        add(buildReactiveSection());
+        add(Box.createVerticalStrut(6));
         add(buildControls());
         add(Box.createVerticalStrut(6));
         add(buildLog());
 
         runBtn.addActionListener(e -> onRun());
+        pauseBtn.addActionListener(e -> onPauseToggle());
         stopBtn.addActionListener(e -> onStop());
-        addBtn.addActionListener(e -> onAddStep());
+        addBtn.addActionListener(e -> onAddStep(stepListModel, false));
+        addReactiveBtn.addActionListener(e -> onAddStep(reactiveListModel, true));
 
         manager.subscribe(this::onTelemetry);
 
@@ -3209,9 +3445,19 @@ public final class SequencerPanel extends PluginPanel {
         return p;
     }
 
+    private JComponent buildReactiveSection() {
+        JPanel p = new JPanel(new BorderLayout());
+        p.setBorder(BorderFactory.createTitledBorder("Reactive"));
+        reactiveList.setVisibleRowCount(3);
+        p.add(new JScrollPane(reactiveList), BorderLayout.CENTER);
+        p.add(addReactiveBtn, BorderLayout.SOUTH);
+        return p;
+    }
+
     private JComponent buildControls() {
         JPanel p = new JPanel();
         p.add(runBtn);
+        p.add(pauseBtn);
         p.add(stopBtn);
         return p;
     }
@@ -3224,7 +3470,7 @@ public final class SequencerPanel extends PluginPanel {
         return p;
     }
 
-    private void onAddStep() {
+    private void onAddStep(DefaultListModel<StepRow> targetModel, boolean reactive) {
         List<StepFactory> factories = manager.getRegistry().all();
         if (factories.isEmpty()) {
             JOptionPane.showMessageDialog(this, "No step factories registered.");
@@ -3239,15 +3485,33 @@ public final class SequencerPanel extends PluginPanel {
         StepFactory chosen = factories.stream()
             .filter(f -> f.displayName().equals(choice)).findFirst().orElseThrow();
 
-        Map<String, Object> args = new HashMap<>();
-        for (StepParam param : chosen.params()) {
-            String input = JOptionPane.showInputDialog(this,
-                param.name() + " (" + param.type() + ")", String.valueOf(param.defaultValue()));
-            if (input == null) return;
-            args.put(param.name(), parseParam(param, input));
-        }
+        Map<String, Object> args = collectParamsViaForm(chosen);
+        if (args == null) return;   // cancelled
         Step s = chosen.build(args);
-        stepListModel.addElement(new StepRow(s));
+        targetModel.addElement(new StepRow(s));
+        if (reactive) manager.register(s);
+    }
+
+    /** Builds a single dialog with one input row per StepParam. Returns null on cancel. */
+    private Map<String, Object> collectParamsViaForm(StepFactory factory) {
+        List<StepParam> params = factory.params();
+        if (params.isEmpty()) return new HashMap<>();
+        JPanel form = new JPanel(new GridLayout(params.size(), 2, 4, 4));
+        List<JTextField> fields = new java.util.ArrayList<>();
+        for (StepParam p : params) {
+            form.add(new JLabel(p.name() + " (" + p.type() + "):"));
+            JTextField tf = new JTextField(String.valueOf(p.defaultValue()), 16);
+            form.add(tf);
+            fields.add(tf);
+        }
+        int result = JOptionPane.showConfirmDialog(this, form,
+            "Configure " + factory.displayName(), JOptionPane.OK_CANCEL_OPTION);
+        if (result != JOptionPane.OK_OPTION) return null;
+        Map<String, Object> args = new HashMap<>();
+        for (int i = 0; i < params.size(); i++) {
+            args.put(params.get(i).name(), parseParam(params.get(i), fields.get(i).getText()));
+        }
+        return args;
     }
 
     private static Object parseParam(StepParam p, String raw) {
@@ -3277,7 +3541,17 @@ public final class SequencerPanel extends PluginPanel {
         manager.run(seq);
     }
 
-    private void onStop() { manager.stop(); }
+    private void onPauseToggle() {
+        if (manager.state() == SequenceState.PAUSED) {
+            manager.resume();
+            pauseBtn.setText("Pause");
+        } else if (manager.state() == SequenceState.RUNNING) {
+            manager.pause();
+            pauseBtn.setText("Resume");
+        }
+    }
+
+    private void onStop() { manager.stop(); pauseBtn.setText("Pause"); }
 
     private void refreshStatus() {
         SequenceState s = manager.state();
@@ -3356,48 +3630,48 @@ git commit -m "sequencer: add side panel with step picker, run/stop, and telemet
 **Files:**
 - Modify: `runelite-client/src/main/java/net/runelite/client/plugins/walker/WalkerPlugin.java`
 
-- [ ] **Step 1: Replace direct menuAction call with engine call**
+- [ ] **Step 1: Add @PluginDependency and @Inject the SequencerPlugin**
 
-Open the existing file and replace the `walkToTarget()` method:
+Edit `WalkerPlugin.java`:
 
-```java
-@Inject private net.runelite.client.plugins.PluginManager pluginManager;
-
-private void walkToTarget() {
-    if (client.getGameState() != GameState.LOGGED_IN) return;
-    WorldPoint target = new WorldPoint(config.targetX(), config.targetY(), config.targetZ());
-
-    // Find the SequencerPlugin instance and use its SequenceManager
-    pluginManager.getPlugins().stream()
-        .filter(p -> p instanceof net.runelite.client.plugins.sequencer.SequencerPlugin)
-        .map(p -> (net.runelite.client.plugins.sequencer.SequencerPlugin) p)
-        .findFirst()
-        .ifPresent(sp -> {
-            var manager = sp.manager();
-            if (manager == null) return;
-            if (manager.state() != net.runelite.client.sequence.SequenceState.IDLE) return;
-            manager.run(new net.runelite.client.sequence.composite.LinearSequence("walker-hotkey")
-                .then(new net.runelite.client.sequence.activities.WalkStep(target)));
-        });
-}
-```
-
-Add `@PluginDependency(SequencerPlugin.class)` above the WalkerPlugin's `@PluginDescriptor`:
+Add the dependency annotation directly above `@PluginDescriptor` (RuneLite's plugin loader populates dependencies via the Guice injector when this annotation is present):
 
 ```java
 @PluginDependency(net.runelite.client.plugins.sequencer.SequencerPlugin.class)
 @PluginDescriptor(
     name = "Walker",
-    ...
+    description = "Walk to configured world coordinates via hotkey",
+    tags = {"walk", "coordinates", "movement"}
 )
+public class WalkerPlugin extends Plugin {
+    // ...
+    @Inject private net.runelite.client.plugins.sequencer.SequencerPlugin sequencerPlugin;
+    // ...
+}
 ```
 
-- [ ] **Step 2: Verify compile**
+- [ ] **Step 2: Replace direct menuAction call with engine call**
+
+Replace the `walkToTarget()` method:
+
+```java
+private void walkToTarget() {
+    if (client.getGameState() != GameState.LOGGED_IN) return;
+    var manager = sequencerPlugin.manager();
+    if (manager == null) return;
+    if (manager.state() != net.runelite.client.sequence.SequenceState.IDLE) return;
+    WorldPoint target = new WorldPoint(config.targetX(), config.targetY(), config.targetZ());
+    manager.run(new net.runelite.client.sequence.composite.LinearSequence("walker-hotkey")
+        .then(new net.runelite.client.sequence.activities.WalkStep(target)));
+}
+```
+
+- [ ] **Step 3: Verify compile**
 
 Run: `./gradlew :runelite-client:compileJava`
 Expected: BUILD SUCCESSFUL
 
-- [ ] **Step 3: Commit**
+- [ ] **Step 4: Commit**
 
 ```bash
 git add runelite-client/src/main/java/net/runelite/client/plugins/walker/WalkerPlugin.java
@@ -3514,29 +3788,46 @@ git commit -m "sequence: add end-to-end acceptance test for §21 criteria 3-5"
 
 ## Self-review
 
-Spec coverage check:
-- §1 Purpose — covered by overall structure.
-- §2 Scope — `Verifier` correctly absent; ParallelGroup deferred (Task 20 note).
-- §3 Principles — interfaces vs concrete construction respected throughout.
-- §4 Package layout — Tasks 1–22 build it.
-- §5 Step contract + Actions API — Tasks 6, 9.
-- §6 Sealed types — Task 2.
-- §7 Engine loop — Task 16, plus composite orchestration in Tasks 17–19.
-- §8 Composites — Tasks 17–19 (ParallelGroup deferred).
-- §9 Frames — Task 10 + composite frame subclasses in Tasks 17–19.
-- §10 Blackboard — Task 3.
-- §11 Action budget — Tasks 5, 14.
-- §12 InputDispatcher — Tasks 7, 8.
-- §13 Subsystem table — Task 23 (SequenceManager wiring).
-- §14 Telemetry — Task 11.
-- §15 SequenceManager — Task 23.
-- §16 WalkStep — Task 22.
-- §17 Panel + factories — Tasks 21, 24, 25.
-- §18 Lifecycle/threading — Task 24.
-- §19 Testing — Tasks 8, 12, 27.
-- §20 Future work — explicitly out of scope.
-- §21 Acceptance criteria — Task 27 covers 3, 4, 5; criteria 1 (compiles) and 2 (plugin discoverable) are continuous.
+Spec coverage:
 
-No `TBD` placeholders, no "similar to Task N" stubs. All code blocks contain working code.
+| Spec § | Plan task(s) |
+|---|---|
+| §1 Purpose | overall structure |
+| §2 Scope | `Verifier` absent ✓; ParallelGroup deferred (Task 20 note) |
+| §3 Principles (interfaces, facade) | Task 23 setEngine accepts `SequenceEngine` interface |
+| §4 Package layout | Tasks 1–22 build it |
+| §5 Step contract + Actions API + StepContext | Tasks 6, 9 |
+| §6 Sealed types + Recovery semantics table | Task 2 + Task 16 (`applyRecovery` + `popAndOrchestrate`) |
+| §7 Engine loop ordering | Task 16 — events → check/pop → orchestrate → planner+preempt → tick → drain |
+| §8 Composites (LinearSequence/Selector/RepeatStep) | Tasks 17–19; ParallelGroup deferred |
+| §9 Frames + composite-specific frame subclasses | Task 10 + Tasks 17–19 |
+| §10 Blackboard + scope cleanup on pop | Task 3 + Task 16 (`popAndOrchestrate` clears STEP, root-pop clears SEQUENCE, stop clears RUN) |
+| §11 Action budget + arbitration | Tasks 5, 14 |
+| §12 InputDispatcher seam + InputMode | Tasks 7, 8 |
+| §13 Subsystem swap surface | Task 23 (Manager wiring; `Verifier` correctly absent) |
+| §14 Telemetry + EVENT/PREEMPTED/RESUMED records | Tasks 11 + Task 16 (engine emits all event types) |
+| §15 SequenceManager (full API) | Task 23 — `setEngine` takes interface, `offerEvent` passthrough, reactive register/unregister |
+| §16 WalkStep + waypoint picker | Task 22 — `pickReachableWaypointToward` implemented |
+| §17 Panel + StepRegistry + reactive list + pause | Tasks 21, 24, 25 |
+| §18 Lifecycle/threading | Task 24 (plugin forwards GameTick + curated events) |
+| §19 Testing (`LinearEngine` + `MockInputDispatcher` + `FixtureObserver`) | Tasks 8, 12 + `SequenceEngine.advanceTicks` default method (no separate LinearEngine class) |
+| §20 Future work | explicitly out of scope |
+| §21 Acceptance criteria | Task 27 covers 3, 4, 5 |
 
-Type consistency: `StepFrame` accessors match across Tasks 10, 16, 17–19. `Completion`, `Recovery`, `Failure` signatures unchanged after definition. `Actions` method names match across Tasks 6, 22, 25.
+Engine loop semantics (§5 + §7):
+- `tick()` only on leaves — `CompositeStep.tick()` is `final` no-op; engine iterates `frames.leaves()`
+- `check()` is passive — only reads state; mutation goes through `ctx.actions()`
+- `onStart()` deferred to first `advanceTick` so a real snapshot is available
+- Step exceptions caught in `tick`/`onStart`/`onEvent`/`check` — produce synthetic `Failed`/`Abort`
+- Preemption with suspension/resumption (PREEMPTED/RESUMED telemetry)
+- Recovery propagation: `Skip`/`Retry`-exhausted invoke `popAndOrchestrate` so parent composites advance correctly
+- `JumpToAnchor` resolved by walking outward through frames (Task 17)
+- Reactive eligibility excludes steps already on the frame stack (`eligibleReactives()`)
+
+Lombok safety:
+- `StepFrame` and composite-frame subclasses have `@Setter` only on mutable fields, never at class level
+- `@Value` on `ActionRequest` + `@Builder(toBuilder = true)` for ergonomic construction
+
+Type consistency confirmed: `Completion`, `Recovery`, `Failure`, `StepFrame`, `Actions`, `SequenceEngine`, `CompositeStep.NextAction` signatures unchanged after their defining tasks.
+
+No `TBD` placeholders. All code blocks contain working code or marked extension points (`[X branch added in Task Y]`).
