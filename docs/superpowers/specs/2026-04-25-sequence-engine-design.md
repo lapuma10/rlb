@@ -18,7 +18,7 @@ A state-driven sequence engine for orchestrating multi-step workflows in OSRS vi
 
 ### In scope
 
-- The engine core: `SequenceEngine`, `Step`, `StepContext`, `Planner`, `Verifier`, `Observer`, `Blackboard`, `Telemetry`, `InputDispatcher`.
+- The engine core: `SequenceEngine`, `Step`, `StepContext`, `Planner`, `Observer`, `Blackboard`, `Telemetry`, `InputDispatcher`.
 - Composite steps: `LinearSequence`, `ParallelGroup`, `Selector`, `RepeatStep`.
 - A first concrete activity: `WalkStep` (replaces the standalone Walker plugin's logic).
 - A thin RuneLite plugin (`SequencerPlugin`) that owns the sidebar panel and wires the engine into the client.
@@ -76,7 +76,7 @@ net.runelite.client.sequence/                  ← engine (no plugin coupling)
     ScopedBlackboard.java                       ← default
 
   dispatch/
-    InputDispatcher.java                        ← interface (the humanization seam)
+    InputDispatcher.java                        ← interface (the dispatch strategy seam)
     DirectInputDispatcher.java                  ← default
 
   telemetry/
@@ -93,6 +93,7 @@ net.runelite.client.sequence/                  ← engine (no plugin coupling)
   activities/
     WalkStep.java                               ← first concrete activity
     StepFactory.java                            ← interface
+    StepRegistry.java                           ← collects registered factories
     StepParam.java                              ← param descriptor for UI
     WalkStepFactory.java
 
@@ -243,32 +244,65 @@ snapshot = observer.snapshot(client)
 routeQueuedEvents(frameStack)            // top of stack (innermost) first,
                                           // then outward to root
 
-for each LEAF frame (primitives only — one per active branch):
-    leaf.step.tick(ctx)                   // only primitives queue actions
-                                          // composites tick is a no-op
+// 1. Verify and pop completed/failed leaf frames
+for each LEAF frame:
+    result = leaf.step.check(snapshot, bb)        // passive
+    switch result:
+        case Succeeded(r) -> telemetry.succeeded(leaf, r); popFrame(leaf)
+        case Failed(r)    -> applyRecovery(leaf.step.onFailure(...))
+        case Running()    -> if leaf.timedOut(): applyRecovery(...)
 
-executor.drainActionQueue(budget)         // arbitration + budget enforcement
-                                          // delegates each request to InputDispatcher
+// 2. Composite orchestration (driven by popFrame above)
+//    LinearSequence: child popped Succeeded -> push next child, or pop self
+//    Selector:       child popped Succeeded -> pop self with Succeeded
+//                    child popped Failed    -> push next eligible sibling
+//    ParallelGroup:  child popped -> evaluate Policy; pop self if satisfied
+//    RepeatStep:     child popped Succeeded -> increment counter; push child
+//                                              again or pop self
+//    These callbacks may push new frames or pop the composite itself.
 
+// 3. Planner & preemption
 if frameStack.empty():
     next = planner.select(snapshot, bb, registeredSteps)
     if next != null:
-        push frame; next.onStart(ctx); telemetry.started(next)
-
+        pushFrame(next); next.onStart(ctx); telemetry.started(next)
 else:
-    activeFrame = frameStack.top()
-
     if reactiveStep eligible
-       AND activeFrame.step.preemptionPolicy() != NEVER
-       AND activeFrame.step.isSafeToPause(snapshot, bb):
-        preempt(activeFrame); pick reactiveStep
+       AND topFrame.step.preemptionPolicy() != NEVER
+       AND topFrame.step.isSafeToPause(snapshot, bb):
+        preempt(topFrame); pushFrame(reactiveStep); reactiveStep.onStart(ctx)
 
-    result = activeFrame.step.check(snapshot, bb)   // passive
-    switch result:
-        case Succeeded(r) -> telemetry.succeeded(activeFrame, r); pop()
-        case Failed(r)    -> apply(activeFrame.step.onFailure(...))
-        case Running()    -> if activeFrame.timedOut(): apply(onFailure(...))
+// 4. Tick leaves (now includes any newly-pushed frames from steps 2-3)
+for each LEAF frame (primitives only — one per active branch):
+    leaf.step.tick(ctx)                           // only primitives queue actions
+                                                  // composites tick is a no-op
+
+// 5. Drain — last so onStart-queued and tick-queued actions both go out
+executor.drainActionQueue(budget)                 // arbitration + budget
+                                                  // delegates to InputDispatcher
 ```
+
+### Frame lifecycle callbacks
+
+`popFrame(leaf)` does not just remove the leaf — it walks up the stack and notifies the parent composite, which is responsible for deciding what happens next. Each composite type implements an internal `onChildPopped(child, status)` method:
+
+```java
+// LinearSequence
+void onChildPopped(StepFrame child, Completion status) {
+    if (status instanceof Succeeded) {
+        currentChildIndex++;
+        if (currentChildIndex < children.size()) {
+            engine.pushFrame(this, children.get(currentChildIndex));
+        } else {
+            engine.popFrame(this, new Succeeded("all children done"));
+        }
+    } else if (status instanceof Failed f) {
+        engine.popFrame(this, f);                  // propagate up
+    }
+}
+```
+
+These callbacks are engine-internal mechanics, not part of the public `Step` interface — composites collaborate with `StateDrivenEngine` through a package-private hook.
 
 ### Key invariants
 
@@ -331,13 +365,23 @@ class StepFrame {
     Step step;
     int startedTick;
     int retryCount;
-    int currentChildIndex;     // composites only
     Completion status;
     BlackboardScope stepScope; // cleared when frame pops
 }
 ```
 
 This separation lets the same `Step` instance appear multiple times in a sequence without state collisions. The `FrameStack` is the runtime tree of currently-active frames.
+
+### Composite-specific frame state
+
+Composite step state varies by type and lives on each composite's own subclass of `StepFrame`, not on the shared shape:
+
+- `LinearSequenceFrame` — adds `currentChildIndex`.
+- `ParallelGroupFrame` — adds `Set<StepFrame> activeChildren`, `Map<StepFrame, Completion> resolved`.
+- `SelectorFrame` — adds `int nextChildIndex` for falling through to the next eligible sibling on child failure.
+- `RepeatStepFrame` — adds `int iterationsCompleted`.
+
+Primitive (leaf) frames use the base `StepFrame` directly.
 
 ## 10. Blackboard
 
@@ -481,6 +525,8 @@ public final class SequenceManager {
     public void register(Step reactiveStep);   // always-on, priority-eligible
     public void unregister(Step reactiveStep);
 
+    public StepRegistry registry();            // factories the panel can pick from
+
     public void run(Step rootSequence);
     public void pause();
     public void resume();
@@ -501,6 +547,12 @@ Reactive steps registered via `register(...)` are evaluated each tick by the pla
 public final class WalkStep implements Step {
     private final WorldPoint target;
     private final int arrivalRadius;       // tiles, default 1
+
+    public WalkStep(WorldPoint target)                  { this(target, 1); }
+    public WalkStep(WorldPoint target, int arrivalRadius) {
+        this.target = target;
+        this.arrivalRadius = arrivalRadius;
+    }
 
     public String name()                       { return "WalkTo " + target; }
     public int priority()                      { return 50; }
@@ -580,7 +632,25 @@ public enum ParamType {
 }
 ```
 
-`WalkStepFactory` declares one `WORLD_POINT` parameter (`"target"`). The panel renders three int fields (X, Y, plane) automatically. Adding new activities later requires writing the `Step` and a `StepFactory` — the panel form generation is for free.
+### Step factory registry
+
+`SequenceManager` owns a `StepRegistry` so the panel can enumerate available activities for the "Add step" picker:
+
+```java
+public final class StepRegistry {
+    public void register(StepFactory factory);
+    public void unregister(String typeId);
+    public List<StepFactory> all();
+    public StepFactory byTypeId(String typeId);
+}
+
+// On SequenceManager:
+public StepRegistry registry();
+```
+
+`SequencerPlugin.startUp()` registers built-in factories (`WalkStepFactory` for v1). External plugins or user code can call `manager.registry().register(...)` to contribute new step types. The panel iterates `registry().all()` to populate the picker and uses `byTypeId(...)` to rebuild a step from saved parameters.
+
+`WalkStepFactory` declares one `WORLD_POINT` parameter (`"target"`). The panel renders three int fields (X, Y, plane) automatically. Adding new activities later requires writing the `Step` and a `StepFactory`, then registering — the panel form generation is for free.
 
 ## 18. Lifecycle and threading
 
