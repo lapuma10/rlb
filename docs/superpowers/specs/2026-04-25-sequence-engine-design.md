@@ -52,16 +52,16 @@ net.runelite.client.sequence/                  ← engine (no plugin coupling)
   Recovery.java                                 ← sealed: Retry/Skip/Abort/JumpToAnchor
   PreemptionPolicy.java                         ← enum
   Failure.java                                  ← record
-  WorldSnapshot.java                            ← record / interface
+  SequenceState.java                            ← enum: IDLE/RUNNING/PAUSED/FAILED
+  WorldSnapshot.java                            ← interface
 
   internal/
     StateDrivenEngine.java                      ← default SequenceEngine
     Planner.java                                ← interface
     PriorityPlanner.java                        ← default
-    Verifier.java                               ← interface
-    TickVerifier.java                           ← default
     Observer.java                               ← interface
     ClientObserver.java                         ← default
+    Executor.java                               ← engine-internal; not a swap point
     FrameStack.java
     StepFrame.java
     ActionBudget.java
@@ -159,6 +159,26 @@ public interface StepContext {
 
 Passive reads in `canStart` and `check` use the `WorldSnapshot` argument those methods receive directly. `onStart`, `tick`, and `onEvent` use `ctx.snapshot()` if they need to inspect state before queueing actions.
 
+### The Actions API
+
+Steps queue intents through `Actions`; the executor drains the queue under `ActionBudget` and forwards each request to `InputDispatcher`. Initial method set:
+
+```java
+public interface Actions {
+    void walkTo(WorldPoint tile);
+    void clickTile(WorldPoint tile);
+    void clickNpc(int npcIndex, String option);
+    void clickGameObject(int objectId, WorldPoint at, String option);
+    void clickGroundItem(int itemId, WorldPoint at, String option);
+    void clickWidget(int widgetId, int childIndex, String option);
+    void clickInventoryItem(int slot, String option);
+    void sendKey(int keyCode);
+    void cancelPending();           // clear this step's queued requests
+}
+```
+
+Adding a new action verb means adding a method here and implementing it in `DirectActions`. Steps stay decoupled from `Client`.
+
 ## 6. Sealed result types
 
 ```java
@@ -178,9 +198,32 @@ public sealed interface Recovery {
 public enum PreemptionPolicy {
     NEVER, AFTER_CURRENT_TICK, WHEN_SAFE, ALWAYS
 }
+
+public enum SequenceState {
+    IDLE, RUNNING, PAUSED, FAILED
+}
+
+public record Failure(
+    String reason,        // free-form, mirrors Completion.Failed.reason
+    int ticksElapsed,     // ticks the step ran before failing
+    Throwable cause       // null if not exception-driven (e.g. timeout)
+) {}
 ```
 
-Sealed interfaces with reason-carrying records are used (not bare enums) so that telemetry and recovery have human-readable context.
+Sealed interfaces with reason-carrying records are used (not bare enums) so that telemetry and recovery have human-readable context. The engine constructs a `Failure` when `check()` returns `Failed` (cause = null) or when `timeoutTicks` is exceeded (cause = null, reason = `"timeout"`); steps that throw inside `tick()` / `onStart()` / `onEvent()` produce a `Failure` with the throwable as `cause`.
+
+### Recovery semantics
+
+How each `Recovery` is applied depends on the failed frame's position in the stack:
+
+| Recovery | Frame is root | Frame is child of `LinearSequence` | Frame is child of `ParallelGroup` | Frame is child of `Selector` |
+|---|---|---|---|---|
+| `Retry(n)` | re-run frame; abort if attempts exhausted | re-run frame; on exhaustion, propagate `Failed` to parent | re-run; on exhaustion, child reports `Failed` to parent's policy | re-run; on exhaustion, parent tries next sibling |
+| `Skip(reason)` | engine stops with `FAILED` | parent advances to next sibling | child treated as `Succeeded` for policy purposes | parent tries next sibling |
+| `Abort(reason)` | engine stops with `FAILED` (always) | engine stops with `FAILED` (propagates to root) | engine stops with `FAILED` | engine stops with `FAILED` |
+| `JumpToAnchor(name)` | engine stops with `FAILED` (no enclosing composite) | nearest enclosing `LinearSequence` with that anchor restarts from it; `FAILED` if no match found | not applicable — fails fast with `FAILED` | not applicable — fails fast with `FAILED` |
+
+`JumpToAnchor` resolution walks **outward** through the frame stack looking for an enclosing `LinearSequence` that declared the named anchor. The first match wins. If none is found the engine stops with `FAILED`.
 
 ## 7. The engine loop
 
@@ -188,7 +231,8 @@ Sealed interfaces with reason-carrying records are used (not bare enums) so that
 
 ```
 snapshot = observer.snapshot(client)
-routeQueuedEvents(frameStack)            // top-down through stack
+routeQueuedEvents(frameStack)            // top of stack (innermost) first,
+                                          // then outward to root
 
 for each frame in frameStack (top-to-bottom):
     frame.step.tick(ctx)                  // queues action requests
@@ -228,12 +272,23 @@ else:
 ```
 LinearSequence  — ordered children; child N's canStart gates on N-1 success.
                   Carries optional anchors as metadata for JumpToAnchor recovery.
-ParallelGroup   — children active concurrently; completion policy is
-                  ALL_SUCCEED / ANY_SUCCEEDS / FIRST_DONE.
-                  Action arbitration: priority desc, then frame depth, then
-                  insertion order. ActionBudget caps per-tick mutations.
+ParallelGroup   — children active concurrently; ParallelGroup.Policy controls
+                  completion. Action arbitration: priority desc, then frame
+                  depth, then insertion order. ActionBudget caps per-tick
+                  mutations.
 Selector        — first child whose canStart returns true is chosen.
 RepeatStep      — wraps a child; repeats N times or until a condition.
+```
+
+```java
+public final class ParallelGroup implements Step {
+    public enum Policy {
+        ALL_SUCCEED,   // group succeeds when every child has Succeeded
+        ANY_SUCCEEDS,  // group succeeds as soon as one child Succeeds
+        FIRST_DONE     // group resolves on first terminal child (Succeeded or Failed)
+    }
+    // ...
+}
 ```
 
 Composite steps implement `Step` themselves and are nestable.
@@ -355,25 +410,38 @@ The engine, steps, planner, verifier, blackboard, telemetry, and panel all remai
 |---|---|---|
 | `SequenceEngine` | `StateDrivenEngine` | `LinearEngine` (tests), `RecordingEngine` |
 | `Planner` | `PriorityPlanner` | `RoundRobinPlanner`, `WeightedRandomPlanner` |
-| `Verifier` | `TickVerifier` | `EventOnlyVerifier`, `MockVerifier` |
 | `Observer` | `ClientObserver` | `FixtureObserver` (tests) |
 | `Blackboard` | `ScopedBlackboard` | `PersistentBlackboard` |
 | `Telemetry` | `RingBufferTelemetry` | `JsonFileTelemetry`, `NoopTelemetry` |
 | `InputDispatcher` | `DirectInputDispatcher` | `HumanizedInputDispatcher` |
 | `Step` | `WalkStep`, composites | any further activities |
 
+The `Executor` (action queue drain + arbitration + budget enforcement) and the completion-detection logic that calls `step.check()` live **inside** `StateDrivenEngine` as engine-internal collaborators. They are not separately swappable — to change either, you swap the engine.
+
 ## 14. Telemetry
 
 A ring buffer of structured records:
 
 ```java
-record TelemetryRecord(
+public record TelemetryRecord(
     int tick,
     int frameDepth,
     String stepName,
-    Event event,            // SELECTED / STARTED / CHECK / SUCCEEDED / FAILED / RECOVERY / ...
+    Event event,
     String payload          // free-form context
-) {}
+) {
+    public enum Event {
+        SELECTED,    // planner chose this step
+        STARTED,     // onStart() was called
+        CHECK,       // check() ran (payload includes Running/Succeeded/Failed reason)
+        SUCCEEDED,   // frame popped after Succeeded
+        FAILED,      // frame entered onFailure()
+        RECOVERY,    // a Recovery was applied (payload = recovery type + detail)
+        PREEMPTED,   // frame paused so a higher-priority step could run
+        RESUMED,     // frame resumed after preemption
+        EVENT        // routed RuneLite event delivered to step.onEvent()
+    }
+}
 ```
 
 The default size is 2048 records. The panel subscribes to the telemetry stream and tails the last N to its log view. Sample output:
@@ -396,7 +464,6 @@ public final class SequenceManager {
     public void setTelemetry(Telemetry telemetry);
     public void setObserver(Observer observer);
     public void setPlanner(Planner planner);
-    public void setVerifier(Verifier verifier);
     public void setBlackboard(Blackboard blackboard);
 
     public void register(Step reactiveStep);   // always-on, priority-eligible
@@ -412,7 +479,9 @@ public final class SequenceManager {
 }
 ```
 
-Every setter is a one-line swap. The default wiring (`StateDrivenEngine`, `PriorityPlanner`, `TickVerifier`, `ClientObserver`, `ScopedBlackboard`, `RingBufferTelemetry`, `DirectInputDispatcher`) is established by `SequencerPlugin.startUp()`.
+Every setter is a one-line swap. The default wiring (`StateDrivenEngine`, `PriorityPlanner`, `ClientObserver`, `ScopedBlackboard`, `RingBufferTelemetry`, `DirectInputDispatcher`) is established by `SequencerPlugin.startUp()`.
+
+Reactive steps registered via `register(...)` are evaluated each tick by the planner: a step is **eligible** when it is registered, its `canStart(snapshot, bb)` returns `true`, and it is not already on the frame stack. The planner picks the highest-`priority()` eligible step. If a non-reactive frame is currently active, the eligible reactive step preempts it only when the active frame's `preemptionPolicy()` and `isSafeToPause(...)` both permit it.
 
 ## 16. The first activity: WalkStep
 
@@ -464,6 +533,8 @@ public final class WalkStep implements Step {
 }
 ```
 
+**`pickReachableWaypointToward` — v1 implementation:** pick the loaded scene tile closest to `target` that lies inside the current scene bounds (via `WorldPoint.isInScene` / `LocalPoint.fromWorld`). No collision-aware pathfinding; the game's own click-to-walk handles in-scene routing. Cross-map walks work because successive scene loads make new tiles reachable, and `tick()` re-clicks each time the player goes idle. Full pathfinding (collision-aware, multi-region) is out of scope and listed in §20.
+
 `WalkStep` handles cross-map walks naturally: as scene loads bring more tiles into range, `tick()` re-clicks toward the target whenever the player has gone idle and is not yet within the arrival radius.
 
 The existing `WalkerPlugin` becomes a thin wrapper that, on hotkey, builds a one-step `LinearSequence(new WalkStep(...))` and calls `manager.run(...)` — same UX, routed through the proper engine.
@@ -511,10 +582,9 @@ public enum ParamType {
 
 Each interface has a test double:
 
-- `LinearEngine` — minimal engine for unit-testing step composition.
+- `LinearEngine` — minimal engine for unit-testing step composition. Exposes `advanceTicks(int)` for synchronous test driving (not present on the production `StateDrivenEngine`).
 - `FixtureObserver` — feeds canned `WorldSnapshot`s.
 - `MockInputDispatcher` — captures `ActionRequest`s for assertions; never hits `Client`.
-- `MockVerifier` — drives `Completion` results explicitly.
 
 A typical step test:
 
@@ -522,9 +592,14 @@ A typical step test:
 WalkStep step = new WalkStep(new WorldPoint(3208, 3219, 0), 1);
 FixtureObserver obs = new FixtureObserver(snapshotsAlongPath);
 MockInputDispatcher disp = new MockInputDispatcher();
-manager.setObserver(obs); manager.setDispatcher(disp);
+LinearEngine engine = new LinearEngine();   // synchronous, advanceTicks-driven
+
+manager.setEngine(engine);
+manager.setObserver(obs);
+manager.setDispatcher(disp);
 manager.run(new LinearSequence("test").then(step));
-manager.advanceTicks(20);
+
+engine.advanceTicks(20);
 assertThat(disp.requests()).contains(walkTo(...));
 ```
 
