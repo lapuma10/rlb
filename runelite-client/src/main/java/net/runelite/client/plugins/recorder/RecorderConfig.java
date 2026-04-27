@@ -27,6 +27,7 @@ package net.runelite.client.plugins.recorder;
 import net.runelite.client.config.Config;
 import net.runelite.client.config.ConfigGroup;
 import net.runelite.client.config.ConfigItem;
+import net.runelite.client.config.ConfigSection;
 import net.runelite.client.config.Keybind;
 
 @ConfigGroup("recorder")
@@ -110,5 +111,97 @@ public interface RecorderConfig extends Config
 	default String recordingsDir()
 	{
 		return "";
+	}
+
+	@ConfigSection(
+		name = "Chicken overlay",
+		description = "Debug overlay that highlights chickens by selector eligibility. Closest eligible chicken (= what the combat loop would pick next) gets a brighter colour and a thicker outline.",
+		position = 100,
+		closedByDefault = true
+	)
+	String chickenOverlaySection = "chickenOverlay";
+
+	@ConfigItem(
+		keyName = "chickenOverlay",
+		name = "Show chicken overlay",
+		description = "Master toggle. When on, every chicken in view is outlined in a colour reflecting whether it would pass the selector's filters.",
+		section = chickenOverlaySection,
+		position = 0
+	)
+	default boolean chickenOverlay()
+	{
+		return false;
+	}
+
+	@ConfigItem(
+		keyName = "chickenOverlayShowOutOfRange",
+		name = "Show: out of range",
+		description = "Outline chickens beyond the selector's range (default 6 tiles). Useful for spotting when the player has drifted away from the flock.",
+		section = chickenOverlaySection,
+		position = 1
+	)
+	default boolean chickenOverlayShowOutOfRange()
+	{
+		return true;
+	}
+
+	@ConfigItem(
+		keyName = "chickenOverlayShowNotVisible",
+		name = "Show: not visible",
+		description = "Outline chickens rejected by the visibility filter (behind a fence, off-canvas, under a HUD widget, or under an open right-click menu).",
+		section = chickenOverlaySection,
+		position = 2
+	)
+	default boolean chickenOverlayShowNotVisible()
+	{
+		return true;
+	}
+
+	@ConfigItem(
+		keyName = "chickenOverlayShowEngagedByOther",
+		name = "Show: engaged by other",
+		description = "Outline chickens currently being attacked by another player.",
+		section = chickenOverlaySection,
+		position = 3
+	)
+	default boolean chickenOverlayShowEngagedByOther()
+	{
+		return true;
+	}
+
+	@ConfigItem(
+		keyName = "chickenOverlayShowWrongPlane",
+		name = "Show: wrong plane",
+		description = "Outline chickens on a different floor than the player. Off by default — rarely interesting.",
+		section = chickenOverlaySection,
+		position = 4
+	)
+	default boolean chickenOverlayShowWrongPlane()
+	{
+		return false;
+	}
+
+	@ConfigItem(
+		keyName = "chickenOverlayShowDying",
+		name = "Show: dying",
+		description = "Outline chickens whose HP bar has emptied (transient — usually only visible for a tick or two).",
+		section = chickenOverlaySection,
+		position = 5
+	)
+	default boolean chickenOverlayShowDying()
+	{
+		return false;
+	}
+
+	@ConfigItem(
+		keyName = "chickenOverlayShowCounts",
+		name = "Show counts panel",
+		description = "Render a small panel in the top-left listing how many chickens fall in each category (eligible, out of range, not visible, …).",
+		section = chickenOverlaySection,
+		position = 6
+	)
+	default boolean chickenOverlayShowCounts()
+	{
+		return true;
 	}
 }

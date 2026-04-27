@@ -106,26 +106,8 @@ public final class NpcSelector
         for (NPC npc : npcs)
         {
             if (npc == null) continue;
-            if (npc.getIndex() == excludedIndex) continue;
-            if (!matchesName(npc)) continue;
-            WorldPoint npcLoc = npc.getWorldLocation();
-            if (npcLoc == null) continue;
-            if (npcLoc.getPlane() != playerPos.getPlane()) continue;
-            // Health ratio == 0 means HP bar is empty (dying / dead). Some
-            // NPCs report -1 when no HP info is transmitted yet — treat that
-            // as "alive (unknown)" since chickens always have a HP scale once
-            // engaged.
-            if (npc.getHealthRatio() == 0) continue;
-            int dist = npcLoc.distanceTo(playerPos);
-            if (dist > range) continue;
-            // Reject if engaged by another player (someone else's chicken).
-            // If the NPC's interacting target is the local player, we don't
-            // exclude it — that's our prior engagement we may want to resume.
-            Actor interacting = npc.getInteracting();
-            if (interacting instanceof Player p && p != self) continue;
-            // Visibility — last filter, most expensive (canvas + collision
-            // reads). Closest *visible* chicken wins.
-            if (!visibility.canSee(npc, self, wv)) continue;
+            if (classify(npc, self, playerPos, excludedIndex, wv, visibility) != null) continue;
+            int dist = npc.getWorldLocation().distanceTo(playerPos);
             int idx = npc.getIndex();
             if (dist < bestDist || (dist == bestDist && idx < bestIndex))
             {
@@ -135,6 +117,69 @@ public final class NpcSelector
             }
         }
         return best;
+    }
+
+    /** Reasons a single NPC can fail the selector pipeline. {@link #classify}
+     *  returns one of these (or {@code null} for "passes all filters — would
+     *  be considered a valid target by {@link #pick}"). Surfaced for the
+     *  combat-overlay debug UI so it can colour-code each NPC by exactly the
+     *  same logic the selector uses, with no risk of drift. */
+    public enum Rejection
+    {
+        /** NPC index matches the {@code excludedIndex} the caller passed in. */
+        EXCLUDED,
+        /** NPC name (markup-stripped, case-insensitive) does not match the
+         *  selector's filter — i.e. it is not a target species at all. */
+        NAME_MISMATCH,
+        /** NPC's world location is null (uninitialised / despawning). */
+        NULL_LOC,
+        /** NPC is on a different plane than the player. */
+        WRONG_PLANE,
+        /** NPC's HP bar is empty — already dying / dead. */
+        DYING,
+        /** NPC's tile is further than the selector's range. */
+        OUT_OF_RANGE,
+        /** NPC is currently interacting with another player (someone else's
+         *  kill — taking it is unsporting and humans wouldn't). */
+        ENGAGED_BY_OTHER,
+        /** NPC fails the visibility checker — off-canvas, behind a wall, not
+         *  reachable on foot, under a hidden roof, or occluded by an open
+         *  menu / HUD widget. */
+        NOT_VISIBLE
+    }
+
+    /** Returns the first filter that rejects {@code npc} (in pipeline order),
+     *  or {@code null} if the NPC passes every filter. {@link #pick} consumes
+     *  this directly; callers that want a per-NPC verdict (debug overlay,
+     *  diagnostics) can call this without re-running the loop. The visibility
+     *  filter is skipped when {@code visibility} is null. */
+    @Nullable
+    public Rejection classify(NPC npc, @Nullable Player self,
+                              @Nullable WorldPoint playerPos, int excludedIndex,
+                              @Nullable WorldView wv,
+                              @Nullable TargetVisibility visibility)
+    {
+        Objects.requireNonNull(npc, "npc");
+        if (playerPos == null) return Rejection.NULL_LOC;
+        if (npc.getIndex() == excludedIndex) return Rejection.EXCLUDED;
+        if (!matchesName(npc)) return Rejection.NAME_MISMATCH;
+        WorldPoint npcLoc = npc.getWorldLocation();
+        if (npcLoc == null) return Rejection.NULL_LOC;
+        if (npcLoc.getPlane() != playerPos.getPlane()) return Rejection.WRONG_PLANE;
+        // Health ratio == 0 means HP bar is empty (dying / dead). Some
+        // NPCs report -1 when no HP info is transmitted yet — treat that
+        // as "alive (unknown)" since chickens always have a HP scale once
+        // engaged.
+        if (npc.getHealthRatio() == 0) return Rejection.DYING;
+        if (npcLoc.distanceTo(playerPos) > range) return Rejection.OUT_OF_RANGE;
+        // Reject if engaged by another player (someone else's chicken).
+        // If the NPC's interacting target is the local player, we don't
+        // exclude it — that's our prior engagement we may want to resume.
+        Actor interacting = npc.getInteracting();
+        if (interacting instanceof Player p && p != self) return Rejection.ENGAGED_BY_OTHER;
+        // Visibility — last filter, most expensive (canvas + collision reads).
+        if (visibility != null && !visibility.canSee(npc, self, wv)) return Rejection.NOT_VISIBLE;
+        return null;
     }
 
     /** Convenience wrapper without an excluded index. */

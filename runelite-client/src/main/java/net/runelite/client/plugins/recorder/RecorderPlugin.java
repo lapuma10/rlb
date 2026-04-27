@@ -45,6 +45,7 @@ import net.runelite.client.plugins.recorder.capture.KeyCapture;
 import net.runelite.client.plugins.recorder.capture.MouseCapture;
 import net.runelite.client.plugins.recorder.capture.NearbyResolver;
 import net.runelite.client.plugins.recorder.combat.ChickenCombatLoop;
+import net.runelite.client.plugins.recorder.combat.ChickenOverlay;
 import net.runelite.client.plugins.recorder.debug.DebugOverlay;
 import net.runelite.client.plugins.recorder.debug.TileMarker;
 import net.runelite.client.plugins.recorder.hotkey.HotkeyHandler;
@@ -98,6 +99,7 @@ public class RecorderPlugin extends Plugin
     private HotkeyListener toggleListener;
     private AWTEventListener focusBridge;
     private DebugOverlay debugOverlay;
+    private ChickenOverlay chickenOverlay;
     private TileMarker tileMarker;
     private ChickenCombatLoop chickenLoop;
     private MiningLoop miningLoop;
@@ -130,10 +132,12 @@ public class RecorderPlugin extends Plugin
             mouseCapture, keyCapture, focusCapture, sessions, itemManager, clientThread);
         panel = new RecorderPanel(manager, client, clientThread);
         debugOverlay = new DebugOverlay(client);
+        chickenOverlay = new ChickenOverlay(client, config);
         tileMarker = new TileMarker(client);
         panel.setDebugOverlay(debugOverlay);
         panel.setTileMarker(tileMarker);
         overlayManager.add(debugOverlay);
+        overlayManager.add(chickenOverlay);
 
         // Wire login assistant. We construct a fresh dispatcher here for
         // the assistant so its single-flight busy flag is independent from
@@ -230,6 +234,7 @@ public class RecorderPlugin extends Plugin
         if (chickenLoop != null) chickenLoop.stop();
         if (miningLoop != null) miningLoop.stop();
         if (debugOverlay != null) overlayManager.remove(debugOverlay);
+        if (chickenOverlay != null) overlayManager.remove(chickenOverlay);
         if (navButton != null) clientToolbar.removeNavigation(navButton);
         if (panel != null) panel.dispose();
         if (markerListener != null) keyManager.unregisterKeyListener(markerListener);
@@ -243,7 +248,7 @@ public class RecorderPlugin extends Plugin
         if (keyCapture != null) keyManager.unregisterKeyListener(keyCapture);
         if (focusBridge != null) Toolkit.getDefaultToolkit().removeAWTEventListener(focusBridge);
         if (eventCapture != null) eventBus.unregister(eventCapture);
-        panel = null; navButton = null; debugOverlay = null; tileMarker = null;
+        panel = null; navButton = null; debugOverlay = null; chickenOverlay = null; tileMarker = null;
         markerListener = null; toggleListener = null;
         mouseCapture = null; keyCapture = null; focusCapture = null;
         focusBridge = null;

@@ -29,13 +29,10 @@ import java.awt.Rectangle;
 import javax.annotation.Nullable;
 import lombok.extern.slf4j.Slf4j;
 import net.runelite.api.Client;
-import net.runelite.api.Constants;
 import net.runelite.api.Menu;
 import net.runelite.api.NPC;
 import net.runelite.api.Player;
-import net.runelite.api.Scene;
 import net.runelite.api.WorldView;
-import net.runelite.api.coords.LocalPoint;
 import net.runelite.api.coords.WorldArea;
 import net.runelite.api.coords.WorldPoint;
 import net.runelite.api.gameval.InterfaceID;
@@ -79,14 +76,56 @@ import net.runelite.api.widgets.Widget;
  */
 public interface TargetVisibility
 {
+    /** Per-stage diagnostic — which of the canSee checks rejected the NPC.
+     *  Surfaced by {@link #whyHidden} so callers (debug overlays, log
+     *  diagnostics) can tell {@code "behind a fence"} from {@code "under
+     *  the inventory"}. The order matches the canSee pipeline. */
+    enum Reason
+    {
+        /** One of the input refs (npc / self / wv / world locations) was
+         *  null — defensive guard, not a real visibility failure. */
+        NULL_INPUT,
+        /** Player and NPC are on different floors. */
+        PLANE_MISMATCH,
+        /** Walking BFS can't reach the NPC's tile within
+         *  {@code MAX_REACH_DEPTH}. Catches gates that are closed and
+         *  islands behind impassable terrain. */
+        NOT_REACHABLE,
+        /** NPC's tile didn't project onto the canvas (off-screen or behind
+         *  the camera). The engine's roof-removal state is already baked
+         *  into this — if the engine is hiding the roof for our viewpoint
+         *  the chicken projects normally. */
+        OFF_CANVAS,
+        /** Projected pixel sits outside the playable viewport rectangle. */
+        OUTSIDE_VIEWPORT,
+        /** Projected pixel sits under an open right-click menu. */
+        UNDER_OPEN_MENU,
+        /** Resizable mode: pixel sits under a HUD widget that has actual
+         *  visual content (sprite / text / item / model) — i.e. inventory
+         *  slots, chatbox text, minimap, orbs. Transparent layout
+         *  containers are excluded so chickens in the open play area
+         *  aren't culled by an invisible HUD sibling that happens to
+         *  span across them. */
+        UNDER_HUD
+    }
+
+    /** Returns the first canSee check that rejected {@code npc}, or
+     *  {@code null} if every check passed (the NPC is visible). The boolean
+     *  {@link #canSee} convenience is now a default wrapper around this. */
+    @Nullable
+    Reason whyHidden(NPC npc, @Nullable Player self, @Nullable WorldView wv);
+
     /** True when {@code self} can directly see {@code npc} on the canvas. */
-    boolean canSee(NPC npc, @Nullable Player self, @Nullable WorldView wv);
+    default boolean canSee(NPC npc, @Nullable Player self, @Nullable WorldView wv)
+    {
+        return whyHidden(npc, self, wv) == null;
+    }
 
     /** Test stub — every NPC passes. Used by selector overloads that don't
      *  take a visibility checker, and by ChickenCombatLoop unit tests. */
     static TargetVisibility alwaysVisible()
     {
-        return (npc, self, wv) -> true;
+        return (npc, self, wv) -> null;
     }
 
     /** Production checker bound to the live client. Kept stateless apart
@@ -111,9 +150,9 @@ final class ClientVisibility implements TargetVisibility
     ClientVisibility(Client client) { this.client = client; }
 
     @Override
-    public boolean canSee(NPC npc, @Nullable Player self, @Nullable WorldView wv)
+    public Reason whyHidden(NPC npc, @Nullable Player self, @Nullable WorldView wv)
     {
-        if (npc == null || self == null || wv == null) return false;
+        if (npc == null || self == null || wv == null) return Reason.NULL_INPUT;
         // 0. Plane match. OSRS only lets you interact with things on the
         //    same floor as you — the camera also doesn't render NPCs on a
         //    different plane unless the tile is flagged VIS_BELOW (a
@@ -121,47 +160,28 @@ final class ClientVisibility implements TargetVisibility
         //    first.
         WorldPoint selfWp = self.getWorldLocation();
         WorldPoint npcWp = npc.getWorldLocation();
-        if (selfWp == null || npcWp == null) return false;
+        if (selfWp == null || npcWp == null) return Reason.NULL_INPUT;
         if (selfWp.getPlane() != npcWp.getPlane())
         {
             log.debug("cull npc {} — plane mismatch (self {} vs npc {})",
                 npc.getIndex(), selfWp.getPlane(), npcWp.getPlane());
-            return false;
+            return Reason.PLANE_MISMATCH;
         }
-        // 1. World line-of-sight — Bresenham over collision flags. Zero
-        //    canvas reads, fastest filter so it goes first. Catches
-        //    chickens behind fences/walls in the Lumbridge pen.
+        // 1. Walking reachability. The selector is for melee combat — what
+        //    matters is "can I walk to a tile adjacent to this NPC?", NOT
+        //    "is there a clear projectile arc?". Projectile LOS culls
+        //    chickens in the open courtyard if a wooden fence is between
+        //    them and the player even though you can plainly walk around
+        //    it; we use the canvas-projection check below to confirm the
+        //    chicken is actually on screen for the player. BFS over
+        //    collision flags up to MAX_REACH_DEPTH.
         WorldArea selfArea = self.getWorldArea();
         WorldArea npcArea = npc.getWorldArea();
-        if (selfArea == null || npcArea == null) return false;
-        if (!selfArea.hasLineOfSightTo(wv, npcArea))
-        {
-            log.debug("cull npc {} — no LOS", npc.getIndex());
-            return false;
-        }
-        // 1a. Walking reachability. LOS alone does NOT mean we can melee
-        //     the NPC — the half-fences in the Lumbridge chicken pen pass
-        //     projectile LOS but block walking, so the bot would otherwise
-        //     pick a chicken on the far side and waste cycles failing to
-        //     engage. BFS over collision flags up to MAX_REACH_DEPTH.
+        if (selfArea == null || npcArea == null) return Reason.NULL_INPUT;
         if (!isReachable(selfArea, npcArea, wv))
         {
             log.debug("cull npc {} — not reachable on foot", npc.getIndex());
-            return false;
-        }
-        // 1b. Roof occlusion. If the NPC's tile is under a roof and the
-        //     engine isn't currently removing that roof for our view, the
-        //     player can't see the NPC. Conservative: if NPC is under a
-        //     roof but the player isn't, treat as occluded (different
-        //     building). Engine doc primitives:
-        //       Constants.TILE_FLAG_UNDER_ROOF   — tile is under a roof
-        //       Scene.getRoofs()                 — roof IDs per tile
-        //       Scene.getRoofRemovalMode()       — bitmask of removed roofs
-        if (isUnderHiddenRoof(selfWp, npcWp, wv))
-        {
-            log.debug("cull npc {} — under roof not visible to player",
-                npc.getIndex());
-            return false;
+            return Reason.NOT_REACHABLE;
         }
         // 2. On-canvas — getCanvasTilePoly returns null when the tile is
         //    off-screen or behind the camera. A real player can't click
@@ -170,7 +190,7 @@ final class ClientVisibility implements TargetVisibility
         if (poly == null)
         {
             log.debug("cull npc {} — no canvas tile poly (off-screen)", npc.getIndex());
-            return false;
+            return Reason.OFF_CANVAS;
         }
         Rectangle bb = poly.getBounds();
         int cx = bb.x + bb.width / 2;
@@ -187,7 +207,7 @@ final class ClientVisibility implements TargetVisibility
         {
             log.debug("cull npc {} — pixel ({},{}) outside viewport ({},{} {}x{})",
                 npc.getIndex(), cx, cy, vx, vy, vw, vh);
-            return false;
+            return Reason.OUTSIDE_VIEWPORT;
         }
         // 4. Open right-click menu occlusion. When a menu is open, anything
         //    under it is not visible to the player — clicking through it
@@ -206,77 +226,29 @@ final class ClientVisibility implements TargetVisibility
                 {
                     log.debug("cull npc {} — pixel ({},{}) under open menu ({},{} {}x{})",
                         npc.getIndex(), cx, cy, mx, my, mw, mh);
-                    return false;
+                    return Reason.UNDER_OPEN_MENU;
                 }
             }
         }
         // 5. Persistent HUD widget occlusion — inventory panel, chatbox,
-        //    minimap. In fixed-display mode the viewport check at step 3
-        //    already excluded the chrome area; in resizable mode the
-        //    viewport equals the canvas and HUD widgets float ON TOP of
-        //    the world render. Iterate the toplevel HUD container's
-        //    visible children and treat any that contain our pixel as
-        //    occluding. This naturally covers the inventory side panel,
-        //    the chatbox, and the minimap orbs without hard-coding rects.
+        //    minimap orbs, side tabs. Fixed-display mode already excludes
+        //    the chrome via the viewport rect (step 3); resizable mode has
+        //    HUD widgets floating ON TOP of the world. Recurse the toplevel
+        //    HUD container's visible children, but only treat a widget as
+        //    occluding if it carries actual visual content (sprite / text /
+        //    item / model). Transparent layout containers do not count —
+        //    that was the bug that culled chickens in the open courtyard.
         if (client.isResized() && isUnderHudWidget(cx, cy))
         {
             log.debug("cull npc {} — pixel ({},{}) under HUD widget",
                 npc.getIndex(), cx, cy);
-            return false;
+            return Reason.UNDER_HUD;
         }
-        return true;
+        return null;
     }
 
-    /** True if {@code npcWp}'s tile is under a roof that the engine isn't
-     *  currently removing for our viewpoint. Uses
-     *  {@link Constants#TILE_FLAG_UNDER_ROOF} on
-     *  {@link WorldView#getTileSettings()} together with
-     *  {@link Scene#getRoofs()} so we cull cross-building targets without
-     *  hard-coding region IDs. */
-    private boolean isUnderHiddenRoof(WorldPoint selfWp, WorldPoint npcWp, WorldView wv)
-    {
-        try
-        {
-            byte[][][] settings = wv.getTileSettings();
-            if (settings == null) return false;
-            LocalPoint selfLp = LocalPoint.fromWorld(wv, selfWp);
-            LocalPoint npcLp = LocalPoint.fromWorld(wv, npcWp);
-            if (selfLp == null || npcLp == null) return false;
-            int plane = selfWp.getPlane();
-            if (plane < 0 || plane >= settings.length) return false;
-            int sx = selfLp.getSceneX(), sy = selfLp.getSceneY();
-            int nx = npcLp.getSceneX(), ny = npcLp.getSceneY();
-            if (!inSettingsBounds(settings[plane], sx, sy)) return false;
-            if (!inSettingsBounds(settings[plane], nx, ny)) return false;
-            boolean npcUnderRoof =
-                (settings[plane][nx][ny] & Constants.TILE_FLAG_UNDER_ROOF) != 0;
-            if (!npcUnderRoof) return false;
-            boolean selfUnderRoof =
-                (settings[plane][sx][sy] & Constants.TILE_FLAG_UNDER_ROOF) != 0;
-            // Player outside, NPC inside → cull.
-            if (!selfUnderRoof) return true;
-            // Both indoors — different roof IDs ⇒ different buildings.
-            Scene scene = wv.getScene();
-            if (scene == null) return false;
-            int[][][] roofs = scene.getRoofs();
-            if (roofs == null) return false;
-            int selfRoof = roofs[plane][sx][sy];
-            int npcRoof = roofs[plane][nx][ny];
-            return selfRoof != npcRoof;
-        }
-        catch (Throwable th) { return false; }
-    }
-
-    private static boolean inSettingsBounds(byte[][] plane, int x, int y)
-    {
-        return plane != null
-            && x >= 0 && x < plane.length
-            && y >= 0 && plane[x] != null && y < plane[x].length;
-    }
-
-    /** True if pixel {@code (cx, cy)} sits inside any visible child of the
-     *  toplevel HUD container — i.e. the inventory panel, the chatbox, the
-     *  minimap, or any open interface tab in resizable mode. */
+    /** True if pixel {@code (cx, cy)} sits inside any visible HUD child
+     *  with real visual content. */
     private boolean isUnderHudWidget(int cx, int cy)
     {
         Widget hudFront;
@@ -289,9 +261,10 @@ final class ClientVisibility implements TargetVisibility
         }
         catch (Throwable th) { return false; }
         if (hudFront == null) return false;
-        if (containsAnyVisibleChild(hudFront, cx, cy, 0)) return true;
+        if (containsContentfulChild(hudFront, cx, cy, 0)) return true;
         // Chatbox lives outside the HUD container in some layouts — check
-        // it explicitly so chat-area pixels still get culled.
+        // it explicitly so chat-area pixels still get culled. The chatbox
+        // background is itself a sprite so it has content.
         try
         {
             Widget chat = client.getWidget(InterfaceID.Chatbox.CHATAREA);
@@ -306,23 +279,25 @@ final class ClientVisibility implements TargetVisibility
     }
 
     /** Recursive descent — depth capped to {@link #HUD_DESCENT_LIMIT} to
-     *  avoid pathological widget trees. We treat any visible non-empty
-     *  child whose bounds contain the pixel as occluding. */
-    private static boolean containsAnyVisibleChild(Widget parent, int cx, int cy, int depth)
+     *  bound widget-tree walks. Only a widget that both contains the pixel
+     *  AND has actual rendered content (sprite / text / item / model)
+     *  counts as occluding; transparent layout containers fall through to
+     *  their children. */
+    private static boolean containsContentfulChild(Widget parent, int cx, int cy, int depth)
     {
         if (parent == null || parent.isHidden() || depth > HUD_DESCENT_LIMIT) return false;
         Rectangle b = parent.getBounds();
         if (b == null || b.isEmpty() || !b.contains(cx, cy)) return false;
         // The HUD_CONTAINER_FRONT widget itself spans the canvas — it's
-        // the layer the world renders THROUGH — so we don't treat depth=0
-        // as occluding; only its descendants count.
-        if (depth > 0) return true;
+        // the layer the world renders THROUGH — so depth=0 never
+        // occludes; only descendants are considered.
+        if (depth > 0 && hasVisualContent(parent)) return true;
         Widget[] statics = parent.getStaticChildren();
         if (statics != null)
         {
             for (Widget c : statics)
             {
-                if (containsAnyVisibleChild(c, cx, cy, depth + 1)) return true;
+                if (containsContentfulChild(c, cx, cy, depth + 1)) return true;
             }
         }
         Widget[] dyn = parent.getDynamicChildren();
@@ -330,7 +305,7 @@ final class ClientVisibility implements TargetVisibility
         {
             for (Widget c : dyn)
             {
-                if (containsAnyVisibleChild(c, cx, cy, depth + 1)) return true;
+                if (containsContentfulChild(c, cx, cy, depth + 1)) return true;
             }
         }
         Widget[] nested = parent.getNestedChildren();
@@ -338,9 +313,21 @@ final class ClientVisibility implements TargetVisibility
         {
             for (Widget c : nested)
             {
-                if (containsAnyVisibleChild(c, cx, cy, depth + 1)) return true;
+                if (containsContentfulChild(c, cx, cy, depth + 1)) return true;
             }
         }
+        return false;
+    }
+
+    /** True iff {@code w} carries a sprite, text, item, or model — i.e.
+     *  something a player can actually see drawn on top of the world. */
+    private static boolean hasVisualContent(Widget w)
+    {
+        if (w.getSpriteId() > 0) return true;
+        String text = w.getText();
+        if (text != null && !text.isEmpty()) return true;
+        if (w.getItemId() > 0) return true;
+        if (w.getModelId() > 0) return true;
         return false;
     }
 
