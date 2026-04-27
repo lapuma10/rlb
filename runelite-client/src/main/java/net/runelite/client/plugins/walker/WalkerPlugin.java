@@ -29,17 +29,17 @@ import javax.inject.Inject;
 import lombok.extern.slf4j.Slf4j;
 import net.runelite.api.Client;
 import net.runelite.api.GameState;
-import net.runelite.api.MenuAction;
-import net.runelite.api.coords.LocalPoint;
 import net.runelite.api.coords.WorldPoint;
 import net.runelite.client.callback.ClientThread;
 import net.runelite.client.config.ConfigManager;
 import net.runelite.client.input.KeyManager;
 import net.runelite.client.plugins.Plugin;
+import net.runelite.client.plugins.PluginDependency;
 import net.runelite.client.plugins.PluginDescriptor;
 import net.runelite.client.util.HotkeyListener;
 
 @Slf4j
+@PluginDependency(net.runelite.client.plugins.sequencer.SequencerPlugin.class)
 @PluginDescriptor(
 	name = "Walker",
 	description = "Walk to configured world coordinates via hotkey",
@@ -49,6 +49,9 @@ public class WalkerPlugin extends Plugin
 {
 	@Inject
 	private Client client;
+
+	@Inject
+	private net.runelite.client.plugins.sequencer.SequencerPlugin sequencerPlugin;
 
 	@Inject
 	private ClientThread clientThread;
@@ -88,24 +91,18 @@ public class WalkerPlugin extends Plugin
 
 	private void walkToTarget()
 	{
-		if (client.getGameState() != GameState.LOGGED_IN)
-		{
-			return;
-		}
-
-		final WorldPoint target = new WorldPoint(config.targetX(), config.targetY(), config.targetZ());
-
+		// Hotkey fires on the AWT key thread; client.getGameState() and the manager
+		// must be touched on ClientThread. The manager already marshals run() onto
+		// ClientThread, but the gate reads above happen here, so wrap the whole body.
 		clientThread.invoke(() ->
 		{
-			LocalPoint local = LocalPoint.fromWorld(client.getTopLevelWorldView(), target);
-			if (local == null)
-			{
-				log.debug("Target ({}, {}, {}) is not in the current scene",
-					target.getX(), target.getY(), target.getPlane());
-				return;
-			}
-
-			client.menuAction(local.getSceneX(), local.getSceneY(), MenuAction.WALK, 0, 0, "Walk here", "");
+			if (client.getGameState() != GameState.LOGGED_IN) return;
+			var manager = sequencerPlugin.manager();
+			if (manager == null) return;
+			if (manager.state() != net.runelite.client.sequence.SequenceState.IDLE) return;
+			WorldPoint target = new WorldPoint(config.targetX(), config.targetY(), config.targetZ());
+			manager.run(new net.runelite.client.sequence.composite.LinearSequence("walker-hotkey")
+				.then(new net.runelite.client.sequence.activities.WalkStep(target)));
 		});
 	}
 }

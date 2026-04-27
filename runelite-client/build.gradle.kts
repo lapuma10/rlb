@@ -172,6 +172,11 @@ tasks.processResources {
 
 tasks.compileJava {
     options.isFork = true
+    options.release = 17
+}
+
+tasks.compileTestJava {
+    options.release = 17
 }
 
 tasks.jar {

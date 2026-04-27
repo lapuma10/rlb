@@ -32,7 +32,9 @@ import com.google.inject.Singleton;
 import java.awt.BorderLayout;
 import java.awt.Color;
 import java.awt.Dimension;
+import java.awt.Rectangle;
 import java.lang.reflect.Field;
+import java.util.Arrays;
 import java.util.Comparator;
 import java.util.Enumeration;
 import java.util.HashMap;
@@ -184,6 +186,11 @@ class WidgetInspector extends DevToolsFrame
 		}));
 		bottomPanel.add(revalidateWidget);
 
+		final JButton dumpAllBtn = new JButton("Dump All");
+		dumpAllBtn.setToolTipText("Recursively log every widget root + child to client.log, ignoring 'Hide hidden'");
+		dumpAllBtn.addActionListener(ev -> clientThread.invokeLater(this::dumpAllWidgetsToLog));
+		bottomPanel.add(dumpAllBtn);
+
 		final JSplitPane split = new JSplitPane(JSplitPane.HORIZONTAL_SPLIT, treeScrollPane, infoScrollPane);
 		add(split, BorderLayout.CENTER);
 
@@ -196,6 +203,49 @@ class WidgetInspector extends DevToolsFrame
 		boolean onTop = config.inspectorAlwaysOnTop();
 		setAlwaysOnTop(onTop);
 		alwaysOnTop.setSelected(onTop);
+	}
+
+	private void dumpAllWidgetsToLog()
+	{
+		Widget[] roots = client.getWidgetRoots();
+		int rootCount = roots == null ? 0 : roots.length;
+		log.info("=== Widget dump: gameState={}, {} root(s) ===", client.getGameState(), rootCount);
+		if (roots != null)
+		{
+			for (Widget r : roots)
+			{
+				dumpWidget(r, 0);
+			}
+		}
+		log.info("=== End widget dump ===");
+	}
+
+	private void dumpWidget(Widget w, int depth)
+	{
+		if (w == null) return;
+		String pad = depth == 0 ? "" : String.format("%" + (depth * 2) + "s", "");
+		Rectangle b = w.getBounds();
+		String boundsStr = b == null ? "null" : (b.x + "," + b.y + " " + b.width + "x" + b.height);
+		String text = w.getText();
+		if (text != null)
+		{
+			text = text.replace('\n', ' ').replace('\r', ' ');
+			if (text.length() > 60) text = text.substring(0, 57) + "...";
+		}
+		String[] actions = w.getActions();
+		log.info("{}id={} grp={} chld={} type={} hidden={} self={} bounds={} text={} name={} actions={}",
+			pad, w.getId(),
+			WidgetUtil.componentToInterface(w.getId()),
+			WidgetUtil.componentToId(w.getId()),
+			w.getType(), w.isHidden(), w.isSelfHidden(),
+			boundsStr, text, w.getName(),
+			actions == null ? "[]" : Arrays.toString(actions));
+		Widget[] dyn = w.getDynamicChildren();
+		if (dyn != null) for (Widget c : dyn) dumpWidget(c, depth + 1);
+		Widget[] sta = w.getStaticChildren();
+		if (sta != null) for (Widget c : sta) dumpWidget(c, depth + 1);
+		Widget[] nes = w.getNestedChildren();
+		if (nes != null) for (Widget c : nes) dumpWidget(c, depth + 1);
 	}
 
 	private void refreshWidgets()
@@ -414,9 +464,18 @@ class WidgetInspector extends DevToolsFrame
 					.reversed()
 					.thenComparingInt(Widget::getId)
 					.reversed())
-				.findFirst().get();
+				.findFirst().orElse(null);
 			x = 4;
 			y = 4;
+		}
+
+		if (parent == null || parent.isHidden())
+		{
+			// No clickable LAYER root — happens on the title/login screen which
+			// is engine-painted, not widget-driven. The tree + Dump All still
+			// work; just skip the picker so the inspector stays usable.
+			log.info("Widget Inspector: no parent for picker (gameState={}); use Refresh / Dump All", client.getGameState());
+			return;
 		}
 
 		picker = parent.createChild(-1, WidgetType.GRAPHIC);
