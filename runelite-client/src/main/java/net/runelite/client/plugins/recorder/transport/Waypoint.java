@@ -24,6 +24,7 @@
  */
 package net.runelite.client.plugins.recorder.transport;
 
+import java.util.HashSet;
 import java.util.Iterator;
 import java.util.Set;
 import javax.annotation.Nullable;
@@ -116,7 +117,7 @@ public final class Waypoint
         if (w <= 0 || h <= 0)
             throw new IllegalArgumentException(
                 "walkArea rect has non-positive dimension: " + w + "x" + h);
-        java.util.Set<WorldPoint> filled = new java.util.HashSet<>(w * h);
+        Set<WorldPoint> filled = new HashSet<>(w * h);
         for (int dx = 0; dx < w; dx++)
         {
             for (int dy = 0; dy < h; dy++)

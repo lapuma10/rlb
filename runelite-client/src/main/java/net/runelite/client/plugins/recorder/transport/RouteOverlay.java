@@ -7,6 +7,7 @@ import java.awt.Graphics2D;
 import java.awt.Polygon;
 import java.awt.Stroke;
 import java.util.List;
+import java.util.Set;
 import java.util.concurrent.atomic.AtomicReference;
 import javax.annotation.Nullable;
 import net.runelite.api.Client;
@@ -100,7 +101,7 @@ public final class RouteOverlay extends Overlay
         return null;
     }
 
-    private void drawTileSet(Graphics2D g, java.util.Set<WorldPoint> tiles,
+    private void drawTileSet(Graphics2D g, Set<WorldPoint> tiles,
                              boolean selected, String label)
     {
         WorldView wv = client.getTopLevelWorldView();

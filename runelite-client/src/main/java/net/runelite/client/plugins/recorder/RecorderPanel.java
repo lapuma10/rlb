@@ -272,11 +272,13 @@ public final class RecorderPanel extends PluginPanel
                         @Override public void onCommit(Set<WorldPoint> tiles)
                         {
                             hudOverlay.show(null);
+                            clearAnnotatorKeybindings();
                             onCommit.accept(tiles);
                         }
                         @Override public void onCancel()
                         {
                             hudOverlay.show(null);
+                            clearAnnotatorKeybindings();
                         }
                         @Override public void onDragPreview(@Nullable WorldPoint pressTile,
                                                             @Nullable WorldPoint dragTile,
@@ -378,6 +380,16 @@ public final class RecorderPanel extends PluginPanel
         }, "annotator-test-walk");
         t.setDaemon(true);
         t.start();
+    }
+
+    private void clearAnnotatorKeybindings()
+    {
+        getInputMap(JComponent.WHEN_IN_FOCUSED_WINDOW)
+            .remove(KeyStroke.getKeyStroke(KeyEvent.VK_ENTER, 0));
+        getInputMap(JComponent.WHEN_IN_FOCUSED_WINDOW)
+            .remove(KeyStroke.getKeyStroke(KeyEvent.VK_ESCAPE, 0));
+        getActionMap().remove("annotator-commit");
+        getActionMap().remove("annotator-cancel");
     }
 
     // ------------------------------------------------------------------
