@@ -1,6 +1,7 @@
 package net.runelite.client.plugins.recorder.annotator;
 
 import java.awt.BorderLayout;
+import java.awt.Color;
 import java.awt.Dimension;
 import java.awt.FlowLayout;
 import java.awt.event.MouseAdapter;
@@ -20,6 +21,7 @@ import javax.swing.JOptionPane;
 import javax.swing.JPanel;
 import javax.swing.JScrollPane;
 import javax.swing.JTextField;
+import javax.annotation.Nullable;
 import lombok.extern.slf4j.Slf4j;
 import net.runelite.api.coords.WorldPoint;
 import net.runelite.client.plugins.recorder.transport.RouteOverlay;
@@ -40,7 +42,7 @@ public final class WaypointEditor extends JPanel
         /** User clicked Mark area. Caller starts the AreaSelector with the
          *  given prepopulated set (empty for new) and invokes the callback
          *  on commit. */
-        void onMarkArea(@javax.annotation.Nullable Waypoint editing, Consumer<Set<WorldPoint>> onCommit);
+        void onMarkArea(@Nullable Waypoint editing, Consumer<Set<WorldPoint>> onCommit);
 
         /** User clicked Mark object. Caller fires findAnyTransport and
          *  emits a TRANSPORT waypoint when the click resolves. */
@@ -123,10 +125,10 @@ public final class WaypointEditor extends JPanel
 
         JPanel rowWalk = new JPanel(new FlowLayout(FlowLayout.LEFT, 4, 0));
         JButton walkBtn = new JButton("Walk path");
-        walkBtn.addActionListener(e -> hooks.onWalkPath(waypoints));
+        walkBtn.addActionListener(e -> hooks.onWalkPath(List.copyOf(waypoints)));
         JButton walkToBtn = new JButton("Walk to selected");
         walkToBtn.addActionListener(e -> {
-            if (selectedIdx >= 0) hooks.onWalkToSelected(waypoints, selectedIdx);
+            if (selectedIdx >= 0) hooks.onWalkToSelected(List.copyOf(waypoints), selectedIdx);
         });
         rowWalk.add(walkBtn);
         rowWalk.add(walkToBtn);
@@ -148,6 +150,8 @@ public final class WaypointEditor extends JPanel
     {
         try
         {
+            selectedIdx = -1;
+            routeOverlay.setSelected(null);
             String text = Files.exists(routeFile) ? Files.readString(routeFile) : "";
             RouteParser.Result r = RouteParser.parse(text);
             this.waypoints = new ArrayList<>(r.waypoints());
@@ -169,7 +173,7 @@ public final class WaypointEditor extends JPanel
             Waypoint wp = waypoints.get(i);
             JPanel row = new JPanel(new FlowLayout(FlowLayout.LEFT, 2, 0));
             row.setBorder(BorderFactory.createMatteBorder(0, 0, 1, 0,
-                java.awt.Color.DARK_GRAY));
+                Color.DARK_GRAY));
             row.setMaximumSize(new Dimension(Integer.MAX_VALUE, 28));
             JLabel idxLabel = new JLabel("#" + i);
             idxLabel.setPreferredSize(new Dimension(24, 18));
@@ -208,7 +212,7 @@ public final class WaypointEditor extends JPanel
             });
             if (idx == selectedIdx)
             {
-                row.setBackground(new java.awt.Color(60, 80, 110));
+                row.setBackground(new Color(60, 80, 110));
             }
             listColumn.add(row);
         }
@@ -252,6 +256,8 @@ public final class WaypointEditor extends JPanel
         Waypoint w = waypoints.remove(from);
         waypoints.add(to, w);
         if (selectedIdx == from) selectedIdx = to;
+        else if (from < selectedIdx && to >= selectedIdx) selectedIdx--;
+        else if (from > selectedIdx && to <= selectedIdx) selectedIdx++;
         save();
         renderList();
     }
@@ -283,7 +289,7 @@ public final class WaypointEditor extends JPanel
         renderList();
     }
 
-    private static Waypoint withName(Waypoint old, @javax.annotation.Nullable String name)
+    private static Waypoint withName(Waypoint old, @Nullable String name)
     {
         switch (old.kind())
         {
@@ -299,7 +305,7 @@ public final class WaypointEditor extends JPanel
         }
     }
 
-    private void doMarkArea(@javax.annotation.Nullable Waypoint editing)
+    private void doMarkArea(@Nullable Waypoint editing)
     {
         hooks.onMarkArea(editing, tiles -> {
             if (tiles == null || tiles.isEmpty()) return;
