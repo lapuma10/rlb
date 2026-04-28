@@ -2,6 +2,7 @@ package net.runelite.client.plugins.recorder.scripts;
 
 import java.awt.Rectangle;
 import java.awt.Shape;
+import java.awt.event.KeyEvent;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.Supplier;
@@ -23,6 +24,8 @@ import net.runelite.api.coords.WorldArea;
 import net.runelite.api.coords.WorldPoint;
 import net.runelite.api.Perspective;
 import net.runelite.api.WorldView;
+import net.runelite.api.gameval.InterfaceID;
+import net.runelite.api.widgets.Widget;
 import net.runelite.client.callback.ClientThread;
 import net.runelite.client.plugins.recorder.combat.ChickenCombatLoop;
 import net.runelite.client.plugins.recorder.farm.BankInteraction;
@@ -170,6 +173,10 @@ public final class LumbridgeBankPenScript
     /** Throttle for bank booth clicks — bank widget takes ~600ms to load
      *  after click, so we wait ≥ 3s between booth clicks before retrying. */
     private long lastBankClickAtMs;
+    /** Throttle for stairs / gate menu invocations. Plane change after a
+     *  staircase click takes ~1-2s; without this we'd re-invoke every
+     *  tick during the animation. */
+    private long lastInteractionAtMs;
 
     public LumbridgeBankPenScript(Client client, ClientThread clientThread,
                                   HumanizedInputDispatcher dispatcher,
@@ -332,13 +339,51 @@ public final class LumbridgeBankPenScript
         if (empty)
         {
             status.set("inventory empty — heading to pen");
-            bank.closeBank();
+            closeBankSafe();
             setState(State.OUTBOUND);
             return;
         }
         // 4. Deposit inventory.
         status.set("depositing inventory");
-        bank.clickDepositInventory();
+        clickDepositInventorySafe();
+    }
+
+    /**
+     * Click the Deposit-inventory orb. Reads the widget bounds on the
+     * client thread (Widget.isHidden / getBounds assert client thread
+     * under -ea) and dispatches the canvas click off-thread (the
+     * dispatcher humanizes timing, which we don't want to do on the
+     * client thread). BankInteraction's version touches the widget
+     * from whatever thread called it; that works in production
+     * without -ea but throws in dev mode.
+     */
+    private boolean clickDepositInventorySafe() throws InterruptedException
+    {
+        Rectangle b = onClientThread(() -> {
+            Widget w = client.getWidget(InterfaceID.Bankmain.DEPOSITINV);
+            if (w == null || w.isHidden()) return null;
+            Rectangle r = w.getBounds();
+            return r == null || r.isEmpty() ? null : r;
+        });
+        if (b == null) return false;
+        dispatcher.clickCanvas(b.x + b.width / 2, b.y + b.height / 2);
+        return true;
+    }
+
+    /**
+     * Close the bank widget by sending Escape. Same threading concern
+     * as {@link #clickDepositInventorySafe}: the bank-open check reads
+     * a widget; do that on the client thread and the keypress dispatch
+     * off-thread.
+     */
+    private void closeBankSafe() throws InterruptedException
+    {
+        boolean open = onClientThread(() -> {
+            Widget w = client.getWidget(InterfaceID.Bankmain.UNIVERSE);
+            return w != null && !w.isHidden();
+        });
+        if (!open) return;
+        dispatcher.tapKey(KeyEvent.VK_ESCAPE);
     }
 
     // ────────────────────────────────────────────────────────────────
@@ -370,8 +415,19 @@ public final class LumbridgeBankPenScript
                         setState(State.ABORTED);
                     return;
                 }
+                if (!isPlayerSettled())
+                {
+                    status.set("at stairs (p2) — waiting for walk to settle");
+                    return;
+                }
+                if (!canInteract())
+                {
+                    status.set("at stairs (p2) — waiting for previous climb");
+                    return;
+                }
                 status.set("climb down (p2 → p1)");
                 climbDown();
+                lastInteractionAtMs = System.currentTimeMillis();
                 return;
 
             case 1:
@@ -382,8 +438,19 @@ public final class LumbridgeBankPenScript
                         setState(State.ABORTED);
                     return;
                 }
+                if (!isPlayerSettled())
+                {
+                    status.set("at stairs (p1) — waiting for walk to settle");
+                    return;
+                }
+                if (!canInteract())
+                {
+                    status.set("at stairs (p1) — waiting for previous climb");
+                    return;
+                }
                 status.set("climb down (p1 → p0)");
                 climbDown();
+                lastInteractionAtMs = System.currentTimeMillis();
                 return;
 
             case 0:
@@ -396,8 +463,22 @@ public final class LumbridgeBankPenScript
                 int idx = currentLandmarkIndex(OUTBOUND_PATH_P0, here);
                 if (idx == OUTBOUND_PATH_P0.length - 1)
                 {
+                    if (!isPlayerSettled())
+                    {
+                        status.set("at gate — waiting for walk to settle");
+                        return;
+                    }
+                    if (!canInteract())
+                    {
+                        status.set("at gate — waiting after previous open");
+                        return;
+                    }
                     status.set("opening gate (or already open)");
-                    if (!openGate())
+                    if (openGate())
+                    {
+                        lastInteractionAtMs = System.currentTimeMillis();
+                    }
+                    else
                     {
                         // No gate verb visible — try to walk into the pen
                         // (the engine routes around what's blocking).
@@ -463,8 +544,22 @@ public final class LumbridgeBankPenScript
             case 0:
                 if (areaContains(PEN_AREA, here))
                 {
+                    if (!isPlayerSettled())
+                    {
+                        status.set("at pen — waiting for walk to settle before gate");
+                        return;
+                    }
+                    if (!canInteract())
+                    {
+                        status.set("at pen — waiting after previous open");
+                        return;
+                    }
                     status.set("opening gate to leave pen");
-                    if (!openGate())
+                    if (openGate())
+                    {
+                        lastInteractionAtMs = System.currentTimeMillis();
+                    }
+                    else
                     {
                         if (advanceWalk(PEN_APPROACH) == WalkResult.STUCK)
                             setState(State.ABORTED);
@@ -474,8 +569,19 @@ public final class LumbridgeBankPenScript
                 int rIdx = currentLandmarkIndex(OUTBOUND_PATH_P0, here);
                 if (rIdx == 0)
                 {
+                    if (!isPlayerSettled())
+                    {
+                        status.set("at stairs (p0) — waiting for walk to settle");
+                        return;
+                    }
+                    if (!canInteract())
+                    {
+                        status.set("at stairs (p0) — waiting for previous climb");
+                        return;
+                    }
                     status.set("climb up (p0 → p1)");
                     climbUp();
+                    lastInteractionAtMs = System.currentTimeMillis();
                     return;
                 }
                 WorldArea prev = rIdx > 0
@@ -495,8 +601,19 @@ public final class LumbridgeBankPenScript
                         setState(State.ABORTED);
                     return;
                 }
+                if (!isPlayerSettled())
+                {
+                    status.set("at stairs (p1) — waiting for walk to settle");
+                    return;
+                }
+                if (!canInteract())
+                {
+                    status.set("at stairs (p1) — waiting for previous climb");
+                    return;
+                }
                 status.set("climb up (p1 → p2)");
                 climbUp();
+                lastInteractionAtMs = System.currentTimeMillis();
                 return;
 
             case 2:
@@ -573,10 +690,11 @@ public final class LumbridgeBankPenScript
 
         boolean targetChanged = lastWalkTarget == null
             || !sameArea(lastWalkTarget, target);
-        // Player is still walking from previous click while sinceMove
-        // is small. Don't re-click during that window.
-        boolean stillWalking = sinceMove < 1500;
-        boolean recentClick = sinceClick < 1500;
+        // Tunable thresholds: pathfinding caps at 25 tiles per click and
+        // a long walk takes ~10-15s. Wait at least 3s after a click
+        // before considering a re-click (engine latency + animation).
+        boolean stillWalking = sinceMove < 2500;
+        boolean recentClick = sinceClick < 3000;
 
         boolean shouldClick = targetChanged
             || (!recentClick && !stillWalking);
@@ -619,6 +737,36 @@ public final class LumbridgeBankPenScript
         lastMoveAtMs = System.currentTimeMillis();
         stateEnteredAtMs = System.currentTimeMillis();
         lastBankClickAtMs = 0L;
+        lastInteractionAtMs = 0L;
+    }
+
+    /**
+     * Read player position and update lastSeenPos / lastMoveAtMs. Then
+     * return true if the player has been on the same tile for ≥ 600ms.
+     * Use this before invoking a menu action — without it we fire the
+     * action while the engine is still processing the previous walk,
+     * which silently drops the action.
+     */
+    private boolean isPlayerSettled()
+    {
+        WorldPoint here = playerPos();
+        if (here == null) return false;
+        long now = System.currentTimeMillis();
+        if (lastSeenPos == null || !lastSeenPos.equals(here))
+        {
+            lastSeenPos = here;
+            lastMoveAtMs = now;
+            return false;
+        }
+        return (now - lastMoveAtMs) > 600;
+    }
+
+    /** True if it's been ≥ 3s since the last stairs/gate interaction.
+     *  Throttle so we don't re-invoke during the climb/open animation. */
+    private boolean canInteract()
+    {
+        if (lastInteractionAtMs == 0L) return true;
+        return (System.currentTimeMillis() - lastInteractionAtMs) > 3000;
     }
 
     /** Bbox-bounds check: is the point inside the rectangle, on the
@@ -663,65 +811,105 @@ public final class LumbridgeBankPenScript
     }
 
     /**
-     * Click a random walkable tile inside {@code area} to walk-here.
-     * Picks tiles from the area's bounds, filtered for current plane +
-     * canvas-projectability. No-op if no tile projects (e.g. the entire
-     * area is off-screen).
+     * Walk toward {@code area}. Picks the tile inside {@code area} that
+     * is closest to the player (Chebyshev) and dispatches a click.
+     * <ul>
+     *   <li>Prefer a canvas click if the target projects onto the visible
+     *       game viewport (more accurate, avoids minimap zoom quirks).</li>
+     *   <li>Fall back to a minimap click for tiles within minimap range
+     *       (~50 tiles) but off the visible canvas.</li>
+     * </ul>
      */
     private void walkTo(WorldArea area) throws InterruptedException
     {
-        WorldPoint pick = onClientThread(() -> {
-            Player self = client.getLocalPlayer();
-            if (self == null) return null;
-            WorldPoint here = self.getWorldLocation();
-            if (here == null) return null;
-            // Try the area's center first; if it doesn't project, scan
-            // outward. The chicken-farm-bot's RouteWalker uses random
-            // sampling; for the script we use deterministic center +
-            // fallback so logs are easier to read.
-            int cx = area.getX() + area.getWidth() / 2;
-            int cy = area.getY() + area.getHeight() / 2;
-            for (int rx = 0; rx < area.getWidth(); rx++)
-            {
-                for (int ry = 0; ry < area.getHeight(); ry++)
-                {
-                    WorldPoint candidate = new WorldPoint(
-                        cx + ((rx % 2 == 0) ? rx / 2 : -(rx / 2 + 1)),
-                        cy + ((ry % 2 == 0) ? ry / 2 : -(ry / 2 + 1)),
-                        area.getPlane());
-                    if (candidate.getPlane() != here.getPlane()) continue;
-                    if (projects(candidate)) return candidate;
-                }
-            }
-            return null;
-        });
-        if (pick == null) return;
-        clickWorldPoint(pick);
+        WalkPick pick = onClientThread(() -> pickWalkTarget(area));
+        if (pick == null)
+        {
+            log.warn("script: walkTo({}) — no reachable tile (none projects to canvas or minimap)",
+                describeArea(area));
+            return;
+        }
+        log.info("script: clicking {} ({}px,{}px) → tile {}",
+            pick.viaMinimap ? "minimap" : "canvas",
+            pick.canvas.getX(), pick.canvas.getY(),
+            pick.tile);
+        dispatcher.clickCanvas(pick.canvas.getX(), pick.canvas.getY());
     }
 
-    /** Click the tile, projected to canvas. Off-thread dispatch. */
-    private void clickWorldPoint(WorldPoint wp) throws InterruptedException
+    /** Resolved click target: a world tile, the canvas pixel to click,
+     *  and which kind of click (canvas / minimap). */
+    private static final class WalkPick
     {
-        Point cp = onClientThread(() -> projectCenter(wp));
-        if (cp == null) return;
-        dispatcher.clickCanvas(cp.getX(), cp.getY());
+        final WorldPoint tile;
+        final Point canvas;
+        final boolean viaMinimap;
+        WalkPick(WorldPoint t, Point c, boolean m)
+        { tile = t; canvas = c; viaMinimap = m; }
     }
 
-    /** Project a world tile to canvas center, or return null. */
-    private Point projectCenter(WorldPoint wp)
+    /**
+     * Pick the closest tile in the area, prefer a canvas-visible tile,
+     * fall back to minimap. Must be called on the client thread.
+     */
+    private WalkPick pickWalkTarget(WorldArea area)
     {
+        Player self = client.getLocalPlayer();
+        if (self == null) return null;
+        WorldPoint here = self.getWorldLocation();
+        if (here == null) return null;
         WorldView wv = client.getTopLevelWorldView();
         if (wv == null) return null;
-        LocalPoint lp = LocalPoint.fromWorld(wv, wp);
-        if (lp == null) return null;
-        return Perspective.localToCanvas(client, lp, wp.getPlane());
+
+        WalkPick canvasPick = null;
+        int canvasBestDist = Integer.MAX_VALUE;
+        WalkPick minimapPick = null;
+        int minimapBestDist = Integer.MAX_VALUE;
+
+        for (int dx = 0; dx < area.getWidth(); dx++)
+        {
+            for (int dy = 0; dy < area.getHeight(); dy++)
+            {
+                WorldPoint t = new WorldPoint(
+                    area.getX() + dx, area.getY() + dy, area.getPlane());
+                if (t.getPlane() != here.getPlane()) continue;
+                int d = Math.max(Math.abs(t.getX() - here.getX()),
+                                 Math.abs(t.getY() - here.getY()));
+
+                LocalPoint lp = LocalPoint.fromWorld(wv, t);
+                if (lp == null) continue;
+
+                // Try canvas projection first (preferred — more accurate).
+                Point cv = Perspective.localToCanvas(client, lp, t.getPlane());
+                if (cv != null && inViewport(cv))
+                {
+                    if (d < canvasBestDist)
+                    {
+                        canvasBestDist = d;
+                        canvasPick = new WalkPick(t, cv, false);
+                    }
+                    continue;
+                }
+
+                // Off-canvas — try minimap.
+                Point mp = Perspective.localToMinimap(client, lp);
+                if (mp != null)
+                {
+                    if (d < minimapBestDist)
+                    {
+                        minimapBestDist = d;
+                        minimapPick = new WalkPick(t, mp, true);
+                    }
+                }
+            }
+        }
+
+        // Prefer canvas — more reliable.
+        if (canvasPick != null) return canvasPick;
+        return minimapPick;
     }
 
-    /** True if the tile projects onto the visible canvas viewport. */
-    private boolean projects(WorldPoint wp)
+    private boolean inViewport(Point cp)
     {
-        Point cp = projectCenter(wp);
-        if (cp == null) return false;
         int vx = client.getViewportXOffset();
         int vy = client.getViewportYOffset();
         int vw = client.getViewportWidth();
@@ -730,16 +918,109 @@ public final class LumbridgeBankPenScript
             && cp.getY() >= vy && cp.getY() < vy + vh;
     }
 
-    /** Find the closest staircase with the Climb-down verb and click it. */
+    /** Find the closest object with the Climb-down verb and invoke it.
+     *  Middle-floor staircases expose BOTH Climb-up and Climb-down as
+     *  separate menu options, so we can't rely on the engine's default
+     *  L-click — invoke the verb's slot directly via menuAction. */
     private void climbDown() throws InterruptedException
     {
-        clickNearestObjectWithVerb("Climb-down");
+        invokeNearestObjectAction("Climb-down");
     }
 
-    /** Find the closest staircase with the Climb-up verb and click it. */
+    /** Same as {@link #climbDown} for Climb-up. */
     private void climbUp() throws InterruptedException
     {
-        clickNearestObjectWithVerb("Climb-up");
+        invokeNearestObjectAction("Climb-up");
+    }
+
+    /**
+     * Spiral-search around the player for any GameObject whose
+     * ObjectComposition has an action matching {@code verb} (case-
+     * insensitive). On the first hit, invoke that specific menu action
+     * via {@link Client#menuAction} — this picks the verb's slot
+     * deliberately rather than relying on the engine's default
+     * left-click resolution. Works correctly for middle-floor stairs
+     * that have both Climb-up and Climb-down.
+     */
+    private boolean invokeNearestObjectAction(String verb) throws InterruptedException
+    {
+        return onClientThread(() -> {
+            Player self = client.getLocalPlayer();
+            if (self == null) return false;
+            WorldPoint here = self.getWorldLocation();
+            if (here == null) return false;
+            WorldView wv = client.getTopLevelWorldView();
+            if (wv == null) return false;
+            Scene scene = wv.getScene();
+            if (scene == null) return false;
+            Tile[][][] tiles = scene.getTiles();
+            int plane = here.getPlane();
+            if (tiles == null || plane < 0 || plane >= tiles.length) return false;
+            Tile[][] planeTiles = tiles[plane];
+
+            int hereSx = here.getX() - wv.getBaseX();
+            int hereSy = here.getY() - wv.getBaseY();
+
+            for (int r = 0; r <= OBJECT_SEARCH_RADIUS; r++)
+            {
+                for (int dx = -r; dx <= r; dx++)
+                {
+                    for (int dy = -r; dy <= r; dy++)
+                    {
+                        if (Math.max(Math.abs(dx), Math.abs(dy)) != r) continue;
+                        int sx = hereSx + dx;
+                        int sy = hereSy + dy;
+                        if (sx < 0 || sy < 0
+                            || sx >= planeTiles.length
+                            || sy >= planeTiles[0].length) continue;
+                        Tile t = planeTiles[sx][sy];
+                        if (t == null) continue;
+                        GameObject[] gos = t.getGameObjects();
+                        if (gos == null) continue;
+                        for (GameObject go : gos)
+                        {
+                            if (go == null) continue;
+                            ObjectComposition def = client.getObjectDefinition(go.getId());
+                            if (def == null) continue;
+                            String[] actions = def.getActions();
+                            if (actions == null) continue;
+                            for (int i = 0; i < actions.length && i < 5; i++)
+                            {
+                                String a = actions[i];
+                                if (a == null) continue;
+                                if (!a.equalsIgnoreCase(verb)) continue;
+                                MenuAction ma = gameObjectOptionForSlot(i);
+                                if (ma == null) continue;
+                                LocalPoint lp = go.getLocalLocation();
+                                if (lp == null) continue;
+                                int objSx = lp.getSceneX();
+                                int objSy = lp.getSceneY();
+                                log.info("script: invoking '{}' on object id={} '{}' (slot {}) at scene ({},{})",
+                                    a, go.getId(), def.getName(), i, objSx, objSy);
+                                client.menuAction(objSx, objSy, ma, go.getId(), -1,
+                                    a, def.getName());
+                                return true;
+                            }
+                        }
+                    }
+                }
+            }
+            log.warn("script: no '{}' action within {} tiles", verb, OBJECT_SEARCH_RADIUS);
+            return false;
+        });
+    }
+
+    private static MenuAction gameObjectOptionForSlot(int slot)
+    {
+        switch (slot)
+        {
+            case 0:  return MenuAction.GAME_OBJECT_FIRST_OPTION;
+            case 1:  return MenuAction.GAME_OBJECT_SECOND_OPTION;
+            case 2:  return MenuAction.GAME_OBJECT_THIRD_OPTION;
+            case 3:  return MenuAction.GAME_OBJECT_FOURTH_OPTION;
+            case 4:  return MenuAction.GAME_OBJECT_FIFTH_OPTION;
+            default: return null;
+        }
     }
 
     /**
