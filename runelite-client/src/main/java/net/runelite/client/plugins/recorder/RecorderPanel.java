@@ -258,6 +258,9 @@ public final class RecorderPanel extends PluginPanel
                                                  Consumer<Set<WorldPoint>> onCommit)
                 {
                     if (areaSelector == null || hudOverlay == null) return;
+                    // Re-clicking Mark area mid-session restarts the session
+                    // cleanly rather than throwing IllegalStateException.
+                    if (areaSelector.isActive()) areaSelector.cancel();
                     Set<WorldPoint> initial = editing == null
                         ? Set.of()
                         : editing.tiles();
