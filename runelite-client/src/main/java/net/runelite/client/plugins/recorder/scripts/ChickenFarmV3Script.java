@@ -1,6 +1,5 @@
 package net.runelite.client.plugins.recorder.scripts;
 
-import java.awt.Rectangle;
 import java.util.Optional;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicReference;
@@ -24,6 +23,7 @@ import net.runelite.client.plugins.recorder.trail.TrailPlanner;
 import net.runelite.client.plugins.recorder.trail.TrailRegistry;
 import net.runelite.client.plugins.recorder.trail.TrailWalker;
 import net.runelite.client.sequence.dispatch.HumanizedInputDispatcher;
+import net.runelite.client.sequence.internal.ActionRequest;
 
 /**
  * Chicken farm bot, V3 — uses the recorded {@link
@@ -357,14 +357,17 @@ public final class ChickenFarmV3Script
 
     private boolean clickDepositInventoryThreadSafe() throws InterruptedException
     {
-        Rectangle b = onClient(() -> {
+        Boolean visible = onClient(() -> {
             Widget w = client.getWidget(InterfaceID.Bankmain.DEPOSITINV);
-            if (w == null || w.isHidden()) return null;
-            Rectangle r = w.getBounds();
-            return r == null || r.isEmpty() ? null : r;
+            return w != null && !w.isHidden();
         });
-        if (b == null) return false;
-        dispatcher.clickCanvas(b.x + b.width / 2, b.y + b.height / 2);
+        if (!Boolean.TRUE.equals(visible)) return false;
+        ActionRequest req = ActionRequest.builder()
+            .kind(ActionRequest.Kind.CLICK_WIDGET)
+            .channel(ActionRequest.Channel.MOUSE)
+            .widgetId(InterfaceID.Bankmain.DEPOSITINV)
+            .build();
+        dispatcher.dispatch(req);
         return true;
     }
 
