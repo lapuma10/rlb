@@ -68,7 +68,15 @@ public final class UniversalWalker
      *  many ms have passed since the last click without the player moving.
      *  Prevents click spam during a long walk while still recovering from
      *  dropped clicks. */
-    public static final long RECLICK_AFTER_MS = 1_500;
+    public static final long RECLICK_AFTER_MS = 3_000;
+
+    /** Player must have been still for at least this long since the last
+     *  position change before we re-click. Mirror's V1's 2.5s rule:
+     *  while the engine is walking the player toward our previous click,
+     *  re-clicking the same step just queues redundant walk targets and
+     *  cancels in-flight movement. Only re-click when the engine has
+     *  stopped doing what we asked it to do. */
+    public static final long STILL_THRESHOLD_MS = 2_500;
 
     /** Throttle between transport interactions — gives the engine time to
      *  play the climb / open animation before we re-click. */
@@ -98,6 +106,11 @@ public final class UniversalWalker
     private long lastClickMs;
     private long lastInteractMs;
     private WorldPoint lastClickTile;
+    /** Which step the last click was for. Click cadence is per-step: a
+     *  step change triggers an immediate click, the next click on the
+     *  same step waits for {@link #STILL_THRESHOLD_MS} of stillness AND
+     *  {@link #RECLICK_AFTER_MS} since last click. */
+    private int lastClickStepIdx = -1;
     private Waypoint lastTransportClicked;
 
     public UniversalWalker(Client client, ClientThread clientThread,
@@ -127,6 +140,7 @@ public final class UniversalWalker
         lastClickMs = 0;
         lastInteractMs = 0;
         lastClickTile = null;
+        lastClickStepIdx = -1;
         lastTransportClicked = null;
     }
 
@@ -264,37 +278,87 @@ public final class UniversalWalker
      *  This is monotonic — once we've passed a waypoint we never go
      *  back, even if the player drifts back into its bbox. */
     /** Pick the active step. Monotonic forward — only ever returns
-     *  indices ≥ {@code minIdx}. Strategy:
-     *  <ol>
-     *    <li>Scan ALL steps from {@code minIdx} forward and find the
-     *        HIGHEST-indexed one the player has already arrived at.</li>
-     *    <li>If any, advance past it — return that index + 1.</li>
-     *    <li>If none, stick with {@code minIdx} — we haven't reached
-     *        anything yet.</li>
-     *  </ol>
-     *  This handles mid-route resume correctly: if the player starts at
-     *  PEN_APPROACH (step 7) instead of the bank, scanning finds step 7
-     *  as the highest "arrived" step (its area contains the player) and
-     *  the walker advances to step 8 (gate) instead of trying to walk
-     *  back to step 2 (stairs-landing) just because step 0 and 1 were
-     *  CLIMB_DOWN to planes the player is no longer on.
+     *  indices ≥ {@code minIdx}. Three-pass strategy mirroring V1:
      *
-     *  <p>Earlier this returned the FIRST not-arrived step. That meant
-     *  for a player on plane 0 starting at PEN_APPROACH:
-     *  step 0 (climbDown p2) → "arrived" (player on p0 not p2), skip;
-     *  step 1 (climbDown p1) → "arrived" (player on p0 not p1), skip;
-     *  step 2 (walk stairs-landing) → not arrived, return 2.
-     *  Walker tries to walk 80 tiles back to stairs-landing. Wrong. */
+     *  <ol>
+     *    <li><b>Containing area wins outright.</b> If a WALK_AREA contains
+     *        the player's tile, advance past it (= go to next step).</li>
+     *    <li><b>Past transports.</b> Find the highest CLIMB the player
+     *        has descended/ascended past. The next walking step is
+     *        somewhere after that.</li>
+     *    <li><b>Closest WALK_AREA on the player's plane.</b> Among
+     *        WALK_AREA steps after the last transport-passed, pick the
+     *        one closest to the player by Chebyshev distance to the area
+     *        centre. This is V1's {@code closestLandmarkIdx}: a player
+     *        BETWEEN two landmarks gets snapped to the nearer one and
+     *        walks forward from there.</li>
+     *  </ol>
+     *
+     *  <p>If no WALK_AREA matches the player's plane, fall back to the
+     *  next transport — typically a CLIMB up/down the player needs to
+     *  do. */
     private static int chooseStep(PathSpec spec, WorldPoint pos, int minIdx)
     {
         List<Waypoint> wps = spec.waypoints();
-        int highestArrived = -1;
+
+        // Pass 1: WALK_AREA containing the player.
+        int containedIdx = -1;
         for (int i = minIdx; i < wps.size(); i++)
         {
-            if (arrived(wps.get(i), pos)) highestArrived = i;
+            Waypoint w = wps.get(i);
+            if (w.kind() != Waypoint.Kind.WALK_AREA) continue;
+            WorldArea a = w.area();
+            if (a == null) continue;
+            if (a.getPlane() == pos.getPlane()
+                && pos.getX() >= a.getX() && pos.getX() < a.getX() + a.getWidth()
+                && pos.getY() >= a.getY() && pos.getY() < a.getY() + a.getHeight())
+            {
+                containedIdx = i;
+            }
         }
-        if (highestArrived >= 0) return Math.min(highestArrived + 1, wps.size());
-        return minIdx;
+        if (containedIdx >= 0)
+        {
+            return Math.min(containedIdx + 1, wps.size());
+        }
+
+        // Pass 2: highest TRANSPORT the player has passed (CLIMB
+        // destination-plane reached, OPEN adjacency, etc.).
+        int highestTransportArrived = -1;
+        for (int i = minIdx; i < wps.size(); i++)
+        {
+            Waypoint w = wps.get(i);
+            if (w.kind() == Waypoint.Kind.TRANSPORT && arrived(w, pos))
+            {
+                highestTransportArrived = i;
+            }
+        }
+        int searchFrom = Math.max(minIdx, highestTransportArrived + 1);
+
+        // Pass 3: closest WALK_AREA on the player's plane after the
+        // last transport.
+        int closestIdx = -1;
+        int closestDist = Integer.MAX_VALUE;
+        for (int i = searchFrom; i < wps.size(); i++)
+        {
+            Waypoint w = wps.get(i);
+            if (w.kind() != Waypoint.Kind.WALK_AREA) continue;
+            WorldArea a = w.area();
+            if (a == null || a.getPlane() != pos.getPlane()) continue;
+            int cx = a.getX() + a.getWidth() / 2;
+            int cy = a.getY() + a.getHeight() / 2;
+            int d = Math.max(Math.abs(pos.getX() - cx),
+                             Math.abs(pos.getY() - cy));
+            if (d < closestDist)
+            {
+                closestDist = d;
+                closestIdx = i;
+            }
+        }
+        if (closestIdx >= 0) return closestIdx;
+
+        // No WALK_AREA on player's plane — must be mid-staircase.
+        // Stay on the next transport (typically a climb).
+        return searchFrom;
     }
 
     /** Has the player reached {@code w}? */
@@ -319,10 +383,17 @@ public final class UniversalWalker
             {
                 WorldPoint t = w.tile();
                 if (t == null) return false;
-                if (w.transportKind() == Waypoint.TransportKind.CLIMB_UP
-                    || w.transportKind() == Waypoint.TransportKind.CLIMB_DOWN)
+                if (w.transportKind() == Waypoint.TransportKind.CLIMB_DOWN)
                 {
-                    return pos.getPlane() != t.getPlane();
+                    // Source plane = t.plane. Past this climb iff player has
+                    // descended below it. NOT just "different plane" — a
+                    // player still on a higher plane than the source hasn't
+                    // started yet.
+                    return pos.getPlane() < t.getPlane();
+                }
+                if (w.transportKind() == Waypoint.TransportKind.CLIMB_UP)
+                {
+                    return pos.getPlane() > t.getPlane();
                 }
                 // OPEN / INTERACT — adjacency on the same plane is enough.
                 // The walker decides whether to count adjacency as "arrived"
@@ -386,15 +457,18 @@ public final class UniversalWalker
                 return Status.IN_PROGRESS;
             }
         }
-        if (shouldClick(pick.tile, now))
+        if (shouldClick(now))
         {
-            log.debug("walker: clicking {} ({}px,{}px) toward step {} {}",
+            log.info("walker: clicking {} ({}px,{}px) toward step {} {} (sinceClick={}ms, sinceMove={}ms)",
                 pick.viaMinimap ? "minimap" : "canvas",
                 pick.canvasPixel.getX(), pick.canvasPixel.getY(),
-                stepIdx, describe(active));
+                stepIdx, describe(active),
+                lastClickMs == 0 ? "never" : (now - lastClickMs) + "",
+                now - lastMovementMs);
             dispatcher.clickCanvas(pick.canvasPixel.getX(), pick.canvasPixel.getY());
             lastClickTile = pick.tile;
             lastClickMs = now;
+            lastClickStepIdx = stepIdx;
         }
         return Status.IN_PROGRESS;
     }
@@ -437,14 +511,17 @@ public final class UniversalWalker
                 log.debug("walker: transport step {} — can't reach tile {} yet", stepIdx, t);
                 return Status.IN_PROGRESS;
             }
-            if (shouldClick(pick.tile, now))
+            if (shouldClick(now))
             {
-                log.debug("walker: walking toward transport {} via {} ({}px,{}px)",
+                log.info("walker: walking toward transport {} via {} ({}px,{}px) (sinceClick={}ms, sinceMove={}ms)",
                     t, pick.viaMinimap ? "minimap" : "canvas",
-                    pick.canvasPixel.getX(), pick.canvasPixel.getY());
+                    pick.canvasPixel.getX(), pick.canvasPixel.getY(),
+                    lastClickMs == 0 ? "never" : (now - lastClickMs) + "",
+                    now - lastMovementMs);
                 dispatcher.clickCanvas(pick.canvasPixel.getX(), pick.canvasPixel.getY());
                 lastClickTile = pick.tile;
                 lastClickMs = now;
+                lastClickStepIdx = stepIdx;
             }
             return Status.IN_PROGRESS;
         }
@@ -453,6 +530,21 @@ public final class UniversalWalker
         if (now - lastInteractMs < INTERACT_THROTTLE_MS)
         {
             // Wait for the previous interaction to settle before re-issuing.
+            return Status.IN_PROGRESS;
+        }
+        // Wait for the player to STOP animating before clicking the verb.
+        // V1's rule: never invoke a stairs/gate menu while the player is
+        // mid-walk — the engine drops the click and we fall back to a
+        // wrong-verb canvas resolution at the cursor pixel (e.g. wrong
+        // gate). Reads getPoseAnimation() == getIdlePoseAnimation() on
+        // the client thread.
+        Boolean settled = clientCall(() -> {
+            Player self = client.getLocalPlayer();
+            if (self == null) return false;
+            return self.getPoseAnimation() == self.getIdlePoseAnimation();
+        });
+        if (settled == null || !settled)
+        {
             return Status.IN_PROGRESS;
         }
         ClickPair pair = clientCall(() -> {
@@ -542,11 +634,24 @@ public final class UniversalWalker
         return true;
     }
 
-    private boolean shouldClick(WorldPoint targetTile, long now)
+    /** V1-style click cadence — re-click only when the active step has
+     *  changed OR (the player has been still for {@link #STILL_THRESHOLD_MS}
+     *  AND it's been {@link #RECLICK_AFTER_MS} since the last click).
+     *
+     *  <p>Earlier this compared the picked TILE; the BFS picks a different
+     *  tile every tick (player position shifts, BFS frontier shifts), so
+     *  the comparison was always "tile changed" and clicks fired on every
+     *  tick. The fix is to compare the STEP — the leg the walker is on.
+     *  A step is a stable unit; the picked tile inside it is not. */
+    private boolean shouldClick(long now)
     {
-        if (lastClickTile == null) return true;
-        if (!lastClickTile.equals(targetTile)) return true;
-        return (now - lastClickMs) >= RECLICK_AFTER_MS;
+        boolean stepChanged = lastClickStepIdx != stepIdx;
+        if (stepChanged) return true;
+        long sinceClick = lastClickMs == 0 ? Long.MAX_VALUE : now - lastClickMs;
+        long sinceMove = now - lastMovementMs;
+        boolean stillWalking = sinceMove < STILL_THRESHOLD_MS;
+        boolean recentClick = sinceClick < RECLICK_AFTER_MS;
+        return !recentClick && !stillWalking;
     }
 
     /** Read-side helper that hops to the client thread and returns a value.
