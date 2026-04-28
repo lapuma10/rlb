@@ -3,6 +3,8 @@ package net.runelite.client.plugins.recorder.scripts;
 import java.awt.Rectangle;
 import java.awt.Shape;
 import java.awt.event.KeyEvent;
+import java.util.ArrayDeque;
+import java.util.HashSet;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.Supplier;
@@ -32,6 +34,7 @@ import net.runelite.client.plugins.recorder.farm.BankInteraction;
 import net.runelite.client.plugins.recorder.farm.InventoryUtil;
 import net.runelite.client.plugins.recorder.transport.TransportResolver;
 import net.runelite.client.sequence.dispatch.HumanizedInputDispatcher;
+import net.runelite.client.sequence.internal.ActionRequest;
 
 /**
  * Walking script: Lumbridge bank ↔ chicken pen, round-trip.
@@ -529,14 +532,21 @@ public final class LumbridgeBankPenScript
                         return;
                     }
                     status.set("opening gate (or already open)");
-                    if (openGate())
+                    switch (openGate())
                     {
-                        lastInteractionAtMs = System.currentTimeMillis();
-                    }
-                    else
-                    {
-                        if (advanceWalk(PEN_AREA) == WalkResult.STUCK)
-                            setState(State.ABORTED);
+                        case CLICKED_OPEN:
+                            // Engine walks-and-opens. Throttle and wait.
+                            lastInteractionAtMs = System.currentTimeMillis();
+                            break;
+                        case ALREADY_OPEN:
+                        case NOT_FOUND:
+                            // ALREADY_OPEN: gate is open but no click was fired,
+                            // so we still need to walk through into the pen.
+                            // NOT_FOUND: scene hasn't loaded the wall yet, so
+                            // step closer until it does.
+                            if (advanceWalk(PEN_AREA) == WalkResult.STUCK)
+                                setState(State.ABORTED);
+                            break;
                     }
                     return;
                 }
@@ -604,14 +614,16 @@ public final class LumbridgeBankPenScript
                         return;
                     }
                     status.set("opening gate to leave pen");
-                    if (openGate())
+                    switch (openGate())
                     {
-                        lastInteractionAtMs = System.currentTimeMillis();
-                    }
-                    else
-                    {
-                        if (advanceWalk(PEN_APPROACH) == WalkResult.STUCK)
-                            setState(State.ABORTED);
+                        case CLICKED_OPEN:
+                            lastInteractionAtMs = System.currentTimeMillis();
+                            break;
+                        case ALREADY_OPEN:
+                        case NOT_FOUND:
+                            if (advanceWalk(PEN_APPROACH) == WalkResult.STUCK)
+                                setState(State.ABORTED);
+                            break;
                     }
                     return;
                 }
@@ -957,7 +969,119 @@ public final class LumbridgeBankPenScript
             return Math.random() < 0.3 ? minimapPick : canvasPick;
         }
         if (canvasPick != null) return canvasPick;
-        return minimapPick;
+        if (minimapPick != null) return minimapPick;
+
+        // No tile in the target area is reachable as a single click — the
+        // hop is past minimap range (>20 tiles) or behind a wall. Fall back
+        // to a BFS-based stepping-stone: walk toward the target along
+        // collision-passable tiles, picking the furthest one that projects.
+        return pickStepToward(area, here, wv);
+    }
+
+    /** BFS depth for the step-toward fallback. The minimap projects tiles
+     *  up to ~20 tiles from the player; we cap the BFS at 16 to leave a
+     *  margin. The engine's per-click pathfind reaches 25 tiles, so a
+     *  16-tile click is comfortably one walk segment. */
+    private static final int STEP_DEPTH = 16;
+
+    /** Don't pick a stepping-stone within this many tiles of the player —
+     *  we'd waste a click on barely any progress and re-click on the next
+     *  tick. Has to be larger than the player's per-tick walk speed (1) and
+     *  small enough that single-tile detours around obstacles still
+     *  qualify. */
+    private static final int STEP_MIN_PROGRESS = 4;
+
+    /**
+     * Walk toward {@code target} via a single intermediate stepping-stone.
+     * Runs an 8-connected BFS from the player's tile (using engine
+     * collision flags via {@link WorldArea#canTravelInDirection}, so it
+     * correctly stops at closed gates / walls / water) up to
+     * {@link #STEP_DEPTH} steps. Picks the BFS-reachable tile with the
+     * minimum Chebyshev distance to {@code target}'s centre that ALSO
+     * projects to the minimap, AND strictly improves toward the target
+     * compared to the player's current position. Must be called on the
+     * client thread.
+     *
+     * <p>Always uses minimap clicks: a canvas click resolves through
+     * whatever's rendered at the picked pixel — trees become "Chop", logs
+     * become "Take", NPCs become "Attack". Minimap clicks always route as
+     * "Walk here" with no object-action ambiguity. The direct path in
+     * {@link #pickWalkTarget} keeps canvas as an option because the
+     * destination ITSELF is the click target there; only this fallback
+     * picks an intermediate tile, where a wrong-pixel-overlap is the rule
+     * not the exception.
+     *
+     * <p>Returns null when:
+     * <ul>
+     *   <li>player and target are on different planes (can't BFS across);
+     *   <li>BFS finds no reachable tile that strictly improves toTarget
+     *       AND projects to the minimap (player walled in / too far).
+     * </ul>
+     */
+    private WalkPick pickStepToward(WorldArea target, WorldPoint here, WorldView wv)
+    {
+        if (target.getPlane() != here.getPlane()) return null;
+        int plane = here.getPlane();
+        int tcx = target.getX() + target.getWidth() / 2;
+        int tcy = target.getY() + target.getHeight() / 2;
+        // Player's current distance to target — any candidate must beat it.
+        int hereToTarget = Math.max(Math.abs(here.getX() - tcx),
+                                    Math.abs(here.getY() - tcy));
+
+        WalkPick best = null;
+        int bestToTarget = hereToTarget;
+
+        // 8-connected — engine collision encodes diagonals via the wall-flag
+        // matrix in WorldArea, and players walk diagonally on open tiles.
+        final int[] DX = {0, 0, 1, -1, 1, 1, -1, -1};
+        final int[] DY = {1, -1, 0, 0, 1, -1, 1, -1};
+
+        HashSet<Long> visited = new HashSet<>();
+        ArrayDeque<int[]> queue = new ArrayDeque<>();
+        visited.add(packXY(here.getX(), here.getY()));
+        queue.add(new int[]{here.getX(), here.getY(), 0});
+
+        while (!queue.isEmpty())
+        {
+            int[] cur = queue.poll();
+            int x = cur[0], y = cur[1], d = cur[2];
+            if (d >= STEP_DEPTH) continue;
+            WorldArea hereArea = new WorldArea(x, y, 1, 1, plane);
+            for (int i = 0; i < 8; i++)
+            {
+                int nx = x + DX[i], ny = y + DY[i];
+                long key = packXY(nx, ny);
+                if (visited.contains(key)) continue;
+                if (!hereArea.canTravelInDirection(wv, DX[i], DY[i])) continue;
+                visited.add(key);
+                queue.add(new int[]{nx, ny, d + 1});
+
+                // Reached a new tile — could it be a better click target?
+                int progress = Math.max(Math.abs(nx - here.getX()),
+                                        Math.abs(ny - here.getY()));
+                if (progress < STEP_MIN_PROGRESS) continue;
+                int toTarget = Math.max(Math.abs(nx - tcx),
+                                        Math.abs(ny - tcy));
+                // Strict progress toward target — never click a tile that's
+                // farther from target than the player already is.
+                if (toTarget >= bestToTarget) continue;
+
+                WorldPoint candTile = new WorldPoint(nx, ny, plane);
+                LocalPoint lp = LocalPoint.fromWorld(wv, candTile);
+                if (lp == null) continue;
+                Point mp = Perspective.localToMinimap(client, lp);
+                if (mp == null) continue;
+
+                bestToTarget = toTarget;
+                best = new WalkPick(candTile, mp, true);
+            }
+        }
+        return best;
+    }
+
+    private static long packXY(int x, int y)
+    {
+        return ((long) x << 32) | (y & 0xffffffffL);
     }
 
     private boolean inViewport(Point cp)
@@ -986,140 +1110,159 @@ public final class LumbridgeBankPenScript
     }
 
     /**
-     * Spiral-search around the player for any GameObject whose
-     * ObjectComposition has an action matching {@code verb} (case-
-     * insensitive). On the first hit, invoke that specific menu action
-     * via {@link Client#menuAction} — this picks the verb's slot
-     * deliberately rather than relying on the engine's default
-     * left-click resolution. Works correctly for middle-floor stairs
-     * that have both Climb-up and Climb-down.
+     * Spiral-search for the nearest GameObject whose composition exposes
+     * {@code verb}, then dispatch a humanized right-click + menu-pick via
+     * {@link HumanizedInputDispatcher#dispatch}. The dispatcher routes the
+     * cursor onto the object, opens the right-click menu when the verb is
+     * not the L-click default, and selects the matching row.
+     *
+     * <p>Earlier this called {@link Client#menuAction} directly with
+     * {@code GAME_OBJECT_THIRD_OPTION} for "Climb-down" on middle-floor
+     * stairs (id=16672). The engine silently dropped that — the menuAction
+     * pipeline only honours the L-click slot reliably, deeper slots need
+     * the full hover-state-driven flow the dispatcher provides.
      */
     private boolean invokeNearestObjectAction(String verb) throws InterruptedException
     {
-        return onClientThread(() -> {
-            Player self = client.getLocalPlayer();
-            if (self == null) return false;
-            WorldPoint here = self.getWorldLocation();
-            if (here == null) return false;
-            WorldView wv = client.getTopLevelWorldView();
-            if (wv == null) return false;
-            Scene scene = wv.getScene();
-            if (scene == null) return false;
-            Tile[][][] tiles = scene.getTiles();
-            int plane = here.getPlane();
-            if (tiles == null || plane < 0 || plane >= tiles.length) return false;
-            Tile[][] planeTiles = tiles[plane];
+        WorldPoint matchedTile = onClientThread(() -> findNearestObjectTileWithVerb(verb));
+        if (matchedTile == null) return false;
+        ActionRequest req = ActionRequest.builder()
+            .kind(ActionRequest.Kind.CLICK_GAME_OBJECT)
+            .channel(ActionRequest.Channel.MOUSE)
+            .tile(matchedTile)
+            .verb(verb)
+            .build();
+        log.info("script: dispatching '{}' on object at world {}", verb, matchedTile);
+        dispatcher.dispatch(req);
+        return true;
+    }
 
-            int hereSx = here.getX() - wv.getBaseX();
-            int hereSy = here.getY() - wv.getBaseY();
+    /** Spiral-search the loaded scene around the player for a GameObject
+     *  whose composition (or impostor composition for multi-state objects)
+     *  exposes {@code verb}. Returns the matched object's world tile, or
+     *  null if nothing within {@link #OBJECT_SEARCH_RADIUS} matches. Must
+     *  be called on the client thread. */
+    private WorldPoint findNearestObjectTileWithVerb(String verb)
+    {
+        Player self = client.getLocalPlayer();
+        if (self == null) return null;
+        WorldPoint here = self.getWorldLocation();
+        if (here == null) return null;
+        WorldView wv = client.getTopLevelWorldView();
+        if (wv == null) return null;
+        Scene scene = wv.getScene();
+        if (scene == null) return null;
+        Tile[][][] tiles = scene.getTiles();
+        int plane = here.getPlane();
+        if (tiles == null || plane < 0 || plane >= tiles.length) return null;
+        Tile[][] planeTiles = tiles[plane];
 
-            for (int r = 0; r <= OBJECT_SEARCH_RADIUS; r++)
+        int hereSx = here.getX() - wv.getBaseX();
+        int hereSy = here.getY() - wv.getBaseY();
+
+        for (int r = 0; r <= OBJECT_SEARCH_RADIUS; r++)
+        {
+            for (int dx = -r; dx <= r; dx++)
             {
-                for (int dx = -r; dx <= r; dx++)
+                for (int dy = -r; dy <= r; dy++)
                 {
-                    for (int dy = -r; dy <= r; dy++)
+                    if (Math.max(Math.abs(dx), Math.abs(dy)) != r) continue;
+                    int sx = hereSx + dx;
+                    int sy = hereSy + dy;
+                    if (sx < 0 || sy < 0
+                        || sx >= planeTiles.length
+                        || sy >= planeTiles[0].length) continue;
+                    Tile t = planeTiles[sx][sy];
+                    if (t == null) continue;
+                    GameObject[] gos = t.getGameObjects();
+                    if (gos == null) continue;
+                    for (GameObject go : gos)
                     {
-                        if (Math.max(Math.abs(dx), Math.abs(dy)) != r) continue;
-                        int sx = hereSx + dx;
-                        int sy = hereSy + dy;
-                        if (sx < 0 || sy < 0
-                            || sx >= planeTiles.length
-                            || sy >= planeTiles[0].length) continue;
-                        Tile t = planeTiles[sx][sy];
-                        if (t == null) continue;
-                        GameObject[] gos = t.getGameObjects();
-                        if (gos == null) continue;
-                        for (GameObject go : gos)
+                        if (go == null) continue;
+                        ObjectComposition baseDef = client.getObjectDefinition(go.getId());
+                        if (baseDef == null) continue;
+                        ObjectComposition def = baseDef;
+                        int liveId = go.getId();
+                        if (baseDef.getImpostorIds() != null)
                         {
-                            if (go == null) continue;
-                            ObjectComposition baseDef = client.getObjectDefinition(go.getId());
-                            if (baseDef == null) continue;
-                            // Multi-state objects (open/closed door, staircase
-                            // with extra "Top floor"/"Bottom floor" options
-                            // added by the April-2025 update) carry the
-                            // currently-visible actions on the IMPOSTOR, not
-                            // the base def. Mirror what TransportResolver
-                            // does for verb matching.
-                            ObjectComposition def = baseDef;
-                            int liveId = go.getId();
-                            if (baseDef.getImpostorIds() != null)
+                            try
                             {
-                                try
+                                ObjectComposition imp = baseDef.getImpostor();
+                                if (imp != null)
                                 {
-                                    ObjectComposition imp = baseDef.getImpostor();
-                                    if (imp != null)
-                                    {
-                                        def = imp;
-                                        liveId = imp.getId();
-                                    }
+                                    def = imp;
+                                    liveId = imp.getId();
                                 }
-                                catch (Throwable ignored) { /* base def fallback */ }
                             }
-                            String[] actions = def.getActions();
-                            if (actions == null) continue;
-                            for (int i = 0; i < actions.length && i < 5; i++)
-                            {
-                                String a = actions[i];
-                                if (a == null) continue;
-                                if (!a.equalsIgnoreCase(verb)) continue;
-                                MenuAction ma = gameObjectOptionForSlot(i);
-                                if (ma == null) continue;
-                                LocalPoint lp = go.getLocalLocation();
-                                if (lp == null) continue;
-                                int objSx = lp.getSceneX();
-                                int objSy = lp.getSceneY();
-                                log.info("script: invoking '{}' on object baseId={} liveId={} '{}' (slot {}) at scene ({},{})",
-                                    a, go.getId(), liveId, def.getName(), i, objSx, objSy);
-                                // The engine looks up the object at scene
-                                // (sx, sy) and matches by id — pass the live
-                                // (impostor) id so the menu slot binds to
-                                // the impostor's action table.
-                                client.menuAction(objSx, objSy, ma, liveId, -1,
-                                    a, def.getName());
-                                return true;
-                            }
+                            catch (Throwable ignored) { /* base def fallback */ }
+                        }
+                        String[] actions = def.getActions();
+                        if (actions == null) continue;
+                        for (int i = 0; i < actions.length && i < 5; i++)
+                        {
+                            String a = actions[i];
+                            if (a == null) continue;
+                            if (!a.equalsIgnoreCase(verb)) continue;
+                            LocalPoint lp = go.getLocalLocation();
+                            if (lp == null) continue;
+                            WorldPoint wp = WorldPoint.fromLocal(client, lp);
+                            log.info("script: matched '{}' on object baseId={} liveId={} '{}' (slot {}) at world {}",
+                                a, go.getId(), liveId, def.getName(), i, wp);
+                            return wp;
                         }
                     }
                 }
             }
-            log.warn("script: no '{}' action within {} tiles", verb, OBJECT_SEARCH_RADIUS);
-            return false;
-        });
+        }
+        log.warn("script: no '{}' action within {} tiles", verb, OBJECT_SEARCH_RADIUS);
+        return null;
     }
 
-    private static MenuAction gameObjectOptionForSlot(int slot)
+    /** Outcome of attempting to traverse the pen gate, signalled to the
+     *  outer tick so it knows whether a click was dispatched (and the
+     *  engine will walk-and-open) or whether the caller still needs to
+     *  fire a walk-through click (gate was already open — no click yet). */
+    private enum GateResult
     {
-        switch (slot)
-        {
-            case 0:  return MenuAction.GAME_OBJECT_FIRST_OPTION;
-            case 1:  return MenuAction.GAME_OBJECT_SECOND_OPTION;
-            case 2:  return MenuAction.GAME_OBJECT_THIRD_OPTION;
-            case 3:  return MenuAction.GAME_OBJECT_FOURTH_OPTION;
-            case 4:  return MenuAction.GAME_OBJECT_FIFTH_OPTION;
-            default: return null;
-        }
+        /** A click on the closed gate's "Open" was dispatched; the engine
+         *  walks the player to it and opens it. Caller throttles via
+         *  {@code lastInteractionAtMs} and waits. */
+        CLICKED_OPEN,
+        /** No "Open" verb in range, but a "Close" verb is present — the
+         *  gate is already open. No click was dispatched; caller must
+         *  walk through into the destination area. */
+        ALREADY_OPEN,
+        /** Neither "Open" nor "Close" within range — we're not actually
+         *  near the gate, or the scene hasn't loaded the wall object yet.
+         *  Caller falls back to walking toward the destination. */
+        NOT_FOUND
     }
 
     /**
-     * Open the gate at the chicken pen. If a gate within range has the
-     * "Open" verb → click it (returns true). If it only has "Close"
-     * (already open) → no click, walk through (returns true). If no
-     * gate is found → false (caller decides what to do).
+     * Decide what to do at the pen gate. Splits the three outcomes so
+     * the caller can react: {@link GateResult#CLICKED_OPEN} fires the
+     * gate's pathfind, {@link GateResult#ALREADY_OPEN} requires the
+     * caller to walk through (no click was dispatched here),
+     * {@link GateResult#NOT_FOUND} means we're not in range yet.
+     *
+     * <p>Earlier this returned a boolean; the open-but-no-click case was
+     * indistinguishable from the open-and-click case, so the player
+     * silently stalled at the open gate. This split is the fix.
      */
-    private boolean openGate() throws InterruptedException
+    private GateResult openGate() throws InterruptedException
     {
         // Try Open first — if the gate is closed this finds it.
-        if (clickNearestObjectWithVerb("Open")) return true;
+        if (clickNearestObjectWithVerb("Open")) return GateResult.CLICKED_OPEN;
         // No "Open" verb in range — maybe the gate is already open
-        // (only "Close" verb). Treat that as "walk through".
+        // (only "Close" verb). Caller must walk through.
         TransportResolver.Match closeMatch = onClientThread(() ->
             findNearestMatchWithVerb("Close"));
         if (closeMatch != null && closeMatch.isSuccess())
         {
-            log.info("script: gate already open (Close verb present) — walking through");
-            return true;
+            log.info("script: gate already open (Close verb present) — caller walks through");
+            return GateResult.ALREADY_OPEN;
         }
-        return false;
+        return GateResult.NOT_FOUND;
     }
 
     /**
