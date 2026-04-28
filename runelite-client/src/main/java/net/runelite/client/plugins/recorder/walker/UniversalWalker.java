@@ -111,6 +111,14 @@ public final class UniversalWalker
      *  same step waits for {@link #STILL_THRESHOLD_MS} of stillness AND
      *  {@link #RECLICK_AFTER_MS} since last click. */
     private int lastClickStepIdx = -1;
+    /** Highest TRANSPORT step index we've explicitly clicked (or
+     *  detected as already-open). Pass 1 of chooseStep uses this to
+     *  ensure we don't advance past an OPEN/INTERACT transport just
+     *  because the player happens to be inside the bbox of the
+     *  WALK_AREA on the OTHER side of the fence (the static
+     *  {@link #arrived} check for OPEN is mere adjacency — it can't
+     *  tell whether we've actually crossed). */
+    private int lastClickedTransportIdx = -1;
     private Waypoint lastTransportClicked;
 
     public UniversalWalker(Client client, ClientThread clientThread,
@@ -141,6 +149,7 @@ public final class UniversalWalker
         lastInteractMs = 0;
         lastClickTile = null;
         lastClickStepIdx = -1;
+        lastClickedTransportIdx = -1;
         lastTransportClicked = null;
     }
 
@@ -194,7 +203,7 @@ public final class UniversalWalker
         }
 
         // Pick the active step — monotonic forward.
-        int newIdx = chooseStep(spec, snap.position, stepIdx);
+        int newIdx = chooseStep(spec, snap.position, stepIdx, lastClickedTransportIdx);
         if (newIdx > stepIdx)
         {
             log.info("walker: advancing step {} → {} (player at {})",
@@ -297,7 +306,8 @@ public final class UniversalWalker
      *  <p>If no WALK_AREA matches the player's plane, fall back to the
      *  next transport — typically a CLIMB up/down the player needs to
      *  do. */
-    private static int chooseStep(PathSpec spec, WorldPoint pos, int minIdx)
+    private static int chooseStep(PathSpec spec, WorldPoint pos, int minIdx,
+                                  int lastClickedTransportIdx)
     {
         List<Waypoint> wps = spec.waypoints();
 
@@ -318,48 +328,50 @@ public final class UniversalWalker
         }
         if (containedIdx >= 0)
         {
+            // Block: if any TRANSPORT between minIdx and containedIdx
+            // hasn't been finished, return that transport's index — we
+            // can't advance through a gate/staircase just because the
+            // player happens to be inside the bbox of the WALK_AREA on
+            // the other side. CLIMB done = plane crossed (arrived());
+            // OPEN/INTERACT done = explicit click recorded in
+            // lastClickedTransportIdx.
+            int blocking = unfinishedTransportBefore(
+                wps, minIdx, containedIdx, pos, lastClickedTransportIdx);
+            if (blocking >= 0) return blocking;
             return Math.min(containedIdx + 1, wps.size());
         }
 
         // STAY-ON-TRANSPORT — never skip past an unfinished transport.
-        // Without this, a player who has just left the previous landmark
-        // (e.g. walked north out of pen-approach toward the gate) gets
-        // snapped forward to the closest WALK_AREA on plane (the pen
-        // interior), bypassing the gate handler entirely. The L-click
-        // pathfind may still walk through if the gate's default action
-        // is "Open", but the walker's intent — explicit gate handling
-        // with isPlayerSettled + verb-pick — is lost. Stay on the gate
-        // until adjacency arrived.
         if (minIdx < wps.size())
         {
             Waypoint cur = wps.get(minIdx);
-            if (cur.kind() == Waypoint.Kind.TRANSPORT && !arrived(cur, pos))
+            if (cur.kind() == Waypoint.Kind.TRANSPORT
+                && !transportFinished(cur, minIdx, pos, lastClickedTransportIdx))
             {
                 return minIdx;
             }
         }
 
-        // Pass 2: highest TRANSPORT the player has passed (CLIMB
-        // destination-plane reached, OPEN adjacency, etc.).
+        // Pass 2: highest TRANSPORT the player has passed.
         int highestTransportArrived = -1;
         for (int i = minIdx; i < wps.size(); i++)
         {
             Waypoint w = wps.get(i);
-            if (w.kind() == Waypoint.Kind.TRANSPORT && arrived(w, pos))
+            if (w.kind() == Waypoint.Kind.TRANSPORT
+                && transportFinished(w, i, pos, lastClickedTransportIdx))
             {
                 highestTransportArrived = i;
             }
         }
         int searchFrom = Math.max(minIdx, highestTransportArrived + 1);
 
-        // Cap forward scan at the next unfinished TRANSPORT — same
-        // reason as the STAY rule above: don't snap to a WALK_AREA past
-        // a gate / staircase the player still needs to traverse.
+        // Cap forward scan at the next unfinished TRANSPORT.
         int upperBound = wps.size();
         for (int i = searchFrom; i < wps.size(); i++)
         {
             Waypoint w = wps.get(i);
-            if (w.kind() == Waypoint.Kind.TRANSPORT && !arrived(w, pos))
+            if (w.kind() == Waypoint.Kind.TRANSPORT
+                && !transportFinished(w, i, pos, lastClickedTransportIdx))
             {
                 upperBound = i;
                 break;
@@ -391,6 +403,51 @@ public final class UniversalWalker
         // No WALK_AREA on player's plane in the bounded range — must
         // be mid-staircase or already at upperBound transport. Stay.
         return searchFrom;
+    }
+
+    /** True iff this TRANSPORT step is "done" — the walker should
+     *  consider it traversed and let chooseStep advance past it.
+     *  Definition differs by kind:
+     *  <ul>
+     *    <li>CLIMB_UP / CLIMB_DOWN: destination plane reached
+     *        (delegates to {@link #arrived}).</li>
+     *    <li>OPEN / INTERACT: walker has explicitly clicked the
+     *        verb at this step. Adjacency alone isn't enough — a
+     *        player can be adjacent to a closed gate without ever
+     *        having opened it; advancing past in that case bypasses
+     *        the gate-handling pipeline.</li>
+     *  </ul>
+     */
+    private static boolean transportFinished(Waypoint w, int idx, WorldPoint pos,
+                                             int lastClickedTransportIdx)
+    {
+        if (w == null || w.kind() != Waypoint.Kind.TRANSPORT) return false;
+        Waypoint.TransportKind tk = w.transportKind();
+        if (tk == Waypoint.TransportKind.CLIMB_UP
+            || tk == Waypoint.TransportKind.CLIMB_DOWN)
+        {
+            return arrived(w, pos);
+        }
+        // OPEN / INTERACT — require explicit click recorded.
+        return idx <= lastClickedTransportIdx;
+    }
+
+    /** Find the lowest-indexed unfinished TRANSPORT in
+     *  {@code [from, until)}. Returns -1 if none. Used by chooseStep
+     *  to block Pass 1 from advancing past gates the walker hasn't
+     *  actually clicked. */
+    private static int unfinishedTransportBefore(List<Waypoint> wps,
+                                                 int from, int until,
+                                                 WorldPoint pos,
+                                                 int lastClickedTransportIdx)
+    {
+        for (int i = from; i < until; i++)
+        {
+            Waypoint w = wps.get(i);
+            if (w.kind() != Waypoint.Kind.TRANSPORT) continue;
+            if (!transportFinished(w, i, pos, lastClickedTransportIdx)) return i;
+        }
+        return -1;
     }
 
     /** Has the player reached {@code w}? */
@@ -610,6 +667,7 @@ public final class UniversalWalker
             // player is held adjacent for a frame longer.
             lastInteractMs = now;
             lastTransportClicked = active;
+            lastClickedTransportIdx = stepIdx;
             return Status.IN_PROGRESS;
         }
         if (pair.missing)
@@ -623,6 +681,7 @@ public final class UniversalWalker
             t, active.verb(), cx, cy);
         dispatcher.clickCanvas(cx, cy);
         lastInteractMs = now;
+        lastClickedTransportIdx = stepIdx;
         lastClickMs = now;
         lastTransportClicked = active;
         state = InternalState.CROSSING;

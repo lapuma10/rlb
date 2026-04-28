@@ -94,7 +94,9 @@ public final class ChickenFarmV2Script
     private static final WorldPoint STAIRS_TILE_P2 = new WorldPoint(3205, 3229, 2);
     private static final WorldPoint STAIRS_TILE_P1 = new WorldPoint(3205, 3229, 1);
     private static final WorldPoint STAIRS_TILE_P0 = new WorldPoint(3205, 3229, 0);
-    private static final WorldPoint PEN_GATE       = new WorldPoint(3236, 3296, 0);
+    /** Pen gate tile — verified in-game via the L-click hover panel:
+     *  tile (3236, 3295, p=0), object id 1560, L-click "Open Gate". */
+    private static final WorldPoint PEN_GATE       = new WorldPoint(3236, 3295, 0);
 
     /** Bank → pen path. The walker walks to each landmark in order; at a
      *  Transport step it invokes the verb on the matching object via
