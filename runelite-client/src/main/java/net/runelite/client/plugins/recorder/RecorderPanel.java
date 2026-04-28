@@ -150,6 +150,7 @@ public final class RecorderPanel extends PluginPanel
     private AreaSelector areaSelector;
     private RoutesTab routesTab;
     private final JPanel routesContainer = new JPanel(new BorderLayout());
+    private volatile Thread walkerThread;
 
     public RecorderPanel(RecorderManager manager, Client client)
     {
@@ -395,52 +396,196 @@ public final class RecorderPanel extends PluginPanel
         routesContainer.repaint();
     }
 
-    /** Drive the walker over waypoints[0..endExclusive). Fork to a daemon
-     *  thread for sleeping between ticks, but dispatch each arrived/tick
-     *  call onto the client thread — the engine asserts that getLocalPlayer
-     *  / getWorldLocation must be called from there (developer-mode -ea). */
+    /** Drive the walker over waypoints[0..endExclusive).
+     *  <ul>
+     *    <li>Cancels any in-flight walker so multiple Walk path / Walk to
+     *        selected clicks don't stack up concurrent threads.</li>
+     *    <li>Each arrived / tick / position read happens on the client
+     *        thread (the engine asserts via -ea in developer mode).</li>
+     *    <li>Click cadence is "click once, then wait for the player to
+     *        move; only re-click if the player has been still for 3+
+     *        seconds." So one waypoint = ~one click instead of ~one click
+     *        per tick.</li>
+     *    <li>Plane mismatch (player on plane A, waypoint on plane B) for
+     *        non-TRANSPORT waypoints is detected up front and the waypoint
+     *        is skipped with a clear warning — the route needs an explicit
+     *        climb-up / climb-down transport waypoint.</li>
+     *    <li>State-level log lines: starting / arrived / advancing /
+     *        skipping / stuck. Per-tick noise is gone.</li>
+     *  </ul>
+     */
     private void runWalker(List<Waypoint> wps, int endExclusive)
     {
         if (client == null || dispatcher == null || transportResolver == null
-            || clientThread == null) return;
+            || clientThread == null)
+        {
+            log.warn("walker: aborting — missing dependency");
+            return;
+        }
+        // Cancel any in-flight walker before starting fresh.
+        Thread previous = walkerThread;
+        if (previous != null && previous.isAlive())
+        {
+            log.info("walker: cancelling previous walker thread");
+            previous.interrupt();
+            try { previous.join(500); }
+            catch (InterruptedException ie) { Thread.currentThread().interrupt(); }
+        }
+
         final List<Waypoint> slice = new ArrayList<>(
             wps.subList(0, Math.max(0, Math.min(endExclusive, wps.size()))));
+        log.info("walker: starting slice of {} waypoints", slice.size());
+
         Thread t = new Thread(() -> {
             try
             {
                 RouteWalker w = new RouteWalker(client, dispatcher, transportResolver);
-                for (Waypoint wp : slice)
+                for (int i = 0; i < slice.size(); i++)
                 {
                     if (Thread.currentThread().isInterrupted()) break;
-                    while (true)
+                    Waypoint wp = slice.get(i);
+                    int wpIdx = i;
+                    String wpLabel = "#" + wpIdx
+                        + (wp.name() == null ? "" : " " + wp.name());
+
+                    // Plane check up front: if the waypoint is plane-locked
+                    // and the player is on a different plane, no amount of
+                    // clicking will help — the route needs a climb verb.
+                    java.util.concurrent.atomic.AtomicReference<WorldPoint> initialPos =
+                        new java.util.concurrent.atomic.AtomicReference<>();
+                    java.util.concurrent.CountDownLatch posLatch =
+                        new java.util.concurrent.CountDownLatch(1);
+                    clientThread.invokeLater(() -> {
+                        try
+                        {
+                            net.runelite.api.Player self = client.getLocalPlayer();
+                            if (self != null) initialPos.set(self.getWorldLocation());
+                        }
+                        finally { posLatch.countDown(); }
+                    });
+                    posLatch.await();
+
+                    int wpPlane = wp.area() != null ? wp.area().getPlane()
+                        : wp.tile() != null ? wp.tile().getPlane() : -1;
+                    WorldPoint here = initialPos.get();
+                    if (wp.kind() != Waypoint.Kind.TRANSPORT
+                        && here != null && wpPlane >= 0
+                        && here.getPlane() != wpPlane)
                     {
-                        if (Thread.currentThread().isInterrupted()) break;
-                        // arrived/tick must run on the client thread.
+                        log.warn("walker: skipping {} (plane={}, player on plane={})"
+                                + " — route needs an explicit climb-up / climb-down waypoint",
+                            wpLabel, wpPlane, here.getPlane());
+                        continue;
+                    }
+
+                    log.info("walker: starting {}", wpLabel);
+
+                    WorldPoint lastSeen = here;
+                    long lastClickAt = 0L;
+                    long lastMoveAt = System.currentTimeMillis();
+                    boolean arrivedHere = false;
+
+                    while (!Thread.currentThread().isInterrupted())
+                    {
                         java.util.concurrent.atomic.AtomicBoolean arrived =
                             new java.util.concurrent.atomic.AtomicBoolean(false);
+                        java.util.concurrent.atomic.AtomicReference<WorldPoint> curPos =
+                            new java.util.concurrent.atomic.AtomicReference<>();
                         java.util.concurrent.CountDownLatch latch =
                             new java.util.concurrent.CountDownLatch(1);
                         clientThread.invokeLater(() -> {
                             try
                             {
-                                if (w.arrived(wp)) arrived.set(true);
-                                else w.tick(wp);
+                                if (w.arrived(wp))
+                                {
+                                    arrived.set(true);
+                                }
+                                else
+                                {
+                                    net.runelite.api.Player self = client.getLocalPlayer();
+                                    if (self != null) curPos.set(self.getWorldLocation());
+                                }
                             }
                             catch (Throwable ex)
                             {
-                                log.warn("walker tick failed", ex);
+                                log.warn("walker arrived/pos failed", ex);
                             }
                             finally { latch.countDown(); }
                         });
                         latch.await();
-                        if (arrived.get()) break;
-                        Thread.sleep(300 + (int)(Math.random() * 300));
+
+                        if (arrived.get())
+                        {
+                            log.info("walker: arrived at {}", wpLabel);
+                            arrivedHere = true;
+                            break;
+                        }
+
+                        WorldPoint cur = curPos.get();
+                        long now = System.currentTimeMillis();
+                        boolean moved = cur != null && lastSeen != null
+                            && !cur.equals(lastSeen);
+                        if (moved)
+                        {
+                            lastSeen = cur;
+                            lastMoveAt = now;
+                        }
+
+                        long sinceClick = now - lastClickAt;
+                        long sinceMove = now - lastMoveAt;
+                        // Click if: never clicked yet, OR player has been
+                        // still for 3+ seconds since the last click took
+                        // effect. The engine handles re-targets cleanly,
+                        // but spamming clicks every tick floods the UI.
+                        boolean shouldClick = lastClickAt == 0L
+                            || (sinceClick > 3000 && sinceMove > 3000);
+
+                        if (shouldClick)
+                        {
+                            log.info("walker: click toward {} (player at {})",
+                                wpLabel, cur);
+                            java.util.concurrent.CountDownLatch clickLatch =
+                                new java.util.concurrent.CountDownLatch(1);
+                            clientThread.invokeLater(() -> {
+                                try { w.tick(wp); }
+                                catch (Throwable ex)
+                                {
+                                    log.warn("walker tick failed", ex);
+                                }
+                                finally { clickLatch.countDown(); }
+                            });
+                            clickLatch.await();
+                            lastClickAt = now;
+                        }
+
+                        // Stuck timeout: 15 seconds with no movement and
+                        // no arrival → give up on this waypoint.
+                        if (lastClickAt != 0L && sinceMove > 15000)
+                        {
+                            log.warn("walker: stuck on {} for 15s — advancing to next",
+                                wpLabel);
+                            break;
+                        }
+
+                        // Poll cadence (NOT click cadence). 800-1200ms.
+                        Thread.sleep(800 + (int)(Math.random() * 400));
+                    }
+
+                    if (!arrivedHere)
+                    {
+                        log.info("walker: leaving {} without arrival", wpLabel);
                     }
                 }
+                log.info("walker: finished slice");
             }
-            catch (InterruptedException ie) { Thread.currentThread().interrupt(); }
+            catch (InterruptedException ie)
+            {
+                Thread.currentThread().interrupt();
+                log.info("walker: interrupted");
+            }
         }, "annotator-test-walk");
         t.setDaemon(true);
+        walkerThread = t;
         t.start();
     }
 

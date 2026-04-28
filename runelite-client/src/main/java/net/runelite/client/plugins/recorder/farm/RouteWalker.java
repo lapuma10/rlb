@@ -84,10 +84,18 @@ public final class RouteWalker
             case WALK:
             case WALK_AREA:
             {
-                // Source of truth is the tile set; for rectangular sets this is
-                // every bbox tile (equivalent to the old bbox check), for
-                // irregular sets it correctly excludes holes in the bbox.
-                return wp.tiles().contains(here);
+                // Bbox bounds — generous arrival tolerance so the user's
+                // expectation ("I'm in the area") wins even on irregular sets
+                // where the player may stand in a hole inside the bounding
+                // rect. Combined with the per-tick sampler restricting clicks
+                // to the actual tile set, holes still don't get clicked.
+                WorldArea a = wp.area();
+                if (a == null) return false;
+                return here.getPlane() == a.getPlane()
+                    && here.getX() >= a.getX()
+                    && here.getX() < a.getX() + a.getWidth()
+                    && here.getY() >= a.getY()
+                    && here.getY() < a.getY() + a.getHeight();
             }
             case TRANSPORT:
             {

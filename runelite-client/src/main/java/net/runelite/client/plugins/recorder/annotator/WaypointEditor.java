@@ -125,10 +125,16 @@ public final class WaypointEditor extends JPanel
 
         JPanel rowWalk = new JPanel(new FlowLayout(FlowLayout.LEFT, 4, 0));
         JButton walkBtn = new JButton("Walk path");
-        walkBtn.addActionListener(e -> hooks.onWalkPath(List.copyOf(waypoints)));
+        walkBtn.addActionListener(e -> {
+            log.info("Walk path button clicked: waypoints={}", waypoints.size());
+            hooks.onWalkPath(List.copyOf(waypoints));
+        });
         JButton walkToBtn = new JButton("Walk to selected");
         walkToBtn.addActionListener(e -> {
+            log.info("Walk to selected button clicked: waypoints={}, selectedIdx={}",
+                waypoints.size(), selectedIdx);
             if (selectedIdx >= 0) hooks.onWalkToSelected(List.copyOf(waypoints), selectedIdx);
+            else log.warn("Walk to selected: no waypoint selected");
         });
         rowWalk.add(walkBtn);
         rowWalk.add(walkToBtn);
