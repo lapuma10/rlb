@@ -263,4 +263,42 @@ public final class TransportResolver
         }
         return null;
     }
+
+    /** Click+match pair from a neighborhood search. */
+    public static final class TileMatch
+    {
+        private final WorldPoint tile;
+        private final AnyMatch match;
+        public TileMatch(WorldPoint tile, AnyMatch match) { this.tile = tile; this.match = match; }
+        public WorldPoint tile() { return tile; }
+        public AnyMatch match() { return match; }
+    }
+
+    /** Like {@link #findAnyTransport} but checks {@code world} first and
+     *  then its 8 neighbors. The Mark object UX needs this because a
+     *  click on a visible door / gate often resolves to the floor tile
+     *  beside the {@link net.runelite.api.WallObject} rather than the
+     *  wall tile itself. Returns the matched neighbor's coords + the
+     *  AnyMatch, or null if nothing matches in the radius-1 ring.
+     *
+     *  <p>The 4 cardinal neighbors are tried before the 4 diagonals so
+     *  doors aligned with the click axis win over corner-adjacent
+     *  scenery. */
+    @Nullable
+    public TileMatch findAnyTransportNear(WorldPoint world)
+    {
+        if (world == null) return null;
+        AnyMatch direct = findAnyTransport(world);
+        if (direct != null) return new TileMatch(world, direct);
+        int[][] dirs = { {0,1}, {1,0}, {0,-1}, {-1,0},
+                         {1,1}, {1,-1}, {-1,1}, {-1,-1} };
+        for (int[] d : dirs)
+        {
+            WorldPoint near = new WorldPoint(
+                world.getX() + d[0], world.getY() + d[1], world.getPlane());
+            AnyMatch m = findAnyTransport(near);
+            if (m != null) return new TileMatch(near, m);
+        }
+        return null;
+    }
 }

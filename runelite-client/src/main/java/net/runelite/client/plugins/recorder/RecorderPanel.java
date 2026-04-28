@@ -340,10 +340,21 @@ public final class RecorderPanel extends PluginPanel
                     tileMarker.arm(wp -> {
                         if (wp == null) return;
                         clientThread.invokeLater(() -> {
-                            TransportResolver.AnyMatch match = transportResolver.findAnyTransport(wp);
+                            // Search the click tile + its 8 neighbors so a
+                            // click on the visible door / gate resolves even
+                            // when the engine snapped the cursor to the floor
+                            // tile beside the WallObject.
+                            TransportResolver.TileMatch tm =
+                                transportResolver.findAnyTransportNear(wp);
                             SwingUtilities.invokeLater(() -> {
-                                if (match == null) return;
-                                Waypoint t = Waypoint.transport(wp, match.kind(), match.verb());
+                                if (tm == null)
+                                {
+                                    log.warn("Mark object: no transport found near {}", wp);
+                                    return;
+                                }
+                                TransportResolver.AnyMatch match = tm.match();
+                                Waypoint t = Waypoint.transport(
+                                    tm.tile(), match.kind(), match.verb());
                                 onCommit.accept(t);
                             });
                         });
