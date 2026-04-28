@@ -23,7 +23,6 @@ import net.runelite.client.plugins.recorder.trail.TrailPath;
 import net.runelite.client.plugins.recorder.trail.TrailPlanner;
 import net.runelite.client.plugins.recorder.trail.TrailRegistry;
 import net.runelite.client.plugins.recorder.trail.TrailWalker;
-import net.runelite.client.plugins.recorder.transport.TransportResolver;
 import net.runelite.client.sequence.dispatch.HumanizedInputDispatcher;
 
 /**
@@ -78,7 +77,6 @@ public final class ChickenFarmV3Script
 
     public ChickenFarmV3Script(Client client, ClientThread clientThread,
                                HumanizedInputDispatcher dispatcher,
-                               TransportResolver resolver,
                                TrailRegistry registry)
     {
         this.client = client;

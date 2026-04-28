@@ -60,7 +60,6 @@ import net.runelite.client.plugins.recorder.hotkey.HotkeyHandler;
 import net.runelite.client.plugins.recorder.mining.MiningLoop;
 import net.runelite.client.plugins.recorder.session.SessionDirectory;
 import net.runelite.client.plugins.recorder.transport.RouteOverlay;
-import net.runelite.client.plugins.recorder.transport.TransportResolver;
 import net.runelite.client.sequence.dispatch.HumanizedInputDispatcher;
 import net.runelite.client.sequence.login.CredentialStore;
 import net.runelite.client.sequence.login.EncryptedFileCredentialStore;
@@ -234,10 +233,9 @@ public class RecorderPlugin extends Plugin
         // trail framework for the walking phases. Independent dispatcher
         // so V1/V2/V3 can coexist. Wired after trailRegistry is created.
         HumanizedInputDispatcher v3Dispatcher = new HumanizedInputDispatcher(client, clientThread);
-        TransportResolver v3Resolver = new TransportResolver(client);
         net.runelite.client.plugins.recorder.scripts.ChickenFarmV3Script chickenFarmV3 =
             new net.runelite.client.plugins.recorder.scripts.ChickenFarmV3Script(
-                client, clientThread, v3Dispatcher, v3Resolver, trailRegistry);
+                client, clientThread, v3Dispatcher, trailRegistry);
         panel.setChickenFarmV3(chickenFarmV3);
 
         // Mining loop: separate dispatcher, independent busy flag from

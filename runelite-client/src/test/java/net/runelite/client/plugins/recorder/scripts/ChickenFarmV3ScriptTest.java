@@ -23,7 +23,7 @@ public class ChickenFarmV3ScriptTest
         ChickenFarmV3Script s = new ChickenFarmV3Script(
             mock(Client.class), mock(ClientThread.class),
             mock(HumanizedInputDispatcher.class),
-            null, reg);
+            reg);
         assertEquals(ChickenFarmV3Script.State.IDLE, s.state());
     }
 
