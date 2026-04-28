@@ -37,7 +37,6 @@ import net.runelite.client.plugins.recorder.events.Events;
 import net.runelite.client.plugins.recorder.events.RecordedEvent;
 import net.runelite.client.plugins.recorder.transport.RouteOverlay;
 import net.runelite.client.plugins.recorder.transport.TransportResolver;
-import net.runelite.client.plugins.recorder.transport.Waypoint;
 import net.runelite.client.sequence.dispatch.HumanizedInputDispatcher;
 import net.runelite.client.sequence.login.CredentialStore;
 import net.runelite.client.sequence.login.CredentialStoreException;
@@ -46,6 +45,8 @@ import net.runelite.client.sequence.login.LoginCredentials;
 import net.runelite.client.ui.ColorScheme;
 import net.runelite.client.ui.PluginPanel;
 import javax.swing.BorderFactory;
+import javax.swing.Box;
+import javax.swing.BoxLayout;
 import javax.swing.DefaultListModel;
 import javax.swing.JButton;
 import javax.swing.JComponent;
@@ -63,6 +64,7 @@ import javax.swing.SwingUtilities;
 import javax.swing.Timer;
 import java.awt.BorderLayout;
 import java.awt.Dimension;
+import java.awt.FlowLayout;
 import java.awt.Point;
 import java.awt.event.ActionEvent;
 import java.io.IOException;
@@ -181,7 +183,7 @@ public final class RecorderPanel extends PluginPanel
     private JComponent buildStatusHeader()
     {
         JPanel p = new JPanel();
-        p.setLayout(new javax.swing.BoxLayout(p, javax.swing.BoxLayout.Y_AXIS));
+        p.setLayout(new BoxLayout(p, BoxLayout.Y_AXIS));
         p.setBorder(BorderFactory.createTitledBorder("Status"));
         p.add(stateLabel);
         p.add(elapsedLabel);
@@ -198,17 +200,17 @@ public final class RecorderPanel extends PluginPanel
     private JPanel buildRoutesTab()
     {
         JPanel p = new JPanel();
-        p.setLayout(new javax.swing.BoxLayout(p, javax.swing.BoxLayout.Y_AXIS));
+        p.setLayout(new BoxLayout(p, BoxLayout.Y_AXIS));
 
         // Placeholder label — wired in Task 11.
         p.add(new JLabel("Routes annotator — wired in Task 11"));
-        p.add(javax.swing.Box.createVerticalStrut(8));
+        p.add(Box.createVerticalStrut(8));
 
         // Debug + tile mark: compact testing surface — mark a tile, walk to
         // it, or clear. The WaypointEditor (Task 10) will absorb this into
         // its toolbar; until then the buttons live here.
         JPanel debug = new JPanel();
-        debug.setLayout(new javax.swing.BoxLayout(debug, javax.swing.BoxLayout.Y_AXIS));
+        debug.setLayout(new BoxLayout(debug, BoxLayout.Y_AXIS));
         debug.setBorder(BorderFactory.createTitledBorder("Debug + tile mark"));
         debug.add(markTileBtn);
         JPanel row = new JPanel(new BorderLayout(4, 4));
@@ -232,7 +234,7 @@ public final class RecorderPanel extends PluginPanel
         // only triggers the combat orchestrator. Status string is updated by
         // the loop itself; the timer below polls state + kill count.
         JPanel p = new JPanel();
-        p.setLayout(new javax.swing.BoxLayout(p, javax.swing.BoxLayout.Y_AXIS));
+        p.setLayout(new BoxLayout(p, BoxLayout.Y_AXIS));
         p.setBorder(BorderFactory.createTitledBorder("Combat"));
         JPanel row = new JPanel(new BorderLayout(4, 4));
         row.add(chickenStartBtn, BorderLayout.CENTER);
@@ -250,14 +252,14 @@ public final class RecorderPanel extends PluginPanel
     private JPanel buildRecordTab()
     {
         JPanel p = new JPanel();
-        p.setLayout(new javax.swing.BoxLayout(p, javax.swing.BoxLayout.Y_AXIS));
+        p.setLayout(new BoxLayout(p, BoxLayout.Y_AXIS));
 
         // Recording controls
         JPanel controls = new JPanel();
         controls.setBorder(BorderFactory.createTitledBorder("Recording"));
         controls.add(recordBtn);
         p.add(controls);
-        p.add(javax.swing.Box.createVerticalStrut(6));
+        p.add(Box.createVerticalStrut(6));
 
         // Marker
         JPanel marker = new JPanel(new BorderLayout(4, 4));
@@ -265,7 +267,7 @@ public final class RecorderPanel extends PluginPanel
         marker.add(markerField, BorderLayout.CENTER);
         marker.add(markerBtn, BorderLayout.EAST);
         p.add(marker);
-        p.add(javax.swing.Box.createVerticalStrut(6));
+        p.add(Box.createVerticalStrut(6));
 
         // Recent events
         JPanel recent = new JPanel(new BorderLayout());
@@ -291,7 +293,7 @@ public final class RecorderPanel extends PluginPanel
         // stand next to the rock they want, click Add, repeat for 2-3
         // rocks, then start.
         JPanel p = new JPanel();
-        p.setLayout(new javax.swing.BoxLayout(p, javax.swing.BoxLayout.Y_AXIS));
+        p.setLayout(new BoxLayout(p, BoxLayout.Y_AXIS));
         p.setBorder(BorderFactory.createTitledBorder("Mining"));
         JPanel row1 = new JPanel(new BorderLayout(4, 4));
         row1.add(miningStartBtn, BorderLayout.CENTER);
@@ -320,7 +322,7 @@ public final class RecorderPanel extends PluginPanel
         credList.setVisibleRowCount(4);
         JScrollPane scroll = new JScrollPane(credList);
 
-        JPanel buttons = new JPanel(new java.awt.FlowLayout(java.awt.FlowLayout.LEFT, 4, 0));
+        JPanel buttons = new JPanel(new FlowLayout(FlowLayout.LEFT, 4, 0));
         buttons.add(addBtn);
         buttons.add(deleteBtn);
         buttons.add(loginBtn);
@@ -411,6 +413,9 @@ public final class RecorderPanel extends PluginPanel
                     .channel(net.runelite.client.sequence.internal.ActionRequest.Channel.MOUSE)
                     .tile(wp)
                     .build();
+            // TODO(Task 10): single ActionRequest.WALK only walks within minimap
+            // click radius. Long hops will silently stop short until the new
+            // WaypointEditor's Walk path / Walk to selected absorbs this button.
             dispatcher.dispatch(req);
             String err = dispatcher.lastErrorMessage();
             SwingUtilities.invokeLater(() -> {
