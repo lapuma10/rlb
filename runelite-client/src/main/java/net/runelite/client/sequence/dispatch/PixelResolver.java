@@ -78,9 +78,14 @@ public final class PixelResolver
     private final Deque<int[]> recentClicks = new ArrayDeque<>();
     private static final int RECENT_CLICK_HISTORY = 12;
     /** No two consecutive clicks within this many pixels of each other.
-     *  Small enough to fit inside a tile's minimap ring (~4px diameter)
-     *  while still meaningfully de-duplicating. */
-    private static final int MIN_REPEAT_PX = 2;
+     *  6 px is large enough that a human watching the cursor sees a
+     *  visibly different landing spot between two clicks on the same
+     *  model (a stairs hull is typically 30-60 px wide so the rejection
+     *  budget never starves the sampler), small enough to still fit
+     *  inside the minimap disc when the resolver falls back to ring
+     *  jitter (the ring radius scales with the rejection budget — see
+     *  {@link #ringJitter}). */
+    private static final int MIN_REPEAT_PX = 6;
 
     /** Pick a screen pixel to walk toward.
      *
