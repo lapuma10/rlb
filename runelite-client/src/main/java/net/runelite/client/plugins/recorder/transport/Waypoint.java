@@ -67,7 +67,7 @@ public final class Waypoint
     private final String verb;
     private final String name;
     // Cached bounding box for WALK_AREA — computed lazily.
-    private WorldArea cachedBbox;
+    private volatile WorldArea cachedBbox;
 
     private Waypoint(Kind kind, WorldPoint tile, Set<WorldPoint> tiles,
                      TransportKind tk, String verb, String name)
@@ -111,12 +111,15 @@ public final class Waypoint
     public static Waypoint walkArea(@Nullable String name, WorldArea area)
     {
         if (area == null) throw new IllegalArgumentException("walkArea rect null");
-        int n = area.getWidth() * area.getHeight();
-        if (n <= 0) throw new IllegalArgumentException("walkArea rect empty");
-        java.util.Set<WorldPoint> filled = new java.util.HashSet<>(n);
-        for (int dx = 0; dx < area.getWidth(); dx++)
+        int w = area.getWidth();
+        int h = area.getHeight();
+        if (w <= 0 || h <= 0)
+            throw new IllegalArgumentException(
+                "walkArea rect has non-positive dimension: " + w + "x" + h);
+        java.util.Set<WorldPoint> filled = new java.util.HashSet<>(w * h);
+        for (int dx = 0; dx < w; dx++)
         {
-            for (int dy = 0; dy < area.getHeight(); dy++)
+            for (int dy = 0; dy < h; dy++)
             {
                 filled.add(new WorldPoint(area.getX() + dx, area.getY() + dy, area.getPlane()));
             }
