@@ -35,6 +35,7 @@ import net.runelite.api.Tile;
 import net.runelite.api.TileItem;
 import net.runelite.api.WorldView;
 import net.runelite.api.coords.LocalPoint;
+import net.runelite.api.coords.WorldArea;
 import net.runelite.api.coords.WorldPoint;
 import net.runelite.api.gameval.InventoryID;
 import net.runelite.client.callback.ClientThread;
@@ -157,6 +158,18 @@ public final class ChickenCombatLoop
     {
         this(CombatDispatcher.forHumanized(dispatcher), client, clientThread,
             new NpcSelector(CHICKEN_NAME), TargetVisibility.forClient(client), s -> {});
+    }
+
+    /** Same as the 3-arg constructor but pins target selection to a given
+     *  WorldArea. The farm loop uses this to constrain combat to the pen. */
+    public ChickenCombatLoop(HumanizedInputDispatcher dispatcher,
+                             Client client,
+                             @Nullable ClientThread clientThread,
+                             @Nullable WorldArea confineTo)
+    {
+        this(CombatDispatcher.forHumanized(dispatcher), client, clientThread,
+            new NpcSelector(CHICKEN_NAME, NpcSelector.DEFAULT_RANGE, confineTo),
+            TargetVisibility.forClient(client), s -> {});
     }
 
     /** Tests can pass {@link TargetVisibility#alwaysVisible()} to bypass the
@@ -665,7 +678,7 @@ public final class ChickenCombatLoop
      *  away") instead of just "no chickens nearby" after 36s. */
     private void logSelectionDiagnostic(Snapshot snap)
     {
-        int matching = 0, outOfRange = 0, wrongPlane = 0, dying = 0, engagedByOther = 0;
+        int matching = 0, outOfArea = 0, outOfRange = 0, wrongPlane = 0, dying = 0, engagedByOther = 0;
         int closestDist = Integer.MAX_VALUE;
         int playerPlane = snap.playerPos.getPlane();
         for (NPC npc : snap.npcs)
@@ -680,16 +693,27 @@ public final class ChickenCombatLoop
             if (loc == null) continue;
             int dist = loc.distanceTo(snap.playerPos);
             if (dist < closestDist) closestDist = dist;
+            WorldArea conf = selector.confineTo();
+            if (conf != null
+                && (loc.getPlane() != conf.getPlane()
+                 || loc.getX() < conf.getX()
+                 || loc.getX() >= conf.getX() + conf.getWidth()
+                 || loc.getY() < conf.getY()
+                 || loc.getY() >= conf.getY() + conf.getHeight()))
+            {
+                outOfArea++;
+                continue;
+            }
             if (loc.getPlane() != playerPlane) { wrongPlane++; continue; }
             if (npc.getHealthRatio() == 0) { dying++; continue; }
             if (dist > NpcSelector.DEFAULT_RANGE) { outOfRange++; continue; }
             Actor interacting = npc.getInteracting();
             if (interacting instanceof Player p && p != snap.self) engagedByOther++;
         }
-        log.info("pick miss at {} (plane {}): {} chicken(s) total, closest dist={}, rejected outOfRange={} wrongPlane={} dying={} engagedByOther={} (range={})",
+        log.info("pick miss at {} (plane {}): {} chicken(s) total, closest dist={}, rejected outOfArea={} outOfRange={} wrongPlane={} dying={} engagedByOther={} (range={})",
             snap.playerPos, playerPlane, matching,
             closestDist == Integer.MAX_VALUE ? -1 : closestDist,
-            outOfRange, wrongPlane, dying, engagedByOther,
+            outOfArea, outOfRange, wrongPlane, dying, engagedByOther,
             NpcSelector.DEFAULT_RANGE);
     }
 

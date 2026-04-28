@@ -48,9 +48,13 @@ import net.runelite.client.plugins.recorder.combat.ChickenCombatLoop;
 import net.runelite.client.plugins.recorder.combat.ChickenOverlay;
 import net.runelite.client.plugins.recorder.debug.DebugOverlay;
 import net.runelite.client.plugins.recorder.debug.TileMarker;
+import net.runelite.client.plugins.recorder.farm.ChickenFarmLoop;
+import net.runelite.client.plugins.recorder.farm.FarmConfig;
 import net.runelite.client.plugins.recorder.hotkey.HotkeyHandler;
 import net.runelite.client.plugins.recorder.mining.MiningLoop;
 import net.runelite.client.plugins.recorder.session.SessionDirectory;
+import net.runelite.client.plugins.recorder.transport.RouteOverlay;
+import net.runelite.client.plugins.recorder.transport.TransportResolver;
 import net.runelite.client.sequence.dispatch.HumanizedInputDispatcher;
 import net.runelite.client.sequence.login.CredentialStore;
 import net.runelite.client.sequence.login.EncryptedFileCredentialStore;
@@ -100,8 +104,10 @@ public class RecorderPlugin extends Plugin
     private AWTEventListener focusBridge;
     private DebugOverlay debugOverlay;
     private ChickenOverlay chickenOverlay;
+    private RouteOverlay routeOverlay;
     private TileMarker tileMarker;
     private ChickenCombatLoop chickenLoop;
+    private ChickenFarmLoop farmLoop;
     private MiningLoop miningLoop;
 
     @Provides
@@ -133,11 +139,15 @@ public class RecorderPlugin extends Plugin
         panel = new RecorderPanel(manager, client, clientThread);
         debugOverlay = new DebugOverlay(client);
         chickenOverlay = new ChickenOverlay(client, config);
+        routeOverlay = new RouteOverlay(client);
+        panel.setRouteOverlay(routeOverlay);
+        panel.setTransportResolver(new TransportResolver(client));
         tileMarker = new TileMarker(client);
         panel.setDebugOverlay(debugOverlay);
         panel.setTileMarker(tileMarker);
         overlayManager.add(debugOverlay);
         overlayManager.add(chickenOverlay);
+        overlayManager.add(routeOverlay);
 
         // Wire login assistant. We construct a fresh dispatcher here for
         // the assistant so its single-flight busy flag is independent from
@@ -169,6 +179,25 @@ public class RecorderPlugin extends Plugin
         HumanizedInputDispatcher combatDispatcher = new HumanizedInputDispatcher(client, clientThread);
         chickenLoop = new ChickenCombatLoop(combatDispatcher, client, clientThread);
         panel.setChickenLoop(chickenLoop);
+
+        // Farm loop: outer state machine that drives the combat loop,
+        // walks bank ↔ pen, and banks loot. A fresh dispatcher keeps its
+        // busy flag independent from combat / login / walk-test. If the
+        // route file is missing the loop is left null; the panel will report
+        // "unavailable" and fall back to the bare combat-loop UI path.
+        try
+        {
+            FarmConfig farmCfg = FarmConfig.load(FarmConfig.DEFAULT_ROUTE_FILE);
+            HumanizedInputDispatcher farmDispatcher = new HumanizedInputDispatcher(client, clientThread);
+            farmLoop = new ChickenFarmLoop(client, clientThread, farmDispatcher, farmCfg);
+            panel.setFarmLoop(farmLoop);
+            log.info("farm loop ready (route: {})", FarmConfig.DEFAULT_ROUTE_FILE);
+        }
+        catch (Exception ex)
+        {
+            log.warn("farm loop NOT ready (route load failed: {}). Side-panel buttons will report 'unavailable'.",
+                ex.getMessage());
+        }
 
         // Mining loop: separate dispatcher, independent busy flag from
         // combat / login / test-walk. The user adds candidate rocks via
@@ -232,9 +261,11 @@ public class RecorderPlugin extends Plugin
             manager.abort();
         }
         if (chickenLoop != null) chickenLoop.stop();
+        if (farmLoop != null) farmLoop.stop();
         if (miningLoop != null) miningLoop.stop();
         if (debugOverlay != null) overlayManager.remove(debugOverlay);
         if (chickenOverlay != null) overlayManager.remove(chickenOverlay);
+        if (routeOverlay != null) overlayManager.remove(routeOverlay);
         if (navButton != null) clientToolbar.removeNavigation(navButton);
         if (panel != null) panel.dispose();
         if (markerListener != null) keyManager.unregisterKeyListener(markerListener);
@@ -248,12 +279,12 @@ public class RecorderPlugin extends Plugin
         if (keyCapture != null) keyManager.unregisterKeyListener(keyCapture);
         if (focusBridge != null) Toolkit.getDefaultToolkit().removeAWTEventListener(focusBridge);
         if (eventCapture != null) eventBus.unregister(eventCapture);
-        panel = null; navButton = null; debugOverlay = null; chickenOverlay = null; tileMarker = null;
+        panel = null; navButton = null; debugOverlay = null; chickenOverlay = null; routeOverlay = null; tileMarker = null;
         markerListener = null; toggleListener = null;
         mouseCapture = null; keyCapture = null; focusCapture = null;
         focusBridge = null;
         eventCapture = null; manager = null; hotkeys = null;
-        chickenLoop = null;
+        chickenLoop = null; farmLoop = null;
         miningLoop = null;
     }
 }

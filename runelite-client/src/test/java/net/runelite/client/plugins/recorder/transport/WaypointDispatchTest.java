@@ -43,20 +43,26 @@ public class WaypointDispatchTest
      *  test, so walker changes that diverge from this contract fail loudly. */
     private static ActionRequest buildRequest(Waypoint wp)
     {
-        if (wp.kind() == Waypoint.Kind.WALK)
+        switch (wp.kind())
         {
-            return ActionRequest.builder()
-                .kind(ActionRequest.Kind.WALK)
-                .channel(ActionRequest.Channel.MOUSE)
-                .tile(wp.tile())
-                .build();
+            case WALK:
+                return ActionRequest.builder()
+                    .kind(ActionRequest.Kind.WALK)
+                    .channel(ActionRequest.Channel.MOUSE)
+                    .tile(wp.tile())
+                    .build();
+            case TRANSPORT:
+                return ActionRequest.builder()
+                    .kind(ActionRequest.Kind.CLICK_GAME_OBJECT)
+                    .channel(ActionRequest.Channel.MOUSE)
+                    .tile(wp.tile())
+                    .verb(wp.verb())
+                    .build();
+            case WALK_AREA:
+            default:
+                throw new UnsupportedOperationException(
+                    "WALK_AREA not supported by legacy dispatch contract");
         }
-        return ActionRequest.builder()
-            .kind(ActionRequest.Kind.CLICK_GAME_OBJECT)
-            .channel(ActionRequest.Channel.MOUSE)
-            .tile(wp.tile())
-            .verb(wp.verb())
-            .build();
     }
 
     @Test

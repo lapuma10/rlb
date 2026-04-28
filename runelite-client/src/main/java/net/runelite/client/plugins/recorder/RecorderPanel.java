@@ -30,11 +30,13 @@ import net.runelite.api.Tile;
 import net.runelite.api.coords.WorldPoint;
 import net.runelite.client.callback.ClientThread;
 import net.runelite.client.plugins.recorder.combat.ChickenCombatLoop;
-import net.runelite.client.plugins.recorder.mining.MiningLoop;
 import net.runelite.client.plugins.recorder.debug.DebugOverlay;
+import net.runelite.client.plugins.recorder.farm.ChickenFarmLoop;
+import net.runelite.client.plugins.recorder.mining.MiningLoop;
 import net.runelite.client.plugins.recorder.debug.TileMarker;
 import net.runelite.client.plugins.recorder.events.Events;
 import net.runelite.client.plugins.recorder.events.RecordedEvent;
+import net.runelite.client.plugins.recorder.transport.RouteOverlay;
 import net.runelite.client.plugins.recorder.transport.RouteParser;
 import net.runelite.client.plugins.recorder.transport.TransportResolver;
 import net.runelite.client.plugins.recorder.transport.Waypoint;
@@ -57,6 +59,7 @@ import javax.swing.JList;
 import javax.swing.JOptionPane;
 import javax.swing.JPanel;
 import javax.swing.JPasswordField;
+import javax.swing.JCheckBox;
 import javax.swing.JScrollPane;
 import javax.swing.JTextArea;
 import javax.swing.JTextField;
@@ -106,6 +109,20 @@ public final class RecorderPanel extends PluginPanel
     private final JButton loadRouteBtn = new JButton("Load");
     private final JLabel testWalkStatus = new JLabel(" ");
     private volatile Thread testWalkThread;
+    private final JTextField annotateNameField = new JTextField(8);
+    /** Placeholder for a future option that toggles whether walks between
+     *  marked areas are auto-emitted alongside the area boundary. Not yet
+     *  wired to any handler — the checkbox currently only displays state. */
+    private final JCheckBox annotatePathBox = new JCheckBox("Path", true);
+    private final JButton markAreaBtn = new JButton("Mark area");
+    private final JButton markObjectBtn = new JButton("Mark object");
+    private final JLabel annotateStatus = new JLabel(" ");
+    private TransportResolver transportResolver;
+    /** Holds the SW corner between the two clicks of {@link #onMarkArea}.
+     *  Only accessed on the EDT (set by the first tileMarker callback,
+     *  read by the second). Not volatile — the EDT-only invariant is
+     *  the synchronisation. */
+    private WorldPoint pendingAreaSw;
     /** Where named saved routes ("platforms") live. Each route is a text
      *  file with one waypoint per line — same format the test-walk text
      *  area accepts, so save/load is just a string round-trip. */
@@ -129,12 +146,14 @@ public final class RecorderPanel extends PluginPanel
     private CredentialStore credentialStore;
     private DebugOverlay debugOverlay;
     private TileMarker tileMarker;
+    private RouteOverlay routeOverlay;
     private Timer refreshTimer;
     private final JButton chickenStartBtn = new JButton("Start chicken loop");
     private final JButton chickenStopBtn = new JButton("Stop");
     private final JLabel chickenStatusLabel = new JLabel("Chicken loop: idle");
     private final JLabel chickenKillsLabel = new JLabel("Kills: 0");
     private ChickenCombatLoop chickenLoop;
+    private ChickenFarmLoop farmLoop;
     // Mining section — unique field names so the parallel-agent's Combat
     // section doesn't collide. The loop is wired by the plugin via
     // setMiningLoop(); the panel only owns the UI surface.
@@ -192,6 +211,8 @@ public final class RecorderPanel extends PluginPanel
         testWalkStopBtn.addActionListener(e -> onTestWalkStop());
         addCurPosBtn.addActionListener(e -> onAddCurrentPos());
         addMarkedBtn.addActionListener(e -> onAddMarked());
+        markAreaBtn.addActionListener(e -> onMarkArea());
+        markObjectBtn.addActionListener(e -> onMarkObject());
         saveRouteBtn.addActionListener(e -> onSaveRoute());
         loadRouteBtn.addActionListener(e -> onLoadRoute());
         markTileBtn.addActionListener(e -> onMarkTile());
@@ -258,6 +279,13 @@ public final class RecorderPanel extends PluginPanel
 
     /** Wire the tile-marker mouse listener for click-to-mark. */
     public void setTileMarker(TileMarker tm) { this.tileMarker = tm; }
+
+    /** Wire the transport resolver for the "Mark object" annotator button. */
+    public void setTransportResolver(TransportResolver tr) { this.transportResolver = tr; }
+
+    /** Wire the route overlay. Task 6 will use this reference to push parsed
+     *  routes via {@code routeOverlay.setRoute(...)} from the annotator buttons. */
+    public void setRouteOverlay(RouteOverlay ro) { this.routeOverlay = ro; }
 
     /** Wire the {@link LoginAssistant} so the Login button has somewhere to
      *  go. The plugin owns lifetime and constructs the assistant only when
@@ -376,9 +404,21 @@ public final class RecorderPanel extends PluginPanel
         JPanel rowFile = new JPanel(new java.awt.FlowLayout(java.awt.FlowLayout.LEFT, 4, 0));
         rowFile.add(saveRouteBtn);
         rowFile.add(loadRouteBtn);
+        JPanel rowAnnotate1 = new JPanel(new java.awt.FlowLayout(java.awt.FlowLayout.LEFT, 4, 0));
+        rowAnnotate1.add(new JLabel("Name:"));
+        rowAnnotate1.add(annotateNameField);
+        rowAnnotate1.add(annotatePathBox);
+        rowAnnotate1.setAlignmentX(0f);
+        JPanel rowAnnotate2 = new JPanel(new java.awt.FlowLayout(java.awt.FlowLayout.LEFT, 4, 0));
+        rowAnnotate2.add(markAreaBtn);
+        rowAnnotate2.add(markObjectBtn);
+        rowAnnotate2.setAlignmentX(0f);
         buttons.add(rowWalk);
         buttons.add(rowAdd);
         buttons.add(rowFile);
+        buttons.add(rowAnnotate1);
+        buttons.add(rowAnnotate2);
+        buttons.add(annotateStatus);
         buttons.add(testWalkStatus);
         p.add(buttons, BorderLayout.SOUTH);
         return p;
@@ -403,6 +443,98 @@ public final class RecorderPanel extends PluginPanel
         appendWaypoint(wp);
         testWalkStatus.setText("added marked → " + wp.getX() + "," + wp.getY()
             + (wp.getPlane() == 0 ? "" : ",p=" + wp.getPlane()));
+    }
+
+    private void onMarkArea()
+    {
+        if (tileMarker == null) { annotateStatus.setText("tile marker not wired"); return; }
+        pendingAreaSw = null;
+        annotateStatus.setText("click SW corner…");
+        tileMarker.arm(sw -> {
+            if (sw == null) { annotateStatus.setText("first click cancelled"); return; }
+            pendingAreaSw = sw;
+            annotateStatus.setText("click NE corner… (sw=" + sw.getX() + "," + sw.getY() + ")");
+            tileMarker.arm(ne -> {
+                if (ne == null || pendingAreaSw == null)
+                {
+                    annotateStatus.setText("second click cancelled");
+                    pendingAreaSw = null;
+                    return;
+                }
+                int sx = Math.min(pendingAreaSw.getX(), ne.getX());
+                int sy = Math.min(pendingAreaSw.getY(), ne.getY());
+                int nx = Math.max(pendingAreaSw.getX(), ne.getX());
+                int ny = Math.max(pendingAreaSw.getY(), ne.getY());
+                int plane = ne.getPlane();
+                String name = annotateNameField.getText().trim();
+                String prefix = name.isEmpty() ? "" : name + ": ";
+                String line = prefix + "walkbox:" + sx + "," + sy + " - " + nx + "," + ny
+                    + "," + plane;
+                appendLine(line);
+                annotateStatus.setText("added area " + (name.isEmpty() ? "(unnamed)" : name));
+                pendingAreaSw = null;
+                annotateNameField.setText("");
+                refreshOverlayFromText();
+            });
+        });
+    }
+
+    private void onMarkObject()
+    {
+        if (tileMarker == null || transportResolver == null)
+        {
+            annotateStatus.setText("not wired (need tile marker + resolver)");
+            return;
+        }
+        annotateStatus.setText("click an object (gate/stairs/ladder)…");
+        tileMarker.arm(wp -> {
+            if (wp == null) { annotateStatus.setText("click cancelled"); return; }
+            clientThread.invokeLater(() -> {
+                TransportResolver.AnyMatch m = transportResolver.findAnyTransport(wp);
+                javax.swing.SwingUtilities.invokeLater(() -> {
+                    if (m == null)
+                    {
+                        annotateStatus.setText("no known transport at "
+                            + wp.getX() + "," + wp.getY());
+                        return;
+                    }
+                    String name = annotateNameField.getText().trim();
+                    String prefix = name.isEmpty() ? "" : name + ": ";
+                    String body;
+                    switch (m.kind())
+                    {
+                        case OPEN:        body = "open:";        break;
+                        case CLIMB_UP:    body = "climb-up:";    break;
+                        case CLIMB_DOWN:  body = "climb-down:";  break;
+                        default:          body = "interact:";    break;
+                    }
+                    String tail = wp.getX() + "," + wp.getY() + "," + wp.getPlane();
+                    String line = m.kind() == Waypoint.TransportKind.INTERACT
+                        ? prefix + body + tail + ":" + m.verb() + "  # objId=" + m.objectId()
+                        : prefix + body + tail + "  # objId=" + m.objectId() + " verb=" + m.verb();
+                    appendLine(line);
+                    annotateStatus.setText("added " + body.replace(":", "")
+                        + " (" + m.verb() + ", id=" + m.objectId() + ")");
+                    annotateNameField.setText("");
+                    refreshOverlayFromText();
+                });
+            });
+        });
+    }
+
+    private void appendLine(String line)
+    {
+        String existing = testWalkArea.getText();
+        if (!existing.isEmpty() && !existing.endsWith("\n"))
+            testWalkArea.append("\n");
+        testWalkArea.append(line + "\n");
+    }
+
+    private void refreshOverlayFromText()
+    {
+        if (routeOverlay == null) return;
+        RouteParser.Result r = RouteParser.parse(testWalkArea.getText());
+        routeOverlay.setRoute(r.waypoints());
     }
 
     private void appendWaypoint(WorldPoint wp)
@@ -471,6 +603,11 @@ public final class RecorderPanel extends PluginPanel
      *  {@link #chickenStatusLabel} via the EDT. */
     public void setChickenLoop(ChickenCombatLoop loop) { this.chickenLoop = loop; }
 
+    /** Wire the farm loop. Called by the plugin during startUp if the route
+     *  file loads successfully; stays null (panel reports "unavailable") if
+     *  the route file is missing. */
+    public void setFarmLoop(ChickenFarmLoop fl) { this.farmLoop = fl; }
+
     private JComponent buildCombat()
     {
         // Manual start/stop for the chicken combat loop. The loop assumes the
@@ -491,20 +628,20 @@ public final class RecorderPanel extends PluginPanel
 
     private void onChickenStart()
     {
-        if (chickenLoop == null)
+        if (farmLoop == null)
         {
-            chickenStatusLabel.setText("Chicken loop: unavailable");
+            chickenStatusLabel.setText("Farm loop: unavailable (no route file?)");
             return;
         }
-        chickenLoop.start();
-        chickenStatusLabel.setText("Chicken loop: starting");
+        farmLoop.start();
+        chickenStatusLabel.setText("Farm loop: starting");
     }
 
     private void onChickenStop()
     {
-        if (chickenLoop == null) return;
-        chickenLoop.stop();
-        chickenStatusLabel.setText("Chicken loop: stopping");
+        if (farmLoop == null) return;
+        farmLoop.stop();
+        chickenStatusLabel.setText("Farm loop: stopping");
     }
 
     private JComponent buildLogin()
@@ -866,19 +1003,28 @@ public final class RecorderPanel extends PluginPanel
             Waypoint wp = waypoints.get(i);
             int idx = i;
             boolean isFinal = (i == waypoints.size() - 1);
-            if (wp.kind() == Waypoint.Kind.WALK)
+            switch (wp.kind())
             {
-                if (!walkToTile(wp.tile(), idx, waypoints.size(), isFinal ? 0 : 3, false))
+                case WALK:
+                    if (!walkToTile(wp.tile(), idx, waypoints.size(), isFinal ? 0 : 3, false))
+                        return;
+                    break;
+                case WALK_AREA:
+                    // The legacy single-tile walker can't sample a tile from an area;
+                    // the area-aware RouteWalker (farm-loop scope) handles this. Fail
+                    // loudly so route files mixing walkbox: with the legacy "Walk" button
+                    // produce a deterministic error instead of an NPE.
+                    SwingUtilities.invokeLater(() -> testWalkStatus.setText(
+                        "WALK_AREA not supported by Walk button; use the farm loop"));
                     return;
-            }
-            else
-            {
-                // Approach with a generous tolerance so the dispatcher can
-                // still see the object on screen. After arrival, fire the
-                // transport click and wait for its state transition.
-                if (!walkToTile(wp.tile(), idx, waypoints.size(), INTERACTION_RANGE, true))
-                    return;
-                if (!doTransport(wp, idx, waypoints.size())) return;
+                case TRANSPORT:
+                    // Approach with a generous tolerance so the dispatcher can
+                    // still see the object on screen. After arrival, fire the
+                    // transport click and wait for its state transition.
+                    if (!walkToTile(wp.tile(), idx, waypoints.size(), INTERACTION_RANGE, true))
+                        return;
+                    if (!doTransport(wp, idx, waypoints.size())) return;
+                    break;
             }
         }
         SwingUtilities.invokeLater(() -> testWalkStatus.setText("done"));
@@ -1239,9 +1385,28 @@ public final class RecorderPanel extends PluginPanel
 
     /** Mirror the chicken loop's state into the panel labels. The loop runs
      *  on a daemon thread; the timer polls (~500ms) so any state change shows
-     *  up promptly without us having to register a listener on the loop. */
+     *  up promptly without us having to register a listener on the loop.
+     *
+     *  When the farm loop is available it takes precedence; the bare combat
+     *  loop is kept as a fallback (null farm loop) so existing test workflows
+     *  still work. */
     private void refreshCombat()
     {
+        if (farmLoop != null)
+        {
+            ChickenFarmLoop.State st = farmLoop.state();
+            chickenStatusLabel.setText("Farm: " + st.name().toLowerCase()
+                + " — " + farmLoop.status());
+            // killCount lives on the bare combat loop (the farm loop drives it
+            // internally). Surface it if we still hold a reference.
+            if (chickenLoop != null)
+                chickenKillsLabel.setText("Kills: " + chickenLoop.killCount());
+            chickenStartBtn.setEnabled(st == ChickenFarmLoop.State.IDLE
+                || st == ChickenFarmLoop.State.ABORTED);
+            chickenStopBtn.setEnabled(st != ChickenFarmLoop.State.IDLE
+                && st != ChickenFarmLoop.State.ABORTED);
+            return;
+        }
         if (chickenLoop == null) return;
         ChickenCombatLoop.State st = chickenLoop.state();
         chickenStatusLabel.setText("Chicken loop: " + st.name().toLowerCase()

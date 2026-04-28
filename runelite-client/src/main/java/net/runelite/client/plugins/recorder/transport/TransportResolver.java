@@ -200,4 +200,67 @@ public final class TransportResolver
             || sceneY >= tiles[plane][sceneX].length) return null;
         return tiles[plane][sceneX][sceneY];
     }
+
+    /** Result of an annotator-side "what kind of transport is on this tile"
+     *  lookup. Kind + verb are chosen from the first action the object
+     *  exposes that maps to a known {@link Waypoint.TransportKind}. */
+    public static final class AnyMatch
+    {
+        private final Waypoint.TransportKind kind;
+        private final String verb;
+        private final int objectId;
+        private AnyMatch(Waypoint.TransportKind kind, String verb, int objectId)
+        {
+            this.kind = kind; this.verb = verb; this.objectId = objectId;
+        }
+        public Waypoint.TransportKind kind() { return kind; }
+        public String verb() { return verb; }
+        public int objectId() { return objectId; }
+    }
+
+    /** Verbs we recognise as transports for the annotator, in priority order.
+     *  "Close" is deliberately omitted: we always capture an object in its
+     *  closed/un-traversed form so the runtime can skip the verb when the
+     *  object is already open. INTERACT is the catch-all for "Use" / "Push"
+     *  / "Pull" / shortcut verbs and is matched after the explicit OPEN /
+     *  CLIMB-UP / CLIMB-DOWN buckets.
+     *
+     *  <p>The {@code String[][]} shape (priority bucket → verb forms within
+     *  the bucket) is forward-compat for cases where one bucket has multiple
+     *  synonymous verb spellings; today every bucket is a singleton.
+     */
+    private static final String[][] TRANSPORT_VERBS_IN_ORDER = {
+        {"Open"},
+        {"Climb-up"},
+        {"Climb-down"},
+        {"Use"}, {"Push"}, {"Pull"}, {"Squeeze-through"}, {"Climb-over"},
+        {"Search"}
+    };
+
+    /** Look at every object on a tile and return the first known
+     *  transport-shaped verb it advertises, or null if nothing matches. */
+    @Nullable
+    public AnyMatch findAnyTransport(WorldPoint world)
+    {
+        if (world == null) return null;
+        Tile tile = tileAt(world);
+        if (tile == null) return null;
+        for (String[] verbs : TRANSPORT_VERBS_IN_ORDER)
+        {
+            for (String verb : verbs)
+            {
+                Match m = findTransport(world, verb);
+                if (m.isSuccess())
+                {
+                    Waypoint.TransportKind k =
+                        "Open".equalsIgnoreCase(verb) ? Waypoint.TransportKind.OPEN
+                      : "Climb-up".equalsIgnoreCase(verb) ? Waypoint.TransportKind.CLIMB_UP
+                      : "Climb-down".equalsIgnoreCase(verb) ? Waypoint.TransportKind.CLIMB_DOWN
+                      : Waypoint.TransportKind.INTERACT;
+                    return new AnyMatch(k, m.matchedVerb(), m.matchedObjectId());
+                }
+            }
+        }
+        return null;
+    }
 }

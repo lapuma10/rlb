@@ -27,6 +27,7 @@ package net.runelite.client.plugins.recorder.combat;
 import net.runelite.api.NPC;
 import net.runelite.api.NPCComposition;
 import net.runelite.api.Player;
+import net.runelite.api.coords.WorldArea;
 import net.runelite.api.coords.WorldPoint;
 import org.junit.Test;
 import static org.junit.Assert.*;
@@ -123,5 +124,18 @@ public class NpcSelectorTest
         NPC pick = new NpcSelector("Chicken").pick(npcs, null, here, 1);
         assertNotNull(pick);
         assertEquals("excluded #1 → must pick #2", 2, pick.getIndex());
+    }
+
+    @Test
+    public void rejectsChickenOutsideArea()
+    {
+        WorldPoint here = new WorldPoint(3236, 3296, 0);
+        WorldArea pen = new WorldArea(3232, 3293, 8, 8, 0);
+        NPC inside = mockChicken(1, 3235, 3296, 0);
+        NPC outside = mockChicken(2, 3245, 3296, 0); // east of the pen
+        NpcSelector sel = new NpcSelector("Chicken", NpcSelector.DEFAULT_RANGE, pen);
+        assertEquals(NpcSelector.Rejection.OUT_OF_AREA,
+            sel.classify(outside, null, here, -1, null, null));
+        assertNull(sel.classify(inside, null, here, -1, null, null));
     }
 }

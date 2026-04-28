@@ -99,4 +99,35 @@ public class TransportResolverTest
         assertFalse(m.isSuccess());
         assertTrue(m.failure().contains("out of loaded scene"));
     }
+
+    @Test
+    public void findAnyTransportPicksFirstKnownVerb()
+    {
+        // Mock a tile holding a WallObject whose composition advertises "Open".
+        Client client = mock(Client.class);
+        Tile tile = mock(Tile.class);
+        WorldView wv = mock(WorldView.class);
+        Scene scene = mock(Scene.class);
+        when(client.getTopLevelWorldView()).thenReturn(wv);
+        when(wv.getScene()).thenReturn(scene);
+        when(wv.getBaseX()).thenReturn(3200);
+        when(wv.getBaseY()).thenReturn(3200);
+        Tile[][][] tiles = new Tile[4][104][104];
+        int sx = 3239 - 3200, sy = 3295 - 3200;
+        tiles[0][sx][sy] = tile;
+        when(scene.getTiles()).thenReturn(tiles);
+        WallObject wall = mock(WallObject.class);
+        when(wall.getId()).thenReturn(1551);
+        ObjectComposition comp = mock(ObjectComposition.class);
+        when(comp.getActions()).thenReturn(new String[]{"Open", null, null, "Examine", null});
+        when(client.getObjectDefinition(1551)).thenReturn(comp);
+        when(tile.getWallObject()).thenReturn(wall);
+
+        TransportResolver tr = new TransportResolver(client);
+        TransportResolver.AnyMatch any = tr.findAnyTransport(new WorldPoint(3239, 3295, 0));
+        assertNotNull(any);
+        assertEquals(Waypoint.TransportKind.OPEN, any.kind());
+        assertEquals("Open", any.verb());
+        assertEquals(1551, any.objectId());
+    }
 }

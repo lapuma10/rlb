@@ -24,30 +24,28 @@
  */
 package net.runelite.client.plugins.recorder.transport;
 
+import javax.annotation.Nullable;
+import net.runelite.api.coords.WorldArea;
 import net.runelite.api.coords.WorldPoint;
 
 /**
- * A single step in a route. Either a plain walk target ({@link Kind#WALK})
- * or a transport interaction ({@link Kind#TRANSPORT}) that requires the walker
- * to find a tile object at the tile and dispatch a verb against it
- * (e.g. "Open" a door, "Climb-up" a ladder). Modeled as a discriminated record
- * so callers can {@code switch} on the kind without holding stringly-typed
- * shape data.
+ * A single step in a route. Either a plain walk target ({@link Kind#WALK}),
+ * a walk into an arbitrary tile area ({@link Kind#WALK_AREA}) — runtime
+ * samples one valid tile per visit so the bot never hits the same pixel
+ * twice — or a transport interaction ({@link Kind#TRANSPORT}) that requires
+ * the walker to find an on-tile object exposing a verb. Modeled as a
+ * discriminated union with optional human-readable {@code name} for
+ * status messages and route-overlay labels.
  */
 public final class Waypoint
 {
-    public enum Kind { WALK, TRANSPORT }
+    public enum Kind { WALK, WALK_AREA, TRANSPORT }
 
     public enum TransportKind
     {
-        /** Door / gate. Looks at WallObjects first; falls back to GameObjects. */
         OPEN("Open"),
-        /** Stair / ladder / trapdoor going up. */
         CLIMB_UP("Climb-up"),
-        /** Stair / ladder / trapdoor going down. */
         CLIMB_DOWN("Climb-down"),
-        /** Generic verb (Use / Push / Pull / Search-for-traps / etc.) — the
-         *  walker matches whatever string the user gave us. */
         INTERACT(null);
 
         private final String defaultVerb;
@@ -56,45 +54,94 @@ public final class Waypoint
     }
 
     private final Kind kind;
-    private final WorldPoint tile;
+    private final WorldPoint tile;       // non-null for WALK and TRANSPORT
+    private final WorldArea area;        // non-null for WALK_AREA
     private final TransportKind transportKind;
     private final String verb;
+    private final String name;
 
-    private Waypoint(Kind kind, WorldPoint tile, TransportKind tk, String verb)
+    private Waypoint(Kind kind, WorldPoint tile, WorldArea area,
+                     TransportKind tk, String verb, String name)
     {
         this.kind = kind;
         this.tile = tile;
+        this.area = area;
         this.transportKind = tk;
         this.verb = verb;
+        this.name = name;
     }
 
     public static Waypoint walk(WorldPoint tile)
     {
-        return new Waypoint(Kind.WALK, tile, null, null);
+        return new Waypoint(Kind.WALK, tile, null, null, null, null);
+    }
+
+    public static Waypoint walkNamed(String name, WorldPoint tile)
+    {
+        return new Waypoint(Kind.WALK, tile, null, null, null, name);
+    }
+
+    public static Waypoint walkArea(@Nullable String name, WorldArea area)
+    {
+        if (area == null) throw new IllegalArgumentException("area null");
+        return new Waypoint(Kind.WALK_AREA, null, area, null, null, name);
     }
 
     public static Waypoint transport(WorldPoint tile, TransportKind tk, String verb)
     {
-        return new Waypoint(Kind.TRANSPORT, tile, tk, verb);
+        return new Waypoint(Kind.TRANSPORT, tile, null, tk, verb, null);
+    }
+
+    public static Waypoint transportNamed(String name, WorldPoint tile,
+                                          TransportKind tk, String verb)
+    {
+        return new Waypoint(Kind.TRANSPORT, tile, null, tk, verb, name);
     }
 
     public Kind kind() { return kind; }
-    public WorldPoint tile() { return tile; }
-    public TransportKind transportKind() { return transportKind; }
-    /** The exact menu verb to match (case-insensitive). For OPEN / CLIMB_UP
-     *  / CLIMB_DOWN this is the default verb of the transport kind; for
-     *  INTERACT it is whatever the user supplied after the colon. */
-    public String verb() { return verb; }
+
+    /** Single-tile target. Null for {@link Kind#WALK_AREA}. */
+    @Nullable public WorldPoint tile() { return tile; }
+
+    /** Tile area. For {@link Kind#WALK} this returns a 1x1 area at
+     *  {@link #tile()} so consumers can treat WALK and WALK_AREA uniformly.
+     *  Null for {@link Kind#TRANSPORT}. */
+    @Nullable
+    public WorldArea area()
+    {
+        if (kind == Kind.WALK_AREA) return area;
+        if (kind == Kind.WALK) return new WorldArea(tile.getX(), tile.getY(), 1, 1, tile.getPlane());
+        return null;
+    }
+
+    @Nullable public TransportKind transportKind() { return transportKind; }
+    @Nullable public String verb() { return verb; }
+    @Nullable public String name() { return name; }
 
     @Override
     public String toString()
     {
-        if (kind == Kind.WALK)
+        StringBuilder sb = new StringBuilder();
+        if (name != null) sb.append(name).append(": ");
+        switch (kind)
         {
-            return "walk:" + tile.getX() + "," + tile.getY() + ",p=" + tile.getPlane();
+            case WALK:
+                sb.append("walk:").append(tile.getX()).append(',').append(tile.getY())
+                    .append(",p=").append(tile.getPlane());
+                break;
+            case WALK_AREA:
+                sb.append("walkbox:").append(area.getX()).append(',').append(area.getY())
+                    .append(" - ").append(area.getX() + area.getWidth() - 1).append(',')
+                    .append(area.getY() + area.getHeight() - 1)
+                    .append(",p=").append(area.getPlane());
+                break;
+            case TRANSPORT:
+                sb.append(transportKind.name().toLowerCase().replace('_', '-'))
+                    .append(':').append(tile.getX()).append(',').append(tile.getY())
+                    .append(",p=").append(tile.getPlane())
+                    .append(" verb='").append(verb).append("'");
+                break;
         }
-        return transportKind.name().toLowerCase().replace('_', '-')
-            + ":" + tile.getX() + "," + tile.getY() + ",p=" + tile.getPlane()
-            + " verb='" + verb + "'";
+        return sb.toString();
     }
 }

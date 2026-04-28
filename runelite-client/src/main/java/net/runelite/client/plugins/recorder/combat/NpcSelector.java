@@ -29,6 +29,7 @@ import net.runelite.api.NPC;
 import net.runelite.api.NPCComposition;
 import net.runelite.api.Player;
 import net.runelite.api.WorldView;
+import net.runelite.api.coords.WorldArea;
 import net.runelite.api.coords.WorldPoint;
 import javax.annotation.Nullable;
 import java.util.Iterator;
@@ -54,16 +55,24 @@ public final class NpcSelector
 
     private final String nameFilter;
     private final int range;
+    @Nullable private final WorldArea confineTo;
 
     public NpcSelector(String nameFilter)
     {
-        this(nameFilter, DEFAULT_RANGE);
+        this(nameFilter, DEFAULT_RANGE, null);
     }
 
     public NpcSelector(String nameFilter, int range)
     {
+        this(nameFilter, range, null);
+    }
+
+    public NpcSelector(String nameFilter, int range,
+                       @Nullable WorldArea confineTo)
+    {
         this.nameFilter = Objects.requireNonNull(nameFilter, "nameFilter");
         this.range = range;
+        this.confineTo = confineTo;
     }
 
     /**
@@ -139,6 +148,9 @@ public final class NpcSelector
         DYING,
         /** NPC's tile is further than the selector's range. */
         OUT_OF_RANGE,
+        /** Selector was constructed with a confinement area and the NPC's
+         *  tile sits outside it. */
+        OUT_OF_AREA,
         /** NPC is currently interacting with another player (someone else's
          *  kill — taking it is unsporting and humans wouldn't). */
         ENGAGED_BY_OTHER,
@@ -171,6 +183,19 @@ public final class NpcSelector
         // as "alive (unknown)" since chickens always have a HP scale once
         // engaged.
         if (npc.getHealthRatio() == 0) return Rejection.DYING;
+        // Area check before range check: an NPC outside the pen is always
+        // OUT_OF_AREA regardless of distance (consistent with overlay counts).
+        if (confineTo != null)
+        {
+            if (npcLoc.getPlane() != confineTo.getPlane()
+                || npcLoc.getX() < confineTo.getX()
+                || npcLoc.getX() >= confineTo.getX() + confineTo.getWidth()
+                || npcLoc.getY() < confineTo.getY()
+                || npcLoc.getY() >= confineTo.getY() + confineTo.getHeight())
+            {
+                return Rejection.OUT_OF_AREA;
+            }
+        }
         if (npcLoc.distanceTo(playerPos) > range) return Rejection.OUT_OF_RANGE;
         // Reject if engaged by another player (someone else's chicken).
         // If the NPC's interacting target is the local player, we don't
@@ -219,4 +244,5 @@ public final class NpcSelector
 
     public String nameFilter() { return nameFilter; }
     public int range() { return range; }
+    @Nullable public WorldArea confineTo() { return confineTo; }
 }

@@ -24,9 +24,13 @@
  */
 package net.runelite.client.plugins.recorder.transport;
 
+import net.runelite.api.coords.WorldArea;
 import net.runelite.api.coords.WorldPoint;
 import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.HashSet;
 import java.util.List;
+import java.util.Set;
 
 /**
  * Parses route text-area lines into {@link Waypoint}s. Plain {@code x,y[,p]}
@@ -70,45 +74,173 @@ public final class RouteParser
     {
         if (line == null || line.isBlank())
             throw new IllegalArgumentException("empty line");
-        // Detect a leading verb prefix by looking for ':' before any digit.
-        // (We use ':' as the separator so a coordinate doesn't get confused
-        // with the prefix parser.)
-        int colon = line.indexOf(':');
-        if (colon < 0 || hasDigitBefore(line, colon))
+        // Strip inline annotator comments (separator is "  #" — two spaces + hash)
+        // so saved routes like "open:3222,3222,0  # objId=1551" round-trip safely.
+        int hashIdx = line.indexOf("  #");
+        if (hashIdx >= 0) line = line.substring(0, hashIdx).trim();
+        String name = null;
+        String body = line;
+        // Optional "name: <body>" prefix.  A name is a letter-starting token
+        // before ':' that is immediately followed by a space (": "), so that
+        // bare verb prefixes like "open:x,y" or "teleport:x,y" are NOT
+        // mistakenly treated as named routes.  The body after stripping the
+        // name must also start with a known verb prefix or a digit.
+        int firstColon = line.indexOf(':');
+        if (firstColon > 0 && firstColon + 1 < line.length()
+            && line.charAt(firstColon + 1) == ' ')
         {
-            // Plain "x,y[,p]" walk waypoint.
-            return Waypoint.walk(parseTile(line));
+            String head = line.substring(0, firstColon);
+            String candidateBody = line.substring(firstColon + 1).trim();
+            if (looksLikeName(head) && bodyHasKnownStart(candidateBody))
+            {
+                name = head.trim();
+                body = candidateBody;
+            }
         }
-        String prefix = line.substring(0, colon).trim().toLowerCase();
-        String rest = line.substring(colon + 1).trim();
+        return parseBody(body, name);
+    }
+
+    /** Reserved verb prefixes that must never be treated as name tokens. */
+    private static final Set<String> RESERVED_PREFIXES = new HashSet<>(Arrays.asList(
+        "walk", "walkbox", "open", "interact",
+        "climb-up", "climbup", "climb-down", "climbdown"
+    ));
+
+    /**
+     * A name token must start with a letter and must not be a reserved verb
+     * prefix and must not contain a comma (which would indicate a coordinate).
+     */
+    private static boolean looksLikeName(String head)
+    {
+        if (head.isBlank()) return false;
+        String trimmed = head.trim().toLowerCase();
+        if (RESERVED_PREFIXES.contains(trimmed)) return false;
+        char first = trimmed.charAt(0);
+        if (!Character.isLetter(first)) return false;
+        for (int i = 0; i < head.length(); i++)
+        {
+            if (head.charAt(i) == ',') return false;
+        }
+        return true;
+    }
+
+    /**
+     * Returns true if the candidate body starts with a digit (plain tile) or
+     * a known verb prefix followed by ':'. This guards against treating
+     * arbitrary unknown-prefix lines like "teleport:..." as named routes.
+     */
+    private static boolean bodyHasKnownStart(String body)
+    {
+        if (body.isEmpty()) return false;
+        // Plain tile: starts with a digit
+        if (Character.isDigit(body.charAt(0))) return true;
+        // Known verb prefix
+        int colon = body.indexOf(':');
+        if (colon > 0)
+        {
+            String prefix = body.substring(0, colon).trim().toLowerCase();
+            if (RESERVED_PREFIXES.contains(prefix)) return true;
+        }
+        return false;
+    }
+
+    private static Waypoint parseBody(String body, String name)
+    {
+        int colon = body.indexOf(':');
+        if (colon < 0 || hasDigitBefore(body, colon))
+        {
+            // Plain "x,y[,p]"
+            WorldPoint tile = parseTile(body);
+            return name == null ? Waypoint.walk(tile) : Waypoint.walkNamed(name, tile);
+        }
+        String prefix = body.substring(0, colon).trim().toLowerCase();
+        String rest = body.substring(colon + 1).trim();
         switch (prefix)
         {
             case "walk":
-                return Waypoint.walk(parseTile(rest));
+            {
+                WorldPoint tile = parseTile(rest);
+                return name == null ? Waypoint.walk(tile) : Waypoint.walkNamed(name, tile);
+            }
+            case "walkbox":
+            {
+                return Waypoint.walkArea(name, parseWalkbox(rest));
+            }
             case "open":
-                return Waypoint.transport(parseTile(rest), Waypoint.TransportKind.OPEN, "Open");
+            {
+                WorldPoint t = parseTile(rest);
+                return name == null
+                    ? Waypoint.transport(t, Waypoint.TransportKind.OPEN, "Open")
+                    : Waypoint.transportNamed(name, t, Waypoint.TransportKind.OPEN, "Open");
+            }
             case "climb-up":
             case "climbup":
-                return Waypoint.transport(parseTile(rest), Waypoint.TransportKind.CLIMB_UP, "Climb-up");
+            {
+                WorldPoint t = parseTile(rest);
+                return name == null
+                    ? Waypoint.transport(t, Waypoint.TransportKind.CLIMB_UP, "Climb-up")
+                    : Waypoint.transportNamed(name, t, Waypoint.TransportKind.CLIMB_UP, "Climb-up");
+            }
             case "climb-down":
             case "climbdown":
-                return Waypoint.transport(parseTile(rest), Waypoint.TransportKind.CLIMB_DOWN, "Climb-down");
+            {
+                WorldPoint t = parseTile(rest);
+                return name == null
+                    ? Waypoint.transport(t, Waypoint.TransportKind.CLIMB_DOWN, "Climb-down")
+                    : Waypoint.transportNamed(name, t, Waypoint.TransportKind.CLIMB_DOWN, "Climb-down");
+            }
             case "interact":
             {
-                // interact:x,y[,p]:Verb — split the rest on the next ':'.
                 int sep = rest.indexOf(':');
                 if (sep < 0)
                     throw new IllegalArgumentException(
                         "interact requires a verb after the tile (interact:x,y[,p]:Verb)");
-                WorldPoint tile = parseTile(rest.substring(0, sep).trim());
+                WorldPoint t = parseTile(rest.substring(0, sep).trim());
                 String verb = rest.substring(sep + 1).trim();
                 if (verb.isEmpty())
                     throw new IllegalArgumentException("interact verb cannot be empty");
-                return Waypoint.transport(tile, Waypoint.TransportKind.INTERACT, verb);
+                return name == null
+                    ? Waypoint.transport(t, Waypoint.TransportKind.INTERACT, verb)
+                    : Waypoint.transportNamed(name, t, Waypoint.TransportKind.INTERACT, verb);
             }
             default:
                 throw new IllegalArgumentException("unknown prefix '" + prefix
-                    + "' (expected open / climb-up / climb-down / interact / walk)");
+                    + "' (expected one of: " + String.join(", ", new java.util.TreeSet<>(RESERVED_PREFIXES)) + ")");
+        }
+    }
+
+    /** Parse {@code "sw_x,sw_y - ne_x,ne_y[,plane]"} into a {@link WorldArea}. */
+    private static WorldArea parseWalkbox(String s)
+    {
+        if (s == null || s.isBlank()) throw new IllegalArgumentException("missing area");
+        int sep = s.indexOf(" - ");
+        if (sep < 0) throw new IllegalArgumentException(
+            "walkbox needs sw and ne corners separated by ' - '");
+        String swPart = s.substring(0, sep).trim();
+        String nePart = s.substring(sep + 3).trim();
+        String[] sw = swPart.split("\\s*,\\s*");
+        String[] ne = nePart.split("\\s*,\\s*");
+        if (sw.length < 2) throw new IllegalArgumentException("sw corner needs x,y");
+        if (ne.length < 2) throw new IllegalArgumentException("ne corner needs x,y");
+        try
+        {
+            int sx = Integer.parseInt(sw[0]);
+            int sy = Integer.parseInt(sw[1]);
+            int nx = Integer.parseInt(ne[0]);
+            int ny = Integer.parseInt(ne[1]);
+            if (nx < sx || ny < sy)
+                throw new IllegalArgumentException(
+                    "walkbox ne corner must be >= sw corner (got sw=" + sx + "," + sy
+                        + " ne=" + nx + "," + ny + ")");
+            // plane lives on the ne side: "sw - ne,plane"
+            int plane = 0;
+            if (ne.length >= 3) plane = Integer.parseInt(ne[2]);
+            else if (sw.length >= 3) plane = Integer.parseInt(sw[2]);
+            return new WorldArea(sx, sy, nx - sx + 1, ny - sy + 1, plane);
+        }
+        catch (NumberFormatException nfe)
+        {
+            throw new IllegalArgumentException("non-numeric coordinate in walkbox '" + s + "'");
         }
     }
 
