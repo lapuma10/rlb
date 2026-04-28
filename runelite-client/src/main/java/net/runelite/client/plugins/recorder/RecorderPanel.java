@@ -38,6 +38,12 @@ import net.runelite.client.plugins.recorder.farm.RouteWalker;
 import net.runelite.client.plugins.recorder.mining.MiningLoop;
 import net.runelite.client.plugins.recorder.scripts.ChickenFarmV2Script;
 import net.runelite.client.plugins.recorder.scripts.LumbridgeBankPenScript;
+import net.runelite.client.plugins.recorder.trail.TrailGraph;
+import net.runelite.client.plugins.recorder.trail.TrailPath;
+import net.runelite.client.plugins.recorder.trail.TrailPlanner;
+import net.runelite.client.plugins.recorder.trail.TrailRecorder;
+import net.runelite.client.plugins.recorder.trail.TrailRegistry;
+import net.runelite.client.plugins.recorder.trail.TrailWalker;
 import net.runelite.client.plugins.recorder.debug.TileMarker;
 import net.runelite.client.plugins.recorder.events.Events;
 import net.runelite.client.plugins.recorder.events.RecordedEvent;
@@ -174,6 +180,16 @@ public final class RecorderPanel extends PluginPanel
     private RoutesTab routesTab;
     private final JPanel routesContainer = new JPanel(new BorderLayout());
     private volatile Thread walkerThread;
+    // Trails section — wired by RecorderPlugin via setTrailRecorder / setTrailRegistry.
+    private TrailRecorder trailRecorder;
+    private TrailRegistry trailRegistry;
+    private final JTextField trailNameField = new JTextField(14);
+    private final JButton trailRecordBtn = new JButton("Record trail");
+    private final JButton trailStopSaveBtn = new JButton("Stop & save");
+    private final JTextField trailWalkToField = new JTextField(14);
+    private final JButton trailWalkToBtn = new JButton("Walk to…");
+    private final JLabel trailStatusLabel = new JLabel("Trails: idle");
+    private volatile Thread trailWalkerThread;
 
     public RecorderPanel(RecorderManager manager, Client client)
     {
@@ -264,7 +280,15 @@ public final class RecorderPanel extends PluginPanel
         row.add(clearMarkBtn, BorderLayout.EAST);
         debug.add(row);
         debug.add(markedLabel);
-        p.add(debug, BorderLayout.SOUTH);
+
+        JPanel south = new JPanel();
+        south.setLayout(new BoxLayout(south, BoxLayout.Y_AXIS));
+        south.setBackground(ColorScheme.DARK_GRAY_COLOR);
+        south.add(debug);
+        south.add(Box.createVerticalStrut(8));
+        south.add(buildTrailsSection());
+        south.add(Box.createVerticalStrut(8));
+        p.add(south, BorderLayout.SOUTH);
 
         return p;
     }
@@ -1099,6 +1123,184 @@ public final class RecorderPanel extends PluginPanel
     public void setChickenFarmV2(ChickenFarmV2Script script)
     {
         this.chickenFarmV2 = script;
+    }
+
+    public void setTrailRecorder(TrailRecorder rec)
+    {
+        this.trailRecorder = rec;
+        SwingUtilities.invokeLater(this::updateTrailButtons);
+    }
+
+    public void setTrailRegistry(TrailRegistry reg)
+    {
+        this.trailRegistry = reg;
+        SwingUtilities.invokeLater(this::updateTrailButtons);
+    }
+
+    private void updateTrailButtons()
+    {
+        boolean ready = trailRecorder != null && trailRegistry != null;
+        boolean recording = ready && trailRecorder.isRecording();
+        trailRecordBtn.setEnabled(ready && !recording);
+        trailStopSaveBtn.setEnabled(ready && recording);
+        trailWalkToBtn.setEnabled(ready && !recording);
+        trailNameField.setEnabled(ready && !recording);
+        trailStatusLabel.setText("Trails: " + (recording
+            ? "recording \"" + trailRecorder.currentName() + "\""
+            : "idle"));
+    }
+
+    private JComponent buildTrailsSection()
+    {
+        JPanel out = new JPanel();
+        out.setLayout(new BoxLayout(out, BoxLayout.Y_AXIS));
+        out.setBackground(ColorScheme.DARK_GRAY_COLOR);
+        out.setBorder(BorderFactory.createTitledBorder("Trails"));
+        JPanel row1 = new JPanel(new FlowLayout(FlowLayout.LEFT, 4, 4));
+        row1.setBackground(ColorScheme.DARK_GRAY_COLOR);
+        row1.add(new JLabel("Name:"));
+        row1.add(trailNameField);
+        out.add(row1);
+        JPanel row2 = new JPanel(new FlowLayout(FlowLayout.LEFT, 4, 4));
+        row2.setBackground(ColorScheme.DARK_GRAY_COLOR);
+        row2.add(trailRecordBtn);
+        row2.add(trailStopSaveBtn);
+        out.add(row2);
+        JPanel row3 = new JPanel(new FlowLayout(FlowLayout.LEFT, 4, 4));
+        row3.setBackground(ColorScheme.DARK_GRAY_COLOR);
+        row3.add(new JLabel("Walk to (x,y,p):"));
+        row3.add(trailWalkToField);
+        row3.add(trailWalkToBtn);
+        out.add(row3);
+        out.add(trailStatusLabel);
+        trailRecordBtn.addActionListener(e -> startTrailRecord());
+        trailStopSaveBtn.addActionListener(e -> stopTrailAndSave());
+        trailWalkToBtn.addActionListener(e -> walkToTarget());
+        updateTrailButtons();
+        return out;
+    }
+
+    private void startTrailRecord()
+    {
+        if (trailRecorder == null) return;
+        String name = trailNameField.getText().trim();
+        if (name.isEmpty())
+        {
+            trailStatusLabel.setText("Trails: name required");
+            return;
+        }
+        try { trailRecorder.start(name); }
+        catch (Throwable t)
+        {
+            trailStatusLabel.setText("Trails: " + t.getMessage());
+            return;
+        }
+        updateTrailButtons();
+    }
+
+    private void stopTrailAndSave()
+    {
+        if (trailRecorder == null || trailRegistry == null) return;
+        try
+        {
+            var trail = trailRecorder.stopAndBuild();
+            trailRegistry.save(trail);
+            trailStatusLabel.setText("Trails: saved \"" + trail.name() + "\" ("
+                + trail.events().size() + " events)");
+        }
+        catch (Throwable t)
+        {
+            trailStatusLabel.setText("Trails: save failed: " + t.getMessage());
+            log.warn("trail save failed", t);
+        }
+        updateTrailButtons();
+    }
+
+    private void walkToTarget()
+    {
+        if (trailRegistry == null) return;
+        String txt = trailWalkToField.getText().trim();
+        WorldPoint target = parseWorldPoint(txt);
+        if (target == null)
+        {
+            trailStatusLabel.setText("Trails: bad target — use \"x,y,p\"");
+            return;
+        }
+        trailRegistry.load();   // pick up any trail saved this session
+        TrailGraph graph = TrailGraph.build(trailRegistry.all());
+        TrailPlanner planner = new TrailPlanner(graph);
+        WorldPoint here;
+        try { here = onClientThreadGetWorldPoint(); }
+        catch (Throwable t) { trailStatusLabel.setText("Trails: " + t); return; }
+        if (here == null) { trailStatusLabel.setText("Trails: player not loaded"); return; }
+        var pathOpt = planner.plan(here, target);
+        if (pathOpt.isEmpty())
+        {
+            trailStatusLabel.setText("Trails: no trail covers this route — record one");
+            return;
+        }
+        TrailPath path = pathOpt.get();
+        trailStatusLabel.setText("Trails: walking " + path.size() + " legs");
+        // Off-thread driver so the EDT stays responsive.
+        Thread t = new Thread(() -> driveTrailWalker(path), "trail-walker-test");
+        t.setDaemon(true);
+        trailWalkerThread = t;
+        t.start();
+    }
+
+    private void driveTrailWalker(TrailPath path)
+    {
+        TrailWalker w = new TrailWalker(client, clientThread, dispatcher);
+        try
+        {
+            while (!Thread.currentThread().isInterrupted())
+            {
+                TrailWalker.Status s = w.tick(path);
+                final String label = "Trails: walking — leg " + (w.currentLegIndex() + 1)
+                    + "/" + path.size() + " — " + s;
+                SwingUtilities.invokeLater(() -> trailStatusLabel.setText(label));
+                if (s == TrailWalker.Status.ARRIVED || s == TrailWalker.Status.STUCK
+                    || s == TrailWalker.Status.ERROR)
+                {
+                    final String done = "Trails: " + s;
+                    SwingUtilities.invokeLater(() -> trailStatusLabel.setText(done));
+                    return;
+                }
+                Thread.sleep(600);
+            }
+        }
+        catch (InterruptedException ie) { Thread.currentThread().interrupt(); }
+    }
+
+    @Nullable
+    private static WorldPoint parseWorldPoint(String txt)
+    {
+        String[] parts = txt.split(",");
+        if (parts.length != 3) return null;
+        try
+        {
+            return new WorldPoint(
+                Integer.parseInt(parts[0].trim()),
+                Integer.parseInt(parts[1].trim()),
+                Integer.parseInt(parts[2].trim()));
+        }
+        catch (NumberFormatException ex) { return null; }
+    }
+
+    private WorldPoint onClientThreadGetWorldPoint() throws InterruptedException
+    {
+        java.util.concurrent.atomic.AtomicReference<WorldPoint> ref = new java.util.concurrent.atomic.AtomicReference<>();
+        java.util.concurrent.CountDownLatch latch = new java.util.concurrent.CountDownLatch(1);
+        clientThread.invokeLater(() -> {
+            try
+            {
+                var local = client.getLocalPlayer();
+                ref.set(local == null ? null : local.getWorldLocation());
+            }
+            finally { latch.countDown(); }
+        });
+        latch.await();
+        return ref.get();
     }
 
     private void onLumbyStart()

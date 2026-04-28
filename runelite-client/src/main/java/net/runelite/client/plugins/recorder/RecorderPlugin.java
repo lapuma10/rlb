@@ -40,6 +40,8 @@ import net.runelite.client.plugins.recorder.annotator.AnnotatorHudOverlay;
 import net.runelite.client.plugins.recorder.annotator.AreaSelector;
 import net.runelite.client.plugins.recorder.scripts.ChickenFarmV2Script;
 import net.runelite.client.plugins.recorder.scripts.LumbridgeBankPenScript;
+import net.runelite.client.plugins.recorder.trail.TrailRecorder;
+import net.runelite.client.plugins.recorder.trail.TrailRegistry;
 import net.runelite.client.plugins.recorder.transport.TransportResolver;
 import net.runelite.client.plugins.recorder.capture.CameraSampler;
 import net.runelite.client.plugins.recorder.capture.ChatFilter;
@@ -113,6 +115,8 @@ public class RecorderPlugin extends Plugin
     private TileMarker tileMarker;
     private ChickenCombatLoop chickenLoop;
     private MiningLoop miningLoop;
+    private TrailRecorder trailRecorder;
+    private TrailRegistry trailRegistry;
     private AnnotatorHudOverlay hudOverlay;
     private AreaSelector areaSelector;
 
@@ -213,6 +217,19 @@ public class RecorderPlugin extends Plugin
             client, clientThread, v2Dispatcher, v2Resolver);
         panel.setChickenFarmV2(chickenFarmV2);
 
+        // Trail recorder + registry. The registry directory lives under
+        // ~/.runelite/recorder/trails/ — separate from the session
+        // recordings root because trails are a different artefact (route
+        // capture, not full session capture).
+        java.nio.file.Path trailDir = java.nio.file.Paths.get(
+            System.getProperty("user.home"), ".runelite", "recorder", "trails");
+        trailRegistry = new TrailRegistry(trailDir);
+        trailRegistry.load();
+        trailRecorder = new TrailRecorder(client);
+        eventBus.register(trailRecorder);
+        panel.setTrailRecorder(trailRecorder);
+        panel.setTrailRegistry(trailRegistry);
+
         // Mining loop: separate dispatcher, independent busy flag from
         // combat / login / test-walk. The user adds candidate rocks via
         // the side-panel "Mining" section, then starts/stops the loop.
@@ -294,6 +311,9 @@ public class RecorderPlugin extends Plugin
         }
         if (keyCapture != null) keyManager.unregisterKeyListener(keyCapture);
         if (focusBridge != null) Toolkit.getDefaultToolkit().removeAWTEventListener(focusBridge);
+        if (trailRecorder != null) eventBus.unregister(trailRecorder);
+        trailRecorder = null;
+        trailRegistry = null;
         if (eventCapture != null) eventBus.unregister(eventCapture);
         panel = null; navButton = null; debugOverlay = null; chickenOverlay = null; routeOverlay = null; tileMarker = null;
         hudOverlay = null; areaSelector = null;
