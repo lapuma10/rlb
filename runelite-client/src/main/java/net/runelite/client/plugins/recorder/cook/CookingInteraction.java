@@ -489,24 +489,16 @@ public final class CookingInteraction
     // Helpers
     // ────────────────────────────────────────────────────────────────
 
-    /** Block until the dispatcher's async worker is idle, with a hard
-     *  cap so a stuck dispatch can't hang the script forever. The cap
-     *  is generous (covers a humanized cursor path + 2 humanized
-     *  clicks). On timeout, returns anyway — the caller's next action
-     *  will set its own error if the dispatcher really is wedged. */
+    /** Block until the dispatcher's async worker is idle. Delegates to
+     *  the dispatcher's own {@code awaitIdle}; the cap is generous
+     *  (covers a humanized cursor path + 2 humanized clicks). On
+     *  timeout we proceed anyway — the caller's next action will set
+     *  its own error if the dispatcher really is wedged. */
     private void waitForDispatcherIdle() throws InterruptedException
     {
-        long deadline = System.currentTimeMillis() + 4000L;
-        while (dispatcher.isBusy())
+        if (!dispatcher.awaitIdle(4000L))
         {
-            if (Thread.currentThread().isInterrupted())
-                throw new InterruptedException("dispatcher wait interrupted");
-            if (System.currentTimeMillis() > deadline)
-            {
-                log.warn("cook: dispatcher busy timeout — proceeding anyway");
-                return;
-            }
-            Thread.sleep(50);
+            log.warn("cook: dispatcher busy timeout — proceeding anyway");
         }
     }
 
