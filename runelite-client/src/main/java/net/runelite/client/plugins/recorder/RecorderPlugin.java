@@ -38,6 +38,7 @@ import net.runelite.client.plugins.Plugin;
 import net.runelite.client.plugins.PluginDescriptor;
 import net.runelite.client.plugins.recorder.annotator.AnnotatorHudOverlay;
 import net.runelite.client.plugins.recorder.annotator.AreaSelector;
+import net.runelite.client.plugins.recorder.scripts.ChickenFarmV2Script;
 import net.runelite.client.plugins.recorder.scripts.LumbridgeBankPenScript;
 import net.runelite.client.plugins.recorder.transport.TransportResolver;
 import net.runelite.client.plugins.recorder.capture.CameraSampler;
@@ -215,13 +216,24 @@ public class RecorderPlugin extends Plugin
         }
 
         // Lumbridge bank ↔ pen script — the hand-coded loop the user
-        // wrote. Independent dispatcher; uses the TransportResolver
+        // wrote (V1). Independent dispatcher; uses the TransportResolver
         // already constructed for the panel's Mark object button.
         HumanizedInputDispatcher lumbyDispatcher = new HumanizedInputDispatcher(client, clientThread);
         TransportResolver lumbyResolver = new TransportResolver(client);
         LumbridgeBankPenScript lumbyScript = new LumbridgeBankPenScript(
             client, clientThread, lumbyDispatcher, lumbyResolver);
         panel.setLumbyScript(lumbyScript);
+
+        // Chicken farm V2 — same route, but the walking phases are driven
+        // by the walker framework (UniversalWalker + PathSpec). Banking
+        // and combat stay in the script. Lives alongside V1 with its own
+        // dispatcher so the two can be compared side-by-side without
+        // dispatcher-busy contention.
+        HumanizedInputDispatcher v2Dispatcher = new HumanizedInputDispatcher(client, clientThread);
+        TransportResolver v2Resolver = new TransportResolver(client);
+        ChickenFarmV2Script chickenFarmV2 = new ChickenFarmV2Script(
+            client, clientThread, v2Dispatcher, v2Resolver);
+        panel.setChickenFarmV2(chickenFarmV2);
 
         // Mining loop: separate dispatcher, independent busy flag from
         // combat / login / test-walk. The user adds candidate rocks via

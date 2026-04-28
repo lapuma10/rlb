@@ -37,6 +37,7 @@ import net.runelite.client.plugins.recorder.debug.DebugOverlay;
 import net.runelite.client.plugins.recorder.farm.ChickenFarmLoop;
 import net.runelite.client.plugins.recorder.farm.RouteWalker;
 import net.runelite.client.plugins.recorder.mining.MiningLoop;
+import net.runelite.client.plugins.recorder.scripts.ChickenFarmV2Script;
 import net.runelite.client.plugins.recorder.scripts.LumbridgeBankPenScript;
 import net.runelite.client.plugins.recorder.debug.TileMarker;
 import net.runelite.client.plugins.recorder.events.Events;
@@ -137,10 +138,17 @@ public final class RecorderPanel extends PluginPanel
     private ChickenFarmLoop farmLoop;
     // "Chicken farm" tab — hand-coded Lumbridge bank ↔ pen script.
     private LumbridgeBankPenScript lumbyScript;
+    // Same tab — V2 (walker-framework version). Optional; both can coexist.
+    private ChickenFarmV2Script chickenFarmV2;
     private final JButton lumbyStartBtn = new JButton("Start");
     private final JButton lumbyStopBtn = new JButton("Stop");
     private final JLabel lumbyStatusLabel = new JLabel("Chicken farm: idle");
     private final JLabel lumbyKillsLabel = new JLabel("Kills: 0");
+    // V2 — same route via UniversalWalker. Lives next to V1 for side-by-side comparison.
+    private final JButton v2StartBtn = new JButton("Start");
+    private final JButton v2StopBtn = new JButton("Stop");
+    private final JLabel v2StatusLabel = new JLabel("V2: idle");
+    private final JLabel v2KillsLabel = new JLabel("Kills: 0");
     // Mining section — unique field names so the parallel-agent's Combat
     // section doesn't collide. The loop is wired by the plugin via
     // setMiningLoop(); the panel only owns the UI surface.
@@ -191,6 +199,8 @@ public final class RecorderPanel extends PluginPanel
         chickenStopBtn.addActionListener(e -> onChickenStop());
         lumbyStartBtn.addActionListener(e -> onLumbyStart());
         lumbyStopBtn.addActionListener(e -> onLumbyStop());
+        v2StartBtn.addActionListener(e -> onV2Start());
+        v2StopBtn.addActionListener(e -> onV2Stop());
         miningStartBtn.addActionListener(e -> onMiningStart());
         miningStopBtn.addActionListener(e -> onMiningStop());
         miningAddRockBtn.addActionListener(e -> onMiningAddRock());
@@ -869,14 +879,33 @@ public final class RecorderPanel extends PluginPanel
     {
         JPanel p = new JPanel();
         p.setLayout(new BoxLayout(p, BoxLayout.Y_AXIS));
-        p.setBorder(BorderFactory.createTitledBorder(
-            "Chicken farm — Lumbridge bank ↔ pen"));
-        JPanel row = new JPanel(new BorderLayout(4, 4));
-        row.add(lumbyStartBtn, BorderLayout.CENTER);
-        row.add(lumbyStopBtn, BorderLayout.EAST);
-        p.add(row);
-        p.add(lumbyStatusLabel);
-        p.add(lumbyKillsLabel);
+
+        // V1 — hand-coded LumbridgeBankPenScript.
+        JPanel v1 = new JPanel();
+        v1.setLayout(new BoxLayout(v1, BoxLayout.Y_AXIS));
+        v1.setBorder(BorderFactory.createTitledBorder(
+            "V1 — hand-coded (LumbridgeBankPenScript)"));
+        JPanel v1Row = new JPanel(new BorderLayout(4, 4));
+        v1Row.add(lumbyStartBtn, BorderLayout.CENTER);
+        v1Row.add(lumbyStopBtn, BorderLayout.EAST);
+        v1.add(v1Row);
+        v1.add(lumbyStatusLabel);
+        v1.add(lumbyKillsLabel);
+        p.add(v1);
+
+        // V2 — same route via UniversalWalker (walker framework).
+        JPanel v2 = new JPanel();
+        v2.setLayout(new BoxLayout(v2, BoxLayout.Y_AXIS));
+        v2.setBorder(BorderFactory.createTitledBorder(
+            "V2 — walker framework (ChickenFarmV2Script)"));
+        JPanel v2Row = new JPanel(new BorderLayout(4, 4));
+        v2Row.add(v2StartBtn, BorderLayout.CENTER);
+        v2Row.add(v2StopBtn, BorderLayout.EAST);
+        v2.add(v2Row);
+        v2.add(v2StatusLabel);
+        v2.add(v2KillsLabel);
+        p.add(v2);
+
         return p;
     }
 
@@ -885,6 +914,12 @@ public final class RecorderPanel extends PluginPanel
     public void setLumbyScript(LumbridgeBankPenScript script)
     {
         this.lumbyScript = script;
+    }
+
+    /** V2 wiring — same shape as {@link #setLumbyScript}. */
+    public void setChickenFarmV2(ChickenFarmV2Script script)
+    {
+        this.chickenFarmV2 = script;
     }
 
     private void onLumbyStart()
@@ -905,6 +940,24 @@ public final class RecorderPanel extends PluginPanel
         lumbyStatusLabel.setText("Chicken farm: stopping");
     }
 
+    private void onV2Start()
+    {
+        if (chickenFarmV2 == null)
+        {
+            v2StatusLabel.setText("V2: unavailable");
+            return;
+        }
+        chickenFarmV2.start();
+        v2StatusLabel.setText("V2: starting");
+    }
+
+    private void onV2Stop()
+    {
+        if (chickenFarmV2 == null) return;
+        chickenFarmV2.stop();
+        v2StatusLabel.setText("V2: stopping");
+    }
+
     /** Mirror script state into the labels. Polled by refreshTimer. */
     private void refreshLumby()
     {
@@ -912,11 +965,24 @@ public final class RecorderPanel extends PluginPanel
         {
             lumbyStatusLabel.setText("Chicken farm: unavailable");
             lumbyKillsLabel.setText("Kills: 0");
-            return;
         }
-        lumbyStatusLabel.setText("Chicken farm: " + lumbyScript.state()
-            + " — " + lumbyScript.status());
-        lumbyKillsLabel.setText("Kills: " + lumbyScript.killCount());
+        else
+        {
+            lumbyStatusLabel.setText("V1: " + lumbyScript.state()
+                + " — " + lumbyScript.status());
+            lumbyKillsLabel.setText("Kills: " + lumbyScript.killCount());
+        }
+        if (chickenFarmV2 == null)
+        {
+            v2StatusLabel.setText("V2: unavailable");
+            v2KillsLabel.setText("Kills: 0");
+        }
+        else
+        {
+            v2StatusLabel.setText("V2: " + chickenFarmV2.state()
+                + " — " + chickenFarmV2.status());
+            v2KillsLabel.setText("Kills: " + chickenFarmV2.killCount());
+        }
     }
 
     private void updateButtons()
