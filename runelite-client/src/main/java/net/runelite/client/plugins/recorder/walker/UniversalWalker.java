@@ -336,7 +336,10 @@ public final class UniversalWalker
             return Status.IN_PROGRESS;
         }
 
-        StepClickPicker.ClickTarget pick = picker.pick(snap.reach, area);
+        // Picker reads Perspective.localToCanvas / localToMinimap, both of
+        // which require the client thread under -ea (they touch live
+        // camera + widget state). Route through clientCall.
+        StepClickPicker.ClickTarget pick = clientCall(() -> picker.pick(snap.reach, area));
         if (pick == null)
         {
             // No reachable tile inside the area projects. Two fallbacks:
@@ -348,7 +351,7 @@ public final class UniversalWalker
                 area.getX() + area.getWidth() / 2,
                 area.getY() + area.getHeight() / 2,
                 area.getPlane());
-            pick = picker.pickTowards(snap.reach, centre);
+            pick = clientCall(() -> picker.pickTowards(snap.reach, centre));
             if (pick == null)
             {
                 ObstacleHandler.Result obs = clientCall(() ->
@@ -406,7 +409,9 @@ public final class UniversalWalker
                 return Status.ERROR;
             }
             if (snap.reach == null) return Status.IN_PROGRESS;
-            StepClickPicker.ClickTarget pick = picker.pickTowards(snap.reach, t);
+            // pickTowards reads Perspective.localTo*, requires client thread.
+            StepClickPicker.ClickTarget pick = clientCall(() ->
+                picker.pickTowards(snap.reach, t));
             if (pick == null)
             {
                 log.debug("walker: transport step {} — can't reach tile {} yet", stepIdx, t);
