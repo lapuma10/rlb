@@ -177,6 +177,12 @@ public final class LumbridgeBankPenScript
      *  staircase click takes ~1-2s; without this we'd re-invoke every
      *  tick during the animation. */
     private long lastInteractionAtMs;
+    /** Latest landmark we've been inside on plane 0 — used to keep the
+     *  outbound/return walk monotonic. Without this, when the player is
+     *  between two landmarks, closestLandmark can flip back to the one
+     *  we just left and we oscillate. -1 = uninitialised (set on first
+     *  tick of OUTBOUND/RETURN). */
+    private int lastVisitedIdx = -1;
 
     public LumbridgeBankPenScript(Client client, ClientThread clientThread,
                                   HumanizedInputDispatcher dispatcher,
@@ -460,8 +466,27 @@ public final class LumbridgeBankPenScript
                     setState(State.AT_PEN);
                     return;
                 }
-                int idx = currentLandmarkIndex(OUTBOUND_PATH_P0, here);
-                if (idx == OUTBOUND_PATH_P0.length - 1)
+                // Initialise lastVisitedIdx on the first tick of OUTBOUND
+                // on plane 0 — pick the closest landmark as the anchor.
+                if (lastVisitedIdx < 0)
+                {
+                    lastVisitedIdx = closestLandmarkIdx(OUTBOUND_PATH_P0, here);
+                    log.info("script: outbound starting from landmark #{}", lastVisitedIdx);
+                }
+                // Advance lastVisitedIdx if the player has entered any
+                // forward landmark since last tick. We never go backwards
+                // — that's the whole point of tracking idx.
+                for (int i = lastVisitedIdx + 1; i < OUTBOUND_PATH_P0.length; i++)
+                {
+                    if (areaContains(OUTBOUND_PATH_P0[i], here))
+                    {
+                        lastVisitedIdx = i;
+                        log.info("script: outbound advanced to landmark #{}", i);
+                        break;
+                    }
+                }
+                // Past the last landmark — gate logic.
+                if (lastVisitedIdx >= OUTBOUND_PATH_P0.length - 1)
                 {
                     if (!isPlayerSettled())
                     {
@@ -480,19 +505,13 @@ public final class LumbridgeBankPenScript
                     }
                     else
                     {
-                        // No gate verb visible — try to walk into the pen
-                        // (the engine routes around what's blocking).
                         if (advanceWalk(PEN_AREA) == WalkResult.STUCK)
                             setState(State.ABORTED);
                     }
                     return;
                 }
-                WorldArea next = idx >= 0
-                    ? OUTBOUND_PATH_P0[idx + 1]
-                    : closestLandmark(OUTBOUND_PATH_P0, here);
-                status.set(idx >= 0
-                    ? "walk → landmark #" + (idx + 1)
-                    : "walk → nearest landmark");
+                WorldArea next = OUTBOUND_PATH_P0[lastVisitedIdx + 1];
+                status.set("walk → landmark #" + (lastVisitedIdx + 1));
                 if (advanceWalk(next) == WalkResult.STUCK) setState(State.ABORTED);
                 return;
 
@@ -566,8 +585,25 @@ public final class LumbridgeBankPenScript
                     }
                     return;
                 }
-                int rIdx = currentLandmarkIndex(OUTBOUND_PATH_P0, here);
-                if (rIdx == 0)
+                // Same monotonic-index trick as outbound, but going
+                // backwards. lastVisitedIdx walks from N-1 down toward 0.
+                if (lastVisitedIdx < 0)
+                {
+                    lastVisitedIdx = closestLandmarkIdx(OUTBOUND_PATH_P0, here);
+                    log.info("script: return starting from landmark #{}", lastVisitedIdx);
+                }
+                // Advance backward — if we've entered any earlier
+                // landmark since last tick, drop idx to it.
+                for (int i = lastVisitedIdx - 1; i >= 0; i--)
+                {
+                    if (areaContains(OUTBOUND_PATH_P0[i], here))
+                    {
+                        lastVisitedIdx = i;
+                        log.info("script: return advanced back to landmark #{}", i);
+                        break;
+                    }
+                }
+                if (lastVisitedIdx == 0)
                 {
                     if (!isPlayerSettled())
                     {
@@ -584,12 +620,8 @@ public final class LumbridgeBankPenScript
                     lastInteractionAtMs = System.currentTimeMillis();
                     return;
                 }
-                WorldArea prev = rIdx > 0
-                    ? OUTBOUND_PATH_P0[rIdx - 1]
-                    : closestLandmark(OUTBOUND_PATH_P0, here);
-                status.set(rIdx > 0
-                    ? "walk back → landmark #" + (rIdx - 1)
-                    : "walk back → nearest landmark");
+                WorldArea prev = OUTBOUND_PATH_P0[lastVisitedIdx - 1];
+                status.set("walk back → landmark #" + (lastVisitedIdx - 1));
                 if (advanceWalk(prev) == WalkResult.STUCK) setState(State.ABORTED);
                 return;
 
@@ -738,27 +770,23 @@ public final class LumbridgeBankPenScript
         stateEnteredAtMs = System.currentTimeMillis();
         lastBankClickAtMs = 0L;
         lastInteractionAtMs = 0L;
+        lastVisitedIdx = -1;
     }
 
     /**
-     * Read player position and update lastSeenPos / lastMoveAtMs. Then
-     * return true if the player has been on the same tile for ≥ 600ms.
-     * Use this before invoking a menu action — without it we fire the
-     * action while the engine is still processing the previous walk,
-     * which silently drops the action.
+     * True when the player is NOT animating a walk / run / interaction
+     * pose. Compares getPoseAnimation() to getIdlePoseAnimation() —
+     * when they match the player is standing still. This is the engine's
+     * source of truth, not a heuristic over position deltas.
      */
     private boolean isPlayerSettled()
     {
-        WorldPoint here = playerPos();
-        if (here == null) return false;
-        long now = System.currentTimeMillis();
-        if (lastSeenPos == null || !lastSeenPos.equals(here))
-        {
-            lastSeenPos = here;
-            lastMoveAtMs = now;
-            return false;
-        }
-        return (now - lastMoveAtMs) > 600;
+        Boolean v = onClientThread(() -> {
+            Player self = client.getLocalPlayer();
+            if (self == null) return false;
+            return self.getPoseAnimation() == self.getIdlePoseAnimation();
+        });
+        return v != null && v;
     }
 
     /** True if it's been ≥ 3s since the last stairs/gate interaction.
@@ -780,32 +808,21 @@ public final class LumbridgeBankPenScript
             && p.getY() < area.getY() + area.getHeight();
     }
 
-    /** Index of the first landmark in {@code path} the point is inside,
-     *  or -1 if the point isn't in any of them. */
-    private static int currentLandmarkIndex(WorldArea[] path, WorldPoint p)
+    /** Index of the landmark whose bbox center is closest to {@code p}
+     *  by Chebyshev distance. Used as the starting anchor when entering
+     *  OUTBOUND/RETURN mid-route. */
+    private static int closestLandmarkIdx(WorldArea[] path, WorldPoint p)
     {
+        int best = 0;
+        int bestDist = Integer.MAX_VALUE;
         for (int i = 0; i < path.length; i++)
         {
-            if (areaContains(path[i], p)) return i;
-        }
-        return -1;
-    }
-
-    /** Landmark whose bbox center is closest to {@code p} by Chebyshev
-     *  distance. Used to converge the bot back onto the path when it
-     *  starts mid-route or wanders off. Never null because we always
-     *  pass a non-empty {@code path}. */
-    private static WorldArea closestLandmark(WorldArea[] path, WorldPoint p)
-    {
-        WorldArea best = path[0];
-        int bestDist = Integer.MAX_VALUE;
-        for (WorldArea a : path)
-        {
+            WorldArea a = path[i];
             if (a.getPlane() != p.getPlane()) continue;
             int cx = a.getX() + a.getWidth() / 2;
             int cy = a.getY() + a.getHeight() / 2;
             int d = Math.max(Math.abs(p.getX() - cx), Math.abs(p.getY() - cy));
-            if (d < bestDist) { bestDist = d; best = a; }
+            if (d < bestDist) { bestDist = d; best = i; }
         }
         return best;
     }
