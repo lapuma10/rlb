@@ -13,9 +13,8 @@ import net.runelite.client.sequence.dispatch.HumanizedInputDispatcher;
 import net.runelite.client.sequence.internal.ActionRequest;
 
 /**
- * Clicks the in-game Logout button. The Logout panel (InterfaceID.Logout)
- * must already be open — if it is not, {@link #tryLogout()} returns
- * {@code false} and the caller retries next tick.
+ * Clicks the in-game Logout button. Handles opening the side-panel tab
+ * if needed before clicking the inner Logout panel.
  *
  * <p>Caller is responsible for ensuring the player is logged in and idle
  * (e.g. not in combat) — clicks during combat are silently dropped by the
@@ -29,20 +28,25 @@ public final class LogoutHelper
     private final ClientThread clientThread;
     private final HumanizedInputDispatcher dispatcher;
 
-    /**
-     * Try to click the Logout button.
-     *
-     * @return {@code true} if the CLICK_WIDGET request was dispatched;
-     *         {@code false} if the panel is not open yet — caller retries
-     *         next tick.
-     */
+    /** Multi-step logout sequence:
+     *  1. Inspect whether the inner Logout panel is visible.
+     *  2. If yes — dispatch CLICK_WIDGET on `Logout.LOGOUT` (the actual
+     *     "Click here to logout" button). Caller stops on the next tick.
+     *  3. If no — dispatch CLICK_WIDGET on the side-panel tab
+     *     (`Toplevel.LOGOUT` for fixed layout, `ToplevelOsm.LOGOUT` for
+     *     resizable). Caller retries next tick to issue the real click.
+     *  Returns true if a click was dispatched (either tab-open or final),
+     *  false if no widget was found in either pass (caller retries). */
     public boolean tryLogout() throws InterruptedException
     {
-        Widget logoutBtn = onClient(
-            () -> client.getWidget(InterfaceID.Logout.LOGOUT));
-        if (logoutBtn != null && !logoutBtn.isHidden())
+        // Step 1: inner panel open?
+        Widget innerLogout = onClient(() -> {
+            Widget w = client.getWidget(InterfaceID.Logout.LOGOUT);
+            return (w != null && !w.isHidden()) ? w : null;
+        });
+        if (innerLogout != null)
         {
-            log.info("logout: clicking LOGOUT widget (id={})", InterfaceID.Logout.LOGOUT);
+            log.info("logout: clicking inner LOGOUT widget");
             ActionRequest req = ActionRequest.builder()
                 .kind(ActionRequest.Kind.CLICK_WIDGET)
                 .channel(ActionRequest.Channel.MOUSE)
@@ -51,7 +55,28 @@ public final class LogoutHelper
             dispatcher.dispatch(req);
             return true;
         }
-        log.debug("logout: panel not open — caller should retry");
+        // Step 2: open the side-panel tab.
+        // STONE10 is the logout-orb tab in both fixed (Toplevel) and
+        // resizable-modern (ToplevelOsm) layouts.
+        Integer tabWidgetId = onClient(() -> {
+            int wid = client.isResized()
+                ? InterfaceID.ToplevelOsm.STONE10
+                : InterfaceID.Toplevel.STONE10;
+            Widget w = client.getWidget(wid);
+            return (w != null && !w.isHidden()) ? wid : null;
+        });
+        if (tabWidgetId != null)
+        {
+            log.info("logout: opening side-panel logout tab (widget {})", Integer.toHexString(tabWidgetId));
+            ActionRequest req = ActionRequest.builder()
+                .kind(ActionRequest.Kind.CLICK_WIDGET)
+                .channel(ActionRequest.Channel.MOUSE)
+                .widgetId(tabWidgetId)
+                .build();
+            dispatcher.dispatch(req);
+            return true;
+        }
+        log.debug("logout: neither inner panel nor side-panel tab visible — retry");
         return false;
     }
 
