@@ -260,7 +260,7 @@ public final class RouteParser
 
     /** Parse {@code "x1,y1;x2,y2;...[,plane]"} into a tile set. The trailing
      *  ",plane" applies to every tile; per-tile planes are not allowed. */
-    private static java.util.Set<WorldPoint> parseWalktiles(String s)
+    private static Set<WorldPoint> parseWalktiles(String s)
     {
         if (s == null || s.isBlank()) throw new IllegalArgumentException("missing tiles");
         // The plane is everything after the LAST comma if it has the form
@@ -275,8 +275,14 @@ public final class RouteParser
             if (tail.startsWith("p=")) tail = tail.substring(2);
             try
             {
-                plane = Integer.parseInt(tail);
-                pairs = s.substring(0, lastComma).trim();
+                int candidate = Integer.parseInt(tail);
+                String candidatePairs = s.substring(0, lastComma).trim();
+                // Only accept as plane if at least one full x,y pair remains.
+                if (candidatePairs.contains(",") || candidatePairs.contains(";"))
+                {
+                    plane = candidate;
+                    pairs = candidatePairs;
+                }
             }
             catch (NumberFormatException ignored)
             {
@@ -284,8 +290,7 @@ public final class RouteParser
             }
         }
         String[] tokens = pairs.split("\\s*;\\s*");
-        if (tokens.length == 0) throw new IllegalArgumentException("walktiles needs at least one tile");
-        java.util.Set<WorldPoint> out = new java.util.HashSet<>(tokens.length);
+        Set<WorldPoint> out = new HashSet<>(tokens.length);
         for (String tok : tokens)
         {
             if (tok.isBlank()) continue;

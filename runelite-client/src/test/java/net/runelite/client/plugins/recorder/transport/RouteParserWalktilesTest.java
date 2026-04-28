@@ -46,9 +46,6 @@ public class RouteParserWalktilesTest
             new WorldPoint(3234, 3295, 0),
             new WorldPoint(3233, 3294, 0)));
         String serialised = original.toString();
-        // Strip the "name: " prefix that toString emits.
-        int colon = serialised.indexOf(':');
-        // toString uses "name: walktiles:..." — find the SECOND token's start.
         Waypoint reparsed = RouteParser.parseLine(serialised);
         assertEquals(original.tiles(), reparsed.tiles());
         assertEquals("pen", reparsed.name());
@@ -82,6 +79,31 @@ public class RouteParserWalktilesTest
         {
             assertTrue(ex.getMessage(), ex.getMessage().toLowerCase().contains("non-numeric")
                 || ex.getMessage().toLowerCase().contains("number"));
+        }
+    }
+
+    @Test
+    public void parsesSingleTileWalktilesWithoutPlane()
+    {
+        // No semicolons, no plane suffix — used to be misparsed as plane==y.
+        Waypoint w = RouteParser.parseLine("walktiles:3091,3243");
+        assertEquals(Waypoint.Kind.WALK_AREA, w.kind());
+        assertEquals(Set.of(new WorldPoint(3091, 3243, 0)), w.tiles());
+    }
+
+    @Test
+    public void walktilesRejectsEmptyBody()
+    {
+        try
+        {
+            RouteParser.parseLine("walktiles:");
+            fail("expected IllegalArgumentException");
+        }
+        catch (IllegalArgumentException ex)
+        {
+            assertTrue(ex.getMessage(), ex.getMessage().toLowerCase().contains("missing")
+                || ex.getMessage().toLowerCase().contains("empty")
+                || ex.getMessage().toLowerCase().contains("no tiles"));
         }
     }
 
