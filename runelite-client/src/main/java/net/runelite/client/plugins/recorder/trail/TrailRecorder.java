@@ -1,7 +1,15 @@
 package net.runelite.client.plugins.recorder.trail;
 
+import java.util.ArrayList;
 import java.util.Set;
 import java.util.concurrent.atomic.AtomicReference;
+import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+import net.runelite.api.Client;
+import net.runelite.api.MenuEntry;
+import net.runelite.api.events.GameTick;
+import net.runelite.api.events.MenuOptionClicked;
+import net.runelite.client.eventbus.Subscribe;
 
 /**
  * Live capture of a {@link Trail}: subscribes to the RuneLite event bus
@@ -19,6 +27,8 @@ import java.util.concurrent.atomic.AtomicReference;
  * components (graph builder, walker debug logging) can use the same rule
  * without a circular dependency.
  */
+@Slf4j
+@RequiredArgsConstructor(onConstructor_ = {@javax.inject.Inject})
 public final class TrailRecorder
 {
     /** The verbs that mark a region-transition click. Mirror of the spec. */
@@ -39,6 +49,11 @@ public final class TrailRecorder
         if (option == null) return false;
         return TRANSPORT_VERBS_LOWER.contains(option.toLowerCase());
     }
+
+    private final Client client;
+
+    /** No-arg constructor for tests — client will be null. */
+    public TrailRecorder() { this(null); }
 
     /** Recording session — null when idle. */
     private final AtomicReference<Session> session = new AtomicReference<>(null);
@@ -157,6 +172,88 @@ public final class TrailRecorder
         return recordTransportIfWhitelisted(absoluteMs - s.startMs, tile,
             option, target, targetId, targetKind, actionId, param0, param1,
             menuRowsAtClick);
+    }
+
+    // ──────── event-bus subscriptions ────────
+
+    @Subscribe
+    public void onGameTick(GameTick e)
+    {
+        if (!isRecording()) return;
+        if (client == null) return;
+        var local = client.getLocalPlayer();
+        if (local == null) return;
+        var here = local.getWorldLocation();
+        if (here == null) return;
+        recordTileAtAbsoluteMs(System.currentTimeMillis(), here);
+    }
+
+    @Subscribe
+    public void onMenuOptionClicked(MenuOptionClicked e)
+    {
+        if (!isRecording()) return;
+        if (client == null) return;
+        MenuEntry entry = e.getMenuEntry();
+        if (entry == null) return;
+        String option = entry.getOption();
+        if (!isTransportVerb(option)) return;
+        // Resolve the click's world tile from param0/param1 (scene coords)
+        // → world via the player's current scene base. Falls back to the
+        // player's tile if the scene math fails (rare; means the click
+        // wasn't on a tile-anchored object).
+        var local = client.getLocalPlayer();
+        if (local == null || local.getWorldLocation() == null) return;
+        net.runelite.api.coords.WorldPoint tile = resolveClickTile(entry, local);
+
+        // Snapshot the current menu rows so we can faithfully reproduce
+        // the click context offline. The MenuOptionClicked event fires
+        // BEFORE the engine consumes the click, so the menu is still in
+        // memory. getMenuEntries() includes 'Cancel' at index 0.
+        java.util.List<String> rows = new ArrayList<>();
+        try
+        {
+            MenuEntry[] entries = client.getMenu().getMenuEntries();
+            for (MenuEntry me : entries)
+            {
+                String opt = me.getOption() == null ? "" : me.getOption();
+                String tgt = me.getTarget() == null ? "" : me.getTarget();
+                rows.add((opt + " " + tgt).trim());
+            }
+        }
+        catch (Throwable t) { log.debug("trail: failed to snapshot menu", t); }
+
+        recordTransportAtAbsoluteMsIfWhitelisted(
+            System.currentTimeMillis(),
+            tile,
+            option,
+            entry.getTarget() == null ? "" : entry.getTarget(),
+            entry.getIdentifier(),
+            entry.getType() == null ? "" : entry.getType().toString(),
+            entry.getType() == null ? 0 : entry.getType().getId(),
+            entry.getParam0(),
+            entry.getParam1(),
+            rows);
+    }
+
+    private net.runelite.api.coords.WorldPoint resolveClickTile(
+        MenuEntry entry, net.runelite.api.Player local)
+    {
+        try
+        {
+            // For game-object / wall / decorative menu entries the engine
+            // packs scene coords into param0/param1. Translate to world via
+            // the player's current scene base.
+            int sx = entry.getParam0();
+            int sy = entry.getParam1();
+            net.runelite.api.coords.LocalPoint lp =
+                net.runelite.api.coords.LocalPoint.fromScene(
+                    sx, sy, client.getTopLevelWorldView());
+            net.runelite.api.coords.WorldPoint wp =
+                net.runelite.api.coords.WorldPoint.fromLocal(client, lp);
+            if (wp != null) return wp;
+        }
+        catch (Throwable ignored) { /* fall through */ }
+        return local.getWorldLocation();
     }
 
     static final class Session

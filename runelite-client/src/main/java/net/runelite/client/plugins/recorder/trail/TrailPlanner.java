@@ -23,11 +23,11 @@ public final class TrailPlanner
     public Optional<TrailPath> plan(WorldPoint from, WorldPoint to)
     {
         if (from == null || to == null) return Optional.empty();
-        // Both endpoints must already lie on the graph (or near it within
-        // Chebyshev <= 1 — caller's responsibility, see spec). For now we
-        // require an exact match.
-        if (!graph.nodes().contains(from)) return Optional.empty();
-        if (!graph.nodes().contains(to)) return Optional.empty();
+        WorldPoint snapFrom = snapToGraph(from);
+        if (snapFrom == null) return Optional.empty();
+        WorldPoint snapTo = snapToGraph(to);
+        if (snapTo == null) return Optional.empty();
+        from = snapFrom; to = snapTo;
         if (from.equals(to))
         {
             return Optional.of(new TrailPath(List.of(new Leg.Walk(List.of(from)))));
@@ -120,6 +120,27 @@ public final class TrailPlanner
             legs.add(new Leg.Walk(new ArrayList<>(walkBuf)));
         }
         return new TrailPath(legs);
+    }
+
+    /** Snap {@code p} to the nearest graph node within Chebyshev <= 1 on the
+     *  same plane. Returns {@code p} unchanged if it is already on the
+     *  graph, the closest within-1 node otherwise, or null if no node
+     *  qualifies. */
+    private WorldPoint snapToGraph(WorldPoint p)
+    {
+        if (graph.nodes().contains(p)) return p;
+        WorldPoint best = null;
+        int bestDist = Integer.MAX_VALUE;
+        for (WorldPoint n : graph.nodes())
+        {
+            if (n.getPlane() != p.getPlane()) continue;
+            int dx = Math.abs(n.getX() - p.getX());
+            int dy = Math.abs(n.getY() - p.getY());
+            int d = Math.max(dx, dy);
+            if (d > 1) continue;
+            if (d < bestDist) { best = n; bestDist = d; }
+        }
+        return best;
     }
 
     private static final class Node implements Comparable<Node>
