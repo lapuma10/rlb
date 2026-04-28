@@ -169,6 +169,16 @@ public final class RecorderPanel extends PluginPanel
     private final JLabel v3StatusLabel = new JLabel("V3: idle");
     private final JLabel v3KillsLabel = new JLabel("Kills: 0");
     private net.runelite.client.plugins.recorder.scripts.ChickenFarmV3Script chickenFarmV3;
+    // V3 training-mode controls.
+    private final javax.swing.JCheckBox trainAttackCb   = new javax.swing.JCheckBox("Attack");
+    private final javax.swing.JCheckBox trainStrengthCb = new javax.swing.JCheckBox("Strength");
+    private final javax.swing.JCheckBox trainDefenceCb  = new javax.swing.JCheckBox("Defence");
+    private final JTextField trainAttackLvlField   = new JTextField("20", 3);
+    private final JTextField trainStrengthLvlField = new JTextField("20", 3);
+    private final JTextField trainDefenceLvlField  = new JTextField("20", 3);
+    private final javax.swing.JComboBox<String> autoRetaliateCombo =
+        new javax.swing.JComboBox<>(new String[]{"Leave alone", "ON", "OFF"});
+    private final JButton v3StartTrainingBtn = new JButton("Start Training");
     // Mining section — unique field names so the parallel-agent's Combat
     // section doesn't collide. The loop is wired by the plugin via
     // setMiningLoop(); the panel only owns the UI surface.
@@ -1129,9 +1139,84 @@ public final class RecorderPanel extends PluginPanel
         v3Box.add(v3Row);
         v3StartBtn.addActionListener(e -> { if (chickenFarmV3 != null) chickenFarmV3.start(); });
         v3StopBtn.addActionListener(e -> { if (chickenFarmV3 != null) chickenFarmV3.stop(); });
+
+        // Training-mode sub-section.
+        JPanel trainBox = new JPanel();
+        trainBox.setLayout(new BoxLayout(trainBox, BoxLayout.Y_AXIS));
+        trainBox.setBorder(BorderFactory.createTitledBorder("Training mode"));
+        trainBox.setBackground(ColorScheme.DARK_GRAY_COLOR);
+        trainBox.add(buildTrainSkillRow(trainAttackCb,   trainAttackLvlField));
+        trainBox.add(buildTrainSkillRow(trainStrengthCb, trainStrengthLvlField));
+        trainBox.add(buildTrainSkillRow(trainDefenceCb,  trainDefenceLvlField));
+        JPanel retRow = new JPanel(new FlowLayout(FlowLayout.LEFT, 4, 4));
+        retRow.setBackground(ColorScheme.DARK_GRAY_COLOR);
+        retRow.add(new JLabel("Auto-retaliate:"));
+        retRow.add(autoRetaliateCombo);
+        trainBox.add(retRow);
+        JPanel trainBtnRow = new JPanel(new FlowLayout(FlowLayout.LEFT, 4, 4));
+        trainBtnRow.setBackground(ColorScheme.DARK_GRAY_COLOR);
+        trainBtnRow.add(v3StartTrainingBtn);
+        trainBox.add(trainBtnRow);
+        v3StartTrainingBtn.addActionListener(e -> startV3WithTraining());
+        v3Box.add(trainBox);
+
         p.add(v3Box);
 
         return p;
+    }
+
+    private JComponent buildTrainSkillRow(javax.swing.JCheckBox cb, JTextField lvl)
+    {
+        cb.setBackground(ColorScheme.DARK_GRAY_COLOR);
+        cb.setForeground(java.awt.Color.LIGHT_GRAY);
+        JPanel row = new JPanel(new FlowLayout(FlowLayout.LEFT, 4, 0));
+        row.setBackground(ColorScheme.DARK_GRAY_COLOR);
+        row.add(cb);
+        row.add(new JLabel("→ level"));
+        row.add(lvl);
+        return row;
+    }
+
+    private void startV3WithTraining()
+    {
+        if (chickenFarmV3 == null) return;
+        java.util.List<net.runelite.client.plugins.recorder.combat.SkillTarget> targets =
+            new java.util.ArrayList<>();
+        if (trainAttackCb.isSelected())
+            targets.add(parseSkillTarget(net.runelite.api.Skill.ATTACK,   trainAttackLvlField));
+        if (trainStrengthCb.isSelected())
+            targets.add(parseSkillTarget(net.runelite.api.Skill.STRENGTH, trainStrengthLvlField));
+        if (trainDefenceCb.isSelected())
+            targets.add(parseSkillTarget(net.runelite.api.Skill.DEFENCE,  trainDefenceLvlField));
+        targets.removeIf(java.util.Objects::isNull);
+        if (targets.isEmpty())
+        {
+            v3StatusLabel.setText("V3: select at least one skill, level range 2..99");
+            return;
+        }
+        String retaliate = (String) autoRetaliateCombo.getSelectedItem();
+        boolean retLeave = "Leave alone".equals(retaliate);
+        boolean retOn    = "ON".equals(retaliate);
+        net.runelite.client.plugins.recorder.combat.TrainingPlan plan =
+            retLeave
+            ? new net.runelite.client.plugins.recorder.combat.TrainingPlan(
+                targets, false, true, 2, 5,
+                net.runelite.client.plugins.recorder.combat.TrainingPlan.DEFAULT_XP_HOVER_MS)
+            : net.runelite.client.plugins.recorder.combat.TrainingPlan.basic(targets, retOn);
+        chickenFarmV3.setTrainingPlan(plan);
+        chickenFarmV3.start();
+    }
+
+    private net.runelite.client.plugins.recorder.combat.SkillTarget parseSkillTarget(
+        net.runelite.api.Skill skill, JTextField lvlField)
+    {
+        try
+        {
+            int lvl = Integer.parseInt(lvlField.getText().trim());
+            if (lvl < 2 || lvl > 99) return null;
+            return new net.runelite.client.plugins.recorder.combat.SkillTarget(skill, lvl);
+        }
+        catch (NumberFormatException ex) { return null; }
     }
 
     /** Wire the script. The plugin constructs the script in startUp and
