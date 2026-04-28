@@ -97,10 +97,14 @@ public final class AreaSelector
 		hoverTile = null;
 		MouseAdapter adapter = new MouseAdapter()
 		{
-			@Override public MouseEvent mousePressed(MouseEvent e) { onPress(e); return e; }
-			@Override public MouseEvent mouseDragged(MouseEvent e) { onDrag(e); return e; }
-			@Override public MouseEvent mouseReleased(MouseEvent e) { onRelease(e); return e; }
-			@Override public MouseEvent mouseMoved(MouseEvent e)   { onMove(e);   return e; }
+			// Consume press / drag / release / click so the game engine never
+			// sees them (no walk-here, no menu open). mouseMoved stays
+			// un-consumed so hover effects in the game keep working.
+			@Override public MouseEvent mousePressed(MouseEvent e)  { onPress(e);   e.consume(); return e; }
+			@Override public MouseEvent mouseDragged(MouseEvent e)  { onDrag(e);    e.consume(); return e; }
+			@Override public MouseEvent mouseReleased(MouseEvent e) { onRelease(e); e.consume(); return e; }
+			@Override public MouseEvent mouseClicked(MouseEvent e)  { e.consume(); return e; }
+			@Override public MouseEvent mouseMoved(MouseEvent e)    { onMove(e); return e; }
 		};
 		mouseManager.registerMouseListener(adapter);
 		activeListener = adapter;
