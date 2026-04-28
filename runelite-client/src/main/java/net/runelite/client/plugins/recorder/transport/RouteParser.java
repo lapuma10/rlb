@@ -315,8 +315,8 @@ public final class RouteParser
         return out;
     }
 
-    /** Parse {@code "x,y"} or {@code "x, y, plane"} into a {@link WorldPoint}.
-     *  Plane defaults to 0 if omitted. */
+    /** Parse {@code "x,y"} or {@code "x, y, plane"} or {@code "x,y,p=N"} into a {@link WorldPoint}.
+     *  Plane defaults to 0 if omitted. The {@code p=} prefix on the plane token is optional. */
     private static WorldPoint parseTile(String s)
     {
         if (s == null || s.isBlank()) throw new IllegalArgumentException("missing tile");
@@ -326,7 +326,13 @@ public final class RouteParser
         {
             int x = Integer.parseInt(parts[0]);
             int y = Integer.parseInt(parts[1]);
-            int plane = parts.length >= 3 ? Integer.parseInt(parts[2]) : 0;
+            int plane = 0;
+            if (parts.length >= 3)
+            {
+                String p = parts[2].trim();
+                if (p.startsWith("p=")) p = p.substring(2);
+                plane = Integer.parseInt(p);
+            }
             return new WorldPoint(x, y, plane);
         }
         catch (NumberFormatException nfe)

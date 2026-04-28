@@ -243,8 +243,15 @@ public final class Waypoint
             case TRANSPORT:
                 sb.append(transportKind.name().toLowerCase().replace('_', '-'))
                     .append(':').append(tile.getX()).append(',').append(tile.getY())
-                    .append(",p=").append(tile.getPlane())
-                    .append(" verb='").append(verb).append("'");
+                    .append(",p=").append(tile.getPlane());
+                if (transportKind == TransportKind.INTERACT)
+                {
+                    // INTERACT requires the verb after a colon — see RouteParser
+                    // INTERACT branch which splits the body on ':' to recover it.
+                    sb.append(':').append(verb);
+                }
+                // OPEN / CLIMB_UP / CLIMB_DOWN have implicit verbs from the prefix —
+                // no verb token in the serialised form.
                 break;
         }
         return sb.toString();

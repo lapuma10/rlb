@@ -84,11 +84,10 @@ public final class RouteWalker
             case WALK:
             case WALK_AREA:
             {
-                WorldArea a = wp.area();
-                if (a == null) return false;
-                return here.getPlane() == a.getPlane()
-                    && here.getX() >= a.getX() && here.getX() < a.getX() + a.getWidth()
-                    && here.getY() >= a.getY() && here.getY() < a.getY() + a.getHeight();
+                // Source of truth is the tile set; for rectangular sets this is
+                // every bbox tile (equivalent to the old bbox check), for
+                // irregular sets it correctly excludes holes in the bbox.
+                return wp.tiles().contains(here);
             }
             case TRANSPORT:
             {
