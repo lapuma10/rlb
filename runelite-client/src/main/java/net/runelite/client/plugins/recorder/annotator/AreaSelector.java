@@ -8,10 +8,7 @@ import java.util.concurrent.atomic.AtomicReference;
 import javax.annotation.Nullable;
 import lombok.extern.slf4j.Slf4j;
 import net.runelite.api.Client;
-import net.runelite.api.Perspective;
 import net.runelite.api.Tile;
-import net.runelite.api.WorldView;
-import net.runelite.api.coords.LocalPoint;
 import net.runelite.api.coords.WorldPoint;
 import net.runelite.client.callback.ClientThread;
 import net.runelite.client.input.MouseAdapter;
@@ -198,28 +195,15 @@ public final class AreaSelector
 	@Nullable
 	private WorldPoint tileUnder(int canvasX, int canvasY)
 	{
-		WorldView wv = client.getTopLevelWorldView();
-		if (wv == null) return null;
-		Tile[][][] tiles = wv.getScene().getTiles();
-		int plane = client.getPlane();
-		if (plane < 0 || plane >= tiles.length) return null;
-		Tile[][] planeTiles = tiles[plane];
-		for (int x = 0; x < planeTiles.length; x++)
-		{
-			for (int y = 0; y < planeTiles[x].length; y++)
-			{
-				Tile t = planeTiles[x][y];
-				if (t == null) continue;
-				LocalPoint lp = t.getLocalLocation();
-				if (lp == null) continue;
-				java.awt.Polygon poly = Perspective.getCanvasTilePoly(client, lp);
-				if (poly != null && poly.contains(canvasX, canvasY))
-				{
-					return t.getWorldLocation();
-				}
-			}
-		}
-		return null;
+		// Use the engine-resolved hover tile (same API TileMarker uses).
+		// Iterating the scene tile array from the AWT thread triggers lazy
+		// classloading of injected client classes (NoClassDefFoundError: kg)
+		// — let the engine do the canvas→tile mapping for us. Args are
+		// ignored because getSelectedSceneTile is keyed off the live cursor
+		// position, which AWT keeps in sync with the press/drag/release
+		// events that drive this method.
+		Tile sel = client.getSelectedSceneTile();
+		return sel == null ? null : sel.getWorldLocation();
 	}
 
 	/** Pure: every tile in the rectangle whose corners are {@code a} and {@code b}.
