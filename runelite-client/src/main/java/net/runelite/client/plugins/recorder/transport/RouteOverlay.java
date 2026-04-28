@@ -38,6 +38,13 @@ public final class RouteOverlay extends Overlay
     private static final Color TRANSPORT_LINE = new Color(255, 180, 80, 230);
     private static final Color SELECTED_FILL = new Color(80, 220, 255, 110);
     private static final Color SELECTED_LINE = new Color(80, 220, 255, 255);
+    // Annotator preview while AreaSelector is active — green = additive,
+    // red = subtractive. Distinct from the saved-route blue so the user
+    // can see the in-flight selection on top of any existing waypoints.
+    private static final Color PREVIEW_ADD_FILL = new Color(120, 230, 120, 90);
+    private static final Color PREVIEW_ADD_LINE = new Color(120, 230, 120, 230);
+    private static final Color PREVIEW_SUB_FILL = new Color(230, 120, 120, 90);
+    private static final Color PREVIEW_SUB_LINE = new Color(230, 120, 120, 230);
     private static final Color LABEL_BG = new Color(0, 0, 0, 180);
     private static final BasicStroke STROKE_2 = new BasicStroke(2f);
     private static final BasicStroke STROKE_3 = new BasicStroke(3f);
@@ -45,6 +52,9 @@ public final class RouteOverlay extends Overlay
     private final Client client;
     private final AtomicReference<List<Waypoint>> route = new AtomicReference<>(List.of());
     private final AtomicReference<Waypoint> selected = new AtomicReference<>();
+    private final AtomicReference<Set<WorldPoint>> previewTiles = new AtomicReference<>(Set.of());
+    private final AtomicReference<Set<WorldPoint>> inflightRect = new AtomicReference<>(Set.of());
+    private volatile boolean inflightSubtract;
 
     public RouteOverlay(Client client)
     {
@@ -67,13 +77,32 @@ public final class RouteOverlay extends Overlay
         selected.set(wp);
     }
 
+    /** Replace the live-preview tile set rendered on top of the saved route.
+     *  Used by the AreaSelector to show the in-progress working set. Pass
+     *  {@code Set.of()} (empty) to clear. */
+    public void setPreviewTiles(Set<WorldPoint> tiles)
+    {
+        previewTiles.set(tiles == null ? Set.of() : Set.copyOf(tiles));
+    }
+
+    /** Render a transient rectangle covering {@code tiles} while the user
+     *  is mid-drag. {@code subtract} chooses the colour (red vs green).
+     *  Pass {@code Set.of()} to clear (e.g. on release / cancel). */
+    public void setInflightRect(Set<WorldPoint> tiles, boolean subtract)
+    {
+        inflightRect.set(tiles == null ? Set.of() : Set.copyOf(tiles));
+        this.inflightSubtract = subtract;
+    }
+
     @Override
     public Dimension render(Graphics2D g)
     {
         WorldView wv = client.getTopLevelWorldView();
         if (wv == null) return null;
         List<Waypoint> wps = route.get();
-        if (wps.isEmpty()) return null;
+        Set<WorldPoint> preview = previewTiles.get();
+        Set<WorldPoint> inflight = inflightRect.get();
+        if (wps.isEmpty() && preview.isEmpty() && inflight.isEmpty()) return null;
         Waypoint sel = selected.get();
         Stroke prev = g.getStroke();
         for (int i = 0; i < wps.size(); i++)
@@ -97,8 +126,38 @@ public final class RouteOverlay extends Overlay
                 }
             }
         }
+        // Annotator preview goes ON TOP so the user sees what they're
+        // about to commit even when waypoints overlap.
+        if (!preview.isEmpty())
+        {
+            drawPreview(g, preview, PREVIEW_ADD_FILL, PREVIEW_ADD_LINE);
+        }
+        if (!inflight.isEmpty())
+        {
+            Color fill = inflightSubtract ? PREVIEW_SUB_FILL : PREVIEW_ADD_FILL;
+            Color line = inflightSubtract ? PREVIEW_SUB_LINE : PREVIEW_ADD_LINE;
+            drawPreview(g, inflight, fill, line);
+        }
         g.setStroke(prev);
         return null;
+    }
+
+    private void drawPreview(Graphics2D g, Set<WorldPoint> tiles, Color fill, Color line)
+    {
+        WorldView wv = client.getTopLevelWorldView();
+        if (wv == null) return;
+        g.setStroke(STROKE_2);
+        for (WorldPoint wp : tiles)
+        {
+            LocalPoint lp = LocalPoint.fromWorld(wv, wp);
+            if (lp == null) continue;
+            Polygon poly = Perspective.getCanvasTilePoly(client, lp);
+            if (poly == null) continue;
+            g.setColor(fill);
+            g.fillPolygon(poly);
+            g.setColor(line);
+            g.drawPolygon(poly);
+        }
     }
 
     private void drawTileSet(Graphics2D g, Set<WorldPoint> tiles,

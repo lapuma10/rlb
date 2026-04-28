@@ -266,28 +266,55 @@ public final class RecorderPanel extends PluginPanel
                         : editing.tiles();
                     hudOverlay.show(editing == null ? "New area"
                         : "Editing: " + (editing.name() == null ? "(unnamed)" : editing.name()));
+                    // Seed the preview with the initial set so editing an
+                    // existing waypoint shows its current tiles immediately.
+                    routeOverlay.setPreviewTiles(initial);
                     areaSelector.start(initial, new AreaSelector.Listener()
                     {
                         @Override public void onSetChanged(Set<WorldPoint> tiles)
                         {
-                            // Live preview hook — MVP no-op.
+                            // Push the working set to the overlay so the user
+                            // sees what they've selected after each click /
+                            // drag-release.
+                            routeOverlay.setPreviewTiles(tiles);
                         }
                         @Override public void onCommit(Set<WorldPoint> tiles)
                         {
                             hudOverlay.show(null);
+                            routeOverlay.setPreviewTiles(java.util.Set.of());
+                            routeOverlay.setInflightRect(java.util.Set.of(), false);
                             clearAnnotatorKeybindings();
                             onCommit.accept(tiles);
                         }
                         @Override public void onCancel()
                         {
                             hudOverlay.show(null);
+                            routeOverlay.setPreviewTiles(java.util.Set.of());
+                            routeOverlay.setInflightRect(java.util.Set.of(), false);
                             clearAnnotatorKeybindings();
                         }
                         @Override public void onDragPreview(@Nullable WorldPoint pressTile,
                                                             @Nullable WorldPoint dragTile,
                                                             boolean subtract)
                         {
-                            // MVP: in-flight rectangle preview deferred.
+                            // Live rectangle preview during drag. Null tiles
+                            // (off-canvas, or end-of-drag) clear the rect.
+                            if (pressTile == null || dragTile == null)
+                            {
+                                routeOverlay.setInflightRect(java.util.Set.of(), false);
+                                return;
+                            }
+                            int minX = Math.min(pressTile.getX(), dragTile.getX());
+                            int maxX = Math.max(pressTile.getX(), dragTile.getX());
+                            int minY = Math.min(pressTile.getY(), dragTile.getY());
+                            int maxY = Math.max(pressTile.getY(), dragTile.getY());
+                            int plane = dragTile.getPlane();
+                            java.util.Set<WorldPoint> rect = new java.util.HashSet<>(
+                                (maxX - minX + 1) * (maxY - minY + 1));
+                            for (int x = minX; x <= maxX; x++)
+                                for (int y = minY; y <= maxY; y++)
+                                    rect.add(new WorldPoint(x, y, plane));
+                            routeOverlay.setInflightRect(rect, subtract);
                         }
                     });
                     // Bind Enter / Esc on the panel so the user can commit/cancel.
