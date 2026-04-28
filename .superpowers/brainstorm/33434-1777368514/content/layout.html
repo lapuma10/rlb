@@ -1,0 +1,98 @@
+<h2>How should sections be organized?</h2>
+<p class="subtitle">Status block stays pinned at top in both layouts. The choice is about how everything else is reached.</p>
+
+<style>
+  .panel-mock { width: 240px; background: #2b2b2b; border: 1px solid #444; border-radius: 4px; padding: 8px; font-family: 'RuneScape Smallmono', monospace; font-size: 12px; color: #d4d4d4; }
+  .panel-mock .pinned { background: #1f1f1f; padding: 6px 8px; border: 1px solid #444; border-radius: 3px; margin-bottom: 8px; }
+  .panel-mock .pinned-title { color: #888; font-size: 10px; text-transform: uppercase; letter-spacing: 0.5px; margin-bottom: 2px; }
+  .panel-mock .tab-row { display: flex; gap: 0; border-bottom: 1px solid #444; margin-bottom: 8px; }
+  .panel-mock .tab { flex: 1; padding: 6px 4px; text-align: center; font-size: 11px; cursor: pointer; border: 1px solid #444; border-bottom: none; background: #252525; color: #888; }
+  .panel-mock .tab.active { background: #2b2b2b; color: #d4d4d4; border-bottom: 1px solid #2b2b2b; margin-bottom: -1px; }
+  .panel-mock .tab-body { padding: 4px 0; }
+  .panel-mock .accordion-item { border: 1px solid #444; border-radius: 3px; margin-bottom: 4px; overflow: hidden; }
+  .panel-mock .accordion-header { padding: 6px 8px; background: #252525; cursor: pointer; display: flex; justify-content: space-between; align-items: center; }
+  .panel-mock .accordion-header.open { background: #303030; }
+  .panel-mock .chev { color: #666; font-size: 10px; }
+  .panel-mock .accordion-body { padding: 8px; background: #2b2b2b; }
+  .panel-mock .placeholder-line { height: 8px; background: #3a3a3a; border-radius: 2px; margin: 4px 0; }
+  .panel-mock .placeholder-line.short { width: 60%; }
+  .panel-mock .placeholder-line.med { width: 80%; }
+  .panel-mock button.mock-btn { background: #383838; color: #d4d4d4; border: 1px solid #555; padding: 3px 8px; font-size: 11px; border-radius: 2px; margin: 2px; cursor: pointer; }
+  .scroll-indicator { font-size: 10px; color: #666; text-align: right; padding: 4px; border-top: 1px dashed #444; margin-top: 4px; }
+</style>
+
+<div class="cards">
+
+  <div class="card" data-choice="tabs" onclick="toggleSelect(this)">
+    <div class="card-image">
+      <div class="panel-mock">
+        <div class="pinned">
+          <div class="pinned-title">Status</div>
+          <div>State: IDLE &nbsp; Elapsed: 0s &nbsp; Events: 0</div>
+        </div>
+        <div class="tab-row">
+          <div class="tab active">Routes</div>
+          <div class="tab">Combat</div>
+          <div class="tab">Record</div>
+          <div class="tab">Mine</div>
+          <div class="tab">Login</div>
+        </div>
+        <div class="tab-body">
+          <div class="placeholder-line"></div>
+          <div class="placeholder-line med"></div>
+          <div class="placeholder-line short"></div>
+          <button class="mock-btn">+ New Route</button>
+          <button class="mock-btn">Mark area</button>
+          <div class="placeholder-line med"></div>
+          <div class="placeholder-line short"></div>
+          <div class="placeholder-line"></div>
+          <div class="placeholder-line med"></div>
+        </div>
+      </div>
+    </div>
+    <div class="card-body">
+      <h3>Tabs</h3>
+      <p>Top-level switcher; one section visible at a time. Status pinned. Compact, clean. Tradeoff: can't see Combat status while editing Routes.</p>
+    </div>
+  </div>
+
+  <div class="card" data-choice="accordion" onclick="toggleSelect(this)">
+    <div class="card-image">
+      <div class="panel-mock">
+        <div class="pinned">
+          <div class="pinned-title">Status</div>
+          <div>State: IDLE &nbsp; Elapsed: 0s &nbsp; Events: 0</div>
+        </div>
+        <div class="accordion-item">
+          <div class="accordion-header open"><span>▼ Routes (annotator)</span><span class="chev"></span></div>
+          <div class="accordion-body">
+            <div class="placeholder-line"></div>
+            <div class="placeholder-line med"></div>
+            <button class="mock-btn">+ New Route</button>
+            <button class="mock-btn">Mark area</button>
+          </div>
+        </div>
+        <div class="accordion-item">
+          <div class="accordion-header"><span>▶ Combat</span><span class="chev">idle</span></div>
+        </div>
+        <div class="accordion-item">
+          <div class="accordion-header"><span>▶ Recording</span><span class="chev">stopped</span></div>
+        </div>
+        <div class="accordion-item">
+          <div class="accordion-header"><span>▶ Mining</span><span class="chev">idle</span></div>
+        </div>
+        <div class="accordion-item">
+          <div class="accordion-header"><span>▶ Login</span><span class="chev"></span></div>
+        </div>
+        <div class="scroll-indicator">▲ ▼ scrollable</div>
+      </div>
+    </div>
+    <div class="card-body">
+      <h3>Collapsibles (accordion)</h3>
+      <p>All sections in one column; click headers to expand/collapse. Section header shows live status badge so you can monitor while collapsed. Whole panel scrolls.</p>
+    </div>
+  </div>
+
+</div>
+
+<p class="subtitle" style="margin-top: 24px;">Click whichever feels right — or tell me the dealbreakers.</p>

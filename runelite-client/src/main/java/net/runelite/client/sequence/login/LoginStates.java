@@ -147,20 +147,30 @@ public final class LoginStates
             String target = ctx.getCredentials().getUsername();
             String currentTrimmed = current != null ? current.trim() : "";
             String targetTrimmed = target != null ? target.trim() : "";
-            log.info("[login] resolveUsername: current=\"{}\" target=\"{}\"", currentTrimmed, targetTrimmed);
 
+            String decision;
+            StateResult result;
             if (!currentTrimmed.isEmpty() && currentTrimmed.equalsIgnoreCase(targetTrimmed))
             {
-                log.info("[login] resolveUsername: match → FOCUS_PASSWORD");
-                return new StateResult.Continue(LoginState.FOCUS_PASSWORD);
+                decision = "match → FOCUS_PASSWORD";
+                result = new StateResult.Continue(LoginState.FOCUS_PASSWORD);
             }
-            if (currentTrimmed.isEmpty())
+            else if (currentTrimmed.isEmpty())
             {
-                log.info("[login] resolveUsername: empty → TYPE_USERNAME");
-                return new StateResult.Continue(LoginState.TYPE_USERNAME);
+                decision = "empty → TYPE_USERNAME";
+                result = new StateResult.Continue(LoginState.TYPE_USERNAME);
             }
-            log.info("[login] resolveUsername: mismatch → CLEAR_USERNAME");
-            return new StateResult.Continue(LoginState.CLEAR_USERNAME);
+            else
+            {
+                decision = "mismatch → CLEAR_USERNAME";
+                result = new StateResult.Continue(LoginState.CLEAR_USERNAME);
+            }
+            log.info("[login] resolveUsername: current=\"{}\" target=\"{}\" → {}",
+                currentTrimmed, targetTrimmed, decision);
+            log.info("[login] resolveUsername hex: current={} target={}",
+                LoginDebugBus.hexDump(currentTrimmed), LoginDebugBus.hexDump(targetTrimmed));
+            LoginDebugBus.publish(currentTrimmed, targetTrimmed, decision);
+            return result;
         }
         catch (Exception ex)
         {

@@ -1,0 +1,127 @@
+<h2>Routes tab — internal layout?</h2>
+<p class="subtitle">Both show 3 saved routes and the same waypoint list when one is selected. The difference is whether you see them simultaneously or drill down.</p>
+
+<style>
+  .panel { width: 260px; background: #2b2b2b; border: 1px solid #444; border-radius: 4px; padding: 8px; font-family: 'RuneScape Smallmono', monospace; font-size: 11px; color: #d4d4d4; }
+  .pinned { background: #1f1f1f; padding: 4px 8px; border-radius: 3px; margin-bottom: 6px; font-size: 10px; color: #888; }
+  .tab-row { display: flex; gap: 0; border-bottom: 1px solid #444; margin-bottom: 6px; }
+  .tab { flex: 1; padding: 4px; text-align: center; font-size: 10px; cursor: default; border: 1px solid #444; border-bottom: none; background: #252525; color: #888; }
+  .tab.active { background: #2b2b2b; color: #d4d4d4; border-bottom: 1px solid #2b2b2b; margin-bottom: -1px; }
+
+  .section-title { font-size: 10px; color: #888; text-transform: uppercase; letter-spacing: 0.5px; margin: 4px 0; }
+  .row { padding: 4px 6px; border: 1px solid #3a3a3a; border-radius: 2px; margin: 2px 0; background: #232323; cursor: pointer; }
+  .row.selected { background: #2d3a4a; border-color: #5b7ba8; }
+  .row .nm { color: #d4d4d4; }
+  .row .meta { font-size: 10px; color: #888; margin-left: 4px; }
+  .row .star { color: #d97a3a; }
+  .row .pen-tag { font-size: 9px; color: #d97a3a; border: 1px solid #d97a3a; padding: 0 4px; border-radius: 2px; margin-left: 4px; }
+
+  .toolbar { display: flex; gap: 4px; margin: 6px 0; }
+  .btn { background: #383838; color: #d4d4d4; border: 1px solid #555; padding: 3px 6px; font-size: 10px; border-radius: 2px; cursor: pointer; }
+  .btn-primary { background: #2d4a6a; border-color: #5b7ba8; }
+
+  .wp { padding: 4px 6px; border: 1px solid #3a3a3a; border-radius: 2px; margin: 2px 0; background: #232323; display: flex; align-items: center; gap: 4px; }
+  .wp.selected { background: #2d3a4a; border-color: #5b7ba8; }
+  .wp .ix { color: #666; font-size: 10px; min-width: 18px; }
+  .wp .nm { flex: 1; color: #d4d4d4; }
+  .wp .nm .un { color: #888; font-style: italic; }
+  .wp .verb { font-size: 10px; color: #d97a3a; }
+  .wp .icons { color: #888; font-size: 11px; }
+
+  .scroll-hint { font-size: 9px; color: #555; text-align: right; padding: 4px 0; }
+  .back-btn { color: #888; font-size: 10px; cursor: pointer; padding: 4px 0; border-bottom: 1px solid #444; margin-bottom: 6px; }
+  .h3 { color: #d4d4d4; font-size: 12px; margin: 4px 0; }
+  .undo { font-size: 9px; color: #888; margin-left: auto; }
+</style>
+
+<div class="cards">
+
+  <div class="card" data-choice="inline" onclick="toggleSelect(this)">
+    <div class="card-image">
+      <div class="panel">
+        <div class="pinned">Status: IDLE · Events: 0</div>
+        <div class="tab-row">
+          <div class="tab active">Routes</div>
+          <div class="tab">Combat</div>
+          <div class="tab">Record</div>
+          <div class="tab">Login</div>
+        </div>
+
+        <div class="section-title">Saved routes (3)</div>
+        <div class="row selected">
+          <span class="nm">lumbridge_bank_to_pen<span class="star"> *</span></span>
+          <span class="pen-tag">FARM</span>
+          <span class="meta">12 wp</span>
+        </div>
+        <div class="row">
+          <span class="nm">falador_bank_to_mine</span>
+          <span class="meta">8 wp</span>
+        </div>
+        <div class="row">
+          <span class="nm">varrock_to_chickens</span>
+          <span class="meta">5 wp</span>
+        </div>
+        <div class="toolbar">
+          <button class="btn">+ New</button>
+          <button class="btn">Rename</button>
+          <button class="btn">Delete</button>
+        </div>
+
+        <div class="section-title">Waypoints — lumbridge_bank_to_pen</div>
+        <div class="toolbar">
+          <button class="btn btn-primary">Mark area</button>
+          <button class="btn btn-primary">Mark obj</button>
+          <span class="undo">↶ Undo (2)</span>
+        </div>
+        <div class="wp"><span class="ix">#0</span><span class="nm">lumbridge_bank</span><span class="verb">walkbox</span><span class="icons">⇅ ✎ ×</span></div>
+        <div class="wp selected"><span class="ix">#1</span><span class="nm"><span class="un">(unnamed)</span></span><span class="verb">walkbox</span><span class="icons">⇅ ✎ ×</span></div>
+        <div class="wp"><span class="ix">#2</span><span class="nm">bank_stairs</span><span class="verb">climb-down</span><span class="icons">⇅ ✎ ×</span></div>
+        <div class="wp"><span class="ix">#3</span><span class="nm">(unnamed)</span><span class="verb">walkbox</span><span class="icons">⇅ ✎ ×</span></div>
+        <div class="scroll-hint">▼ scroll</div>
+      </div>
+    </div>
+    <div class="card-body">
+      <h3>A — Inline (split column)</h3>
+      <p>Routes list and waypoints both visible. Switch routes without clicking back. Vertically taller; relies on scrolling. Best when you bounce between routes.</p>
+    </div>
+  </div>
+
+  <div class="card" data-choice="drilldown" onclick="toggleSelect(this)">
+    <div class="card-image">
+      <div class="panel">
+        <div class="pinned">Status: IDLE · Events: 0</div>
+        <div class="tab-row">
+          <div class="tab active">Routes</div>
+          <div class="tab">Combat</div>
+          <div class="tab">Record</div>
+          <div class="tab">Login</div>
+        </div>
+
+        <div class="back-btn">← Back to routes</div>
+        <div class="h3">lumbridge_bank_to_pen<span class="star"> *</span> <span class="pen-tag">FARM</span></div>
+        <div class="toolbar">
+          <button class="btn btn-primary">Mark area</button>
+          <button class="btn btn-primary">Mark obj</button>
+          <button class="btn">Rename</button>
+          <span class="undo">↶ Undo (2)</span>
+        </div>
+        <div class="section-title">Waypoints (12)</div>
+        <div class="wp"><span class="ix">#0</span><span class="nm">lumbridge_bank</span><span class="verb">walkbox</span><span class="icons">⇅ ✎ ×</span></div>
+        <div class="wp selected"><span class="ix">#1</span><span class="nm"><span class="un">(unnamed)</span></span><span class="verb">walkbox</span><span class="icons">⇅ ✎ ×</span></div>
+        <div class="wp"><span class="ix">#2</span><span class="nm">bank_stairs</span><span class="verb">climb-down</span><span class="icons">⇅ ✎ ×</span></div>
+        <div class="wp"><span class="ix">#3</span><span class="nm">(unnamed)</span><span class="verb">walkbox</span><span class="icons">⇅ ✎ ×</span></div>
+        <div class="wp"><span class="ix">#4</span><span class="nm">(unnamed)</span><span class="verb">walkbox</span><span class="icons">⇅ ✎ ×</span></div>
+        <div class="wp"><span class="ix">#5</span><span class="nm">pen_gate</span><span class="verb">open</span><span class="icons">⇅ ✎ ×</span></div>
+        <div class="wp"><span class="ix">#6</span><span class="nm">chicken_pen</span><span class="verb">walkbox</span><span class="icons">⇅ ✎ ×</span></div>
+        <div class="scroll-hint">▼ scroll</div>
+      </div>
+    </div>
+    <div class="card-body">
+      <h3>B — Drill-down</h3>
+      <p>Click a route → editor replaces the list. Back button returns. More vertical room for waypoints, fewer rows on screen at once. Best for focused editing.</p>
+    </div>
+  </div>
+
+</div>
+
+<p class="subtitle" style="margin-top: 16px;">FARM badge marks <code>lumbridge_bank_to_pen.txt</code> — the file the farm bot loads on Start. Star <code>*</code> = unsaved changes (we'll show it for unsaved ops, even though auto-save means it's brief).</p>
