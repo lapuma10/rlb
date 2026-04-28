@@ -6,6 +6,7 @@ import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
 import java.util.Random;
+import java.util.Set;
 import java.util.function.Predicate;
 import lombok.extern.slf4j.Slf4j;
 import net.runelite.api.Client;
@@ -64,7 +65,7 @@ public final class RouteWalker
         {
             case WALK:
             case WALK_AREA:
-                tickWalk(wp.area());
+                tickWalk(wp);
                 break;
             case TRANSPORT:
                 tickTransport(wp);
@@ -110,14 +111,15 @@ public final class RouteWalker
         return false;
     }
 
-    private void tickWalk(WorldArea area) throws InterruptedException
+    private void tickWalk(Waypoint wp) throws InterruptedException
     {
+        WorldArea area = wp.area();
         if (area == null) return;
         Player self = client.getLocalPlayer();
         if (self == null) return;
         WorldPoint here = self.getWorldLocation();
         if (here == null) return;
-        WorldPoint pick = sampleTile(area, rng,
+        WorldPoint pick = sampleTile(area, wp.tiles(), rng,
             tile -> tile.getPlane() == here.getPlane() && projectsToCanvas(tile));
         if (pick == null) return; // try again next tick
         WorldView wv = client.getTopLevelWorldView();
@@ -188,26 +190,26 @@ public final class RouteWalker
         return null;
     }
 
-    /** Pure tile sampler — package-private for tests. Returns null only
-     *  when no tile in the area satisfies the predicate. Strategy: up to
-     *  3*N random rolls, then fall back to a shuffled enumeration so we
-     *  never miss a small accept set. */
-    static WorldPoint sampleTile(WorldArea a, Random rng, Predicate<WorldPoint> accept)
+    /** Pure tile sampler — package-private for tests. Picks a random tile in
+     *  {@code bbox} that's in {@code allowed} and passes {@code accept}. Up to
+     *  3*N random rolls, then falls back to a shuffled enumeration of
+     *  {@code allowed} so we always find a tile if one is acceptable.
+     *  Returns null only when no tile in {@code allowed} passes {@code accept}. */
+    static WorldPoint sampleTile(WorldArea bbox, Set<WorldPoint> allowed,
+                                 Random rng, Predicate<WorldPoint> accept)
     {
-        int n = a.getWidth() * a.getHeight();
+        if (allowed.isEmpty()) return null;
+        int n = bbox.getWidth() * bbox.getHeight();
         int attempts = Math.max(8, n * 3);
         for (int i = 0; i < attempts; i++)
         {
-            int x = a.getX() + rng.nextInt(a.getWidth());
-            int y = a.getY() + rng.nextInt(a.getHeight());
-            WorldPoint p = new WorldPoint(x, y, a.getPlane());
-            if (accept.test(p)) return p;
+            int x = bbox.getX() + rng.nextInt(bbox.getWidth());
+            int y = bbox.getY() + rng.nextInt(bbox.getHeight());
+            WorldPoint p = new WorldPoint(x, y, bbox.getPlane());
+            if (allowed.contains(p) && accept.test(p)) return p;
         }
-        // Last resort: enumerate every tile in random order.
-        List<WorldPoint> all = new ArrayList<>(n);
-        for (int dx = 0; dx < a.getWidth(); dx++)
-            for (int dy = 0; dy < a.getHeight(); dy++)
-                all.add(new WorldPoint(a.getX() + dx, a.getY() + dy, a.getPlane()));
+        // Last resort: enumerate `allowed` in random order.
+        List<WorldPoint> all = new ArrayList<>(allowed);
         Collections.shuffle(all, rng);
         for (WorldPoint p : all) if (accept.test(p)) return p;
         return null;
