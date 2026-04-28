@@ -230,6 +230,16 @@ public class RecorderPlugin extends Plugin
         panel.setTrailRecorder(trailRecorder);
         panel.setTrailRegistry(trailRegistry);
 
+        // Chicken farm V3 — same outer FSM as V2 but uses the recorded
+        // trail framework for the walking phases. Independent dispatcher
+        // so V1/V2/V3 can coexist. Wired after trailRegistry is created.
+        HumanizedInputDispatcher v3Dispatcher = new HumanizedInputDispatcher(client, clientThread);
+        TransportResolver v3Resolver = new TransportResolver(client);
+        net.runelite.client.plugins.recorder.scripts.ChickenFarmV3Script chickenFarmV3 =
+            new net.runelite.client.plugins.recorder.scripts.ChickenFarmV3Script(
+                client, clientThread, v3Dispatcher, v3Resolver, trailRegistry);
+        panel.setChickenFarmV3(chickenFarmV3);
+
         // Mining loop: separate dispatcher, independent busy flag from
         // combat / login / test-walk. The user adds candidate rocks via
         // the side-panel "Mining" section, then starts/stops the loop.

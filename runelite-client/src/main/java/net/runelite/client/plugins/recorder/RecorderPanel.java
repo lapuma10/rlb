@@ -163,6 +163,12 @@ public final class RecorderPanel extends PluginPanel
     private final JButton v2StopBtn = new JButton("Stop");
     private final JLabel v2StatusLabel = new JLabel("V2: idle");
     private final JLabel v2KillsLabel = new JLabel("Kills: 0");
+    // V3 — trail-network walker version. Lives next to V2 for direct comparison.
+    private final JButton v3StartBtn = new JButton("Start");
+    private final JButton v3StopBtn = new JButton("Stop");
+    private final JLabel v3StatusLabel = new JLabel("V3: idle");
+    private final JLabel v3KillsLabel = new JLabel("Kills: 0");
+    private net.runelite.client.plugins.recorder.scripts.ChickenFarmV3Script chickenFarmV3;
     // Mining section — unique field names so the parallel-agent's Combat
     // section doesn't collide. The loop is wired by the plugin via
     // setMiningLoop(); the panel only owns the UI surface.
@@ -1109,6 +1115,22 @@ public final class RecorderPanel extends PluginPanel
         v2.add(v2KillsLabel);
         p.add(v2);
 
+        // V3 — recorded trails via TrailWalker.
+        JPanel v3Box = new JPanel();
+        v3Box.setLayout(new BoxLayout(v3Box, BoxLayout.Y_AXIS));
+        v3Box.setBorder(BorderFactory.createTitledBorder("V3 (recorded trails)"));
+        v3Box.setBackground(ColorScheme.DARK_GRAY_COLOR);
+        v3Box.add(v3StatusLabel);
+        v3Box.add(v3KillsLabel);
+        JPanel v3Row = new JPanel(new FlowLayout(FlowLayout.LEFT, 4, 4));
+        v3Row.setBackground(ColorScheme.DARK_GRAY_COLOR);
+        v3Row.add(v3StartBtn);
+        v3Row.add(v3StopBtn);
+        v3Box.add(v3Row);
+        v3StartBtn.addActionListener(e -> { if (chickenFarmV3 != null) chickenFarmV3.start(); });
+        v3StopBtn.addActionListener(e -> { if (chickenFarmV3 != null) chickenFarmV3.stop(); });
+        p.add(v3Box);
+
         return p;
     }
 
@@ -1123,6 +1145,25 @@ public final class RecorderPanel extends PluginPanel
     public void setChickenFarmV2(ChickenFarmV2Script script)
     {
         this.chickenFarmV2 = script;
+    }
+
+    /** V3 wiring — trail-network version. */
+    public void setChickenFarmV3(net.runelite.client.plugins.recorder.scripts.ChickenFarmV3Script s)
+    {
+        this.chickenFarmV3 = s;
+        SwingUtilities.invokeLater(this::updateV3Controls);
+    }
+
+    private void updateV3Controls()
+    {
+        boolean ready = chickenFarmV3 != null;
+        v3StartBtn.setEnabled(ready);
+        v3StopBtn.setEnabled(ready);
+        if (ready)
+        {
+            v3StatusLabel.setText("V3: " + chickenFarmV3.status());
+            v3KillsLabel.setText("Kills: " + chickenFarmV3.killCount());
+        }
     }
 
     public void setTrailRecorder(TrailRecorder rec)
@@ -1364,6 +1405,7 @@ public final class RecorderPanel extends PluginPanel
                 + " — " + chickenFarmV2.status());
             v2KillsLabel.setText("Kills: " + chickenFarmV2.killCount());
         }
+        updateV3Controls();
     }
 
     private void updateButtons()
