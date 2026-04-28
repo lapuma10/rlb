@@ -12,6 +12,8 @@ import java.util.concurrent.TimeoutException;
 import lombok.extern.slf4j.Slf4j;
 import net.runelite.api.Client;
 import net.runelite.api.GameObject;
+import net.runelite.api.Item;
+import net.runelite.api.ItemContainer;
 import net.runelite.api.MenuAction;
 import net.runelite.api.NPC;
 import net.runelite.api.NPCComposition;
@@ -22,6 +24,8 @@ import net.runelite.api.Tile;
 import net.runelite.api.WorldView;
 import net.runelite.api.coords.WorldPoint;
 import net.runelite.api.gameval.InterfaceID;
+import net.runelite.api.gameval.InventoryID;
+import net.runelite.api.gameval.VarClientID;
 import net.runelite.api.widgets.Widget;
 import net.runelite.client.callback.ClientThread;
 import net.runelite.client.sequence.dispatch.HumanizedInputDispatcher;
@@ -403,6 +407,154 @@ public final class BankInteraction
         return true;
     }
 
+    // ────────────────────────────────────────────────────────────────
+    // Withdraw helpers — read the bank ItemContainer to find a slot,
+    // scroll the bank items widget to make it visible, dispatch a
+    // right-click + "Withdraw-X" verb pick. Returns false on missing
+    // item / non-resolvable widget so the caller can degrade gracefully
+    // instead of crashing.
+    // ────────────────────────────────────────────────────────────────
+
+    /** True iff the {@link InventoryID#BANK} container is populated.
+     *  The bank widget can be visible for a short window before the
+     *  engine fills the container — calling {@link #bankContainsItem}
+     *  during that window would return false and trip a "missing item"
+     *  abort. Callers should gate item-presence checks on this flag. */
+    public boolean bankReady() throws InterruptedException
+    {
+        Boolean ok = onClient(() -> client.getItemContainer(InventoryID.BANK) != null);
+        return Boolean.TRUE.equals(ok);
+    }
+
+    /** True if the bank inventory container holds at least one of {@code itemId}.
+     *  Returns false if the bank container hasn't loaded yet — callers
+     *  must check {@link #bankReady()} first if they want to differentiate
+     *  "not loaded" from "absent". Reads on the client thread. */
+    public boolean bankContainsItem(int itemId) throws InterruptedException
+    {
+        Long n = onClient(() -> bankAmountClientThread(itemId));
+        return n != null && n > 0;
+    }
+
+    /** Quantity of {@code itemId} currently in the bank, or 0 if none /
+     *  bank not open. Reads on the client thread. */
+    public long bankItemAmount(int itemId) throws InterruptedException
+    {
+        Long n = onClient(() -> bankAmountClientThread(itemId));
+        return n == null ? 0L : n;
+    }
+
+    /** Withdraw all of {@code itemId} from the bank via the slot's
+     *  right-click "Withdraw-All" option. The bank must be open. Returns
+     *  true iff a click was dispatched.
+     *
+     *  <p>Failure paths (returns false, sets no error):
+     *  <ul>
+     *    <li>bank not open / item not in bank — call
+     *        {@link #bankContainsItem} first to differentiate.</li>
+     *    <li>bank slot widget is scrolled out and we couldn't make it
+     *        visible — caller falls back to a different strategy.</li>
+     *  </ul> */
+    public boolean withdrawAll(int itemId) throws InterruptedException
+    {
+        return withdrawWithVerb(itemId, "Withdraw-All");
+    }
+
+    /** Withdraw 1 of {@code itemId}. Same shape as {@link #withdrawAll}. */
+    public boolean withdrawOne(int itemId) throws InterruptedException
+    {
+        return withdrawWithVerb(itemId, "Withdraw-1");
+    }
+
+    private boolean withdrawWithVerb(int itemId, String verb) throws InterruptedException
+    {
+        Rectangle bounds = onClient(() -> resolveBankSlotBounds(itemId));
+        if (bounds == null) return false;
+        log.info("bank: withdraw '{}' itemId={} at bounds={}", verb, itemId, bounds);
+        int cx = bounds.x + bounds.width / 2;
+        int cy = bounds.y + bounds.height / 2;
+        dispatcher.rightClickAndPickMenu(cx, cy, verb);
+        return true;
+    }
+
+    /** Client-thread: count item {@code id} in the bank container.
+     *  Returns null if the container is not loaded. */
+    private Long bankAmountClientThread(int id)
+    {
+        ItemContainer bank = client.getItemContainer(InventoryID.BANK);
+        if (bank == null) return null;
+        Item[] items = bank.getItems();
+        if (items == null) return 0L;
+        long n = 0;
+        for (Item it : items)
+        {
+            if (it != null && it.getId() == id) n += it.getQuantity();
+        }
+        return n;
+    }
+
+    /** Client-thread: locate the bank slot widget for {@code itemId},
+     *  scroll the items container to make it visible if needed, and
+     *  return its canvas bounds. Returns null if item not in bank /
+     *  bank not open / scroll failed.
+     *
+     *  <p>The bank's {@code Bankmain.ITEMS_CONTAINER} is a scrollable
+     *  parent whose dynamic children are the per-slot widgets. Each
+     *  child carries {@code getItemId()} and a {@code getRelativeY()}
+     *  position within the parent. We adjust {@code parent.setScrollY()}
+     *  so the child sits inside the visible window, then read the
+     *  child's post-scroll bounds. */
+    private Rectangle resolveBankSlotBounds(int itemId)
+    {
+        // 0x000c_0009 — Bankmain.ITEMS_CONTAINER (scrollable items area).
+        Widget container = client.getWidget(InterfaceID.Bankmain.ITEMS_CONTAINER);
+        if (container == null || container.isHidden()) return null;
+        Widget[] children = container.getDynamicChildren();
+        if (children == null || children.length == 0) return null;
+
+        Widget match = null;
+        for (Widget c : children)
+        {
+            if (c == null) continue;
+            if (c.getItemId() != itemId) continue;
+            match = c;
+            break;
+        }
+        if (match == null) return null;
+
+        // Visible window of the items container in widget-local coords.
+        int containerH = container.getHeight();
+        int relY = match.getRelativeY();
+        int slotH = match.getHeight() <= 0 ? 36 : match.getHeight();
+        int scrollY = container.getScrollY();
+        int top = relY - scrollY;
+        int bottom = top + slotH;
+        boolean visible = top >= 0 && bottom <= containerH;
+
+        if (!visible)
+        {
+            // Aim to position the slot ~one row from the top — feels
+            // less robotic than slamming it to scrollY=0, and gives a
+            // few pixels of margin so a partial-row reveal isn't the
+            // first frame the user sees.
+            int target = Math.max(0, relY - slotH);
+            int maxScroll = Math.max(0, container.getScrollHeight() - containerH);
+            if (maxScroll > 0) target = Math.min(target, maxScroll);
+            container.setScrollY(target);
+            try { container.revalidateScroll(); } catch (Throwable ignored) { /* best-effort */ }
+            // The engine remembers the bank's scroll position via a
+            // varClientInt — without this the next widget rebuild
+            // snaps the items back to the engine-stored position and
+            // our bounds become stale. Pattern mirrored from the
+            // bank-tags plugin (LayoutManager#setScroll).
+            try { client.setVarcIntValue(VarClientID.BANK_SCROLLPOS, target); }
+            catch (Throwable ignored) { /* best-effort */ }
+        }
+        Rectangle r = match.getBounds();
+        if (r == null || r.isEmpty()) return null;
+        return r;
+    }
+
     /** Recursive descent: return the first widget in the subtree of
      *  {@code parent} whose action list contains {@code wantedAction}.
      *  Depth-bounded to avoid pathological / cyclic widget trees. */
@@ -450,7 +602,8 @@ public final class BankInteraction
 
     /** Run a Supplier on the client thread and wait for the result. Used
      *  by {@link #clickBankBoothRandom} which needs to read NPC + Scene
-     *  state. */
+     *  state. Bounded at 2s so a wedged client thread doesn't hang the
+     *  caller. */
     private <T> T onClient(java.util.function.Supplier<T> s) throws InterruptedException
     {
         java.util.concurrent.atomic.AtomicReference<T> ref = new java.util.concurrent.atomic.AtomicReference<>();
@@ -460,7 +613,11 @@ public final class BankInteraction
             catch (Throwable th) { log.warn("bank: onClient threw", th); }
             finally { latch.countDown(); }
         });
-        latch.await();
+        if (!latch.await(2000, java.util.concurrent.TimeUnit.MILLISECONDS))
+        {
+            log.warn("bank: onClient timed out");
+            return null;
+        }
         return ref.get();
     }
 }

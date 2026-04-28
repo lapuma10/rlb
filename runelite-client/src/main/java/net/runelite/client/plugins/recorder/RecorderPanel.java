@@ -33,10 +33,14 @@ import net.runelite.client.plugins.recorder.annotator.AreaSelector;
 import net.runelite.client.plugins.recorder.annotator.RoutesTab;
 import net.runelite.client.plugins.recorder.annotator.WaypointEditor;
 import net.runelite.client.plugins.recorder.combat.ChickenCombatLoop;
+import net.runelite.client.plugins.recorder.cook.CookingFood;
+import net.runelite.client.plugins.recorder.cook.CookingLocation;
+import net.runelite.client.plugins.recorder.cook.CookingLocations;
 import net.runelite.client.plugins.recorder.debug.DebugOverlay;
 import net.runelite.client.plugins.recorder.farm.RouteWalker;
 import net.runelite.client.plugins.recorder.mining.MiningLoop;
 import net.runelite.client.plugins.recorder.scripts.ChickenFarmV2Script;
+import net.runelite.client.plugins.recorder.scripts.CookingScript;
 import net.runelite.client.plugins.recorder.scripts.LumbridgeBankPenScript;
 import net.runelite.client.plugins.recorder.debug.TileMarker;
 import net.runelite.client.plugins.recorder.events.Events;
@@ -57,6 +61,7 @@ import javax.swing.BoxLayout;
 import javax.swing.DefaultListModel;
 import javax.swing.Icon;
 import javax.swing.JButton;
+import javax.swing.JComboBox;
 import javax.swing.JComponent;
 import javax.swing.JLabel;
 import javax.swing.JList;
@@ -168,6 +173,14 @@ public final class RecorderPanel extends PluginPanel
     private final JLabel miningOreCountLabel = new JLabel("Ores: 0");
     private final JLabel miningRockCountLabel = new JLabel("Rocks: 0");
     private MiningLoop miningLoop;
+    // Cooking section.
+    private CookingScript cookingScript;
+    private final JButton cookStartBtn = new JButton("Start cooking");
+    private final JButton cookStopBtn = new JButton("Stop");
+    private final JComboBox<CookingLocation> cookLocationBox = new JComboBox<>();
+    private final JComboBox<CookingFood.Entry> cookFoodBox = new JComboBox<>();
+    private final JLabel cookStatusLabel = new JLabel("Cooking: idle");
+    private final JLabel cookCountsLabel = new JLabel("Cooked: 0  Burnt: 0");
     private final JTabbedPane tabs = new JTabbedPane();
     private AnnotatorHudOverlay hudOverlay;
     private AreaSelector areaSelector;
@@ -199,6 +212,7 @@ public final class RecorderPanel extends PluginPanel
         tabs.addTab("Chicken farm", new JScrollPane(buildChickenFarmTab()));
         tabs.addTab("Record", new JScrollPane(buildRecordTab()));
         tabs.addTab("Mining", new JScrollPane(buildMiningTab()));
+        tabs.addTab("Cooking", new JScrollPane(buildCookingTab()));
         tabs.addTab("Login",  new JScrollPane(buildLoginTab()));
         add(tabs, BorderLayout.CENTER);
 
@@ -213,6 +227,8 @@ public final class RecorderPanel extends PluginPanel
         miningStopBtn.addActionListener(e -> onMiningStop());
         miningAddRockBtn.addActionListener(e -> onMiningAddRock());
         miningClearRocksBtn.addActionListener(e -> onMiningClearRocks());
+        cookStartBtn.addActionListener(e -> onCookStart());
+        cookStopBtn.addActionListener(e -> onCookStop());
         markerBtn.addActionListener(e -> onMarker());
         markTileBtn.addActionListener(e -> onMarkTile());
         walkToMarkBtn.addActionListener(e -> onWalkToMark());
@@ -1164,6 +1180,87 @@ public final class RecorderPanel extends PluginPanel
         }
     }
 
+    // ────────────────────────────────────────────────────────────────
+    // Cooking tab
+    // ────────────────────────────────────────────────────────────────
+
+    private JPanel buildCookingTab()
+    {
+        JPanel p = new JPanel();
+        p.setLayout(new BoxLayout(p, BoxLayout.Y_AXIS));
+        p.setBorder(BorderFactory.createTitledBorder("Cooking"));
+
+        for (CookingLocation l : CookingLocations.all()) cookLocationBox.addItem(l);
+        for (CookingFood.Entry e : CookingFood.all())     cookFoodBox.addItem(e);
+
+        JPanel locationRow = new JPanel(new BorderLayout(4, 4));
+        locationRow.add(new JLabel("Location:"), BorderLayout.WEST);
+        locationRow.add(cookLocationBox, BorderLayout.CENTER);
+        p.add(locationRow);
+
+        JPanel foodRow = new JPanel(new BorderLayout(4, 4));
+        foodRow.add(new JLabel("Food:"), BorderLayout.WEST);
+        foodRow.add(cookFoodBox, BorderLayout.CENTER);
+        p.add(foodRow);
+
+        JPanel buttons = new JPanel(new BorderLayout(4, 4));
+        buttons.add(cookStartBtn, BorderLayout.CENTER);
+        buttons.add(cookStopBtn, BorderLayout.EAST);
+        p.add(buttons);
+
+        p.add(cookStatusLabel);
+        p.add(cookCountsLabel);
+        return p;
+    }
+
+    /** Wire the cooking script. The plugin constructs the script in
+     *  startUp and hands it here; the panel only owns the UI surface. */
+    public void setCookingScript(CookingScript script)
+    {
+        this.cookingScript = script;
+    }
+
+    private void onCookStart()
+    {
+        if (cookingScript == null)
+        {
+            cookStatusLabel.setText("Cooking: unavailable");
+            return;
+        }
+        CookingLocation loc = (CookingLocation) cookLocationBox.getSelectedItem();
+        CookingFood.Entry food = (CookingFood.Entry) cookFoodBox.getSelectedItem();
+        if (loc == null || food == null)
+        {
+            cookStatusLabel.setText("Cooking: pick location + food first");
+            return;
+        }
+        cookingScript.setLocation(loc);
+        cookingScript.setRawFoodId(food.rawId);
+        cookingScript.start();
+        cookStatusLabel.setText("Cooking: starting");
+    }
+
+    private void onCookStop()
+    {
+        if (cookingScript == null) return;
+        cookingScript.stop();
+        cookStatusLabel.setText("Cooking: stopping");
+    }
+
+    private void refreshCooking()
+    {
+        if (cookingScript == null)
+        {
+            cookStatusLabel.setText("Cooking: unavailable");
+            cookCountsLabel.setText("Cooked: 0  Burnt: 0");
+            return;
+        }
+        cookStatusLabel.setText("Cooking: " + cookingScript.state()
+            + " — " + cookingScript.status());
+        cookCountsLabel.setText("Cooked: " + cookingScript.cookedCount()
+            + "  Burnt: " + cookingScript.burntCount());
+    }
+
     private void updateButtons()
     {
         boolean hasSel = selectedUsername != null;
@@ -1576,6 +1673,7 @@ public final class RecorderPanel extends PluginPanel
         refreshCombat();
         refreshMining();
         refreshLumby();
+        refreshCooking();
     }
 
     /** Mirror the bare chicken combat loop's state into the panel labels.

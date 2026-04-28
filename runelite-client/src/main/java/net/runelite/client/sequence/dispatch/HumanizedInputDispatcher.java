@@ -1037,6 +1037,40 @@ public class HumanizedInputDispatcher implements InputDispatcher
         moveCursorTo(x, y);
     }
 
+    /** Move to (x, y), then dispatch a humanized right-click + select the
+     *  menu row whose option matches {@code verb}. If {@code verb} is
+     *  already the engine's left-click default at the cursor, fires a
+     *  single left-click instead — same shortcut path the
+     *  widget/object verb-clicks use.
+     *
+     *  <p>Used by callers (e.g. bank-slot withdraw) that have a
+     *  pre-resolved canvas pixel rather than a stable widget id, so the
+     *  internal {@code widgetVerbClick} path doesn't apply. Sets
+     *  {@link #lastError} on menu mismatch; never throws. */
+    public void rightClickAndPickMenu(int x, int y, String verb) throws InterruptedException
+    {
+        if (verb == null || verb.isBlank())
+        {
+            lastError.set("rightClickAndPickMenu: empty verb");
+            return;
+        }
+        moveCursorTo(x, y);
+        Thread.sleep(60);
+        boolean isTop = onClient(() -> isTopMenuVerb(verb));
+        if (isTop)
+        {
+            clickPress(MouseEvent.BUTTON1);
+            return;
+        }
+        clickPress(MouseEvent.BUTTON3);
+        Thread.sleep(120);
+        boolean ok = selectMenuVerb(verb);
+        if (!ok)
+        {
+            lastError.set("right-click menu did not contain verb '" + verb + "'");
+        }
+    }
+
     /** Type a single printable character with a humanized hold time. The
      *  caller is responsible for inter-character pacing (see HumanizedTyping). */
     public void typeChar(char ch) throws InterruptedException

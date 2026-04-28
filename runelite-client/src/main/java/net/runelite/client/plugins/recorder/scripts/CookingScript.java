@@ -1,0 +1,890 @@
+package net.runelite.client.plugins.recorder.scripts;
+
+import java.awt.Rectangle;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicReference;
+import java.util.function.Supplier;
+import lombok.extern.slf4j.Slf4j;
+import net.runelite.api.Client;
+import net.runelite.api.Player;
+import net.runelite.api.coords.WorldArea;
+import net.runelite.api.coords.WorldPoint;
+import net.runelite.api.gameval.InterfaceID;
+import net.runelite.api.gameval.ItemID;
+import net.runelite.api.widgets.Widget;
+import net.runelite.client.callback.ClientThread;
+import net.runelite.client.plugins.recorder.cook.CookingFood;
+import net.runelite.client.plugins.recorder.cook.CookingInteraction;
+import net.runelite.client.plugins.recorder.cook.CookingLocation;
+import net.runelite.client.plugins.recorder.farm.BankInteraction;
+import net.runelite.client.plugins.recorder.transport.TransportResolver;
+import net.runelite.client.plugins.recorder.walker.UniversalWalker;
+import net.runelite.client.sequence.dispatch.HumanizedInputDispatcher;
+
+/**
+ * Cooking bot script.
+ *
+ * <p>Runs a configurable bank → cook → rebank loop at a
+ * {@link CookingLocation}. Two heat-source kinds are supported:
+ * fire-from-logs (Tinderbox + Logs ground spawn → light → cook) and
+ * range (use food on a Range game object).
+ *
+ * <p><b>Original prompt (verbatim, for posterity):</b>
+ * <pre>
+ * Look into player animating. How would you write a cooking script?
+ * brainstorm with the skill. see if you can figure out and find out how
+ * cooking works. I want a cooking script that works in lumbridge castle
+ * at p2 in the bank, there are logs that spawn there. I want you to use
+ * tinderbox and take out selected food from the bank (select in the
+ * script). then it should light a fire on the logs with a tinderbox(rightclick
+ * logs ont he ground select light) or click tinderbox with use(left
+ * click) then left click one of the logs. Then left click raw food
+ * selected, then click on the fire thats burning and in the dialogue
+ * select cook all(see cd .. starter script repo for hwo to dismiss
+ * level up dialogue, how to know when youre done cooking, how to know
+ * that your fire has died and u need to light a new one etc.) How to
+ * use the dialogue to select cook all. How to bank, rebank. BUUUT we
+ * need to use our runelite engines api for banking (we have none for
+ * cooking yet, or lighting a fire) also dont hardcode it. we should add
+ * more places to cook. But we start with lumby p2 bank(theres coords
+ * for it in the repo were in rn). Build it in a worktree so we wouldnt
+ * disturb the other stuff, do it based on main branch. us ebrainstorming
+ * to improve and ensure that its propper.and working, send out a subagent
+ * to look into rs wiki to see if we find something usefull. DO NOT
+ * assume anything, ensure to use APi, check api, use correct calls,
+ * animations, widget ids etc. the starter script should have correct
+ * widget ids. Go plan it out, think through it, qc it, then go implement
+ * it. DO NOT STOP until done. THEN Send out 2 qc suabgents to qc
+ * independetnly. also note down my original prompt here in the script
+ * file youll write this in. Keep it generic for us to be able to use
+ * different foods, and fires/ranges, as there are different places to
+ * cook, some places can be used with logs, others have ranges(range)
+ * etc.
+ *
+ * Follow-up: a gotcah is that you have to have whats needed in your
+ * inventory and in the bank, the scrolling, looking for items etc. and
+ * if you dont find it, the bot shouldnt crash right? so ensur ebank is
+ * open, were looking for it, then we close it etc.
+ * </pre>
+ *
+ * <p><b>Threading:</b> mirrors {@code ChickenFarmV2Script} — one daemon
+ * worker tick loop, every read of client state hopped through
+ * {@link ClientThread#invokeLater}, clicks dispatched via the injected
+ * {@link HumanizedInputDispatcher}.
+ */
+@Slf4j
+public final class CookingScript
+{
+    /** Tick cadence — close to one OSRS engine tick (600ms). */
+    private static final long TICK_MS = 600;
+    /** Throttle between any two banking dispatches. */
+    private static final long BANK_PACE_MS = 2000;
+    /** Max time waiting for fire to spawn after we click logs. */
+    private static final long LIGHT_TIMEOUT_MS = 10_000;
+    /** Max time without inventory progress (raw count change) before we
+     *  ABORT the cooking phase. Defensive: should not trip in practice. */
+    private static final long COOK_STUCK_MS = 30_000;
+    /** Throttle between cooking-action dispatches (use raw + click fire). */
+    private static final long COOK_PACE_MS = 1500;
+
+    public enum State
+    {
+        IDLE,
+        BANKING,
+        WALK_TO_COOK,
+        LIGHTING_FIRE,
+        COOKING,
+        WALK_TO_BANK,
+        ABORTED
+    }
+
+    private final Client client;
+    private final ClientThread clientThread;
+    private final HumanizedInputDispatcher dispatcher;
+    private final UniversalWalker walker;
+    private final BankInteraction bank;
+    private final CookingInteraction cook;
+
+    private final AtomicReference<CookingLocation> location = new AtomicReference<>();
+    private final AtomicInteger rawFoodId = new AtomicInteger(0);
+    private final AtomicReference<State> state = new AtomicReference<>(State.IDLE);
+    private final AtomicReference<String> status = new AtomicReference<>("idle");
+    private final AtomicBoolean running = new AtomicBoolean(false);
+    private final AtomicReference<Thread> worker = new AtomicReference<>();
+
+    private final AtomicInteger cookedCount = new AtomicInteger(0);
+    private final AtomicInteger burntCount  = new AtomicInteger(0);
+
+    private long lastBankActionAtMs;
+    private long lastCookActionAtMs;
+    private long lightingStartedAtMs;
+    private long lastInventoryChangeAtMs;
+    private int  lastRawCount = -1;
+    /** When the bank widget first opened this BANKING entry. Gates the
+     *  "missing item" check until the engine has had a tick to populate
+     *  {@code InventoryID.BANK}. */
+    private long bankOpenedAtMs;
+    /** Consecutive failures of withdraw / deposit / close dispatch — too
+     *  many in a row means we're stuck and should abort. */
+    private int  bankFailCount;
+    /** Consecutive Skillmulti Space-presses without the dialog closing —
+     *  switch to the explicit ALL widget click after this many. */
+    private int  cookMenuConfirmAttempts;
+    /** Snapshot of cooked / burnt-in-inventory at the start of the
+     *  current cooking trip. Used so the next banking pass tallies only
+     *  the delta produced this trip, not pre-existing inventory. */
+    private int  tripStartCooked;
+    private int  tripStartBurnt;
+    /** Backoff timestamp for re-entering LIGHTING_FIRE after a failed
+     *  attempt — avoids hammering the same flow if the engine swallows
+     *  our use-mode click. */
+    private long lightingBackoffUntilMs;
+
+    /** Max retries before a banking sub-step (open / deposit / withdraw /
+     *  close) gives up and aborts. */
+    private static final int BANK_MAX_FAIL = 3;
+    /** After this many Space-press attempts that don't close Skillmulti,
+     *  fall back to clicking the ALL widget directly. */
+    private static final int COOK_MENU_FALLBACK_AFTER = 2;
+    /** The bank widget can be open for up to ~600ms before the
+     *  ItemContainer is populated. We wait at least this long after
+     *  detecting bank-open before treating "item not in bank" as a
+     *  hard miss. */
+    private static final long BANK_LOAD_GRACE_MS = 1500;
+
+    public CookingScript(Client client, ClientThread clientThread,
+                         HumanizedInputDispatcher dispatcher,
+                         TransportResolver resolver)
+    {
+        this.client = client;
+        this.clientThread = clientThread;
+        this.dispatcher = dispatcher;
+        this.walker = new UniversalWalker(client, clientThread, dispatcher, resolver);
+        this.bank = new BankInteraction(client, clientThread, dispatcher);
+        this.cook = new CookingInteraction(client, clientThread, dispatcher);
+    }
+
+    public void setLocation(CookingLocation l) { location.set(l); }
+    public void setRawFoodId(int id) { rawFoodId.set(id); }
+    public CookingLocation location() { return location.get(); }
+    public int rawFoodId() { return rawFoodId.get(); }
+    public State state() { return state.get(); }
+    public String status() { return status.get(); }
+    public int cookedCount() { return cookedCount.get(); }
+    public int burntCount() { return burntCount.get(); }
+
+    public void start()
+    {
+        // A worker may still be unwinding from a previous stop() — refuse
+        // to start a second one before the first is fully gone.
+        Thread existing = worker.get();
+        if (existing != null && existing.isAlive())
+        {
+            status.set("already running");
+            return;
+        }
+        if (!running.compareAndSet(false, true)) return;
+        if (location.get() == null)
+        {
+            status.set("no location selected — abort");
+            running.set(false);
+            return;
+        }
+        if (rawFoodId.get() <= 0)
+        {
+            status.set("no food selected — abort");
+            running.set(false);
+            return;
+        }
+        State decided = decideResume();
+        log.info("cook: resume → {} ({})", decided, status.get());
+        setState(decided);
+        if (decided == State.IDLE || decided == State.ABORTED)
+        {
+            running.set(false);
+            return;
+        }
+        // Snapshot pre-trip cooked/burnt counts so we tally only the
+        // delta this run produces (avoids over-counting on resume with
+        // existing inventory).
+        snapshotTripBaseline();
+        Thread t = new Thread(this::tickLoop, "cooking-script");
+        t.setDaemon(true);
+        worker.set(t);
+        t.start();
+    }
+
+    public void stop()
+    {
+        running.set(false);
+        Thread t = worker.getAndSet(null);
+        if (t != null)
+        {
+            t.interrupt();
+            try { t.join(2000); } catch (InterruptedException ie) { Thread.currentThread().interrupt(); }
+        }
+        setState(State.IDLE);
+        status.set("stopped");
+    }
+
+    private State decideResume()
+    {
+        CookingLocation l = location.get();
+        WorldPoint here = onClient(() -> {
+            Player p = client.getLocalPlayer();
+            return p == null ? null : p.getWorldLocation();
+        });
+        if (here == null) { status.set("no player — abort"); return State.ABORTED; }
+        boolean atBank = areaContains(l.bankArea(), here);
+        boolean atCook = areaContains(l.cookArea(), here);
+        int raw = inventoryAmountSafe(rawFoodId.get());
+        if (atBank)
+        {
+            // Even if we have raw food, do a banking pass to ensure
+            // tinderbox + raw food are sufficient before walking to
+            // cook. The banking pass is idempotent.
+            status.set("starting at bank");
+            return State.BANKING;
+        }
+        if (atCook && raw > 0)
+        {
+            status.set("starting at cook spot — beginning to cook");
+            return l.kind() == CookingLocation.SourceKind.FIRE_FROM_LOGS
+                ? State.LIGHTING_FIRE : State.COOKING;
+        }
+        // Mid-route — figure out which direction.
+        if (raw > 0) { status.set("mid-route — heading to cook"); return State.WALK_TO_COOK; }
+        status.set("mid-route — heading to bank");
+        return State.WALK_TO_BANK;
+    }
+
+    private void tickLoop()
+    {
+        try
+        {
+            while (running.get() && !Thread.currentThread().isInterrupted())
+            {
+                // Player gone (loading screen, hopped, disconnected) —
+                // hold; don't tick the FSM into a null-state cascade.
+                WorldPoint here = onClient(() -> {
+                    Player p = client.getLocalPlayer();
+                    return p == null ? null : p.getWorldLocation();
+                });
+                if (here == null)
+                {
+                    status.set("waiting for player (loading / disconnect?)");
+                    Thread.sleep(TICK_MS);
+                    continue;
+                }
+
+                // The level-up popup interrupts everything else — dismiss
+                // first, then run state-specific logic on the next tick.
+                if (safeDismissLevelUp())
+                {
+                    Thread.sleep(TICK_MS);
+                    continue;
+                }
+                switch (state.get())
+                {
+                    case BANKING:        tickBanking();        break;
+                    case WALK_TO_COOK:   tickWalk(true);       break;
+                    case LIGHTING_FIRE:  tickLightingFire();   break;
+                    case COOKING:        tickCooking();        break;
+                    case WALK_TO_BANK:   tickWalk(false);      break;
+                    case ABORTED:
+                    case IDLE:
+                    default:             running.set(false);   break;
+                }
+                Thread.sleep(TICK_MS);
+            }
+        }
+        catch (InterruptedException ie)
+        {
+            Thread.currentThread().interrupt();
+        }
+        finally
+        {
+            running.set(false);
+        }
+    }
+
+    // ────────────────────────────────────────────────────────────────
+    // BANKING
+    // ────────────────────────────────────────────────────────────────
+
+    /**
+     * Banking flow:
+     * <ol>
+     *   <li>Walk to bank area if not there.</li>
+     *   <li>If bank not open → click random booth.</li>
+     *   <li>If bank open and inventory has cooked / burnt food → deposit.</li>
+     *   <li>If bank open and inventory needs tinderbox / raw food → withdraw.
+     *       Missing in bank ⇒ ABORT (close bank first).</li>
+     *   <li>If bank open and inventory ready → close bank, transition to
+     *       WALK_TO_COOK.</li>
+     * </ol>
+     * Paced at ≥ {@link #BANK_PACE_MS} between any two dispatches.
+     */
+    private void tickBanking() throws InterruptedException
+    {
+        CookingLocation l = location.get();
+        if (!playerInArea(l.bankArea()))
+        {
+            UniversalWalker.Status s = walker.tick(l.cookToBank());
+            status.set("bank: walking to bank (" + s + ")");
+            if (s == UniversalWalker.Status.ARRIVED) walker.reset();
+            else if (s == UniversalWalker.Status.STUCK
+                  || s == UniversalWalker.Status.ERROR) abortWithStatus("walker stuck during BANKING");
+            return;
+        }
+
+        long now = System.currentTimeMillis();
+        long since = lastBankActionAtMs == 0 ? Long.MAX_VALUE : now - lastBankActionAtMs;
+        if (since < BANK_PACE_MS)
+        {
+            status.set("bank: pacing (" + since + "ms)");
+            return;
+        }
+
+        boolean open = onClient(bank::isBankOpen);
+        if (!open)
+        {
+            // Reset bank-loaded grace timer; we're about to (re)open.
+            bankOpenedAtMs = 0L;
+            status.set("bank: opening");
+            dispatcher.lastErrorMessage();   // clear pre-existing error
+            boolean clicked = bank.clickBankBoothRandom();
+            if (clicked)
+            {
+                lastBankActionAtMs = now;
+                bankFailCount = 0;
+            }
+            else
+            {
+                bankFailCount++;
+                if (bankFailCount > BANK_MAX_FAIL)
+                    abortWithStatus("no bank booth in range — aborting");
+            }
+            return;
+        }
+        // Bank is open. Track when we first saw it open this entry so
+        // the missing-item check can wait for the container to populate.
+        if (bankOpenedAtMs == 0L) bankOpenedAtMs = now;
+
+        // Surface any dispatch error from the previous bank action and
+        // count consecutive failures.
+        String dispErr = dispatcher.lastErrorMessage();
+        if (dispErr != null)
+        {
+            log.info("cook bank: dispatcher error '{}'", dispErr);
+            bankFailCount++;
+            if (bankFailCount > BANK_MAX_FAIL)
+            {
+                abortWithBankClosed("bank dispatcher errors > " + BANK_MAX_FAIL + " ('" + dispErr + "') — aborting");
+                return;
+            }
+        }
+
+        // Tally cooked/burnt for the trip we just finished — only on
+        // the FIRST bank-open tick so we don't re-count after a deposit.
+        if (lastInventoryChangeAtMs == 0L) tallyCookedBurnt();
+
+        boolean hasCooked = inventoryHasAnyCooked();
+        boolean hasBurnt  = inventoryHasAnyBurnt();
+        if (hasCooked || hasBurnt)
+        {
+            status.set("bank: depositing inventory");
+            if (clickDepositInventoryThreadSafe())
+            {
+                lastBankActionAtMs = now;
+                lastInventoryChangeAtMs = now;   // mark "we did something"
+                bankFailCount = 0;
+            }
+            else
+            {
+                bankFailCount++;
+            }
+            return;
+        }
+
+        int rawId = rawFoodId.get();
+        int rawInInv = cook.inventoryAmount(rawId);
+        boolean needTinderbox = l.kind() == CookingLocation.SourceKind.FIRE_FROM_LOGS
+            && cook.inventoryAmount(ItemID.TINDERBOX) <= 0;
+
+        // Before reading bank contents, ensure the container has loaded.
+        // If not loaded yet AND we've been waiting < grace period, retry.
+        boolean ready = bank.bankReady();
+        if (!ready && (now - bankOpenedAtMs) < BANK_LOAD_GRACE_MS)
+        {
+            status.set("bank: waiting for container to populate");
+            return;
+        }
+        if (!ready)
+        {
+            abortWithBankClosed("bank container did not populate in " + BANK_LOAD_GRACE_MS + "ms — aborting");
+            return;
+        }
+
+        if (needTinderbox)
+        {
+            if (!bank.bankContainsItem(ItemID.TINDERBOX))
+            {
+                abortWithBankClosed("bank missing Tinderbox — aborting");
+                return;
+            }
+            status.set("bank: withdrawing tinderbox");
+            if (bank.withdrawOne(ItemID.TINDERBOX))
+            {
+                lastBankActionAtMs = now;
+                bankFailCount = 0;
+            }
+            else bankFailCount++;
+            return;
+        }
+
+        if (rawInInv == 0)
+        {
+            if (!bank.bankContainsItem(rawId))
+            {
+                CookingFood.Entry e = CookingFood.byRawId(rawId);
+                String name = e == null ? ("id=" + rawId) : e.label;
+                abortWithBankClosed("bank missing " + name + " — aborting");
+                return;
+            }
+            status.set("bank: withdrawing raw food");
+            if (bank.withdrawAll(rawId))
+            {
+                lastBankActionAtMs = now;
+                bankFailCount = 0;
+            }
+            else bankFailCount++;
+            return;
+        }
+
+        // Inventory is ready — close bank and head out.
+        status.set("bank: closing");
+        if (bank.closeBank())
+        {
+            lastBankActionAtMs = now;
+            bankFailCount = 0;
+        }
+        else bankFailCount++;
+        boolean stillOpen = onClient(bank::isBankOpen);
+        if (!stillOpen)
+        {
+            // Snapshot a fresh trip baseline now that we leave the bank.
+            snapshotTripBaseline();
+            setState(State.WALK_TO_COOK);
+        }
+    }
+
+    /** Read the deposit-inv widget on the client thread, dispatch the
+     *  click off-thread. {@link BankInteraction#clickDepositInventory}
+     *  reads the widget on the caller's thread, which trips the engine's
+     *  client-thread assertion under -ea. */
+    private boolean clickDepositInventoryThreadSafe() throws InterruptedException
+    {
+        Rectangle b = onClient(() -> {
+            Widget w = client.getWidget(InterfaceID.Bankmain.DEPOSITINV);
+            if (w == null || w.isHidden()) return null;
+            Rectangle r = w.getBounds();
+            return r == null || r.isEmpty() ? null : r;
+        });
+        if (b == null) return false;
+        dispatcher.clickCanvas(b.x + b.width / 2, b.y + b.height / 2);
+        return true;
+    }
+
+    /** Close the bank (best effort) then transition to ABORTED with
+     *  the given status. Used for "missing item in bank" paths so we
+     *  don't leave the widget open. */
+    private void abortWithBankClosed(String reason) throws InterruptedException
+    {
+        log.warn("cook: {}", reason);
+        try { if (onClient(bank::isBankOpen)) bank.closeBank(); }
+        catch (Throwable th) { log.warn("cook: closeBank during abort threw", th); }
+        abortWithStatus(reason);
+    }
+
+    private void abortWithStatus(String s)
+    {
+        status.set(s);
+        setState(State.ABORTED);
+    }
+
+    // ────────────────────────────────────────────────────────────────
+    // WALK_TO_COOK / WALK_TO_BANK
+    // ────────────────────────────────────────────────────────────────
+
+    private void tickWalk(boolean toCook) throws InterruptedException
+    {
+        CookingLocation l = location.get();
+        UniversalWalker.Status st = walker.tick(toCook ? l.bankToCook() : l.cookToBank());
+        status.set((toCook ? "→ cook" : "→ bank") + ": " + st);
+        switch (st)
+        {
+            case ARRIVED:
+                walker.reset();
+                if (toCook)
+                {
+                    setState(l.kind() == CookingLocation.SourceKind.FIRE_FROM_LOGS
+                        ? State.LIGHTING_FIRE : State.COOKING);
+                }
+                else
+                {
+                    setState(State.BANKING);
+                }
+                break;
+            case STUCK:
+            case ERROR:
+                abortWithStatus("walker " + st + " on " + (toCook ? "outbound" : "return"));
+                break;
+            default:
+                break;
+        }
+    }
+
+    // ────────────────────────────────────────────────────────────────
+    // LIGHTING_FIRE
+    // ────────────────────────────────────────────────────────────────
+
+    private void tickLightingFire() throws InterruptedException
+    {
+        CookingLocation l = location.get();
+        // If a Fire is already in range, skip lighting.
+        CookingInteraction.Match fire = cook.findHeatSource(l.heatSourceName());
+        if (fire != null)
+        {
+            status.set("light: existing fire found — cooking");
+            setState(State.COOKING);
+            return;
+        }
+
+        long now = System.currentTimeMillis();
+        if (now < lightingBackoffUntilMs)
+        {
+            status.set("light: backoff (" + (lightingBackoffUntilMs - now) + "ms)");
+            return;
+        }
+
+        // Need to light. If we don't have tinderbox or raw food, head back to bank.
+        if (cook.inventoryAmount(ItemID.TINDERBOX) <= 0)
+        {
+            status.set("light: no tinderbox in inv — back to bank");
+            setState(State.WALK_TO_BANK);
+            return;
+        }
+
+        // Find ground logs near us. If none — wait (logs respawn ~few seconds).
+        // The location config drives which log type to look for; we
+        // never hard-code ItemID.LOGS here.
+        int logsId = l.groundLogsItemId();
+        CookingInteraction.Match logs = cook.findGroundLogs(logsId);
+        if (logs == null)
+        {
+            status.set("light: waiting for log spawn");
+            return;
+        }
+
+        // If we're already firemaking, wait for it to finish + a Fire to appear.
+        if (cook.isFiremaking())
+        {
+            status.set("light: firemaking animation");
+            return;
+        }
+
+        if (lightingStartedAtMs == 0) lightingStartedAtMs = now;
+        if (now - lightingStartedAtMs > LIGHT_TIMEOUT_MS)
+        {
+            // Took too long — back off and retry. Surface dispatcher
+            // error if any, so the panel shows context.
+            String e = dispatcher.lastErrorMessage();
+            log.info("cook: light timeout — backoff (last dispatcher err: {})", e);
+            lightingStartedAtMs = 0L;
+            lightingBackoffUntilMs = now + 2000L;
+            return;
+        }
+
+        if (dispatcher.isBusy())
+        {
+            status.set("light: dispatcher busy");
+            return;
+        }
+        status.set("light: use tinderbox");
+        if (!cook.useTinderbox())
+        {
+            status.set("light: no tinderbox slot found — back to bank");
+            setState(State.WALK_TO_BANK);
+            return;
+        }
+        // Wait briefly for the use-mode to take effect, then click logs.
+        Thread.sleep(400);
+        // Re-resolve logs and verify it's still the SAME tile we just
+        // armed — if the closest logs moved (someone took ours / a new
+        // pile appeared closer) we'd misclick. Bail and retry next tick.
+        CookingInteraction.Match logs2 = cook.findGroundLogs(logsId);
+        if (logs2 == null)
+        {
+            status.set("light: logs despawned during use-mode");
+            lightingBackoffUntilMs = System.currentTimeMillis() + 1000L;
+            return;
+        }
+        if (!logs.tile.equals(logs2.tile))
+        {
+            status.set("light: logs moved during use-mode — retry");
+            lightingBackoffUntilMs = System.currentTimeMillis() + 800L;
+            return;
+        }
+        cook.clickLogsForLight(logs2);
+        // If the dispatcher reported an error during the canvas click,
+        // fall through next tick to retry — don't pile a follow-up
+        // dispatch in this tick.
+    }
+
+    // ────────────────────────────────────────────────────────────────
+    // COOKING
+    // ────────────────────────────────────────────────────────────────
+
+    private void tickCooking() throws InterruptedException
+    {
+        CookingLocation l = location.get();
+        int rawId = rawFoodId.get();
+        long now = System.currentTimeMillis();
+
+        // Confirm "Cook All" if the Skillmulti dialogue is up. Try
+        // Space first; if the dialog doesn't close after a few attempts
+        // (engine-version drift, focus issue), click the ALL widget
+        // explicitly as a fallback.
+        if (cook.isCookMenuOpen())
+        {
+            cookMenuConfirmAttempts++;
+            if (cookMenuConfirmAttempts <= COOK_MENU_FALLBACK_AFTER)
+            {
+                status.set("cook: confirming Cook All (Space)");
+                cook.confirmCookAll();
+            }
+            else
+            {
+                status.set("cook: confirming Cook All (widget click fallback)");
+                cook.clickCookAllWidget();
+            }
+            // Reset stuck timer — opening Skillmulti is progress.
+            // Only reset on the FIRST attempt of this open; if the
+            // dialog stays open across many ticks we want the stuck
+            // timer to eventually trip.
+            if (cookMenuConfirmAttempts == 1) lastInventoryChangeAtMs = now;
+            return;
+        }
+        // Skillmulti closed — reset confirm attempts for the next open.
+        cookMenuConfirmAttempts = 0;
+
+        // Track inventory progress for stuck detection.
+        int raw = cook.inventoryAmount(rawId);
+        if (raw != lastRawCount)
+        {
+            lastRawCount = raw;
+            lastInventoryChangeAtMs = now;
+        }
+        if (lastInventoryChangeAtMs == 0) lastInventoryChangeAtMs = now;
+
+        // Out of raw → done, head to bank.
+        if (raw == 0)
+        {
+            status.set("cook: out of raw food — back to bank");
+            setState(State.WALK_TO_BANK);
+            return;
+        }
+
+        // Heat source missing — for FIRE go re-light, for RANGE walk
+        // back to the cook spot (the range shouldn't move; this handles
+        // wandering off-tile).
+        CookingInteraction.Match heat = cook.findHeatSource(l.heatSourceName());
+        if (heat == null)
+        {
+            if (l.kind() == CookingLocation.SourceKind.FIRE_FROM_LOGS)
+            {
+                status.set("cook: fire died — re-lighting");
+                lightingStartedAtMs = 0;
+                setState(State.LIGHTING_FIRE);
+                return;
+            }
+            status.set("cook: range out of view — walking back");
+            setState(State.WALK_TO_COOK);
+            return;
+        }
+
+        // Currently cooking → wait.
+        if (cook.isCooking())
+        {
+            status.set("cook: cooking (" + raw + " raw left)");
+            // Refresh stuck tracker.
+            return;
+        }
+
+        // Stuck check.
+        if (now - lastInventoryChangeAtMs > COOK_STUCK_MS)
+        {
+            abortWithStatus("cook: no progress for " + COOK_STUCK_MS + "ms");
+            return;
+        }
+
+        if (dispatcher.isBusy())
+        {
+            status.set("cook: dispatcher busy");
+            return;
+        }
+        // Pace cooking dispatches — don't fire two "use food on heat"
+        // sequences within one OSRS tick.
+        if (lastCookActionAtMs > 0 && (now - lastCookActionAtMs) < COOK_PACE_MS)
+        {
+            status.set("cook: pacing (" + (now - lastCookActionAtMs) + "ms)");
+            return;
+        }
+
+        status.set("cook: use raw food on heat source");
+        if (!cook.useRawFood(rawId))
+        {
+            status.set("cook: raw food slot vanished — re-checking");
+            return;
+        }
+        Thread.sleep(400);
+        // Re-resolve heat source after brief wait.
+        CookingInteraction.Match heat2 = cook.findHeatSource(l.heatSourceName());
+        if (heat2 == null)
+        {
+            status.set("cook: heat source vanished mid-use");
+            return;
+        }
+        cook.clickHeatSourceForCook(heat2);
+        lastCookActionAtMs = System.currentTimeMillis();
+    }
+
+    // ────────────────────────────────────────────────────────────────
+    // Helpers
+    // ────────────────────────────────────────────────────────────────
+
+    /** Try to dismiss the level-up popup. Returns true iff a tap was
+     *  dispatched (caller skips the rest of the tick to give the dialog
+     *  one tick to vanish). Wrapped in try/catch so any exotic widget
+     *  state error doesn't kill the loop. */
+    private boolean safeDismissLevelUp()
+    {
+        try { return cook.dismissLevelUp(); }
+        catch (InterruptedException ie) { Thread.currentThread().interrupt(); return false; }
+        catch (Throwable th) { log.warn("cook: dismissLevelUp threw", th); return false; }
+    }
+
+    private boolean inventoryHasAnyCooked() throws InterruptedException
+    {
+        for (CookingFood.Entry e : CookingFood.all())
+        {
+            if (cook.inventoryAmount(e.cookedId) > 0) return true;
+        }
+        return false;
+    }
+
+    private boolean inventoryHasAnyBurnt() throws InterruptedException
+    {
+        for (CookingFood.Entry e : CookingFood.all())
+        {
+            if (cook.inventoryAmount(e.burntId) > 0) return true;
+        }
+        return false;
+    }
+
+    /** Add the trip's cooked / burnt delta to the cumulative totals.
+     *  Calculates {@code current - snapshot} so a resumed script with
+     *  pre-existing cooked food in the inventory doesn't over-count.
+     *  Called on the first BANKING tick after the trip. */
+    private void tallyCookedBurnt() throws InterruptedException
+    {
+        CookingFood.Entry e = CookingFood.byRawId(rawFoodId.get());
+        if (e == null) return;
+        int cookedNow = cook.inventoryAmount(e.cookedId);
+        int burntNow  = cook.inventoryAmount(e.burntId);
+        int dCooked = Math.max(0, cookedNow - tripStartCooked);
+        int dBurnt  = Math.max(0, burntNow  - tripStartBurnt);
+        if (dCooked > 0) cookedCount.addAndGet(dCooked);
+        if (dBurnt  > 0) burntCount.addAndGet(dBurnt);
+    }
+
+    /** Snapshot the inventory's current cooked / burnt count for the
+     *  active food. Reset when transitioning out of BANKING into a
+     *  cook trip so the next tally is a true delta. */
+    private void snapshotTripBaseline()
+    {
+        CookingFood.Entry e = CookingFood.byRawId(rawFoodId.get());
+        if (e == null) { tripStartCooked = 0; tripStartBurnt = 0; return; }
+        try
+        {
+            tripStartCooked = cook.inventoryAmount(e.cookedId);
+            tripStartBurnt  = cook.inventoryAmount(e.burntId);
+        }
+        catch (InterruptedException ie)
+        {
+            Thread.currentThread().interrupt();
+            tripStartCooked = 0;
+            tripStartBurnt = 0;
+        }
+    }
+
+    private int inventoryAmountSafe(int id)
+    {
+        try { return cook.inventoryAmount(id); }
+        catch (InterruptedException ie) { Thread.currentThread().interrupt(); return 0; }
+        catch (Throwable th) { return 0; }
+    }
+
+    private boolean playerInArea(WorldArea area)
+    {
+        WorldPoint here = onClient(() -> {
+            Player p = client.getLocalPlayer();
+            return p == null ? null : p.getWorldLocation();
+        });
+        return here != null && areaContains(area, here);
+    }
+
+    private static boolean areaContains(WorldArea a, WorldPoint p)
+    {
+        return p.getPlane() == a.getPlane()
+            && p.getX() >= a.getX() && p.getX() < a.getX() + a.getWidth()
+            && p.getY() >= a.getY() && p.getY() < a.getY() + a.getHeight();
+    }
+
+    private void setState(State s)
+    {
+        state.set(s);
+        lastBankActionAtMs = 0L;
+        lastCookActionAtMs = 0L;
+        lightingStartedAtMs = 0L;
+        lastInventoryChangeAtMs = 0L;
+        lastRawCount = -1;
+    }
+
+    private <T> T onClient(Supplier<T> s)
+    {
+        java.util.concurrent.atomic.AtomicReference<T> ref = new java.util.concurrent.atomic.AtomicReference<>();
+        java.util.concurrent.CountDownLatch latch = new java.util.concurrent.CountDownLatch(1);
+        clientThread.invokeLater(() -> {
+            try { ref.set(s.get()); }
+            catch (Throwable th) { log.warn("cook: onClient threw", th); }
+            finally { latch.countDown(); }
+        });
+        try
+        {
+            // 2s cap — matches the dispatcher's hop. If the client thread
+            // is wedged we want to surface that as a status update rather
+            // than hang the whole script worker.
+            if (!latch.await(2000, java.util.concurrent.TimeUnit.MILLISECONDS))
+            {
+                log.warn("cook: onClient timed out");
+                return null;
+            }
+        }
+        catch (InterruptedException ie)
+        { Thread.currentThread().interrupt(); return null; }
+        return ref.get();
+    }
+}
