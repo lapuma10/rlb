@@ -77,6 +77,17 @@ public final class BankInteraction
         return w != null && !w.isHidden();
     }
 
+    /** True if the Bank PIN keypad is up. The bot can't enter a PIN
+     *  safely (keystroke pacing matters for that flow); callers should
+     *  abort with a status when this is true rather than continue
+     *  clicking the booth — repeated booth clicks during PIN entry can
+     *  lock the player out for 5 minutes. */
+    public boolean isBankPinUp()
+    {
+        Widget w = client.getWidget(InterfaceID.BankpinKeypad.UNIVERSE);
+        return w != null && !w.isHidden();
+    }
+
     /** Step 1 (legacy / simple variant): find a Banker / Bank booth NPC
      *  and click its convex hull. NPC-only — does not see GameObject
      *  bank booths. Prefer {@link #clickBankBoothRandom} for production
@@ -549,6 +560,12 @@ public final class BankInteraction
             // bank-tags plugin (LayoutManager#setScroll).
             try { client.setVarcIntValue(VarClientID.BANK_SCROLLPOS, target); }
             catch (Throwable ignored) { /* best-effort */ }
+            // Return null this tick — the engine relays out the items
+            // container on the next client tick, so our bounds read
+            // here would still be off-screen. Caller paces and retries;
+            // the next call sees the slot already visible and clicks
+            // the right pixel.
+            return null;
         }
         Rectangle r = match.getBounds();
         if (r == null || r.isEmpty()) return null;

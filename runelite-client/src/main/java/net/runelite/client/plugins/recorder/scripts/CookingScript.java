@@ -347,6 +347,16 @@ public final class CookingScript
             return;
         }
 
+        // Bank PIN keypad up? We don't enter PINs — abort cleanly.
+        // Re-clicking the booth during PIN entry can lock the account
+        // out, which is much worse than just stopping.
+        Boolean pinUp = onClient(bank::isBankPinUp);
+        if (Boolean.TRUE.equals(pinUp))
+        {
+            abortWithStatus("bank PIN required — aborting (enter manually)");
+            return;
+        }
+
         boolean open = onClient(bank::isBankOpen);
         if (!open)
         {
@@ -711,6 +721,25 @@ public final class CookingScript
                 return;
             }
             status.set("cook: range out of view — walking back");
+            setState(State.WALK_TO_COOK);
+            return;
+        }
+
+        // OSRS interaction range cap: the engine refuses object
+        // interactions past ~8 tiles. If the resolved heat source is
+        // further, walk back into the cook area before re-attempting —
+        // otherwise we'd burn the stuck-cook timer firing useless
+        // "use food on heat" sequences.
+        WorldPoint pp = onClient(() -> {
+            Player p = client.getLocalPlayer();
+            return p == null ? null : p.getWorldLocation();
+        });
+        if (pp != null && heat.tile != null
+            && pp.getPlane() == heat.tile.getPlane()
+            && Math.max(Math.abs(pp.getX() - heat.tile.getX()),
+                        Math.abs(pp.getY() - heat.tile.getY())) > 8)
+        {
+            status.set("cook: heat source out of interaction range — walking closer");
             setState(State.WALK_TO_COOK);
             return;
         }

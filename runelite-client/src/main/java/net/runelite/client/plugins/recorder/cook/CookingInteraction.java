@@ -320,11 +320,15 @@ public final class CookingInteraction
      *  use-mode is "Use Tinderbox -&gt; Logs", so a plain canvas click
      *  on the logs hull / tile resolves to it without any menu navigation.
      *
-     *  <p>Returns false if the logs tile no longer projects onto the
-     *  canvas (player walked too far / scene unloaded) — caller retries
-     *  on the next tick. */
+     *  <p>Pans the camera toward the logs before clicking — keeps the
+     *  click target on-screen if the player is mid-rotation. Returns
+     *  false if the logs tile no longer projects onto the canvas
+     *  (player walked too far / scene unloaded) — caller retries on
+     *  the next tick. */
     public boolean clickLogsForLight(Match logsMatch) throws InterruptedException
     {
+        if (logsMatch == null || logsMatch.tile == null) return false;
+        dispatcher.rotateCameraToward(logsMatch.tile);
         Rectangle b = onClient(() -> tileItemBounds(logsMatch));
         if (b == null) return false;
         int cx = b.x + b.width / 2;
@@ -358,10 +362,24 @@ public final class CookingInteraction
     /** Step 2 of cooking: click the heat source (Fire / Range) after
      *  use-mode is engaged on a raw-food slot. Plain canvas click on the
      *  hull — the L-click default is "Use raw-food -&gt; Fire/Range",
-     *  same use-mode semantics as the firemaking step. */
+     *  same use-mode semantics as the firemaking step.
+     *
+     *  <p>Pans the camera toward the heat source if the tile isn't
+     *  already comfortably on-screen — same humanization the
+     *  dispatcher's NPC/object clicks use. Falls back to the tile
+     *  polygon if the hull resolution returns null (some particle-
+     *  effect objects render without a clickable model). */
     public boolean clickHeatSourceForCook(Match heatMatch) throws InterruptedException
     {
-        Rectangle b = onClient(() -> gameObjectBounds(heatMatch));
+        if (heatMatch == null || heatMatch.tile == null) return false;
+        dispatcher.rotateCameraToward(heatMatch.tile);
+        Rectangle b = onClient(() -> {
+            Rectangle hull = gameObjectBounds(heatMatch);
+            if (hull != null) return hull;
+            // Fallback: use the canvas tile poly when the model hull
+            // isn't available (rare, but defensive).
+            return tileItemBounds(heatMatch);
+        });
         if (b == null) return false;
         int cx = b.x + b.width / 2;
         int cy = b.y + b.height / 2;
