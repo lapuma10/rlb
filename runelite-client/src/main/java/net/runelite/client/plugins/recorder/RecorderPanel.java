@@ -34,7 +34,6 @@ import net.runelite.client.plugins.recorder.annotator.RoutesTab;
 import net.runelite.client.plugins.recorder.annotator.WaypointEditor;
 import net.runelite.client.plugins.recorder.combat.ChickenCombatLoop;
 import net.runelite.client.plugins.recorder.debug.DebugOverlay;
-import net.runelite.client.plugins.recorder.farm.ChickenFarmLoop;
 import net.runelite.client.plugins.recorder.farm.RouteWalker;
 import net.runelite.client.plugins.recorder.mining.MiningLoop;
 import net.runelite.client.plugins.recorder.scripts.ChickenFarmV2Script;
@@ -135,7 +134,6 @@ public final class RecorderPanel extends PluginPanel
     private final JLabel chickenStatusLabel = new JLabel("Chicken loop: idle");
     private final JLabel chickenKillsLabel = new JLabel("Kills: 0");
     private ChickenCombatLoop chickenLoop;
-    private ChickenFarmLoop farmLoop;
     // "Chicken farm" tab — hand-coded Lumbridge bank ↔ pen script.
     private LumbridgeBankPenScript lumbyScript;
     // Same tab — V2 (walker-framework version). Optional; both can coexist.
@@ -848,27 +846,22 @@ public final class RecorderPanel extends PluginPanel
      *  {@link #chickenStatusLabel} via the EDT. */
     public void setChickenLoop(ChickenCombatLoop loop) { this.chickenLoop = loop; }
 
-    /** Wire the farm loop. Called by the plugin during startUp if the route
-     *  file loads successfully; stays null (panel reports "unavailable") if
-     *  the route file is missing. */
-    public void setFarmLoop(ChickenFarmLoop fl) { this.farmLoop = fl; }
-
     private void onChickenStart()
     {
-        if (farmLoop == null)
+        if (chickenLoop == null)
         {
-            chickenStatusLabel.setText("Farm loop: unavailable (no route file?)");
+            chickenStatusLabel.setText("Combat: unavailable");
             return;
         }
-        farmLoop.start();
-        chickenStatusLabel.setText("Farm loop: starting");
+        chickenLoop.start();
+        chickenStatusLabel.setText("Combat: starting");
     }
 
     private void onChickenStop()
     {
-        if (farmLoop == null) return;
-        farmLoop.stop();
-        chickenStatusLabel.setText("Farm loop: stopping");
+        if (chickenLoop == null) return;
+        chickenLoop.stop();
+        chickenStatusLabel.setText("Combat: stopping");
     }
 
     // ------------------------------------------------------------------
@@ -1303,33 +1296,15 @@ public final class RecorderPanel extends PluginPanel
         refreshLumby();
     }
 
-    /** Mirror the chicken loop's state into the panel labels. The loop runs
-     *  on a daemon thread; the timer polls (~500ms) so any state change shows
-     *  up promptly without us having to register a listener on the loop.
-     *
-     *  When the farm loop is available it takes precedence; the bare combat
-     *  loop is kept as a fallback (null farm loop) so existing test workflows
-     *  still work. */
+    /** Mirror the bare chicken combat loop's state into the panel labels.
+     *  Used by the Combat tab for ad-hoc combat at the pen — the V1 / V2
+     *  chicken farm scripts have their own combat instance and surface
+     *  status through their own panel sections. */
     private void refreshCombat()
     {
-        if (farmLoop != null)
-        {
-            ChickenFarmLoop.State st = farmLoop.state();
-            chickenStatusLabel.setText("Farm: " + st.name().toLowerCase()
-                + " — " + farmLoop.status());
-            // killCount lives on the bare combat loop (the farm loop drives it
-            // internally). Surface it if we still hold a reference.
-            if (chickenLoop != null)
-                chickenKillsLabel.setText("Kills: " + chickenLoop.killCount());
-            chickenStartBtn.setEnabled(st == ChickenFarmLoop.State.IDLE
-                || st == ChickenFarmLoop.State.ABORTED);
-            chickenStopBtn.setEnabled(st != ChickenFarmLoop.State.IDLE
-                && st != ChickenFarmLoop.State.ABORTED);
-            return;
-        }
         if (chickenLoop == null) return;
         ChickenCombatLoop.State st = chickenLoop.state();
-        chickenStatusLabel.setText("Chicken loop: " + st.name().toLowerCase()
+        chickenStatusLabel.setText("Combat: " + st.name().toLowerCase()
             + " — " + chickenLoop.latestStatus());
         chickenKillsLabel.setText("Kills: " + chickenLoop.killCount());
         chickenStartBtn.setEnabled(st == ChickenCombatLoop.State.IDLE
