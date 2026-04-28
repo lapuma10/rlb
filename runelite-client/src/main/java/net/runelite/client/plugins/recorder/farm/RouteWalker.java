@@ -192,9 +192,11 @@ public final class RouteWalker
 
     /** Pure tile sampler — package-private for tests. Picks a random tile in
      *  {@code bbox} that's in {@code allowed} and passes {@code accept}. Up to
-     *  3*N random rolls, then falls back to a shuffled enumeration of
-     *  {@code allowed} so we always find a tile if one is acceptable.
-     *  Returns null only when no tile in {@code allowed} passes {@code accept}. */
+     *  {@code Math.max(8, 3*N)} random rolls (N = bbox area, so the random
+     *  budget is proportional to how densely the set fills the bbox), then
+     *  falls back to a shuffled enumeration of {@code allowed} so we always
+     *  find a tile if one is acceptable. Returns null only when no tile in
+     *  {@code allowed} passes {@code accept}. */
     static WorldPoint sampleTile(WorldArea bbox, Set<WorldPoint> allowed,
                                  Random rng, Predicate<WorldPoint> accept)
     {
