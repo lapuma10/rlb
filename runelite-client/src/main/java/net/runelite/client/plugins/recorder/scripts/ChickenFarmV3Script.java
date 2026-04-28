@@ -14,6 +14,8 @@ import net.runelite.api.gameval.InterfaceID;
 import net.runelite.api.widgets.Widget;
 import net.runelite.client.callback.ClientThread;
 import net.runelite.client.plugins.recorder.combat.ChickenCombatLoop;
+import net.runelite.client.plugins.recorder.combat.TrainingPlan;
+import net.runelite.client.plugins.recorder.combat.TrainingSession;
 import net.runelite.client.plugins.recorder.farm.BankInteraction;
 import net.runelite.client.plugins.recorder.farm.InventoryUtil;
 import net.runelite.client.plugins.recorder.trail.TrailGraph;
@@ -54,7 +56,7 @@ public final class ChickenFarmV3Script
     private static final long TICK_MS = 600;
     private static final long BANK_PACE_MS = 2000;
 
-    public enum State { IDLE, BANKING, OUTBOUND, AT_PEN, RETURN, ABORTED }
+    public enum State { IDLE, BANKING, OUTBOUND, AT_PEN, RETURN, LOGGING_OFF, ABORTED }
 
     private final Client client;
     private final ClientThread clientThread;
@@ -63,6 +65,9 @@ public final class ChickenFarmV3Script
     private final TrailWalker walker;
     private final BankInteraction bank;
     private final ChickenCombatLoop combat;
+    private final TrainingSession trainingSession;
+    private final LogoutHelper logoutHelper;
+    private volatile TrainingPlan trainingPlan;
 
     private final AtomicReference<State> state = new AtomicReference<>(State.IDLE);
     private final AtomicReference<String> status = new AtomicReference<>("idle");
@@ -83,11 +88,25 @@ public final class ChickenFarmV3Script
         this.walker = new TrailWalker(client, clientThread, dispatcher);
         this.bank = new BankInteraction(client, clientThread, dispatcher);
         this.combat = new ChickenCombatLoop(dispatcher, client, clientThread, PEN_AREA);
+        this.trainingSession = new TrainingSession(client, clientThread, dispatcher);
+        this.logoutHelper = new LogoutHelper(client, clientThread, dispatcher);
     }
 
     public State state() { return state.get(); }
     public String status() { return status.get(); }
     public int killCount() { return combat.killCount(); }
+
+    /** Set the training plan before calling {@link #start()}. Pass
+     *  {@code null} to run in normal (non-training) mode. */
+    public void setTrainingPlan(TrainingPlan plan)
+    {
+        this.trainingPlan = plan;
+    }
+
+    public TrainingPlan trainingPlan()
+    {
+        return trainingPlan;
+    }
 
     public void start()
     {
@@ -100,6 +119,10 @@ public final class ChickenFarmV3Script
                 + "\" and \"" + RETURN_TRAIL_NAME + "\"");
             running.set(false);
             return;
+        }
+        if (trainingPlan != null)
+        {
+            trainingSession.start(trainingPlan);
         }
         State decided = decideResume();
         log.info("v3: resume → {} (status: {})", decided, status.get());
@@ -158,13 +181,14 @@ public final class ChickenFarmV3Script
             {
                 switch (state.get())
                 {
-                    case BANKING:  tickBanking();   break;
-                    case OUTBOUND: tickWalk(true);  break;
-                    case AT_PEN:   tickAtPen();     break;
-                    case RETURN:   tickWalk(false); break;
+                    case BANKING:     tickBanking();      break;
+                    case OUTBOUND:    tickWalk(true);     break;
+                    case AT_PEN:      tickAtPen();        break;
+                    case RETURN:      tickWalk(false);    break;
+                    case LOGGING_OFF: tickLoggingOff();   break;
                     case ABORTED:
                     case IDLE:
-                    default:       running.set(false); break;
+                    default:          running.set(false); break;
                 }
                 Thread.sleep(TICK_MS);
             }
@@ -256,12 +280,33 @@ public final class ChickenFarmV3Script
             if (bank.closeBank()) lastBankActionAtMs = now;
             return;
         }
-        status.set("bank closed — heading to pen");
-        setState(State.OUTBOUND);
+        // !open && empty
+        if (trainingPlan != null && trainingSession.isComplete())
+        {
+            status.set("training done — logging off");
+            setState(State.LOGGING_OFF);
+        }
+        else
+        {
+            status.set("bank closed — heading to pen");
+            setState(State.OUTBOUND);
+        }
     }
 
     private void tickAtPen()
     {
+        if (trainingPlan != null)
+        {
+            trainingSession.tick();
+            if (trainingSession.isComplete())
+            {
+                status.set("training complete — returning to bank");
+                combat.stop();
+                setState(State.RETURN);
+                return;
+            }
+            status.set("training: " + trainingSession.status());
+        }
         if (onClient(() -> InventoryUtil.isInventoryFull(client)))
         {
             status.set("inventory full — RETURN");
@@ -278,6 +323,37 @@ public final class ChickenFarmV3Script
         {
             status.set("combat: " + combat.latestStatus()
                 + " (kills=" + combat.killCount() + ")");
+        }
+    }
+
+    private void tickLoggingOff() throws InterruptedException
+    {
+        // Only click logout when player is idle and out of combat.
+        Boolean idleAndOutOfCombat = onClient(() ->
+        {
+            Player p = client.getLocalPlayer();
+            if (p == null) return false;
+            if (p.getInteracting() != null) return false;
+            return p.getPoseAnimation() == p.getIdlePoseAnimation();
+        });
+        if (!Boolean.TRUE.equals(idleAndOutOfCombat))
+        {
+            status.set("logout: waiting for idle");
+            return;
+        }
+        boolean dispatched = logoutHelper.tryLogout();
+        status.set(dispatched ? "logout: clicked" : "logout: panel not open — retrying");
+        // If player is gone (null) we consider ourselves logged off — stop.
+        WorldPoint here = onClient(() ->
+        {
+            Player p = client.getLocalPlayer();
+            return p == null ? null : p.getWorldLocation();
+        });
+        if (here == null)
+        {
+            status.set("logged off — done");
+            running.set(false);
+            setState(State.IDLE);
         }
     }
 
