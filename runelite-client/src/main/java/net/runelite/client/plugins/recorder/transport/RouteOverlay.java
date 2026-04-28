@@ -8,24 +8,26 @@ import java.awt.Polygon;
 import java.awt.Stroke;
 import java.util.List;
 import java.util.concurrent.atomic.AtomicReference;
+import javax.annotation.Nullable;
 import net.runelite.api.Client;
 import net.runelite.api.Perspective;
 import net.runelite.api.WorldView;
 import net.runelite.api.coords.LocalPoint;
-import net.runelite.api.coords.WorldArea;
 import net.runelite.api.coords.WorldPoint;
 import net.runelite.client.ui.overlay.Overlay;
 import net.runelite.client.ui.overlay.OverlayLayer;
 import net.runelite.client.ui.overlay.OverlayPosition;
 
 /**
- * Paints the in-progress route on the canvas: walk areas as filled
- * rectangles, single-tile walks as outlined tiles, transports as
- * outlined object hulls (or a tile poly when the object isn't loaded).
- * Each waypoint is labelled with its name (when present) and index.
+ * Paints route waypoints on the canvas. Each WALK / WALK_AREA waypoint
+ * draws every tile in its set with a translucent fill + thin outline
+ * (per tile — so irregular shapes render correctly, and the legacy
+ * perimeter-walk bug — drawing across half-tile-offset corners — goes
+ * away). Transports draw their tile poly + verb label.
  *
- * <p>Reads from a swappable {@link AtomicReference} so the panel can
- * push updated route lists without locking.
+ * <p>The currently-selected waypoint (set via {@link #setSelected})
+ * draws with a thicker cyan outline and higher fill alpha so the user
+ * can spot it among the route.
  */
 public final class RouteOverlay extends Overlay
 {
@@ -33,11 +35,15 @@ public final class RouteOverlay extends Overlay
     private static final Color AREA_LINE = new Color(80, 180, 255, 220);
     private static final Color WALK_LINE = new Color(120, 200, 255, 220);
     private static final Color TRANSPORT_LINE = new Color(255, 180, 80, 230);
-    private static final BasicStroke STROKE_2 = new BasicStroke(2f);
+    private static final Color SELECTED_FILL = new Color(80, 220, 255, 110);
+    private static final Color SELECTED_LINE = new Color(80, 220, 255, 255);
     private static final Color LABEL_BG = new Color(0, 0, 0, 180);
+    private static final BasicStroke STROKE_2 = new BasicStroke(2f);
+    private static final BasicStroke STROKE_3 = new BasicStroke(3f);
 
     private final Client client;
     private final AtomicReference<List<Waypoint>> route = new AtomicReference<>(List.of());
+    private final AtomicReference<Waypoint> selected = new AtomicReference<>();
 
     public RouteOverlay(Client client)
     {
@@ -52,6 +58,14 @@ public final class RouteOverlay extends Overlay
         route.set(waypoints == null ? List.of() : List.copyOf(waypoints));
     }
 
+    /** Mark a waypoint as selected so it renders with stronger emphasis.
+     *  Pass {@code null} to clear. The waypoint is matched by reference
+     *  identity — pass the same instance held in the panel's list. */
+    public void setSelected(@Nullable Waypoint wp)
+    {
+        selected.set(wp);
+    }
+
     @Override
     public Dimension render(Graphics2D g)
     {
@@ -59,23 +73,24 @@ public final class RouteOverlay extends Overlay
         if (wv == null) return null;
         List<Waypoint> wps = route.get();
         if (wps.isEmpty()) return null;
+        Waypoint sel = selected.get();
         Stroke prev = g.getStroke();
         for (int i = 0; i < wps.size(); i++)
         {
             Waypoint wp = wps.get(i);
-            String label = (wp.name() == null ? "" : wp.name() + " ") + "#" + i;
+            boolean isSel = wp == sel;
+            String label = (isSel ? "▶ " : "")
+                + (wp.name() == null ? "" : wp.name() + " ") + "#" + i;
             switch (wp.kind())
             {
                 case WALK_AREA:
-                    drawArea(g, wp.area(), label);
-                    break;
                 case WALK:
-                    drawTile(g, wp.tile(), WALK_LINE, label);
+                    drawTileSet(g, wp.tiles(), isSel, label);
                     break;
                 case TRANSPORT:
                 {
                     String verb = wp.verb();
-                    drawTile(g, wp.tile(), TRANSPORT_LINE,
+                    drawTransport(g, wp.tile(), isSel,
                         verb != null ? label + " (" + verb + ")" : label);
                     break;
                 }
@@ -85,68 +100,51 @@ public final class RouteOverlay extends Overlay
         return null;
     }
 
-    private void drawArea(Graphics2D g, WorldArea area, String label)
+    private void drawTileSet(Graphics2D g, java.util.Set<WorldPoint> tiles,
+                             boolean selected, String label)
     {
-        Polygon outline = areaPolygon(area);
-        if (outline == null) return;
-        g.setColor(AREA_FILL);
-        g.fillPolygon(outline);
-        g.setStroke(STROKE_2);
-        g.setColor(AREA_LINE);
-        g.drawPolygon(outline);
-        // Label at the rough centroid of the SW tile.
-        WorldPoint anchor = new WorldPoint(area.getX(), area.getY(), area.getPlane());
-        labelAt(g, anchor, label);
+        WorldView wv = client.getTopLevelWorldView();
+        if (wv == null) return;
+        Color fill = selected ? SELECTED_FILL : AREA_FILL;
+        Color line = selected ? SELECTED_LINE : AREA_LINE;
+        BasicStroke stroke = selected ? STROKE_3 : STROKE_2;
+        WorldPoint labelAnchor = null;
+        for (WorldPoint wp : tiles)
+        {
+            LocalPoint lp = LocalPoint.fromWorld(wv, wp);
+            if (lp == null) continue;
+            Polygon poly = Perspective.getCanvasTilePoly(client, lp);
+            if (poly == null) continue;
+            g.setColor(fill);
+            g.fillPolygon(poly);
+            g.setStroke(stroke);
+            g.setColor(line);
+            g.drawPolygon(poly);
+            // Label on the SW-most tile we successfully projected.
+            if (labelAnchor == null
+                || wp.getX() < labelAnchor.getX()
+                || (wp.getX() == labelAnchor.getX() && wp.getY() < labelAnchor.getY()))
+            {
+                labelAnchor = wp;
+            }
+        }
+        if (labelAnchor != null) labelAt(g, labelAnchor, label);
     }
 
-    private void drawTile(Graphics2D g, WorldPoint wp, Color colour, String label)
+    private void drawTransport(Graphics2D g, WorldPoint wp, boolean selected, String label)
     {
-        Polygon poly = tilePolygon(wp);
+        WorldView wv = client.getTopLevelWorldView();
+        if (wv == null) return;
+        LocalPoint lp = LocalPoint.fromWorld(wv, wp);
+        if (lp == null) return;
+        Polygon poly = Perspective.getCanvasTilePoly(client, lp);
         if (poly == null) return;
-        g.setStroke(STROKE_2);
-        g.setColor(colour);
+        BasicStroke stroke = selected ? STROKE_3 : STROKE_2;
+        Color line = selected ? SELECTED_LINE : TRANSPORT_LINE;
+        g.setStroke(stroke);
+        g.setColor(line);
         g.drawPolygon(poly);
         labelAt(g, wp, label);
-    }
-
-    private Polygon tilePolygon(WorldPoint wp)
-    {
-        WorldView wv = client.getTopLevelWorldView();
-        if (wv == null) return null;
-        LocalPoint lp = LocalPoint.fromWorld(wv, wp);
-        if (lp == null) return null;
-        return Perspective.getCanvasTilePoly(client, lp);
-    }
-
-    private Polygon areaPolygon(WorldArea area)
-    {
-        WorldView wv = client.getTopLevelWorldView();
-        if (wv == null) return null;
-        int x1 = area.getX();
-        int y1 = area.getY();
-        int x2 = area.getX() + area.getWidth() - 1;
-        int y2 = area.getY() + area.getHeight() - 1;
-        int plane = area.getPlane();
-        Polygon poly = new Polygon();
-        // Walk the perimeter — bottom edge L→R, right edge B→T, top edge R→L,
-        // left edge T→B — collecting one canvas point per tile-corner.
-        addPerimeterPoint(poly, wv, x1, y1, plane, false, false);
-        for (int x = x1; x <= x2; x++) addPerimeterPoint(poly, wv, x, y1, plane, true, false);
-        for (int y = y1; y <= y2; y++) addPerimeterPoint(poly, wv, x2, y, plane, true, true);
-        for (int x = x2; x >= x1; x--) addPerimeterPoint(poly, wv, x, y2, plane, false, true);
-        for (int y = y2; y > y1; y--) addPerimeterPoint(poly, wv, x1, y, plane, false, false);
-        return poly.npoints == 0 ? null : poly;
-    }
-
-    private void addPerimeterPoint(Polygon poly, WorldView wv, int x, int y, int plane,
-                                   boolean east, boolean north)
-    {
-        LocalPoint lp = LocalPoint.fromWorld(wv,
-            new WorldPoint(x + (east ? 1 : 0), y + (north ? 1 : 0), plane));
-        if (lp == null) return;
-        net.runelite.api.Point p = Perspective.localToCanvas(client, lp, plane);
-        if (p == null) return;
-        poly.addPoint(p.getX(), p.getY());
     }
 
     private void labelAt(Graphics2D g, WorldPoint wp, String label)
