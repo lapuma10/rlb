@@ -1,6 +1,7 @@
 package net.runelite.client.plugins.recorder.debug;
 
 import net.runelite.api.Client;
+import net.runelite.api.GameState;
 import net.runelite.client.sequence.login.LoginDebugBus;
 import net.runelite.client.ui.overlay.Overlay;
 import net.runelite.client.ui.overlay.OverlayLayer;
@@ -15,14 +16,13 @@ import java.util.ArrayList;
 import java.util.List;
 
 /**
- * Renders the most recent {@code resolveUsername} comparison as a fixed-position
- * panel — current vs. target with per-codepoint hex dump when they fail
- * {@code equalsIgnoreCase}. Stays on screen for {@link #DISPLAY_MS} after the
- * latest publish so a quick login round-trip is still visible.
+ * Compact debug HUD for the most recent {@code resolveUsername} comparison.
+ * Single-line on match (just decision + age); expands with hex dump only on
+ * mismatch. Hidden entirely outside the login flow.
  */
 public final class LoginDebugOverlay extends Overlay
 {
-    private static final long DISPLAY_MS = 60_000L;
+    private static final long DISPLAY_MS = 8_000L;
 
     private final Client client;
 
@@ -37,6 +37,11 @@ public final class LoginDebugOverlay extends Overlay
     @Override
     public Dimension render(Graphics2D g)
     {
+        // Only render while we're actually on the login flow — once in-game
+        // the panel is just noise.
+        GameState gs = client.getGameState();
+        if (gs != GameState.LOGIN_SCREEN && gs != GameState.LOGIN_SCREEN_AUTHENTICATOR) return null;
+
         LoginDebugBus.Snapshot snap = LoginDebugBus.latest();
         if (snap == null) return null;
         long age = System.currentTimeMillis() - snap.timestampMs;
@@ -45,21 +50,22 @@ public final class LoginDebugOverlay extends Overlay
         boolean matches = !snap.current.isEmpty() && snap.current.equalsIgnoreCase(snap.target);
 
         List<String> lines = new ArrayList<>();
-        lines.add("login resolveUsername  (" + (age / 1000) + "s ago)");
-        lines.add("  current : \"" + snap.current + "\"  len=" + snap.current.length());
-        lines.add("  target  : \"" + snap.target + "\"  len=" + snap.target.length());
-        lines.add("  decision: " + snap.decision);
-        if (!matches)
+        if (matches)
         {
-            lines.add("  current hex: " + LoginDebugBus.hexDump(snap.current));
-            lines.add("  target  hex: " + LoginDebugBus.hexDump(snap.target));
-            // Spot-the-difference: first index where they diverge (case-insensitive).
+            // One line: just confirm the match and how long ago.
+            lines.add("login: " + snap.decision + "  (" + (age / 1000) + "s)");
+        }
+        else
+        {
+            lines.add("login mismatch  (" + (age / 1000) + "s)");
+            lines.add("  cur(" + snap.current.length() + "): \"" + snap.current + "\"");
+            lines.add("  tgt(" + snap.target.length() + "): \"" + snap.target + "\"");
             int diff = firstDifferenceIgnoreCase(snap.current, snap.target);
             if (diff >= 0)
             {
-                lines.add("  first diff @ idx " + diff
-                    + ": current=" + cpAt(snap.current, diff)
-                    + "  target=" + cpAt(snap.target, diff));
+                lines.add("  diff@" + diff
+                    + ": cur=" + cpAt(snap.current, diff)
+                    + " tgt=" + cpAt(snap.target, diff));
             }
         }
         return drawPanel(g, 8, 8, lines, matches);

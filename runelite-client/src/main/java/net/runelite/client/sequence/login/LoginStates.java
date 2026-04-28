@@ -255,9 +255,9 @@ public final class LoginStates
 
     static final double PASSWORD_FIELD_X = 0.50;
     static final double PASSWORD_FIELD_Y = 0.54;
-    static final double TAB_TO_PASSWORD_PROBABILITY = 0.7;
     static final long PASSWORD_CLEAR_BASE_MS = 3_500L;
     static final int  PASSWORD_CLEAR_VARIANCE_MS = 800;
+    static final int  LOGIN_FIELD_PASSWORD = 1;
 
     public static StateResult focusPassword(LoginContext ctx)
     {
@@ -266,16 +266,24 @@ public final class LoginStates
             Integer idx = ctx.getDispatcher().runOnClient(ctx.getClient()::getLoginIndex);
             if (idx == null || idx != LOGIN_FORM_INDEX) return new StateResult.Failure(LoginError.FIELD_NOT_CLEARED);
 
-            if (ctx.getRng().nextDouble() < TAB_TO_PASSWORD_PROBABILITY)
-            {
-                ctx.getDispatcher().tapKey(java.awt.event.KeyEvent.VK_TAB);
-            }
-            else
+            // Always click — the previous random TAB (70% odds) only worked if
+            // a form field already had focus, which the match path didn't
+            // guarantee (no prior typing → focus might still be on the now-
+            // hidden "Existing User" widget that NUDGE_INTRO clicked). When
+            // TAB rolled and focus wasn't set, downstream CLEAR_PASSWORD
+            // backspaced into the username field instead.
+            for (int attempt = 0; attempt < 2; attempt++)
             {
                 ctx.getDispatcher().clickCanvas(PASSWORD_FIELD_X, PASSWORD_FIELD_Y);
+                Thread.sleep(120 + ctx.getRng().nextInt(220));
+                Integer focused = ctx.getDispatcher().runOnClient(ctx.getClient()::getCurrentLoginField);
+                if (focused != null && focused == LOGIN_FIELD_PASSWORD)
+                {
+                    return new StateResult.Continue(LoginState.CLEAR_PASSWORD);
+                }
+                log.warn("[login] focusPassword: getCurrentLoginField={} after click, expected 1 — re-clicking", focused);
             }
-            Thread.sleep(120 + ctx.getRng().nextInt(220));
-            return new StateResult.Continue(LoginState.CLEAR_PASSWORD);
+            return new StateResult.Failure(LoginError.FIELD_NOT_CLEARED);
         }
         catch (InterruptedException ie)
         {
@@ -295,6 +303,15 @@ public final class LoginStates
         {
             Integer idx0 = ctx.getDispatcher().runOnClient(ctx.getClient()::getLoginIndex);
             if (idx0 == null || idx0 != LOGIN_FORM_INDEX) return new StateResult.Failure(LoginError.FIELD_NOT_CLEARED);
+            // Don't blindly backspace if focus isn't on the password field —
+            // we'd otherwise wipe the username field. focusPassword should
+            // have set this; if it didn't, abort instead of corrupting state.
+            Integer focused0 = ctx.getDispatcher().runOnClient(ctx.getClient()::getCurrentLoginField);
+            if (focused0 == null || focused0 != LOGIN_FIELD_PASSWORD)
+            {
+                log.warn("[login] clearPassword: focus is on field {} not 1 — aborting before backspaces", focused0);
+                return new StateResult.Failure(LoginError.FIELD_NOT_CLEARED);
+            }
 
             boolean[] aborted = {false};
             java.util.function.Predicate<Void> abortGuard = v -> {
@@ -302,6 +319,8 @@ public final class LoginStates
                 {
                     Integer i = ctx.getDispatcher().runOnClient(ctx.getClient()::getLoginIndex);
                     if (i == null || i != LOGIN_FORM_INDEX) { aborted[0] = true; return true; }
+                    Integer f = ctx.getDispatcher().runOnClient(ctx.getClient()::getCurrentLoginField);
+                    if (f == null || f != LOGIN_FIELD_PASSWORD) { aborted[0] = true; return true; }
                     return false;
                 }
                 catch (Exception e) { aborted[0] = true; return true; }
@@ -342,6 +361,12 @@ public final class LoginStates
         {
             Integer idx = ctx.getDispatcher().runOnClient(ctx.getClient()::getLoginIndex);
             if (idx == null || idx != LOGIN_FORM_INDEX) return new StateResult.Failure(LoginError.FIELD_NOT_CLEARED);
+            Integer focused = ctx.getDispatcher().runOnClient(ctx.getClient()::getCurrentLoginField);
+            if (focused == null || focused != LOGIN_FIELD_PASSWORD)
+            {
+                log.warn("[login] pastePassword: focus is on field {} not 1 — refusing to paste", focused);
+                return new StateResult.Failure(LoginError.FIELD_NOT_CLEARED);
+            }
 
             try { previous = cb.getContents(null); } catch (Exception ignored) {}
 
@@ -394,8 +419,6 @@ public final class LoginStates
         }
     }
 
-    static final double LOGIN_BUTTON_X = 0.50;  // was 0.41 — Login button is centered, not left of center
-    static final double LOGIN_BUTTON_Y = 0.62;  // unchanged — about right vertically
     static final long CLICK_LOGIN_EARLY_GATE_MS = 2_500L;
 
     public static StateResult clickLogin(LoginContext ctx)
@@ -407,34 +430,20 @@ public final class LoginStates
 
             Thread.sleep(200 + ctx.getRng().nextInt(500));
 
-            // Try widget-based detection first
-            java.awt.Point target = ctx.getDispatcher().runOnClient(
-                () -> LoginButtonDetector.clickTarget(ctx.getClient()));
-            if (target != null)
-            {
-                log.info("[login] clicking 'Login' widget at ({}, {})", target.x, target.y);
-                ctx.getDispatcher().clickCanvas(target.x, target.y);
-            }
-            else
-            {
-                log.warn("[login] 'Login' widget not found; falling back to proportional click");
-                ctx.getDispatcher().clickCanvas(LOGIN_BUTTON_X, LOGIN_BUTTON_Y);
-            }
+            // Submit via ENTER instead of clicking the Login widget. The widget
+            // detector returned null on this layout (LoginButtonDetector
+            // matches "Login"/"Log in" text or actions, but the button on the
+            // current login interface presents as a graphic with neither),
+            // and the proportional fallback at (0.50, 0.62) didn't land on
+            // the button either. ENTER is canvas-size-agnostic and is what a
+            // keyboard-first user would do.
+            log.info("[login] submitting via ENTER");
+            ctx.getDispatcher().tapKey(java.awt.event.KeyEvent.VK_ENTER);
 
             if (waitForClickLanded(ctx)) return new StateResult.Continue(LoginState.AWAIT_LOGGED_IN);
 
-            log.info("[login] CLICK_LOGIN gate timed out — re-clicking once");
-            // Re-resolve target in case layout shifted
-            java.awt.Point retarget = ctx.getDispatcher().runOnClient(
-                () -> LoginButtonDetector.clickTarget(ctx.getClient()));
-            if (retarget != null)
-            {
-                ctx.getDispatcher().clickCanvas(retarget.x, retarget.y);
-            }
-            else
-            {
-                ctx.getDispatcher().clickCanvas(LOGIN_BUTTON_X, LOGIN_BUTTON_Y);
-            }
+            log.info("[login] submit gate timed out — re-pressing ENTER once");
+            ctx.getDispatcher().tapKey(java.awt.event.KeyEvent.VK_ENTER);
             return new StateResult.Continue(LoginState.AWAIT_LOGGED_IN);
         }
         catch (InterruptedException ie)
@@ -466,6 +475,10 @@ public final class LoginStates
                 net.runelite.api.GameState gs = ctx.getDispatcher().runOnClient(ctx.getClient()::getGameState);
                 if (gs == net.runelite.api.GameState.LOGGED_IN) return new StateResult.Continue(LoginState.AWAIT_WELCOME);
                 if (gs == net.runelite.api.GameState.CONNECTION_LOST) return new StateResult.Failure(LoginError.CONNECTION_TIMEOUT);
+                if (gs == net.runelite.api.GameState.LOGIN_SCREEN_AUTHENTICATOR)
+                {
+                    return new StateResult.Failure(LoginError.AUTH_REQUIRED);
+                }
 
                 // Check for login error banner — best-effort. Widget ID is TBD per
                 // spec §13; we use loginIndex==2 (still on form) + bannerText to

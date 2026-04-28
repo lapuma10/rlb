@@ -55,6 +55,7 @@ import javax.swing.BorderFactory;
 import javax.swing.Box;
 import javax.swing.BoxLayout;
 import javax.swing.DefaultListModel;
+import javax.swing.Icon;
 import javax.swing.JButton;
 import javax.swing.JComponent;
 import javax.swing.JLabel;
@@ -66,15 +67,24 @@ import javax.swing.JScrollPane;
 import javax.swing.JTabbedPane;
 import javax.swing.JTextField;
 import javax.swing.JViewport;
-import javax.swing.ListSelectionModel;
 import javax.swing.SwingUtilities;
 import javax.swing.Timer;
+import java.awt.BasicStroke;
 import java.awt.BorderLayout;
+import java.awt.Color;
+import java.awt.Component;
+import java.awt.Cursor;
 import java.awt.Dimension;
 import java.awt.FlowLayout;
+import java.awt.Graphics;
+import java.awt.Graphics2D;
+import java.awt.Insets;
 import java.awt.Point;
+import java.awt.RenderingHints;
 import java.awt.event.ActionEvent;
 import java.awt.event.KeyEvent;
+import java.awt.event.MouseAdapter;
+import java.awt.event.MouseEvent;
 import java.io.IOException;
 import java.nio.file.Path;
 import java.util.ArrayList;
@@ -113,10 +123,10 @@ public final class RecorderPanel extends PluginPanel
     private final JButton walkToMarkBtn = new JButton("Walk to mark");
     private final JButton clearMarkBtn = new JButton("Clear");
     private final JLabel markedLabel = new JLabel("Marked: (none)");
-    private final DefaultListModel<String> credModel = new DefaultListModel<>();
-    private final JList<String> credList = new JList<>(credModel);
-    private final JButton addBtn = new JButton("Add…");
-    private final JButton deleteBtn = new JButton("Delete");
+    private final JPanel credListPanel = new JPanel();
+    private final java.util.List<String> currentUsernames = new java.util.ArrayList<>();
+    private String selectedUsername = null;
+    private final JButton addCornerBtn = new JButton("+");
     private final JButton loginBtn = new JButton("Log in");
     private final JButton dumpBtn = new JButton("Debug: dump open widgets");
     private final JLabel loginStatus = new JLabel(" ");
@@ -712,13 +722,21 @@ public final class RecorderPanel extends PluginPanel
         JPanel panel = new JPanel(new BorderLayout(4, 4));
         panel.setBorder(BorderFactory.createTitledBorder("Login"));
 
-        credList.setSelectionMode(ListSelectionModel.SINGLE_SELECTION);
-        credList.setVisibleRowCount(4);
-        JScrollPane scroll = new JScrollPane(credList);
+        // Header: "Saved characters:" + corner "+" button.
+        addCornerBtn.setMargin(new Insets(0, 8, 0, 8));
+        addCornerBtn.setToolTipText("Add credential");
+        addCornerBtn.addActionListener(e -> onAddCredential());
+        JPanel header = new JPanel(new BorderLayout(4, 0));
+        header.add(new JLabel("Saved characters:"), BorderLayout.CENTER);
+        header.add(addCornerBtn, BorderLayout.EAST);
 
+        // Credential rows go directly into a vertical box — no JScrollPane,
+        // no scrollbar. With per-row trash/edit icons we don't expect a
+        // long list.
+        credListPanel.setLayout(new BoxLayout(credListPanel, BoxLayout.Y_AXIS));
+
+        // Bottom: login/stop, status, dump.
         JPanel buttons = new JPanel(new FlowLayout(FlowLayout.LEFT, 4, 0));
-        buttons.add(addBtn);
-        buttons.add(deleteBtn);
         buttons.add(loginBtn);
         buttons.add(stopBtn);
 
@@ -727,19 +745,187 @@ public final class RecorderPanel extends PluginPanel
         south.add(loginStatus, BorderLayout.CENTER);
         south.add(dumpBtn, BorderLayout.SOUTH);
 
-        panel.add(new JLabel("Saved characters:"), BorderLayout.NORTH);
-        panel.add(scroll, BorderLayout.CENTER);
+        panel.add(header, BorderLayout.NORTH);
+        panel.add(credListPanel, BorderLayout.CENTER);
         panel.add(south, BorderLayout.SOUTH);
 
-        addBtn.addActionListener(e -> onAddCredential());
-        deleteBtn.addActionListener(e -> onDeleteCredential());
         loginBtn.addActionListener(e -> onLogin());
         stopBtn.addActionListener(e -> onStopLogin());
         dumpBtn.addActionListener(e -> onDumpWidgets());
 
-        credList.addListSelectionListener(e -> updateButtons());
         updateButtons();
         return panel;
+    }
+
+    private static final int CRED_ROW_HEIGHT = 26;
+    private static final int CRED_ICON_SIZE = 14;
+
+    /** Rebuild the credential rows from {@link #currentUsernames}. Each row is
+     *  a clickable JPanel that selects the username; per-row buttons handle
+     *  edit and delete. Must run on the EDT. */
+    private void rebuildCredRows()
+    {
+        credListPanel.removeAll();
+        if (currentUsernames.isEmpty())
+        {
+            JLabel empty = new JLabel("(no credentials saved)");
+            empty.setBorder(BorderFactory.createEmptyBorder(4, 6, 4, 6));
+            empty.setForeground(Color.GRAY);
+            empty.setAlignmentX(Component.LEFT_ALIGNMENT);
+            credListPanel.add(empty);
+        }
+        else
+        {
+            for (String username : currentUsernames)
+            {
+                credListPanel.add(buildCredRow(username));
+            }
+        }
+        // Push everything to the top — without this glue, BoxLayout.Y_AXIS
+        // stretches the last row to fill the tab.
+        credListPanel.add(Box.createVerticalGlue());
+        credListPanel.revalidate();
+        credListPanel.repaint();
+    }
+
+    private JPanel buildCredRow(final String username)
+    {
+        final JPanel row = new JPanel(new BorderLayout(2, 0));
+        row.setBorder(BorderFactory.createEmptyBorder(2, 6, 2, 2));
+        row.setCursor(Cursor.getPredefinedCursor(Cursor.HAND_CURSOR));
+        // Cap height so BoxLayout.Y_AXIS doesn't stretch this row to fill
+        // the rest of the tab.
+        row.setMaximumSize(new Dimension(Integer.MAX_VALUE, CRED_ROW_HEIGHT));
+        row.setPreferredSize(new Dimension(0, CRED_ROW_HEIGHT));
+        row.setAlignmentX(Component.LEFT_ALIGNMENT);
+        boolean selected = username.equals(selectedUsername);
+        row.setOpaque(true);
+        row.setBackground(selected
+            ? javax.swing.UIManager.getColor("List.selectionBackground")
+            : credListPanel.getBackground());
+
+        JLabel nameLabel = new JLabel(username);
+        nameLabel.setForeground(selected
+            ? javax.swing.UIManager.getColor("List.selectionForeground")
+            : credListPanel.getForeground());
+        row.add(nameLabel, BorderLayout.CENTER);
+
+        JButton editBtn = new JButton(new PencilIcon(CRED_ICON_SIZE));
+        JButton delBtn  = new JButton(new TrashIcon(CRED_ICON_SIZE));
+        for (JButton b : new JButton[]{editBtn, delBtn})
+        {
+            b.setMargin(new Insets(0, 4, 0, 4));
+            b.setFocusable(false);
+            b.setOpaque(false);
+            b.setContentAreaFilled(false);
+            b.setBorderPainted(false);
+            b.setCursor(Cursor.getPredefinedCursor(Cursor.HAND_CURSOR));
+        }
+        editBtn.setToolTipText("Edit credential");
+        delBtn.setToolTipText("Delete credential");
+        editBtn.addActionListener(e -> onEditCredential(username));
+        delBtn.addActionListener(e -> onDeleteCredential(username));
+
+        JPanel actions = new JPanel(new FlowLayout(FlowLayout.RIGHT, 0, 0));
+        actions.setOpaque(false);
+        actions.add(editBtn);
+        actions.add(delBtn);
+        row.add(actions, BorderLayout.EAST);
+
+        // Click anywhere in the row (outside the action buttons) selects.
+        MouseAdapter selectOnClick = new MouseAdapter()
+        {
+            @Override public void mouseClicked(MouseEvent e) { setSelectedUsername(username); }
+        };
+        row.addMouseListener(selectOnClick);
+        nameLabel.addMouseListener(selectOnClick);
+
+        return row;
+    }
+
+    /** Simple pencil drawn with Graphics2D — no PNG asset needed. */
+    private static final class PencilIcon implements Icon
+    {
+        private final int size;
+        PencilIcon(int size) { this.size = size; }
+        @Override public int getIconWidth()  { return size; }
+        @Override public int getIconHeight() { return size; }
+        @Override public void paintIcon(Component c, Graphics g, int x, int y)
+        {
+            Graphics2D g2 = (Graphics2D) g.create();
+            try
+            {
+                g2.setRenderingHint(RenderingHints.KEY_ANTIALIASING, RenderingHints.VALUE_ANTIALIAS_ON);
+                g2.setColor(c.getForeground());
+                g2.setStroke(new BasicStroke(1.4f));
+                int pad = Math.max(1, size / 7);
+                int x0 = x + pad,         y0 = y + size - pad;
+                int x1 = x + size - pad,  y1 = y + pad;
+                // Pencil shaft (diagonal).
+                g2.drawLine(x0, y0, x1, y1);
+                // Tip — short perpendicular nick at the upper-right end.
+                int nick = Math.max(2, size / 5);
+                g2.drawLine(x1, y1, x1 - nick, y1 + 1);
+                g2.drawLine(x1, y1, x1 - 1,    y1 + nick);
+                // Eraser/cap — short perpendicular at the lower-left end.
+                g2.drawLine(x0, y0, x0 + nick, y0 - 1);
+                g2.drawLine(x0, y0, x0 + 1,    y0 - nick);
+            }
+            finally { g2.dispose(); }
+        }
+    }
+
+    /** Simple trash can drawn with Graphics2D — no PNG asset needed. */
+    private static final class TrashIcon implements Icon
+    {
+        private final int size;
+        TrashIcon(int size) { this.size = size; }
+        @Override public int getIconWidth()  { return size; }
+        @Override public int getIconHeight() { return size; }
+        @Override public void paintIcon(Component c, Graphics g, int x, int y)
+        {
+            Graphics2D g2 = (Graphics2D) g.create();
+            try
+            {
+                g2.setRenderingHint(RenderingHints.KEY_ANTIALIASING, RenderingHints.VALUE_ANTIALIAS_ON);
+                g2.setColor(c.getForeground());
+                g2.setStroke(new BasicStroke(1.2f));
+                int pad     = Math.max(1, size / 8);
+                int lidY    = y + pad + 1;
+                int bodyTop = lidY + 2;
+                int bodyBot = y + size - pad;
+                int leftX   = x + pad + 1;
+                int rightX  = x + size - pad - 1;
+                // Lid handle (small arc at top center).
+                int handleW = Math.max(3, size / 3);
+                g2.drawLine(x + size/2 - handleW/2, lidY - 2,
+                            x + size/2 + handleW/2, lidY - 2);
+                // Lid (horizontal line spanning the full width).
+                g2.drawLine(x + pad, lidY, x + size - pad, lidY);
+                // Body sides.
+                g2.drawLine(leftX,  bodyTop, leftX  + 1, bodyBot);
+                g2.drawLine(rightX, bodyTop, rightX - 1, bodyBot);
+                // Body bottom.
+                g2.drawLine(leftX + 1, bodyBot, rightX - 1, bodyBot);
+                // Inner vertical bars.
+                int midX = x + size/2;
+                g2.drawLine(midX, bodyTop + 2, midX, bodyBot - 2);
+                int innerL = leftX + 2;
+                int innerR = rightX - 2;
+                g2.drawLine(innerL, bodyTop + 2, innerL, bodyBot - 2);
+                g2.drawLine(innerR, bodyTop + 2, innerR, bodyBot - 2);
+            }
+            finally { g2.dispose(); }
+        }
+    }
+
+    private void setSelectedUsername(String username)
+    {
+        if (java.util.Objects.equals(selectedUsername, username)) return;
+        selectedUsername = username;
+        persistLastSelected(username);
+        rebuildCredRows();
+        updateButtons();
     }
 
     /** Wire the debug overlay so the panel can clear/set its marked tile.
@@ -980,11 +1166,10 @@ public final class RecorderPanel extends PluginPanel
 
     private void updateButtons()
     {
-        boolean hasSel = credList.getSelectedIndex() >= 0;
+        boolean hasSel = selectedUsername != null;
         boolean inFlight = loginInFlight.get();
-        deleteBtn.setEnabled(hasSel && !inFlight);
         loginBtn.setEnabled(hasSel && !inFlight);
-        addBtn.setEnabled(!inFlight);
+        addCornerBtn.setEnabled(!inFlight);
         stopBtn.setEnabled(inFlight);
     }
 
@@ -1005,11 +1190,15 @@ public final class RecorderPanel extends PluginPanel
                 return;
             }
             String last = readLastSelected();
+            final java.util.List<String> sortedUsernames = new java.util.ArrayList<>(usernames);
+            java.util.Collections.sort(sortedUsernames, String.CASE_INSENSITIVE_ORDER);
             SwingUtilities.invokeLater(() -> {
-                credModel.clear();
-                usernames.forEach(credModel::addElement);
-                if (last != null && credModel.contains(last)) credList.setSelectedValue(last, true);
-                else if (!credModel.isEmpty()) credList.setSelectedIndex(0);
+                currentUsernames.clear();
+                currentUsernames.addAll(sortedUsernames);
+                if (last != null && currentUsernames.contains(last)) selectedUsername = last;
+                else if (!currentUsernames.isEmpty()) selectedUsername = currentUsernames.get(0);
+                else selectedUsername = null;
+                rebuildCredRows();
                 updateButtons();
             });
         }, "creds-refresh");
@@ -1020,7 +1209,7 @@ public final class RecorderPanel extends PluginPanel
     private void onLogin()
     {
         if (loginAssistant == null) { setStatus("login unavailable"); return; }
-        String user = credList.getSelectedValue();
+        String user = selectedUsername;
         if (user == null) { setStatus("no character selected"); return; }
         if (!loginInFlight.compareAndSet(false, true)) return;
         updateButtons();
@@ -1102,8 +1291,8 @@ public final class RecorderPanel extends PluginPanel
                 credentialStore.write(fUser, new String(fPw));
                 SwingUtilities.invokeLater(() -> loginStatus.setText("saved " + fUser));
                 persistLastSelected(fUser);
+                SwingUtilities.invokeLater(() -> selectedUsername = fUser);
                 refreshList();
-                SwingUtilities.invokeLater(() -> credList.setSelectedValue(fUser, true));
             }
             catch (CredentialStoreException cse)
             {
@@ -1119,26 +1308,26 @@ public final class RecorderPanel extends PluginPanel
         t.start();
     }
 
-    private void onDeleteCredential()
+    private void onDeleteCredential(final String username)
     {
-        String sel = credList.getSelectedValue();
-        if (sel == null) return;
+        if (username == null) return;
         int conf = JOptionPane.showConfirmDialog(this,
-            "Delete credentials for '" + sel + "'?",
+            "Delete credentials for '" + username + "'?",
             "Delete credential", JOptionPane.YES_NO_OPTION);
         if (conf != JOptionPane.YES_OPTION) return;
-        final int idx = credList.getSelectedIndex();
         Thread t = new Thread(() -> {
             try
             {
-                credentialStore.delete(sel);
-                SwingUtilities.invokeLater(() -> loginStatus.setText("deleted " + sel));
-                refreshList();
+                credentialStore.delete(username);
                 SwingUtilities.invokeLater(() -> {
-                    int newSize = credModel.size();
-                    if (newSize == 0) { credList.clearSelection(); persistLastSelected(null); }
-                    else credList.setSelectedIndex(Math.min(idx, newSize - 1));
+                    loginStatus.setText("deleted " + username);
+                    if (username.equals(selectedUsername))
+                    {
+                        selectedUsername = null;
+                        persistLastSelected(null);
+                    }
                 });
+                refreshList();
             }
             catch (CredentialStoreException cse)
             {
@@ -1146,6 +1335,99 @@ public final class RecorderPanel extends PluginPanel
                 SwingUtilities.invokeLater(() -> loginStatus.setText("delete failed: " + cse.getMessage()));
             }
         }, "creds-delete");
+        t.setDaemon(true);
+        t.start();
+    }
+
+    /** Edit dialog: username prefilled and editable, password empty. Empty
+     *  password means "don't change the stored password"; non-empty replaces
+     *  it. If username is changed, the entry is renamed (delete + write under
+     *  new key) — this is the only way the underlying store models a rename. */
+    private void onEditCredential(final String oldUsername)
+    {
+        if (oldUsername == null) return;
+        JTextField userField = new JTextField(oldUsername, 20);
+        JPasswordField pwField = new JPasswordField(20);
+        Object[] form = {
+            "Username:", userField,
+            "Password (leave empty to keep current):", pwField
+        };
+        int result = JOptionPane.showConfirmDialog(this, form,
+            "Edit credential", JOptionPane.OK_CANCEL_OPTION, JOptionPane.PLAIN_MESSAGE);
+        if (result != JOptionPane.OK_OPTION) return;
+
+        final String newUser = userField.getText() == null ? "" : userField.getText().trim();
+        final char[] pw = pwField.getPassword();
+        if (newUser.isEmpty())
+        {
+            JOptionPane.showMessageDialog(this, "Username cannot be empty.",
+                "Edit credential", JOptionPane.WARNING_MESSAGE);
+            java.util.Arrays.fill(pw, '\0');
+            return;
+        }
+
+        final boolean usernameChanged = !newUser.equals(oldUsername);
+        final boolean passwordChanged = pw.length > 0;
+        if (!usernameChanged && !passwordChanged)
+        {
+            setStatus("no changes");
+            java.util.Arrays.fill(pw, '\0');
+            return;
+        }
+
+        Thread t = new Thread(() -> {
+            try
+            {
+                if (usernameChanged && credentialStore.list().contains(newUser))
+                {
+                    final int[] over = {-1};
+                    try
+                    {
+                        SwingUtilities.invokeAndWait(() -> over[0] = JOptionPane.showConfirmDialog(this,
+                            "Username '" + newUser + "' already exists. Overwrite it?",
+                            "Overwrite credential", JOptionPane.YES_NO_OPTION));
+                    }
+                    catch (Exception ex) { return; }
+                    if (over[0] != JOptionPane.YES_OPTION) return;
+                }
+
+                String pwToWrite;
+                if (passwordChanged)
+                {
+                    pwToWrite = new String(pw);
+                }
+                else
+                {
+                    // Keep existing password — read it from the store.
+                    pwToWrite = credentialStore.read(oldUsername);
+                    if (pwToWrite == null)
+                    {
+                        SwingUtilities.invokeLater(() -> loginStatus.setText(
+                            "edit failed: existing password unreadable"));
+                        return;
+                    }
+                }
+
+                credentialStore.write(newUser, pwToWrite);
+                if (usernameChanged) credentialStore.delete(oldUsername);
+
+                SwingUtilities.invokeLater(() -> {
+                    loginStatus.setText("updated " + newUser);
+                    selectedUsername = newUser;
+                });
+                persistLastSelected(newUser);
+                refreshList();
+            }
+            catch (CredentialStoreException cse)
+            {
+                log.warn("credential edit failed", cse);
+                SwingUtilities.invokeLater(() -> loginStatus.setText("edit failed: " + cse.getMessage()));
+            }
+            finally
+            {
+                java.util.Arrays.fill(pw, '\0');
+            }
+        }, "creds-edit");
         t.setDaemon(true);
         t.start();
     }

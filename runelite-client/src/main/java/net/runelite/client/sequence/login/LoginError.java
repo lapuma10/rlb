@@ -32,6 +32,7 @@ package net.runelite.client.sequence.login;
  */
 public enum LoginError
 {
+    AUTH_REQUIRED          (false, "2FA / authenticator code required — handle manually"),
     BAD_CREDS              (false, "invalid credentials"),
     BANNED                 (false, "account disabled"),
     LOGIN_LIMIT            (false, "login limit exceeded — wait several minutes"),

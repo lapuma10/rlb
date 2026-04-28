@@ -91,6 +91,13 @@ public final class UniversalWalker
      *  there even if the tile itself isn't standable. */
     public static final int TRANSPORT_ARRIVAL_RADIUS = 1;
 
+    /** Search ring around the gate waypoint when checking for an
+     *  already-open state. When a gate opens, OSRS swings the wall object
+     *  onto an adjacent tile (the closed-state coords no longer host it),
+     *  so a fixed lookup at the waypoint misses the open-state "Close"
+     *  verb. Radius 2 covers single- and double-leaf gate swings. */
+    public static final int OPEN_GATE_SEARCH_RADIUS = 2;
+
     private final Client client;
     private final ClientThread clientThread;
     private final HumanizedInputDispatcher dispatcher;
@@ -592,13 +599,23 @@ public final class UniversalWalker
         }
         if (shouldClick(now))
         {
-            log.info("walker: clicking {} ({}px,{}px) toward step {} {} (sinceClick={}ms, sinceMove={}ms)",
-                pick.viaMinimap ? "minimap" : "canvas",
-                pick.canvasPixel.getX(), pick.canvasPixel.getY(),
-                stepIdx, describe(active),
+            log.info("walker: walking toward tile {} for step {} {} (sinceClick={}ms, sinceMove={}ms)",
+                pick.tile, stepIdx, describe(active),
                 lastClickMs == 0 ? "never" : (now - lastClickMs) + "",
                 now - lastMovementMs);
-            dispatcher.clickCanvas(pick.canvasPixel.getX(), pick.canvasPixel.getY());
+            // Dispatch as WALK — the dispatcher hovers the resolved pixel,
+            // reads the engine's would-be left-click action, and only
+            // L-clicks if it's WALK / SET_HEADING. If a chicken / cow / NPC
+            // is standing on the picked tile (so the L-click would
+            // 'Attack' / 'Talk-to' / 'Take'), it falls back to a minimap
+            // click for the same tile — minimap left-clicks always
+            // resolve to a walk. See HumanizedInputDispatcher.walkClick.
+            ActionRequest req = ActionRequest.builder()
+                .kind(ActionRequest.Kind.WALK)
+                .channel(ActionRequest.Channel.MOUSE)
+                .tile(pick.tile)
+                .build();
+            dispatcher.dispatch(req);
             lastClickTile = pick.tile;
             lastClickMs = now;
             lastClickStepIdx = stepIdx;
@@ -646,12 +663,20 @@ public final class UniversalWalker
             }
             if (shouldClick(now))
             {
-                log.info("walker: walking toward transport {} via {} ({}px,{}px) (sinceClick={}ms, sinceMove={}ms)",
-                    t, pick.viaMinimap ? "minimap" : "canvas",
-                    pick.canvasPixel.getX(), pick.canvasPixel.getY(),
+                log.info("walker: walking toward transport {} via tile {} (sinceClick={}ms, sinceMove={}ms)",
+                    t, pick.tile,
                     lastClickMs == 0 ? "never" : (now - lastClickMs) + "",
                     now - lastMovementMs);
-                dispatcher.clickCanvas(pick.canvasPixel.getX(), pick.canvasPixel.getY());
+                // Same WALK dispatch as handleWalk — verifies the menu
+                // top is 'Walk here' before L-clicking, falls back to
+                // minimap if an NPC / object on the picked tile would
+                // turn the left-click into something else.
+                ActionRequest req = ActionRequest.builder()
+                    .kind(ActionRequest.Kind.WALK)
+                    .channel(ActionRequest.Channel.MOUSE)
+                    .tile(pick.tile)
+                    .build();
+                dispatcher.dispatch(req);
                 lastClickTile = pick.tile;
                 lastClickMs = now;
                 lastClickStepIdx = stepIdx;
@@ -686,15 +711,14 @@ public final class UniversalWalker
             {
                 // Verb missing — gate may already be open (only "Close"
                 // visible) or we resolved the wrong tile. For OPEN, count
-                // the "already open" walk-through as success.
-                if (active.transportKind() == Waypoint.TransportKind.OPEN)
+                // the "already open" walk-through as success. The search
+                // ring matters: when a gate opens, the wall object swings
+                // onto an adjacent tile, so a fixed lookup at the
+                // closed-state waypoint misses it.
+                if (active.transportKind() == Waypoint.TransportKind.OPEN
+                    && hasCloseVerbNear(t))
                 {
-                    TransportResolver.Match closeMatch =
-                        resolver.findTransport(t, "Close");
-                    if (closeMatch != null && closeMatch.isSuccess())
-                    {
-                        return ClickPair.alreadyOpen();
-                    }
+                    return ClickPair.alreadyOpen();
                 }
                 return ClickPair.missing();
             }
@@ -820,6 +844,24 @@ public final class UniversalWalker
         });
         latch.await();
         return ref.get();
+    }
+
+    /** True if any tile within {@link #OPEN_GATE_SEARCH_RADIUS} of
+     *  {@code t} hosts an object with a "Close" verb. Must be called on
+     *  the client thread (delegates to {@link TransportResolver}). */
+    private boolean hasCloseVerbNear(WorldPoint t)
+    {
+        for (int dx = -OPEN_GATE_SEARCH_RADIUS; dx <= OPEN_GATE_SEARCH_RADIUS; dx++)
+        {
+            for (int dy = -OPEN_GATE_SEARCH_RADIUS; dy <= OPEN_GATE_SEARCH_RADIUS; dy++)
+            {
+                WorldPoint p = new WorldPoint(
+                    t.getX() + dx, t.getY() + dy, t.getPlane());
+                TransportResolver.Match m = resolver.findTransport(p, "Close");
+                if (m != null && m.isSuccess()) return true;
+            }
+        }
+        return false;
     }
 
     @Nullable

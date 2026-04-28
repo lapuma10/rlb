@@ -1,7 +1,6 @@
 package net.runelite.client.plugins.recorder.scripts;
 
 import java.awt.Rectangle;
-import java.awt.event.KeyEvent;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.Supplier;
@@ -312,8 +311,7 @@ public final class ChickenFarmV2Script
         if (open && empty)
         {
             status.set("closing bank");
-            closeBankThreadSafe();
-            lastBankActionAtMs = now;
+            if (bank.closeBank()) lastBankActionAtMs = now;
             return;
         }
         // !open && empty — done.
@@ -357,17 +355,6 @@ public final class ChickenFarmV2Script
         if (b == null) return false;
         dispatcher.clickCanvas(b.x + b.width / 2, b.y + b.height / 2);
         return true;
-    }
-
-    /** Same threading care as {@link #clickDepositInventoryThreadSafe}. */
-    private void closeBankThreadSafe() throws InterruptedException
-    {
-        Boolean stillOpen = onClient(() -> {
-            Widget w = client.getWidget(InterfaceID.Bankmain.UNIVERSE);
-            return w != null && !w.isHidden();
-        });
-        if (stillOpen == null || !stillOpen) return;
-        dispatcher.tapKey(KeyEvent.VK_ESCAPE);
     }
 
     // ────────────────────────────────────────────────────────────────

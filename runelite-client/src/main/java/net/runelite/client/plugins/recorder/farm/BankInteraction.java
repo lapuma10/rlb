@@ -34,13 +34,12 @@ import net.runelite.client.sequence.dispatch.HumanizedInputDispatcher;
  * Each step uses the same humanized dispatcher the rest of the system
  * uses.
  *
- * <p><b>Threading:</b> widget probes are read on whatever thread the
- * caller invokes from. The bank-booth scan in {@link #clickBankBoothRandom}
- * routes through {@link ClientThread#invokeLater} internally because it
- * reads NPC + Scene state, but {@link #isBankOpen}, {@link #clickBankBooth},
- * {@link #clickDepositInventory}, {@link #closeBank} read widgets directly
- * — caller is responsible for thread-safety in dev mode (under -ea the
- * engine asserts widget reads happen on the client thread).
+ * <p><b>Threading:</b> {@link #clickBankBoothRandom} and {@link #closeBank}
+ * hop to the client thread internally for widget / scene probes — safe to
+ * call from any worker thread. {@link #isBankOpen}, {@link #clickBankBooth},
+ * {@link #clickDepositInventory} read widgets directly — caller is
+ * responsible for thread-safety in dev mode (under -ea the engine asserts
+ * widget reads happen on the client thread).
  */
 @Slf4j
 public final class BankInteraction
@@ -365,11 +364,88 @@ public final class BankInteraction
         return true;
     }
 
-    /** Step 3: close the bank widget by sending Escape via the dispatcher. */
-    public void closeBank() throws InterruptedException
+    /** Step 3: close the bank widget. Tries the X close button first
+     *  (clicking it via the humanized dispatcher), falls back to Escape
+     *  only if the button can't be located. Returns true iff a click /
+     *  key tap was dispatched.
+     *
+     *  <p>The X close button isn't enumerated in
+     *  {@link InterfaceID.Bankmain} — it's a child of
+     *  {@code Bankmain.UNIVERSE} whose first action is {@code "Close"}
+     *  and which fires {@code MenuAction.CC_OP id=1} on left-click. We
+     *  walk the widget tree to find it.
+     *
+     *  <p>Self-contained on threading: the widget probe hops to the
+     *  client thread internally, the click dispatch goes through the
+     *  dispatcher's own queue. Safe to call from any worker thread. */
+    public boolean closeBank() throws InterruptedException
     {
-        if (!isBankOpen()) return;
+        Rectangle b = onClient(() -> {
+            Widget root = client.getWidget(InterfaceID.Bankmain.UNIVERSE);
+            if (root == null || root.isHidden()) return null;
+            Widget btn = findChildWithAction(root, "Close", 0, 6);
+            if (btn == null) return null;
+            Rectangle r = btn.getBounds();
+            return r == null || r.isEmpty() ? null : r;
+        });
+        if (b != null)
+        {
+            log.info("bank: closing via X button (bounds={})", b);
+            dispatcher.clickCanvas(b.x + b.width / 2, b.y + b.height / 2);
+            return true;
+        }
+        // Fallback — Escape works for some interfaces but the bank
+        // widget tends to swallow it. Logged so we notice if we land
+        // here in production.
+        if (!isBankOpen()) return false;
+        log.warn("bank: X close button not found — falling back to Escape");
         dispatcher.tapKey(KeyEvent.VK_ESCAPE);
+        return true;
+    }
+
+    /** Recursive descent: return the first widget in the subtree of
+     *  {@code parent} whose action list contains {@code wantedAction}.
+     *  Depth-bounded to avoid pathological / cyclic widget trees. */
+    private static Widget findChildWithAction(Widget parent, String wantedAction,
+                                              int depth, int maxDepth)
+    {
+        if (parent == null || parent.isHidden() || depth > maxDepth) return null;
+        String[] actions = parent.getActions();
+        if (actions != null)
+        {
+            for (String a : actions)
+            {
+                if (wantedAction.equals(a)) return parent;
+            }
+        }
+        Widget[] statics = parent.getStaticChildren();
+        if (statics != null)
+        {
+            for (Widget c : statics)
+            {
+                Widget hit = findChildWithAction(c, wantedAction, depth + 1, maxDepth);
+                if (hit != null) return hit;
+            }
+        }
+        Widget[] dyn = parent.getDynamicChildren();
+        if (dyn != null)
+        {
+            for (Widget c : dyn)
+            {
+                Widget hit = findChildWithAction(c, wantedAction, depth + 1, maxDepth);
+                if (hit != null) return hit;
+            }
+        }
+        Widget[] nested = parent.getNestedChildren();
+        if (nested != null)
+        {
+            for (Widget c : nested)
+            {
+                Widget hit = findChildWithAction(c, wantedAction, depth + 1, maxDepth);
+                if (hit != null) return hit;
+            }
+        }
+        return null;
     }
 
     /** Run a Supplier on the client thread and wait for the result. Used
