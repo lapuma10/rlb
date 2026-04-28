@@ -37,6 +37,7 @@ import net.runelite.client.plugins.recorder.debug.DebugOverlay;
 import net.runelite.client.plugins.recorder.farm.ChickenFarmLoop;
 import net.runelite.client.plugins.recorder.farm.RouteWalker;
 import net.runelite.client.plugins.recorder.mining.MiningLoop;
+import net.runelite.client.plugins.recorder.scripts.LumbridgeBankPenScript;
 import net.runelite.client.plugins.recorder.debug.TileMarker;
 import net.runelite.client.plugins.recorder.events.Events;
 import net.runelite.client.plugins.recorder.events.RecordedEvent;
@@ -134,6 +135,12 @@ public final class RecorderPanel extends PluginPanel
     private final JLabel chickenKillsLabel = new JLabel("Kills: 0");
     private ChickenCombatLoop chickenLoop;
     private ChickenFarmLoop farmLoop;
+    // "Chicken farm" tab — hand-coded Lumbridge bank ↔ pen script.
+    private LumbridgeBankPenScript lumbyScript;
+    private final JButton lumbyStartBtn = new JButton("Start");
+    private final JButton lumbyStopBtn = new JButton("Stop");
+    private final JLabel lumbyStatusLabel = new JLabel("Chicken farm: idle");
+    private final JLabel lumbyKillsLabel = new JLabel("Kills: 0");
     // Mining section — unique field names so the parallel-agent's Combat
     // section doesn't collide. The loop is wired by the plugin via
     // setMiningLoop(); the panel only owns the UI surface.
@@ -173,6 +180,7 @@ public final class RecorderPanel extends PluginPanel
 
         tabs.addTab("Routes", new JScrollPane(buildRoutesTab()));
         tabs.addTab("Combat", new JScrollPane(buildCombatTab()));
+        tabs.addTab("Chicken farm", new JScrollPane(buildChickenFarmTab()));
         tabs.addTab("Record", new JScrollPane(buildRecordTab()));
         tabs.addTab("Mining", new JScrollPane(buildMiningTab()));
         tabs.addTab("Login",  new JScrollPane(buildLoginTab()));
@@ -181,6 +189,8 @@ public final class RecorderPanel extends PluginPanel
         recordBtn.addActionListener(this::onRecordToggle);
         chickenStartBtn.addActionListener(e -> onChickenStart());
         chickenStopBtn.addActionListener(e -> onChickenStop());
+        lumbyStartBtn.addActionListener(e -> onLumbyStart());
+        lumbyStopBtn.addActionListener(e -> onLumbyStop());
         miningStartBtn.addActionListener(e -> onMiningStart());
         miningStopBtn.addActionListener(e -> onMiningStop());
         miningAddRockBtn.addActionListener(e -> onMiningAddRock());
@@ -851,6 +861,64 @@ public final class RecorderPanel extends PluginPanel
         chickenStatusLabel.setText("Farm loop: stopping");
     }
 
+    // ------------------------------------------------------------------
+    // Chicken farm tab — hand-coded Lumbridge bank ↔ pen script.
+    // ------------------------------------------------------------------
+
+    private JPanel buildChickenFarmTab()
+    {
+        JPanel p = new JPanel();
+        p.setLayout(new BoxLayout(p, BoxLayout.Y_AXIS));
+        p.setBorder(BorderFactory.createTitledBorder(
+            "Chicken farm — Lumbridge bank ↔ pen"));
+        JPanel row = new JPanel(new BorderLayout(4, 4));
+        row.add(lumbyStartBtn, BorderLayout.CENTER);
+        row.add(lumbyStopBtn, BorderLayout.EAST);
+        p.add(row);
+        p.add(lumbyStatusLabel);
+        p.add(lumbyKillsLabel);
+        return p;
+    }
+
+    /** Wire the script. The plugin constructs the script in startUp and
+     *  hands it here; the panel only owns the UI surface. */
+    public void setLumbyScript(LumbridgeBankPenScript script)
+    {
+        this.lumbyScript = script;
+    }
+
+    private void onLumbyStart()
+    {
+        if (lumbyScript == null)
+        {
+            lumbyStatusLabel.setText("Chicken farm: unavailable");
+            return;
+        }
+        lumbyScript.start();
+        lumbyStatusLabel.setText("Chicken farm: starting");
+    }
+
+    private void onLumbyStop()
+    {
+        if (lumbyScript == null) return;
+        lumbyScript.stop();
+        lumbyStatusLabel.setText("Chicken farm: stopping");
+    }
+
+    /** Mirror script state into the labels. Polled by refreshTimer. */
+    private void refreshLumby()
+    {
+        if (lumbyScript == null)
+        {
+            lumbyStatusLabel.setText("Chicken farm: unavailable");
+            lumbyKillsLabel.setText("Kills: 0");
+            return;
+        }
+        lumbyStatusLabel.setText("Chicken farm: " + lumbyScript.state()
+            + " — " + lumbyScript.status());
+        lumbyKillsLabel.setText("Kills: " + lumbyScript.killCount());
+    }
+
     private void updateButtons()
     {
         boolean hasSel = credList.getSelectedIndex() >= 0;
@@ -1166,6 +1234,7 @@ public final class RecorderPanel extends PluginPanel
         refreshRecent();
         refreshCombat();
         refreshMining();
+        refreshLumby();
     }
 
     /** Mirror the chicken loop's state into the panel labels. The loop runs

@@ -1,0 +1,860 @@
+package net.runelite.client.plugins.recorder.scripts;
+
+import java.awt.Rectangle;
+import java.awt.Shape;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicReference;
+import java.util.function.Supplier;
+import java.util.ArrayList;
+import java.util.List;
+import lombok.extern.slf4j.Slf4j;
+import net.runelite.api.Client;
+import net.runelite.api.MenuAction;
+import net.runelite.api.NPC;
+import net.runelite.api.NPCComposition;
+import net.runelite.api.Player;
+import net.runelite.api.Point;
+import net.runelite.api.coords.LocalPoint;
+import net.runelite.api.coords.WorldArea;
+import net.runelite.api.coords.WorldPoint;
+import net.runelite.api.Perspective;
+import net.runelite.api.WorldView;
+import net.runelite.client.callback.ClientThread;
+import net.runelite.client.plugins.recorder.combat.ChickenCombatLoop;
+import net.runelite.client.plugins.recorder.farm.BankInteraction;
+import net.runelite.client.plugins.recorder.farm.InventoryUtil;
+import net.runelite.client.plugins.recorder.transport.TransportResolver;
+import net.runelite.client.sequence.dispatch.HumanizedInputDispatcher;
+
+/**
+ * Walking script: Lumbridge bank ↔ chicken pen, round-trip.
+ *
+ * <p>This is a hand-written loop — no route file, no annotator. Each
+ * step is explicit Java, so when something goes wrong you can read the
+ * code and tell exactly which step is broken.
+ *
+ * <p>Threading model mirrors {@link net.runelite.client.plugins.recorder.farm.ChickenFarmLoop}:
+ * one daemon thread runs the outer tick loop on a sleep cadence; every
+ * call into client APIs (player position, scene tiles, dispatch) is
+ * routed through {@link ClientThread#invokeLater} because the engine
+ * asserts those run on the client thread (with -ea).
+ */
+@Slf4j
+public final class LumbridgeBankPenScript
+{
+    // ────────────────────────────────────────────────────────────────
+    // Tile constants — fill in / verify with Mark tile.
+    // ────────────────────────────────────────────────────────────────
+
+    /** Top of the bank stairs, plane 2 (where you stand to climb down). */
+    private static final WorldPoint BANK_TOP = new WorldPoint(3209, 3220, 2);
+
+    /** Lumbridge castle staircase — same X,Y across every plane. */
+    private static final int STAIRS_X = 3205;
+    private static final int STAIRS_Y = 3229;
+
+    /** Tile right outside the chicken pen gate. */
+    private static final WorldPoint PEN_GATE_OUTSIDE = new WorldPoint(3239, 3296, 0);
+
+    /** Tile inside the chicken pen — destination after the gate. */
+    private static final WorldPoint PEN_INTERIOR = new WorldPoint(3234, 3295, 0);
+
+    /** Bank tile area (plane 2). */
+    private static final WorldArea BANK_AREA = new WorldArea(3208, 3218, 3, 3, 2);
+
+    /** Staircase landing on each plane — the cluster of tiles right beside
+     *  the staircase. We walk to here, then look for the stairs by verb. */
+    private static final WorldArea STAIRS_AREA_P2 = new WorldArea(3205, 3227, 3, 4, 2);
+    private static final WorldArea STAIRS_AREA_P1 = new WorldArea(3205, 3227, 3, 4, 1);
+    private static final WorldArea STAIRS_LANDING_P0 = new WorldArea(3206, 3227, 4, 2, 0);
+
+    /** Walking landmarks between stairs landing and the pen gate, plane 0. */
+    private static final WorldArea CASTLE_YARD   = new WorldArea(3219, 3217, 9, 4, 0);
+    private static final WorldArea STONE_BRIDGE  = new WorldArea(3237, 3225, 7, 2, 0);
+    private static final WorldArea GOBLIN_FENCE  = new WorldArea(3259, 3234, 2, 4, 0);
+    private static final WorldArea COW_FENCE     = new WorldArea(3249, 3254, 4, 4, 0);
+    private static final WorldArea PEN_APPROACH  = new WorldArea(3238, 3289, 3, 8, 0);
+
+    /** Pen interior — passed to ChickenCombatLoop so it knows where to fight. */
+    private static final WorldArea PEN_AREA = new WorldArea(3225, 3290, 13, 12, 0);
+
+    /** Ordered list of landmarks the bot walks through on plane 0,
+     *  bank-side → pen-side. Matches the route file you wrote:
+     *  Downstairs → Castle yard → Stone bridge → Goblin fence →
+     *  Cow fence → Pen approach. The gate sits at the end and the pen
+     *  interior is past it. */
+    private static final WorldArea[] OUTBOUND_PATH_P0 = {
+        STAIRS_LANDING_P0,
+        CASTLE_YARD,
+        STONE_BRIDGE,
+        GOBLIN_FENCE,
+        COW_FENCE,
+        PEN_APPROACH,
+    };
+
+    /** Search radius (tiles) when looking for the closest staircase / gate.
+     *  Spiral expands outward from the player, so the first match found is
+     *  the closest by Chebyshev (walking) distance. */
+    private static final int OBJECT_SEARCH_RADIUS = 15;
+
+    /** If a banker / bank booth is within this many tiles, pick that one
+     *  deterministically. Beyond it, pick at random from candidates so we
+     *  don't always click the same booth. */
+    private static final int BANK_NEAR_RADIUS = 1;
+
+    // ────────────────────────────────────────────────────────────────
+    // State
+    // ────────────────────────────────────────────────────────────────
+
+    // WHAT THIS NEEDS TO DO:
+
+    /**
+     *  script normally should start in lumby bank, but it should be able to resume and find where it left off last(based on location and inventory state)
+     *
+     * start in lumby bank(plane 2 the first entry.) If our inventory is empty. good! lets go to the chickens!
+     * is the inventory full? not empty? well then we have to find the bank booths and bankers and randomly choose if were gonna a bankbooth or rightclick a banked and select bank.(menu)
+     *
+     * then we deposit the inventory.
+     *
+     * when we then go ahead and walk to the stairs. (the second area in our path)
+     * Here we look for the closest strais object! Oh look its right next to us? great! Click it, were going down!
+     * Once we go down, we see the next stairs? Were in plane 1 and the strais are next to us again! Oh wow! Rightclick the stair object and go downstairs! (on the way back well go upstairs!)
+     * for thsi we need the API to ensure that we get the correct object and correct object id.
+     *
+     * Then were in plane 0! at the bottom of lumby castle! were walking now all the way one by one area, all the way to I believe #7! here we stop. Look for the gate, exact gate thats between us and the chicken pen(theres the 2 parts to it, theyre side by side shouldve been one but i made it 2...)
+     * Here we do the stairs logic again! look for gate and check if it says open or close, does it say close? good! then we walk trough it! does it say open? damn, lets open it and walk through to the pen!
+     *
+     * hooray! were at the pen! that wasnt so hard was it????
+     *
+     * to go back? well check the gate, walk all the way to the stairs back to lumby castle plane 0 (just follow the platforms areas reversed)
+     * Then we climb u the stairs with our newly made stairs util. Oh look plane 1? climb up to 2! and then here we go were at the bank. lets walk over to the bank (dont need to go to the inbetween area between plane 2 stairs area and the bank, go straihh to the bank and use the bank, bank it all)
+     *
+     * Good! Now rinse and repeat!
+     *
+     *
+     *
+     */
+
+
+    /** What phase the script is in. Used by tick() to choose what to do. */
+    public enum State
+    {
+        IDLE,
+        BANKING,            // open bank widget, deposit, close (plane 2)
+        OUTBOUND,           // bank → pen
+        AT_PEN,             // arrived at pen interior — combat runs here
+        RETURN,             // pen → bank
+        ABORTED
+    }
+
+    private final Client client;
+    private final ClientThread clientThread;
+    private final HumanizedInputDispatcher dispatcher;
+    private final TransportResolver resolver;
+    private final BankInteraction bank;
+    private final ChickenCombatLoop combat;
+
+    private final AtomicReference<State> state = new AtomicReference<>(State.IDLE);
+    private final AtomicReference<String> status = new AtomicReference<>("idle");
+    private final AtomicBoolean running = new AtomicBoolean(false);
+    private final AtomicReference<Thread> worker = new AtomicReference<>();
+
+    public LumbridgeBankPenScript(Client client, ClientThread clientThread,
+                                  HumanizedInputDispatcher dispatcher,
+                                  TransportResolver resolver)
+    {
+        this.client = client;
+        this.clientThread = clientThread;
+        this.dispatcher = dispatcher;
+        this.resolver = resolver;
+        this.bank = new BankInteraction(client, clientThread, dispatcher);
+        this.combat = new ChickenCombatLoop(dispatcher, client, clientThread, PEN_AREA);
+    }
+
+    public State state()   { return state.get(); }
+    public String status() { return status.get(); }
+    public int killCount() { return combat.killCount(); }
+
+    // ────────────────────────────────────────────────────────────────
+    // Lifecycle
+    // ────────────────────────────────────────────────────────────────
+
+    /**
+     * Decide initial state from current player position + inventory and
+     * fork the worker thread. Idempotent — calling start() while already
+     * running is a no-op.
+     */
+    public void start()
+    {
+        if (!running.compareAndSet(false, true)) return;
+        State decided = decideResume();
+        log.info("script: resume → {} (status: {})", decided, status.get());
+        state.set(decided);
+        if (decided == State.ABORTED || decided == State.IDLE)
+        {
+            running.set(false);
+            return;
+        }
+        Thread t = new Thread(this::tickLoop, "lumby-bank-pen-script");
+        t.setDaemon(true);
+        worker.set(t);
+        t.start();
+    }
+
+    /**
+     * Pick the most plausible starting state based on where the player
+     * is right now and what's in the inventory. Bias: prefer "do the
+     * trip we'd be on if we were already running" so a stop+start
+     * resumes seamlessly.
+     */
+    private State decideResume()
+    {
+        WorldPoint here = onClientThread(() -> {
+            Player self = client.getLocalPlayer();
+            return self == null ? null : self.getWorldLocation();
+        });
+        if (here == null)
+        {
+            status.set("no player — aborting");
+            return State.ABORTED;
+        }
+        boolean invFull = onClientThread(() -> InventoryUtil.isInventoryFull(client));
+        int free = onClientThread(() -> InventoryUtil.freeSlotCount(client));
+        boolean invEmpty = free >= InventoryUtil.INVENTORY_SIZE;
+
+        if (areaContains(PEN_AREA, here))
+        {
+            status.set("starting at pen");
+            return invFull ? State.RETURN : State.AT_PEN;
+        }
+        if (areaContains(BANK_AREA, here))
+        {
+            status.set("starting at bank");
+            return invEmpty ? State.OUTBOUND : State.BANKING;
+        }
+        // Anywhere else — pick by inventory: empty/partial = go to pen,
+        // full = go to bank.
+        status.set("starting mid-route");
+        return invFull ? State.RETURN : State.OUTBOUND;
+    }
+
+    /** Stop the loop, interrupt any in-flight combat or worker. */
+    public void stop()
+    {
+        running.set(false);
+        state.set(State.IDLE);
+        status.set("stopped");
+        Thread t = worker.getAndSet(null);
+        if (t != null) t.interrupt();
+        combat.stop();
+    }
+
+    // ────────────────────────────────────────────────────────────────
+    // Outer loop — runs on the worker thread, sleeps between ticks.
+    // ────────────────────────────────────────────────────────────────
+
+    private void tickLoop()
+    {
+        try
+        {
+            while (running.get() && !Thread.currentThread().isInterrupted())
+            {
+                State s = state.get();
+                switch (s)
+                {
+                    case BANKING:  tickBanking();  break;
+                    case OUTBOUND: tickOutbound(); break;
+                    case AT_PEN:   tickAtPen();    break;
+                    case RETURN:   tickReturn();   break;
+                    case ABORTED:
+                    case IDLE:
+                    default:       running.set(false); break;
+                }
+                Thread.sleep(humanCadence());
+            }
+        }
+        catch (InterruptedException ie)
+        {
+            Thread.currentThread().interrupt();
+        }
+        finally
+        {
+            running.set(false);
+        }
+    }
+
+    // ────────────────────────────────────────────────────────────────
+    // BANKING — at bank, inventory non-empty: open bank, deposit, advance
+    // ────────────────────────────────────────────────────────────────
+
+    private void tickBanking() throws InterruptedException
+    {
+        // 1. If we're not at the bank tiles yet, walk there (plane 2).
+        if (!playerInArea(BANK_AREA))
+        {
+            walkTo(BANK_AREA);
+            return;
+        }
+        // 2. If bank widget not open, click a bank booth / banker.
+        boolean open = onClientThread(bank::isBankOpen);
+        if (!open)
+        {
+            status.set("clicking bank booth");
+            clickRandomBooth();
+            return;
+        }
+        // 3. Inventory empty? close bank, advance to OUTBOUND.
+        boolean empty = onClientThread(() ->
+            InventoryUtil.freeSlotCount(client) >= InventoryUtil.INVENTORY_SIZE);
+        if (empty)
+        {
+            status.set("inventory empty — heading to pen");
+            bank.closeBank();
+            state.set(State.OUTBOUND);
+            return;
+        }
+        // 4. Deposit inventory.
+        status.set("depositing inventory");
+        bank.clickDepositInventory();
+    }
+
+    // ────────────────────────────────────────────────────────────────
+    // OUTBOUND — bank → stairs ×2 → walk through Lumbridge → gate → pen
+    // ────────────────────────────────────────────────────────────────
+
+    private void tickOutbound() throws InterruptedException
+    {
+        WorldPoint here = playerPos();
+        if (here == null) return;
+        int plane = here.getPlane();
+
+        // Inventory full? Switch to RETURN — the trip already happened
+        // (e.g. user resumed mid-route after killing).
+        if (onClientThread(() -> InventoryUtil.isInventoryFull(client)))
+        {
+            status.set("inventory full mid-outbound — switching to RETURN");
+            state.set(State.RETURN);
+            return;
+        }
+
+        switch (plane)
+        {
+            case 2:
+                // Plane 2: walk to stairs, then climb down.
+                if (!playerInArea(STAIRS_AREA_P2))
+                {
+                    status.set("walk → stairs (p2)");
+                    walkTo(STAIRS_AREA_P2);
+                    return;
+                }
+                status.set("climb down (p2 → p1)");
+                climbDown();
+                return;
+
+            case 1:
+                // Plane 1: still on stairs landing, climb down again.
+                if (!playerInArea(STAIRS_AREA_P1))
+                {
+                    status.set("walk → stairs (p1)");
+                    walkTo(STAIRS_AREA_P1);
+                    return;
+                }
+                status.set("climb down (p1 → p0)");
+                climbDown();
+                return;
+
+            case 0:
+                // Plane 0 — walk through OUTBOUND_PATH_P0 in order, then
+                // gate, then pen interior.
+                if (areaContains(PEN_AREA, here))
+                {
+                    status.set("arrived at pen");
+                    state.set(State.AT_PEN);
+                    return;
+                }
+                int idx = currentLandmarkIndex(OUTBOUND_PATH_P0, here);
+                if (idx == OUTBOUND_PATH_P0.length - 1)
+                {
+                    // In the last landmark (PEN_APPROACH) — gate next.
+                    status.set("opening gate (or already open)");
+                    if (!openGate())
+                    {
+                        // Couldn't see a gate verb — walk into the pen
+                        // anyway; if a gate's actually blocking, the
+                        // engine just stops at it and we retry next tick.
+                        walkTo(PEN_AREA);
+                    }
+                    return;
+                }
+                if (idx >= 0)
+                {
+                    WorldArea next = OUTBOUND_PATH_P0[idx + 1];
+                    status.set("walk → landmark #" + (idx + 1));
+                    walkTo(next);
+                    return;
+                }
+                // Not in any landmark — converge on the closest one
+                // ahead so we rejoin the path.
+                WorldArea snap = closestLandmark(OUTBOUND_PATH_P0, here);
+                status.set("walk → nearest landmark");
+                walkTo(snap);
+                return;
+
+            default:
+                status.set("unexpected plane " + plane + " — aborting");
+                state.set(State.ABORTED);
+        }
+    }
+
+    // ────────────────────────────────────────────────────────────────
+    // AT_PEN — kill chickens until inventory full, then RETURN
+    // ────────────────────────────────────────────────────────────────
+
+    private void tickAtPen()
+    {
+        // Inventory full → stop combat, head back.
+        if (onClientThread(() -> InventoryUtil.isInventoryFull(client)))
+        {
+            status.set("inventory full — RETURN");
+            combat.stop();
+            state.set(State.RETURN);
+            return;
+        }
+        // Combat idle → start it.
+        if (combat.state() == ChickenCombatLoop.State.IDLE)
+        {
+            status.set("starting combat");
+            combat.start();
+        }
+        else
+        {
+            status.set("combat: " + combat.latestStatus()
+                + " (kills=" + combat.killCount() + ")");
+        }
+    }
+
+    // ────────────────────────────────────────────────────────────────
+    // RETURN — gate → walk back through landmarks → stairs ×2 → bank
+    // ────────────────────────────────────────────────────────────────
+
+    private void tickReturn() throws InterruptedException
+    {
+        WorldPoint here = playerPos();
+        if (here == null) return;
+        int plane = here.getPlane();
+
+        switch (plane)
+        {
+            case 0:
+                // Leave the pen first.
+                if (areaContains(PEN_AREA, here))
+                {
+                    status.set("opening gate to leave pen");
+                    if (!openGate())
+                    {
+                        walkTo(PEN_APPROACH);
+                    }
+                    return;
+                }
+                // Walk back through OUTBOUND_PATH_P0 in REVERSE.
+                int rIdx = currentLandmarkIndex(OUTBOUND_PATH_P0, here);
+                if (rIdx == 0)
+                {
+                    // At STAIRS_LANDING_P0 — climb up.
+                    status.set("climb up (p0 → p1)");
+                    climbUp();
+                    return;
+                }
+                if (rIdx > 0)
+                {
+                    WorldArea prev = OUTBOUND_PATH_P0[rIdx - 1];
+                    status.set("walk back → landmark #" + (rIdx - 1));
+                    walkTo(prev);
+                    return;
+                }
+                // Not in any landmark on plane 0 — snap to closest.
+                WorldArea snapBack = closestLandmark(OUTBOUND_PATH_P0, here);
+                status.set("walk back → nearest landmark");
+                walkTo(snapBack);
+                return;
+
+            case 1:
+                if (!playerInArea(STAIRS_AREA_P1))
+                {
+                    status.set("walk → stairs (p1)");
+                    walkTo(STAIRS_AREA_P1);
+                    return;
+                }
+                status.set("climb up (p1 → p2)");
+                climbUp();
+                return;
+
+            case 2:
+                // Walk straight to the bank — skip the in-between area
+                // (per the spec: "go straight to the bank").
+                if (!playerInArea(BANK_AREA))
+                {
+                    status.set("walk → bank");
+                    walkTo(BANK_AREA);
+                    return;
+                }
+                status.set("at bank — switching to BANKING");
+                state.set(State.BANKING);
+                return;
+
+            default:
+                status.set("unexpected plane " + plane + " on return — aborting");
+                state.set(State.ABORTED);
+        }
+    }
+
+    // ────────────────────────────────────────────────────────────────
+    // Helpers — primitive operations the tick* methods compose.
+    // ────────────────────────────────────────────────────────────────
+
+    /** Read the player's current world location on the client thread. */
+    private WorldPoint playerPos()
+    {
+        return onClientThread(() -> {
+            Player self = client.getLocalPlayer();
+            return self == null ? null : self.getWorldLocation();
+        });
+    }
+
+    /** True when the player's tile is inside {@code area}. */
+    private boolean playerInArea(WorldArea area)
+    {
+        WorldPoint here = playerPos();
+        if (here == null) return false;
+        return areaContains(area, here);
+    }
+
+    /** Bbox-bounds check: is the point inside the rectangle, on the
+     *  same plane? Standalone so {@link #decideResume} can reuse it. */
+    private static boolean areaContains(WorldArea area, WorldPoint p)
+    {
+        return p.getPlane() == area.getPlane()
+            && p.getX() >= area.getX()
+            && p.getX() < area.getX() + area.getWidth()
+            && p.getY() >= area.getY()
+            && p.getY() < area.getY() + area.getHeight();
+    }
+
+    /** Index of the first landmark in {@code path} the point is inside,
+     *  or -1 if the point isn't in any of them. */
+    private static int currentLandmarkIndex(WorldArea[] path, WorldPoint p)
+    {
+        for (int i = 0; i < path.length; i++)
+        {
+            if (areaContains(path[i], p)) return i;
+        }
+        return -1;
+    }
+
+    /** Landmark whose bbox center is closest to {@code p} by Chebyshev
+     *  distance. Used to converge the bot back onto the path when it
+     *  starts mid-route or wanders off. Never null because we always
+     *  pass a non-empty {@code path}. */
+    private static WorldArea closestLandmark(WorldArea[] path, WorldPoint p)
+    {
+        WorldArea best = path[0];
+        int bestDist = Integer.MAX_VALUE;
+        for (WorldArea a : path)
+        {
+            if (a.getPlane() != p.getPlane()) continue;
+            int cx = a.getX() + a.getWidth() / 2;
+            int cy = a.getY() + a.getHeight() / 2;
+            int d = Math.max(Math.abs(p.getX() - cx), Math.abs(p.getY() - cy));
+            if (d < bestDist) { bestDist = d; best = a; }
+        }
+        return best;
+    }
+
+    /**
+     * Click a random walkable tile inside {@code area} to walk-here.
+     * Picks tiles from the area's bounds, filtered for current plane +
+     * canvas-projectability. No-op if no tile projects (e.g. the entire
+     * area is off-screen).
+     */
+    private void walkTo(WorldArea area) throws InterruptedException
+    {
+        WorldPoint pick = onClientThread(() -> {
+            Player self = client.getLocalPlayer();
+            if (self == null) return null;
+            WorldPoint here = self.getWorldLocation();
+            if (here == null) return null;
+            // Try the area's center first; if it doesn't project, scan
+            // outward. The chicken-farm-bot's RouteWalker uses random
+            // sampling; for the script we use deterministic center +
+            // fallback so logs are easier to read.
+            int cx = area.getX() + area.getWidth() / 2;
+            int cy = area.getY() + area.getHeight() / 2;
+            for (int rx = 0; rx < area.getWidth(); rx++)
+            {
+                for (int ry = 0; ry < area.getHeight(); ry++)
+                {
+                    WorldPoint candidate = new WorldPoint(
+                        cx + ((rx % 2 == 0) ? rx / 2 : -(rx / 2 + 1)),
+                        cy + ((ry % 2 == 0) ? ry / 2 : -(ry / 2 + 1)),
+                        area.getPlane());
+                    if (candidate.getPlane() != here.getPlane()) continue;
+                    if (projects(candidate)) return candidate;
+                }
+            }
+            return null;
+        });
+        if (pick == null) return;
+        clickWorldPoint(pick);
+    }
+
+    /** Click the tile, projected to canvas. Off-thread dispatch. */
+    private void clickWorldPoint(WorldPoint wp) throws InterruptedException
+    {
+        Point cp = onClientThread(() -> projectCenter(wp));
+        if (cp == null) return;
+        dispatcher.clickCanvas(cp.getX(), cp.getY());
+    }
+
+    /** Project a world tile to canvas center, or return null. */
+    private Point projectCenter(WorldPoint wp)
+    {
+        WorldView wv = client.getTopLevelWorldView();
+        if (wv == null) return null;
+        LocalPoint lp = LocalPoint.fromWorld(wv, wp);
+        if (lp == null) return null;
+        return Perspective.localToCanvas(client, lp, wp.getPlane());
+    }
+
+    /** True if the tile projects onto the visible canvas viewport. */
+    private boolean projects(WorldPoint wp)
+    {
+        Point cp = projectCenter(wp);
+        if (cp == null) return false;
+        int vx = client.getViewportXOffset();
+        int vy = client.getViewportYOffset();
+        int vw = client.getViewportWidth();
+        int vh = client.getViewportHeight();
+        return cp.getX() >= vx && cp.getX() < vx + vw
+            && cp.getY() >= vy && cp.getY() < vy + vh;
+    }
+
+    /** Find the closest staircase with the Climb-down verb and click it. */
+    private void climbDown() throws InterruptedException
+    {
+        clickNearestObjectWithVerb("Climb-down");
+    }
+
+    /** Find the closest staircase with the Climb-up verb and click it. */
+    private void climbUp() throws InterruptedException
+    {
+        clickNearestObjectWithVerb("Climb-up");
+    }
+
+    /**
+     * Open the gate at the chicken pen. If a gate within range has the
+     * "Open" verb → click it (returns true). If it only has "Close"
+     * (already open) → no click, walk through (returns true). If no
+     * gate is found → false (caller decides what to do).
+     */
+    private boolean openGate() throws InterruptedException
+    {
+        // Try Open first — if the gate is closed this finds it.
+        if (clickNearestObjectWithVerb("Open")) return true;
+        // No "Open" verb in range — maybe the gate is already open
+        // (only "Close" verb). Treat that as "walk through".
+        TransportResolver.Match closeMatch = onClientThread(() ->
+            findNearestMatchWithVerb("Close"));
+        if (closeMatch != null && closeMatch.isSuccess())
+        {
+            log.info("script: gate already open (Close verb present) — walking through");
+            return true;
+        }
+        return false;
+    }
+
+    /**
+     * Spiral-search around the player for any object that exposes
+     * {@code verb}. If found, dispatch a click on its hull and return
+     * true. Otherwise false.
+     */
+    private boolean clickNearestObjectWithVerb(String verb) throws InterruptedException
+    {
+        TransportResolver.Match m = onClientThread(() -> findNearestMatchWithVerb(verb));
+        if (m == null || !m.isSuccess()) return false;
+        Rectangle b = onClientThread(() -> hullBounds(m));
+        if (b == null) return false;
+        int cx = b.x + b.width / 2;
+        int cy = b.y + b.height / 2;
+        dispatcher.clickCanvas(cx, cy);
+        return true;
+    }
+
+    /**
+     * Scan tiles in a square ring outward from the player up to
+     * {@link #OBJECT_SEARCH_RADIUS}, returning the first match where
+     * an object has the given verb. Must be called on the client
+     * thread (reads scene state).
+     */
+    private TransportResolver.Match findNearestMatchWithVerb(String verb)
+    {
+        Player self = client.getLocalPlayer();
+        if (self == null) return null;
+        WorldPoint here = self.getWorldLocation();
+        if (here == null) return null;
+        for (int r = 0; r <= OBJECT_SEARCH_RADIUS; r++)
+        {
+            for (int dx = -r; dx <= r; dx++)
+            {
+                for (int dy = -r; dy <= r; dy++)
+                {
+                    if (Math.max(Math.abs(dx), Math.abs(dy)) != r) continue;
+                    WorldPoint p = new WorldPoint(
+                        here.getX() + dx, here.getY() + dy, here.getPlane());
+                    TransportResolver.Match m = resolver.findTransport(p, verb);
+                    if (m.isSuccess()) return m;
+                }
+            }
+        }
+        return null;
+    }
+
+    /** Bounds of the matched object's clickable hull, on canvas. */
+    private Rectangle hullBounds(TransportResolver.Match m)
+    {
+        if (m.wallObject() != null)
+        {
+            Shape h = m.wallObject().getConvexHull();
+            if (h != null) return h.getBounds();
+        }
+        if (m.gameObject() != null)
+        {
+            Shape h = m.gameObject().getConvexHull();
+            if (h != null) return h.getBounds();
+        }
+        if (m.decorativeObject() != null)
+        {
+            var poly = m.decorativeObject().getCanvasTilePoly();
+            if (poly != null) return poly.getBounds();
+        }
+        if (m.groundObject() != null)
+        {
+            var poly = m.groundObject().getCanvasTilePoly();
+            if (poly != null) return poly.getBounds();
+        }
+        return null;
+    }
+
+    /**
+     * Find every "Banker" / "Bank booth" NPC on the same plane, then:
+     * <ul>
+     *   <li>If any is within {@link #BANK_NEAR_RADIUS} tiles (Chebyshev),
+     *       click that one — no point walking past a closer banker.</li>
+     *   <li>Otherwise pick one uniformly at random from the candidates so
+     *       repeated banking trips don't always click the same booth.</li>
+     * </ul>
+     * Returns true if a click was dispatched, false if no banker was
+     * visible (caller can retry next tick — the player may need to walk
+     * closer).
+     */
+    private boolean clickRandomBooth() throws InterruptedException
+    {
+        NPC pick = onClientThread(() -> {
+            WorldView wv = client.getTopLevelWorldView();
+            if (wv == null) return null;
+            Player self = client.getLocalPlayer();
+            if (self == null) return null;
+            WorldPoint here = self.getWorldLocation();
+            if (here == null) return null;
+            List<NPC> candidates = new ArrayList<>();
+            NPC adjacent = null;
+            int adjDist = Integer.MAX_VALUE;
+            for (NPC npc : wv.npcs())
+            {
+                if (npc == null) continue;
+                String name = npc.getName();
+                if (name == null) continue;
+                if (!name.equalsIgnoreCase("Banker")
+                    && !name.equalsIgnoreCase("Bank booth")) continue;
+                WorldPoint loc = npc.getWorldLocation();
+                if (loc == null || loc.getPlane() != here.getPlane()) continue;
+                int cheb = Math.max(
+                    Math.abs(loc.getX() - here.getX()),
+                    Math.abs(loc.getY() - here.getY()));
+                if (cheb <= BANK_NEAR_RADIUS && cheb < adjDist)
+                {
+                    adjacent = npc;
+                    adjDist = cheb;
+                }
+                candidates.add(npc);
+            }
+            if (adjacent != null) return adjacent;
+            if (candidates.isEmpty()) return null;
+            return candidates.get((int)(Math.random() * candidates.size()));
+        });
+        if (pick == null) return false;
+        // Invoke the "Bank" menu action directly. Bank booths' default
+        // (NPC_FIRST_OPTION) is "Bank" so a left-click would work — but
+        // a Banker's default is "Talk-to" and "Bank Banker" lives at a
+        // later slot. Same code path covers both: scan the NPC's
+        // actions, find the one starting with "Bank", invoke it.
+        return onClientThread(() -> {
+            NPCComposition def = pick.getComposition();
+            if (def == null) return false;
+            String[] actions = def.getActions();
+            if (actions == null) return false;
+            for (int i = 0; i < actions.length && i < 5; i++)
+            {
+                String a = actions[i];
+                if (a == null) continue;
+                if (a.toLowerCase().startsWith("bank"))
+                {
+                    MenuAction ma = npcOptionForSlot(i);
+                    if (ma == null) return false;
+                    log.info("script: invoking '{}' on {} (slot {})", a, pick.getName(), i);
+                    client.menuAction(0, 0, ma, pick.getIndex(), -1, a, pick.getName());
+                    return true;
+                }
+            }
+            log.warn("script: no 'Bank' action on {}", pick.getName());
+            return false;
+        });
+    }
+
+    private static MenuAction npcOptionForSlot(int slot)
+    {
+        switch (slot)
+        {
+            case 0:  return MenuAction.NPC_FIRST_OPTION;
+            case 1:  return MenuAction.NPC_SECOND_OPTION;
+            case 2:  return MenuAction.NPC_THIRD_OPTION;
+            case 3:  return MenuAction.NPC_FOURTH_OPTION;
+            case 4:  return MenuAction.NPC_FIFTH_OPTION;
+            default: return null;
+        }
+    }
+
+    /**
+     * Run a callable on the client thread and block this (worker)
+     * thread until it completes. Returns null on interruption.
+     */
+    private <T> T onClientThread(Supplier<T> work)
+    {
+        AtomicReference<T> result = new AtomicReference<>();
+        java.util.concurrent.CountDownLatch latch =
+            new java.util.concurrent.CountDownLatch(1);
+        clientThread.invokeLater(() -> {
+            try { result.set(work.get()); }
+            catch (Throwable ex) { log.warn("clientThread work failed", ex); }
+            finally { latch.countDown(); }
+        });
+        try { latch.await(); }
+        catch (InterruptedException ie) { Thread.currentThread().interrupt(); return null; }
+        return result.get();
+    }
+
+    /** Human-ish sleep duration between ticks (300-700ms). */
+    private static long humanCadence()
+    {
+        return 300L + (long)(Math.random() * 400);
+    }
+}

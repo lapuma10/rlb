@@ -38,6 +38,8 @@ import net.runelite.client.plugins.Plugin;
 import net.runelite.client.plugins.PluginDescriptor;
 import net.runelite.client.plugins.recorder.annotator.AnnotatorHudOverlay;
 import net.runelite.client.plugins.recorder.annotator.AreaSelector;
+import net.runelite.client.plugins.recorder.scripts.LumbridgeBankPenScript;
+import net.runelite.client.plugins.recorder.transport.TransportResolver;
 import net.runelite.client.plugins.recorder.capture.CameraSampler;
 import net.runelite.client.plugins.recorder.capture.ChatFilter;
 import net.runelite.client.plugins.recorder.capture.ClickResolver;
@@ -49,6 +51,7 @@ import net.runelite.client.plugins.recorder.capture.NearbyResolver;
 import net.runelite.client.plugins.recorder.combat.ChickenCombatLoop;
 import net.runelite.client.plugins.recorder.combat.ChickenOverlay;
 import net.runelite.client.plugins.recorder.debug.DebugOverlay;
+import net.runelite.client.plugins.recorder.debug.LoginDebugOverlay;
 import net.runelite.client.plugins.recorder.debug.TileMarker;
 import net.runelite.client.plugins.recorder.farm.ChickenFarmLoop;
 import net.runelite.client.plugins.recorder.farm.FarmConfig;
@@ -105,6 +108,7 @@ public class RecorderPlugin extends Plugin
     private HotkeyListener toggleListener;
     private AWTEventListener focusBridge;
     private DebugOverlay debugOverlay;
+    private LoginDebugOverlay loginDebugOverlay;
     private ChickenOverlay chickenOverlay;
     private RouteOverlay routeOverlay;
     private TileMarker tileMarker;
@@ -142,6 +146,7 @@ public class RecorderPlugin extends Plugin
             mouseCapture, keyCapture, focusCapture, sessions, itemManager, clientThread);
         panel = new RecorderPanel(manager, client, clientThread);
         debugOverlay = new DebugOverlay(client);
+        loginDebugOverlay = new LoginDebugOverlay(client);
         chickenOverlay = new ChickenOverlay(client, config);
         routeOverlay = new RouteOverlay(client);
         panel.setRouteOverlay(routeOverlay);
@@ -154,6 +159,7 @@ public class RecorderPlugin extends Plugin
         panel.setHudOverlay(hudOverlay);
         panel.setAreaSelector(areaSelector);
         overlayManager.add(debugOverlay);
+        overlayManager.add(loginDebugOverlay);
         overlayManager.add(chickenOverlay);
         overlayManager.add(routeOverlay);
         overlayManager.add(hudOverlay);
@@ -207,6 +213,15 @@ public class RecorderPlugin extends Plugin
             log.warn("farm loop NOT ready (route load failed: {}). Side-panel buttons will report 'unavailable'.",
                 ex.getMessage());
         }
+
+        // Lumbridge bank ↔ pen script — the hand-coded loop the user
+        // wrote. Independent dispatcher; uses the TransportResolver
+        // already constructed for the panel's Mark object button.
+        HumanizedInputDispatcher lumbyDispatcher = new HumanizedInputDispatcher(client, clientThread);
+        TransportResolver lumbyResolver = new TransportResolver(client);
+        LumbridgeBankPenScript lumbyScript = new LumbridgeBankPenScript(
+            client, clientThread, lumbyDispatcher, lumbyResolver);
+        panel.setLumbyScript(lumbyScript);
 
         // Mining loop: separate dispatcher, independent busy flag from
         // combat / login / test-walk. The user adds candidate rocks via
@@ -275,6 +290,7 @@ public class RecorderPlugin extends Plugin
         if (hudOverlay != null) overlayManager.remove(hudOverlay);
         if (areaSelector != null && areaSelector.isActive()) areaSelector.cancel();
         if (debugOverlay != null) overlayManager.remove(debugOverlay);
+        if (loginDebugOverlay != null) overlayManager.remove(loginDebugOverlay);
         if (chickenOverlay != null) overlayManager.remove(chickenOverlay);
         if (routeOverlay != null) overlayManager.remove(routeOverlay);
         if (navButton != null) clientToolbar.removeNavigation(navButton);
