@@ -9,11 +9,15 @@ import java.util.ArrayList;
 import java.util.List;
 import lombok.extern.slf4j.Slf4j;
 import net.runelite.api.Client;
+import net.runelite.api.GameObject;
 import net.runelite.api.MenuAction;
 import net.runelite.api.NPC;
 import net.runelite.api.NPCComposition;
+import net.runelite.api.ObjectComposition;
 import net.runelite.api.Player;
 import net.runelite.api.Point;
+import net.runelite.api.Scene;
+import net.runelite.api.Tile;
 import net.runelite.api.coords.LocalPoint;
 import net.runelite.api.coords.WorldArea;
 import net.runelite.api.coords.WorldPoint;
@@ -756,68 +760,194 @@ public final class LumbridgeBankPenScript
      * visible (caller can retry next tick — the player may need to walk
      * closer).
      */
+    /** Either an NPC banker or a GameObject bank booth, plus the slot
+     *  whose action starts with "Bank" (used to invoke the right menu
+     *  action when the default left-click isn't "Bank"). */
+    private static final class BankCandidate
+    {
+        final NPC npc;
+        final GameObject go;
+        final int slot;        // 0..4, slot containing "Bank" action
+        final String actionText;
+        final int distance;    // Chebyshev tiles from player
+
+        BankCandidate(NPC n, int slot, String actionText, int dist)
+        { this.npc = n; this.go = null; this.slot = slot; this.actionText = actionText; this.distance = dist; }
+        BankCandidate(GameObject g, int slot, String actionText, int dist)
+        { this.npc = null; this.go = g; this.slot = slot; this.actionText = actionText; this.distance = dist; }
+    }
+
     private boolean clickRandomBooth() throws InterruptedException
     {
-        NPC pick = onClientThread(() -> {
-            WorldView wv = client.getTopLevelWorldView();
-            if (wv == null) return null;
-            Player self = client.getLocalPlayer();
-            if (self == null) return null;
-            WorldPoint here = self.getWorldLocation();
-            if (here == null) return null;
-            List<NPC> candidates = new ArrayList<>();
-            NPC adjacent = null;
-            int adjDist = Integer.MAX_VALUE;
-            for (NPC npc : wv.npcs())
-            {
-                if (npc == null) continue;
-                String name = npc.getName();
-                if (name == null) continue;
-                if (!name.equalsIgnoreCase("Banker")
-                    && !name.equalsIgnoreCase("Bank booth")) continue;
-                WorldPoint loc = npc.getWorldLocation();
-                if (loc == null || loc.getPlane() != here.getPlane()) continue;
-                int cheb = Math.max(
-                    Math.abs(loc.getX() - here.getX()),
-                    Math.abs(loc.getY() - here.getY()));
-                if (cheb <= BANK_NEAR_RADIUS && cheb < adjDist)
-                {
-                    adjacent = npc;
-                    adjDist = cheb;
-                }
-                candidates.add(npc);
-            }
-            if (adjacent != null) return adjacent;
-            if (candidates.isEmpty()) return null;
-            return candidates.get((int)(Math.random() * candidates.size()));
-        });
+        BankCandidate pick = onClientThread(this::findBankCandidate);
         if (pick == null) return false;
-        // Invoke the "Bank" menu action directly. Bank booths' default
-        // (NPC_FIRST_OPTION) is "Bank" so a left-click would work — but
-        // a Banker's default is "Talk-to" and "Bank Banker" lives at a
-        // later slot. Same code path covers both: scan the NPC's
-        // actions, find the one starting with "Bank", invoke it.
-        return onClientThread(() -> {
-            NPCComposition def = pick.getComposition();
-            if (def == null) return false;
+        if (pick.npc != null)
+        {
+            // Banker NPC — default L-click is "Talk-to". Use menuAction.
+            return onClientThread(() -> {
+                MenuAction ma = npcOptionForSlot(pick.slot);
+                if (ma == null) return false;
+                log.info("script: invoking '{}' on banker {} (slot {})",
+                    pick.actionText, pick.npc.getName(), pick.slot);
+                client.menuAction(0, 0, ma, pick.npc.getIndex(), -1,
+                    pick.actionText, pick.npc.getName());
+                return true;
+            });
+        }
+        // Bank booth GameObject — default L-click IS "Bank Bank booth"
+        // (engine picks "Bank" as default even though it's slot 1). So
+        // a plain hull click invokes the right action.
+        Rectangle b = onClientThread(() -> {
+            Shape h = pick.go.getConvexHull();
+            return h == null ? null : h.getBounds();
+        });
+        if (b == null)
+        {
+            log.warn("script: bank booth at {} has no convex hull",
+                pick.go.getWorldLocation());
+            return false;
+        }
+        int cx = b.x + b.width / 2;
+        int cy = b.y + b.height / 2;
+        log.info("script: clicking bank booth (id={}) hull center ({},{})",
+            pick.go.getId(), cx, cy);
+        dispatcher.clickCanvas(cx, cy);
+        return true;
+    }
+
+    /**
+     * Collect every banker (NPC) and every bank booth (GameObject) that's
+     * within {@link #OBJECT_SEARCH_RADIUS} tiles on the player's plane.
+     * If any is at Chebyshev distance ≤ {@link #BANK_NEAR_RADIUS}, return
+     * that one deterministically. Otherwise pick uniformly at random.
+     * Must be called on the client thread (reads scene + NPC state).
+     */
+    private BankCandidate findBankCandidate()
+    {
+        WorldView wv = client.getTopLevelWorldView();
+        if (wv == null) return null;
+        Player self = client.getLocalPlayer();
+        if (self == null) return null;
+        WorldPoint here = self.getWorldLocation();
+        if (here == null) return null;
+        int plane = here.getPlane();
+
+        List<BankCandidate> candidates = new ArrayList<>();
+        BankCandidate adjacent = null;
+
+        // 1) NPCs (Bankers, occasionally an NPC named "Bank booth").
+        for (NPC npc : wv.npcs())
+        {
+            if (npc == null) continue;
+            String name = npc.getName();
+            if (name == null) continue;
+            if (!name.equalsIgnoreCase("Banker")
+                && !name.equalsIgnoreCase("Bank booth")) continue;
+            WorldPoint loc = npc.getWorldLocation();
+            if (loc == null || loc.getPlane() != plane) continue;
+            NPCComposition def = npc.getComposition();
+            if (def == null) continue;
             String[] actions = def.getActions();
-            if (actions == null) return false;
-            for (int i = 0; i < actions.length && i < 5; i++)
+            if (actions == null) continue;
+            int slot = bankActionSlot(actions);
+            if (slot < 0) continue;
+            int cheb = Math.max(
+                Math.abs(loc.getX() - here.getX()),
+                Math.abs(loc.getY() - here.getY()));
+            if (cheb > OBJECT_SEARCH_RADIUS) continue;
+            BankCandidate c = new BankCandidate(npc, slot, actions[slot], cheb);
+            if (cheb <= BANK_NEAR_RADIUS
+                && (adjacent == null || cheb < adjacent.distance))
+                adjacent = c;
+            candidates.add(c);
+        }
+
+        // 2) Scene GameObjects (the actual Bank booth scenery — multiple
+        //    object IDs exist, so we match by name + Bank action, not id).
+        Scene scene = wv.getScene();
+        if (scene != null)
+        {
+            Tile[][][] tiles = scene.getTiles();
+            if (tiles != null && plane >= 0 && plane < tiles.length)
             {
-                String a = actions[i];
-                if (a == null) continue;
-                if (a.toLowerCase().startsWith("bank"))
+                Tile[][] planeTiles = tiles[plane];
+                int hereSx = here.getX() - wv.getBaseX();
+                int hereSy = here.getY() - wv.getBaseY();
+                int loSx = Math.max(0, hereSx - OBJECT_SEARCH_RADIUS);
+                int loSy = Math.max(0, hereSy - OBJECT_SEARCH_RADIUS);
+                int hiSx = Math.min(planeTiles.length - 1, hereSx + OBJECT_SEARCH_RADIUS);
+                int hiSy = Math.min(planeTiles[0].length - 1, hereSy + OBJECT_SEARCH_RADIUS);
+                for (int sx = loSx; sx <= hiSx; sx++)
                 {
-                    MenuAction ma = npcOptionForSlot(i);
-                    if (ma == null) return false;
-                    log.info("script: invoking '{}' on {} (slot {})", a, pick.getName(), i);
-                    client.menuAction(0, 0, ma, pick.getIndex(), -1, a, pick.getName());
-                    return true;
+                    for (int sy = loSy; sy <= hiSy; sy++)
+                    {
+                        Tile t = planeTiles[sx][sy];
+                        if (t == null) continue;
+                        GameObject[] gos = t.getGameObjects();
+                        if (gos == null) continue;
+                        for (GameObject go : gos)
+                        {
+                            if (go == null) continue;
+                            ObjectComposition def = client.getObjectDefinition(go.getId());
+                            if (def == null) continue;
+                            String name = def.getName();
+                            // Some object defs return "null" string; filter
+                            // by Bank action presence as the strict check.
+                            String[] actions = def.getActions();
+                            if (actions == null) continue;
+                            int slot = bankActionSlot(actions);
+                            if (slot < 0) continue;
+                            // Optional: require name to look bank-ish so we
+                            // don't grab some unrelated Bank-action object.
+                            if (name != null
+                                && !name.toLowerCase().contains("bank")) continue;
+                            WorldPoint loc = go.getWorldLocation();
+                            if (loc == null) continue;
+                            int cheb = Math.max(
+                                Math.abs(loc.getX() - here.getX()),
+                                Math.abs(loc.getY() - here.getY()));
+                            if (cheb > OBJECT_SEARCH_RADIUS) continue;
+                            BankCandidate c = new BankCandidate(go, slot, actions[slot], cheb);
+                            if (cheb <= BANK_NEAR_RADIUS
+                                && (adjacent == null || cheb < adjacent.distance))
+                                adjacent = c;
+                            candidates.add(c);
+                        }
+                    }
                 }
             }
-            log.warn("script: no 'Bank' action on {}", pick.getName());
-            return false;
-        });
+        }
+
+        if (adjacent != null)
+        {
+            log.info("script: bank candidate adjacent (dist={}, kind={})",
+                adjacent.distance, adjacent.npc != null ? "NPC" : "GameObject");
+            return adjacent;
+        }
+        if (candidates.isEmpty())
+        {
+            log.warn("script: no bank candidates within {} tiles",
+                OBJECT_SEARCH_RADIUS);
+            return null;
+        }
+        BankCandidate randomPick = candidates.get((int)(Math.random() * candidates.size()));
+        log.info("script: random bank candidate (n={}, picked dist={}, kind={})",
+            candidates.size(), randomPick.distance,
+            randomPick.npc != null ? "NPC" : "GameObject");
+        return randomPick;
+    }
+
+    /** First slot in {@code actions} whose text starts with "Bank"
+     *  (case-insensitive). -1 if no slot has a Bank action. */
+    private static int bankActionSlot(String[] actions)
+    {
+        for (int i = 0; i < actions.length && i < 5; i++)
+        {
+            String a = actions[i];
+            if (a == null) continue;
+            if (a.toLowerCase().startsWith("bank")) return i;
+        }
+        return -1;
     }
 
     private static MenuAction npcOptionForSlot(int slot)
