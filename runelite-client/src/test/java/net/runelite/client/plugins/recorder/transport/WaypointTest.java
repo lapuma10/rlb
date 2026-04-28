@@ -13,7 +13,14 @@ public class WaypointTest
         WorldArea a = new WorldArea(3091, 3243, 7, 5, 2);
         Waypoint w = Waypoint.walkArea("lumbridge_bank", a);
         assertEquals(Waypoint.Kind.WALK_AREA, w.kind());
-        assertEquals(a, w.area());
+        // area() returns the bounding box (computed from tile set); verify fields.
+        WorldArea bbox = w.area();
+        assertNotNull(bbox);
+        assertEquals(a.getX(), bbox.getX());
+        assertEquals(a.getY(), bbox.getY());
+        assertEquals(a.getWidth(), bbox.getWidth());
+        assertEquals(a.getHeight(), bbox.getHeight());
+        assertEquals(a.getPlane(), bbox.getPlane());
         assertEquals("lumbridge_bank", w.name());
     }
 
