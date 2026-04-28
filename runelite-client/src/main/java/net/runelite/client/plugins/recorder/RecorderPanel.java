@@ -385,10 +385,13 @@ public final class RecorderPanel extends PluginPanel
     }
 
     /** Drive the walker over waypoints[0..endExclusive). Fork to a daemon
-     *  thread; mirrors the legacy walkRoute flow. */
+     *  thread for sleeping between ticks, but dispatch each arrived/tick
+     *  call onto the client thread — the engine asserts that getLocalPlayer
+     *  / getWorldLocation must be called from there (developer-mode -ea). */
     private void runWalker(List<Waypoint> wps, int endExclusive)
     {
-        if (client == null || dispatcher == null || transportResolver == null) return;
+        if (client == null || dispatcher == null || transportResolver == null
+            || clientThread == null) return;
         final List<Waypoint> slice = new ArrayList<>(
             wps.subList(0, Math.max(0, Math.min(endExclusive, wps.size()))));
         Thread t = new Thread(() -> {
@@ -398,10 +401,28 @@ public final class RecorderPanel extends PluginPanel
                 for (Waypoint wp : slice)
                 {
                     if (Thread.currentThread().isInterrupted()) break;
-                    while (!w.arrived(wp))
+                    while (true)
                     {
                         if (Thread.currentThread().isInterrupted()) break;
-                        w.tick(wp);
+                        // arrived/tick must run on the client thread.
+                        java.util.concurrent.atomic.AtomicBoolean arrived =
+                            new java.util.concurrent.atomic.AtomicBoolean(false);
+                        java.util.concurrent.CountDownLatch latch =
+                            new java.util.concurrent.CountDownLatch(1);
+                        clientThread.invokeLater(() -> {
+                            try
+                            {
+                                if (w.arrived(wp)) arrived.set(true);
+                                else w.tick(wp);
+                            }
+                            catch (Throwable ex)
+                            {
+                                log.warn("walker tick failed", ex);
+                            }
+                            finally { latch.countDown(); }
+                        });
+                        latch.await();
+                        if (arrived.get()) break;
                         Thread.sleep(300 + (int)(Math.random() * 300));
                     }
                 }
