@@ -65,8 +65,20 @@ public final class StepClickPicker
         this.client = client;
     }
 
-    /** Pick the best click target inside {@code area}. Returns null if no
-     *  reachable tile in the area projects to canvas or minimap. */
+    /** Pick the best click target inside {@code area}. Two-pass:
+     *  <ol>
+     *    <li>BFS-reachable tiles in the area (preferred — known walkable
+     *        path under our local collision view).</li>
+     *    <li>If none, ANY tile in the area that projects to minimap.
+     *        Trust the engine's pathfind (~25 tile depth, knows how to
+     *        navigate around closed gates and through transports). This
+     *        matches V1's behaviour: V1 clicks the destination and lets
+     *        the engine work it out, which handles the
+     *        goblin-fence → bridge case where a fence sits between
+     *        BFS-reachable tiles and the destination.</li>
+     *  </ol>
+     *  Returns null only if even Pass 2 finds nothing — destination is
+     *  past minimap range entirely. */
     @Nullable
     public ClickTarget pick(Reachability.ReachabilityMap reach, WorldArea area)
     {
@@ -80,9 +92,9 @@ public final class StepClickPicker
         int targetCx = area.getX() + area.getWidth() / 2;
         int targetCy = area.getY() + area.getHeight() / 2;
 
+        // Pass 1: BFS-reachable tiles in the area.
         ClickTarget bestCanvas = null;
         ClickTarget bestMinimap = null;
-
         for (WorldPoint t : reach.reachableTiles())
         {
             if (!areaContains(area, t)) continue;
@@ -98,9 +110,28 @@ public final class StepClickPicker
                 if (isBetter(c, bestCanvas)) bestCanvas = c;
             }
         }
-
         if (bestCanvas != null) return bestCanvas;
-        return bestMinimap;
+        if (bestMinimap != null) return bestMinimap;
+
+        // Pass 2: ANY tile in the area that projects. Engine pathfinds
+        // around obstacles (gates, walls within 25 tiles).
+        ClickTarget bestAny = null;
+        for (int dx = 0; dx < area.getWidth(); dx++)
+        {
+            for (int dy = 0; dy < area.getHeight(); dy++)
+            {
+                WorldPoint t = new WorldPoint(
+                    area.getX() + dx, area.getY() + dy, area.getPlane());
+                int distToTarget = chebyshev(t.getX(), t.getY(),
+                                             targetCx, targetCy);
+                int distFromOrigin = chebyshev(origin.getX(), origin.getY(),
+                                               t.getX(), t.getY());
+                ClickTarget c = projectTile(wv, t, distFromOrigin, distToTarget);
+                if (c == null) continue;
+                if (isBetter(c, bestAny)) bestAny = c;
+            }
+        }
+        return bestAny;
     }
 
     /** Pick the best click target heading TOWARD {@code target} — useful when
@@ -135,6 +166,7 @@ public final class StepClickPicker
         int hereToTarget = chebyshev(origin.getX(), origin.getY(),
                                      target.getX(), target.getY());
 
+        // Pass 1: BFS-reachable tiles, minimap-only.
         ClickTarget best = null;
         for (WorldPoint t : reach.reachableTiles())
         {
@@ -149,7 +181,20 @@ public final class StepClickPicker
                 reach.distance(t), distToTarget);
             if (isBetter(c, best)) best = c;
         }
-        return best;
+        if (best != null) return best;
+
+        // Pass 2: BFS halted (closed gate / wall in the way) — trust the
+        // engine. Click the target tile itself if it projects to minimap;
+        // engine pathfind goes ~25 tiles and navigates around / through
+        // transports. This is the V1 behaviour: see a destination, click
+        // it, let the game work out the route.
+        LocalPoint lpTarget = LocalPoint.fromWorld(wv, target);
+        if (lpTarget == null) return null;
+        Point miniTarget = Perspective.localToMinimap(client, lpTarget);
+        if (miniTarget == null) return null;
+        return new ClickTarget(target, miniTarget, true,
+            chebyshev(origin.getX(), origin.getY(), target.getX(), target.getY()),
+            0);
     }
 
     /** True if {@code candidate} is strictly better than {@code current}

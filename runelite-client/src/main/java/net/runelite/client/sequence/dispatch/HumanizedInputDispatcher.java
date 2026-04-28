@@ -196,7 +196,7 @@ public class HumanizedInputDispatcher implements InputDispatcher
      *  — so the engine's per-frame chase tracks a slowly-moving goal,
      *  yielding a visibly smooth controlled drag. Yaw is 11-bit (0..2047);
      *  0 = south, increasing counter-clockwise from above. */
-    private void rotateCameraToward(WorldPoint target) throws InterruptedException
+    public void rotateCameraToward(WorldPoint target) throws InterruptedException
     {
         if (target == null) return;
         // If the target tile is already comfortably inside the viewport, a

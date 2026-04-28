@@ -213,6 +213,21 @@ public final class UniversalWalker
             // Cancel any pending click target on the previous step so we
             // re-issue immediately for the new one.
             lastClickTile = null;
+            // Rotate camera to face the new step's destination — real
+            // players don't walk staring at the back of their head.
+            // rotateCameraToward jitters ±26° from facing-toward-target,
+            // so the destination ends up roughly forward but off-axis.
+            // The dispatcher skips the rotation if the target is already
+            // comfortably visible.
+            if (stepIdx < spec.size())
+            {
+                WorldPoint focus = stepFocusTile(spec.waypoints().get(stepIdx));
+                if (focus != null)
+                {
+                    try { dispatcher.rotateCameraToward(focus); }
+                    catch (Throwable t) { log.debug("camera rotate failed", t); }
+                }
+            }
         }
         if (stepIdx >= spec.size())
         {
@@ -451,6 +466,30 @@ public final class UniversalWalker
         return -1;
     }
 
+    /** A tile representing where this step is heading — area centre for
+     *  WALK_AREA, the tile itself for WALK / TRANSPORT. Used for camera
+     *  rotation when the walker advances onto this step. */
+    @Nullable
+    private static WorldPoint stepFocusTile(Waypoint w)
+    {
+        if (w == null) return null;
+        switch (w.kind())
+        {
+            case WALK: return w.tile();
+            case WALK_AREA:
+            {
+                WorldArea a = w.area();
+                if (a == null) return null;
+                return new WorldPoint(
+                    a.getX() + a.getWidth() / 2,
+                    a.getY() + a.getHeight() / 2,
+                    a.getPlane());
+            }
+            case TRANSPORT: return w.tile();
+        }
+        return null;
+    }
+
     /** Has the player reached {@code w}? */
     static boolean arrived(Waypoint w, WorldPoint pos)
     {
@@ -535,15 +574,19 @@ public final class UniversalWalker
             pick = clientCall(() -> picker.pickTowards(snap.reach, centre));
             if (pick == null)
             {
-                ObstacleHandler.Result obs = clientCall(() ->
-                    obstacles.findOnFrontier(snap.reach, centre));
-                if (obs != null && tryClickObstacle(obs, now))
-                {
-                    state = InternalState.AT_TRANSPORT;
-                    return Status.IN_PROGRESS;
-                }
-                log.debug("walker: walk step {} — no reachable projection AND no obstacle",
-                    stepIdx);
+                // Used to fall through to ObstacleHandler.findOnFrontier
+                // here, but that scans for ANY object with an Open /
+                // Climb-up / Cross / Pass / etc. verb on the BFS frontier —
+                // and on long open-ground walks (e.g. goblin-fence →
+                // stone-bridge, ~20 tiles), random nearby fence gates and
+                // unrelated staircases match and get auto-clicked. The
+                // chicken farm route already declares its real gates as
+                // explicit .gate() steps in the PathSpec; obstacle auto-
+                // detection on plain WALK legs causes more bugs than it
+                // fixes. Just wait for the player to walk a bit further
+                // and re-BFS next tick.
+                log.debug("walker: walk step {} — no reachable projection yet, "
+                    + "waiting for player to advance", stepIdx);
                 return Status.IN_PROGRESS;
             }
         }
