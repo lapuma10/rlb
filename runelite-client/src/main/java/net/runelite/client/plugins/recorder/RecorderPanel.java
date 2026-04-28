@@ -26,7 +26,6 @@ package net.runelite.client.plugins.recorder;
 
 import lombok.extern.slf4j.Slf4j;
 import net.runelite.api.Client;
-import net.runelite.api.Tile;
 import net.runelite.api.coords.WorldPoint;
 import net.runelite.client.callback.ClientThread;
 import net.runelite.client.plugins.recorder.combat.ChickenCombatLoop;
@@ -37,11 +36,9 @@ import net.runelite.client.plugins.recorder.debug.TileMarker;
 import net.runelite.client.plugins.recorder.events.Events;
 import net.runelite.client.plugins.recorder.events.RecordedEvent;
 import net.runelite.client.plugins.recorder.transport.RouteOverlay;
-import net.runelite.client.plugins.recorder.transport.RouteParser;
 import net.runelite.client.plugins.recorder.transport.TransportResolver;
 import net.runelite.client.plugins.recorder.transport.Waypoint;
 import net.runelite.client.sequence.dispatch.HumanizedInputDispatcher;
-import net.runelite.client.sequence.internal.ActionRequest;
 import net.runelite.client.sequence.login.CredentialStore;
 import net.runelite.client.sequence.login.CredentialStoreException;
 import net.runelite.client.sequence.login.LoginAssistant;
@@ -49,8 +46,6 @@ import net.runelite.client.sequence.login.LoginCredentials;
 import net.runelite.client.ui.ColorScheme;
 import net.runelite.client.ui.PluginPanel;
 import javax.swing.BorderFactory;
-import javax.swing.Box;
-import javax.swing.BoxLayout;
 import javax.swing.DefaultListModel;
 import javax.swing.JButton;
 import javax.swing.JComponent;
@@ -59,9 +54,8 @@ import javax.swing.JList;
 import javax.swing.JOptionPane;
 import javax.swing.JPanel;
 import javax.swing.JPasswordField;
-import javax.swing.JCheckBox;
 import javax.swing.JScrollPane;
-import javax.swing.JTextArea;
+import javax.swing.JTabbedPane;
 import javax.swing.JTextField;
 import javax.swing.JViewport;
 import javax.swing.ListSelectionModel;
@@ -72,9 +66,6 @@ import java.awt.Dimension;
 import java.awt.Point;
 import java.awt.event.ActionEvent;
 import java.io.IOException;
-import java.nio.file.Files;
-import java.nio.file.Path;
-import java.nio.file.Paths;
 import java.util.List;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ExecutionException;
@@ -100,34 +91,7 @@ public final class RecorderPanel extends PluginPanel
     private final DefaultListModel<String> recentModel = new DefaultListModel<>();
     private final JList<String> recentList = new JList<>(recentModel);
     private final JScrollPane recentScroll = new JScrollPane(recentList);
-    private final JTextArea testWalkArea = new JTextArea(6, 18);
-    private final JButton testWalkBtn = new JButton("Walk path");
-    private final JButton testWalkStopBtn = new JButton("Stop");
-    private final JButton addCurPosBtn = new JButton("Add current");
-    private final JButton addMarkedBtn = new JButton("Add marked");
-    private final JButton saveRouteBtn = new JButton("Save");
-    private final JButton loadRouteBtn = new JButton("Load");
-    private final JLabel testWalkStatus = new JLabel(" ");
-    private volatile Thread testWalkThread;
-    private final JTextField annotateNameField = new JTextField(8);
-    /** Placeholder for a future option that toggles whether walks between
-     *  marked areas are auto-emitted alongside the area boundary. Not yet
-     *  wired to any handler — the checkbox currently only displays state. */
-    private final JCheckBox annotatePathBox = new JCheckBox("Path", true);
-    private final JButton markAreaBtn = new JButton("Mark area");
-    private final JButton markObjectBtn = new JButton("Mark object");
-    private final JLabel annotateStatus = new JLabel(" ");
     private TransportResolver transportResolver;
-    /** Holds the SW corner between the two clicks of {@link #onMarkArea}.
-     *  Only accessed on the EDT (set by the first tileMarker callback,
-     *  read by the second). Not volatile — the EDT-only invariant is
-     *  the synchronisation. */
-    private WorldPoint pendingAreaSw;
-    /** Where named saved routes ("platforms") live. Each route is a text
-     *  file with one waypoint per line — same format the test-walk text
-     *  area accepts, so save/load is just a string round-trip. */
-    private static final Path ROUTES_DIR = Paths.get(
-        System.getProperty("user.home"), ".runelite", "sequencer", "routes");
     private final JButton markTileBtn = new JButton("Mark tile (next click)");
     private final JButton walkToMarkBtn = new JButton("Walk to mark");
     private final JButton clearMarkBtn = new JButton("Clear");
@@ -165,6 +129,7 @@ public final class RecorderPanel extends PluginPanel
     private final JLabel miningOreCountLabel = new JLabel("Ores: 0");
     private final JLabel miningRockCountLabel = new JLabel("Rocks: 0");
     private MiningLoop miningLoop;
+    private final JTabbedPane tabs = new JTabbedPane();
 
     public RecorderPanel(RecorderManager manager, Client client)
     {
@@ -180,24 +145,17 @@ public final class RecorderPanel extends PluginPanel
         this.dispatcher = client == null ? null
             : new HumanizedInputDispatcher(client, clientThread);
         setBackground(ColorScheme.DARK_GRAY_COLOR);
-        setLayout(new BoxLayout(this, BoxLayout.Y_AXIS));
-        add(buildStatusHeader());
-        add(Box.createVerticalStrut(6));
-        add(buildControls());
-        add(Box.createVerticalStrut(6));
-        add(buildMarker());
-        add(Box.createVerticalStrut(6));
-        add(buildRecent());
-        add(Box.createVerticalStrut(6));
-        add(buildDebug());
-        add(Box.createVerticalStrut(6));
-        add(buildTestWalk());
-        add(Box.createVerticalStrut(6));
-        add(buildCombat());
-        add(Box.createVerticalStrut(6));
-        add(buildMining());
-        add(Box.createVerticalStrut(6));
-        add(buildLogin());
+        setLayout(new BorderLayout(0, 6));
+        setBorder(BorderFactory.createEmptyBorder(6, 6, 6, 6));
+
+        add(buildStatusHeader(), BorderLayout.NORTH);
+
+        tabs.addTab("Routes", new JScrollPane(buildRoutesTab()));
+        tabs.addTab("Combat", new JScrollPane(buildCombatTab()));
+        tabs.addTab("Record", new JScrollPane(buildRecordTab()));
+        tabs.addTab("Mining", new JScrollPane(buildMiningTab()));
+        tabs.addTab("Login",  new JScrollPane(buildLoginTab()));
+        add(tabs, BorderLayout.CENTER);
 
         recordBtn.addActionListener(this::onRecordToggle);
         chickenStartBtn.addActionListener(e -> onChickenStart());
@@ -207,14 +165,6 @@ public final class RecorderPanel extends PluginPanel
         miningAddRockBtn.addActionListener(e -> onMiningAddRock());
         miningClearRocksBtn.addActionListener(e -> onMiningClearRocks());
         markerBtn.addActionListener(e -> onMarker());
-        testWalkBtn.addActionListener(e -> onTestWalk());
-        testWalkStopBtn.addActionListener(e -> onTestWalkStop());
-        addCurPosBtn.addActionListener(e -> onAddCurrentPos());
-        addMarkedBtn.addActionListener(e -> onAddMarked());
-        markAreaBtn.addActionListener(e -> onMarkArea());
-        markObjectBtn.addActionListener(e -> onMarkObject());
-        saveRouteBtn.addActionListener(e -> onSaveRoute());
-        loadRouteBtn.addActionListener(e -> onLoadRoute());
         markTileBtn.addActionListener(e -> onMarkTile());
         walkToMarkBtn.addActionListener(e -> onWalkToMark());
         clearMarkBtn.addActionListener(e -> onClearMark());
@@ -231,7 +181,7 @@ public final class RecorderPanel extends PluginPanel
     private JComponent buildStatusHeader()
     {
         JPanel p = new JPanel();
-        p.setLayout(new BoxLayout(p, BoxLayout.Y_AXIS));
+        p.setLayout(new javax.swing.BoxLayout(p, javax.swing.BoxLayout.Y_AXIS));
         p.setBorder(BorderFactory.createTitledBorder("Status"));
         p.add(stateLabel);
         p.add(elapsedLabel);
@@ -240,32 +190,160 @@ public final class RecorderPanel extends PluginPanel
         return p;
     }
 
-    private JComponent buildControls()
+    // ------------------------------------------------------------------
+    // Routes tab — placeholder for Task 11; debug tile-mark tools live here
+    // until the WaypointEditor (Task 10) absorbs them.
+    // ------------------------------------------------------------------
+
+    private JPanel buildRoutesTab()
     {
         JPanel p = new JPanel();
-        p.setBorder(BorderFactory.createTitledBorder("Recording"));
-        p.add(recordBtn);
+        p.setLayout(new javax.swing.BoxLayout(p, javax.swing.BoxLayout.Y_AXIS));
+
+        // Placeholder label — wired in Task 11.
+        p.add(new JLabel("Routes annotator — wired in Task 11"));
+        p.add(javax.swing.Box.createVerticalStrut(8));
+
+        // Debug + tile mark: compact testing surface — mark a tile, walk to
+        // it, or clear. The WaypointEditor (Task 10) will absorb this into
+        // its toolbar; until then the buttons live here.
+        JPanel debug = new JPanel();
+        debug.setLayout(new javax.swing.BoxLayout(debug, javax.swing.BoxLayout.Y_AXIS));
+        debug.setBorder(BorderFactory.createTitledBorder("Debug + tile mark"));
+        debug.add(markTileBtn);
+        JPanel row = new JPanel(new BorderLayout(4, 4));
+        row.add(walkToMarkBtn, BorderLayout.CENTER);
+        row.add(clearMarkBtn, BorderLayout.EAST);
+        debug.add(row);
+        debug.add(markedLabel);
+        p.add(debug);
+
         return p;
     }
 
-    private JComponent buildMarker()
+    // ------------------------------------------------------------------
+    // Combat tab
+    // ------------------------------------------------------------------
+
+    private JPanel buildCombatTab()
     {
-        JPanel p = new JPanel(new BorderLayout(4, 4));
-        p.setBorder(BorderFactory.createTitledBorder("Marker"));
-        p.add(markerField, BorderLayout.CENTER);
-        p.add(markerBtn, BorderLayout.EAST);
+        // Manual start/stop for the chicken combat loop. The loop assumes the
+        // user has already walked the player to the chicken pen — this UI
+        // only triggers the combat orchestrator. Status string is updated by
+        // the loop itself; the timer below polls state + kill count.
+        JPanel p = new JPanel();
+        p.setLayout(new javax.swing.BoxLayout(p, javax.swing.BoxLayout.Y_AXIS));
+        p.setBorder(BorderFactory.createTitledBorder("Combat"));
+        JPanel row = new JPanel(new BorderLayout(4, 4));
+        row.add(chickenStartBtn, BorderLayout.CENTER);
+        row.add(chickenStopBtn, BorderLayout.EAST);
+        p.add(row);
+        p.add(chickenStatusLabel);
+        p.add(chickenKillsLabel);
         return p;
     }
 
-    private JComponent buildRecent()
+    // ------------------------------------------------------------------
+    // Record tab — Recording controls + Marker + Recent events list
+    // ------------------------------------------------------------------
+
+    private JPanel buildRecordTab()
     {
-        JPanel p = new JPanel(new BorderLayout());
-        p.setBorder(BorderFactory.createTitledBorder("Recent (last 50)"));
+        JPanel p = new JPanel();
+        p.setLayout(new javax.swing.BoxLayout(p, javax.swing.BoxLayout.Y_AXIS));
+
+        // Recording controls
+        JPanel controls = new JPanel();
+        controls.setBorder(BorderFactory.createTitledBorder("Recording"));
+        controls.add(recordBtn);
+        p.add(controls);
+        p.add(javax.swing.Box.createVerticalStrut(6));
+
+        // Marker
+        JPanel marker = new JPanel(new BorderLayout(4, 4));
+        marker.setBorder(BorderFactory.createTitledBorder("Marker"));
+        marker.add(markerField, BorderLayout.CENTER);
+        marker.add(markerBtn, BorderLayout.EAST);
+        p.add(marker);
+        p.add(javax.swing.Box.createVerticalStrut(6));
+
+        // Recent events
+        JPanel recent = new JPanel(new BorderLayout());
+        recent.setBorder(BorderFactory.createTitledBorder("Recent (last 50)"));
         recentList.setVisibleRowCount(15);
         recentScroll.setPreferredSize(new Dimension(220, 320));
         recentScroll.setHorizontalScrollBarPolicy(JScrollPane.HORIZONTAL_SCROLLBAR_AS_NEEDED);
-        p.add(recentScroll, BorderLayout.CENTER);
+        recent.add(recentScroll, BorderLayout.CENTER);
+        p.add(recent);
+
         return p;
+    }
+
+    // ------------------------------------------------------------------
+    // Mining tab
+    // ------------------------------------------------------------------
+
+    private JPanel buildMiningTab()
+    {
+        // Manual Start / Stop, plus an "Add rock here" that captures the
+        // local player's current world tile as a rock candidate. Same idiom
+        // as the route's "Add current" button. The user is expected to
+        // stand next to the rock they want, click Add, repeat for 2-3
+        // rocks, then start.
+        JPanel p = new JPanel();
+        p.setLayout(new javax.swing.BoxLayout(p, javax.swing.BoxLayout.Y_AXIS));
+        p.setBorder(BorderFactory.createTitledBorder("Mining"));
+        JPanel row1 = new JPanel(new BorderLayout(4, 4));
+        row1.add(miningStartBtn, BorderLayout.CENTER);
+        row1.add(miningStopBtn, BorderLayout.EAST);
+        p.add(row1);
+        JPanel row2 = new JPanel(new BorderLayout(4, 4));
+        row2.add(miningAddRockBtn, BorderLayout.CENTER);
+        row2.add(miningClearRocksBtn, BorderLayout.EAST);
+        p.add(row2);
+        p.add(miningStatusLabel);
+        p.add(miningOreCountLabel);
+        p.add(miningRockCountLabel);
+        return p;
+    }
+
+    // ------------------------------------------------------------------
+    // Login tab
+    // ------------------------------------------------------------------
+
+    private JPanel buildLoginTab()
+    {
+        JPanel panel = new JPanel(new BorderLayout(4, 4));
+        panel.setBorder(BorderFactory.createTitledBorder("Login"));
+
+        credList.setSelectionMode(ListSelectionModel.SINGLE_SELECTION);
+        credList.setVisibleRowCount(4);
+        JScrollPane scroll = new JScrollPane(credList);
+
+        JPanel buttons = new JPanel(new java.awt.FlowLayout(java.awt.FlowLayout.LEFT, 4, 0));
+        buttons.add(addBtn);
+        buttons.add(deleteBtn);
+        buttons.add(loginBtn);
+        buttons.add(stopBtn);
+
+        JPanel south = new JPanel(new BorderLayout(4, 4));
+        south.add(buttons, BorderLayout.NORTH);
+        south.add(loginStatus, BorderLayout.CENTER);
+        south.add(dumpBtn, BorderLayout.SOUTH);
+
+        panel.add(new JLabel("Saved characters:"), BorderLayout.NORTH);
+        panel.add(scroll, BorderLayout.CENTER);
+        panel.add(south, BorderLayout.SOUTH);
+
+        addBtn.addActionListener(e -> onAddCredential());
+        deleteBtn.addActionListener(e -> onDeleteCredential());
+        loginBtn.addActionListener(e -> onLogin());
+        stopBtn.addActionListener(e -> onStopLogin());
+        dumpBtn.addActionListener(e -> onDumpWidgets());
+
+        credList.addListSelectionListener(e -> updateButtons());
+        updateButtons();
+        return panel;
     }
 
     /** Wire the debug overlay so the panel can clear/set its marked tile.
@@ -299,24 +377,6 @@ public final class RecorderPanel extends PluginPanel
         refreshList();
     }
 
-    private JComponent buildDebug()
-    {
-        // Compact testing surface: snapshot the tile currently under the
-        // cursor, then walk to it. Lets you mark a tile, walk away (so it's
-        // off-screen / outside the loaded scene), then walk back to test
-        // the dispatcher's out-of-sight handling.
-        JPanel p = new JPanel();
-        p.setLayout(new BoxLayout(p, BoxLayout.Y_AXIS));
-        p.setBorder(BorderFactory.createTitledBorder("Debug + tile mark"));
-        p.add(markTileBtn);
-        JPanel row = new JPanel(new BorderLayout(4, 4));
-        row.add(walkToMarkBtn, BorderLayout.CENTER);
-        row.add(clearMarkBtn, BorderLayout.EAST);
-        p.add(row);
-        p.add(markedLabel);
-        return p;
-    }
-
     private void onMarkTile()
     {
         // Two-step UX: button arms the trap; the very next left-click on the
@@ -343,11 +403,15 @@ public final class RecorderPanel extends PluginPanel
         if (wp == null) { markedLabel.setText("nothing marked"); return; }
         markedLabel.setText("walking → " + wp.getX() + "," + wp.getY()
             + " (p=" + wp.getPlane() + ")");
-        // Route through walkRoute so we get the auto-subdivider for free —
-        // a marked tile may be 60+ tiles away, well past the minimap's
-        // single-click radius.
+        // Walk the single marked tile via HumanizedInputDispatcher directly.
         Thread t = new Thread(() -> {
-            walkRoute(java.util.List.of(Waypoint.walk(wp)));
+            net.runelite.client.sequence.internal.ActionRequest req =
+                net.runelite.client.sequence.internal.ActionRequest.builder()
+                    .kind(net.runelite.client.sequence.internal.ActionRequest.Kind.WALK)
+                    .channel(net.runelite.client.sequence.internal.ActionRequest.Channel.MOUSE)
+                    .tile(wp)
+                    .build();
+            dispatcher.dispatch(req);
             String err = dispatcher.lastErrorMessage();
             SwingUtilities.invokeLater(() -> {
                 if (err != null) markedLabel.setText("walk failed: " + err);
@@ -372,232 +436,6 @@ public final class RecorderPanel extends PluginPanel
             : "Marked: " + wp.getX() + "," + wp.getY() + " p=" + wp.getPlane());
     }
 
-    private JComponent buildTestWalk()
-    {
-        // Smoke-test surface for HumanizedInputDispatcher: paste world tiles
-        // (one per line, "x,y" or "x,y,plane"), hit Walk path, watch the
-        // cursor walk the route. Build routes by clicking "Add current" /
-        // "Add marked" while you walk in-game; persist them via Save/Load.
-        // The persisted routes are the "platforms" feature — a named list
-        // of waypoints that the script can replay sequentially, giving the
-        // walker enough variance to never trace a perfectly straight path.
-        JPanel p = new JPanel(new BorderLayout(4, 4));
-        p.setBorder(BorderFactory.createTitledBorder("Test walk / Platforms"));
-        testWalkArea.setLineWrap(false);
-        testWalkArea.setToolTipText("<html>One waypoint per line — formats:<br>"
-            + "&nbsp;&nbsp;x,y[,plane] — walk<br>"
-            + "&nbsp;&nbsp;open:x,y[,plane] — open a door<br>"
-            + "&nbsp;&nbsp;climb-up:x,y[,plane] — climb a stair/ladder up<br>"
-            + "&nbsp;&nbsp;climb-down:x,y[,plane] — climb down<br>"
-            + "&nbsp;&nbsp;interact:x,y[,plane]:Verb — generic action</html>");
-        JScrollPane areaScroll = new JScrollPane(testWalkArea);
-        areaScroll.setPreferredSize(new Dimension(220, 110));
-        p.add(areaScroll, BorderLayout.CENTER);
-        JPanel buttons = new JPanel();
-        buttons.setLayout(new BoxLayout(buttons, BoxLayout.Y_AXIS));
-        JPanel rowWalk = new JPanel(new java.awt.FlowLayout(java.awt.FlowLayout.LEFT, 4, 0));
-        rowWalk.add(testWalkBtn);
-        rowWalk.add(testWalkStopBtn);
-        JPanel rowAdd = new JPanel(new java.awt.FlowLayout(java.awt.FlowLayout.LEFT, 4, 0));
-        rowAdd.add(addCurPosBtn);
-        rowAdd.add(addMarkedBtn);
-        JPanel rowFile = new JPanel(new java.awt.FlowLayout(java.awt.FlowLayout.LEFT, 4, 0));
-        rowFile.add(saveRouteBtn);
-        rowFile.add(loadRouteBtn);
-        JPanel rowAnnotate1 = new JPanel(new java.awt.FlowLayout(java.awt.FlowLayout.LEFT, 4, 0));
-        rowAnnotate1.add(new JLabel("Name:"));
-        rowAnnotate1.add(annotateNameField);
-        rowAnnotate1.add(annotatePathBox);
-        rowAnnotate1.setAlignmentX(0f);
-        JPanel rowAnnotate2 = new JPanel(new java.awt.FlowLayout(java.awt.FlowLayout.LEFT, 4, 0));
-        rowAnnotate2.add(markAreaBtn);
-        rowAnnotate2.add(markObjectBtn);
-        rowAnnotate2.setAlignmentX(0f);
-        buttons.add(rowWalk);
-        buttons.add(rowAdd);
-        buttons.add(rowFile);
-        buttons.add(rowAnnotate1);
-        buttons.add(rowAnnotate2);
-        buttons.add(annotateStatus);
-        buttons.add(testWalkStatus);
-        p.add(buttons, BorderLayout.SOUTH);
-        return p;
-    }
-
-    private void onAddCurrentPos()
-    {
-        WorldPoint here = onClient(() -> {
-            var pl = client.getLocalPlayer();
-            return pl == null ? null : pl.getWorldLocation();
-        });
-        if (here == null) { testWalkStatus.setText("no local player"); return; }
-        appendWaypoint(here);
-        testWalkStatus.setText("added current → " + here.getX() + "," + here.getY()
-            + (here.getPlane() == 0 ? "" : ",p=" + here.getPlane()));
-    }
-
-    private void onAddMarked()
-    {
-        WorldPoint wp = debugOverlay == null ? null : debugOverlay.getMarked();
-        if (wp == null) { testWalkStatus.setText("nothing marked"); return; }
-        appendWaypoint(wp);
-        testWalkStatus.setText("added marked → " + wp.getX() + "," + wp.getY()
-            + (wp.getPlane() == 0 ? "" : ",p=" + wp.getPlane()));
-    }
-
-    private void onMarkArea()
-    {
-        if (tileMarker == null) { annotateStatus.setText("tile marker not wired"); return; }
-        pendingAreaSw = null;
-        annotateStatus.setText("click SW corner…");
-        tileMarker.arm(sw -> {
-            if (sw == null) { annotateStatus.setText("first click cancelled"); return; }
-            pendingAreaSw = sw;
-            annotateStatus.setText("click NE corner… (sw=" + sw.getX() + "," + sw.getY() + ")");
-            tileMarker.arm(ne -> {
-                if (ne == null || pendingAreaSw == null)
-                {
-                    annotateStatus.setText("second click cancelled");
-                    pendingAreaSw = null;
-                    return;
-                }
-                int sx = Math.min(pendingAreaSw.getX(), ne.getX());
-                int sy = Math.min(pendingAreaSw.getY(), ne.getY());
-                int nx = Math.max(pendingAreaSw.getX(), ne.getX());
-                int ny = Math.max(pendingAreaSw.getY(), ne.getY());
-                int plane = ne.getPlane();
-                String name = annotateNameField.getText().trim();
-                String prefix = name.isEmpty() ? "" : name + ": ";
-                String line = prefix + "walkbox:" + sx + "," + sy + " - " + nx + "," + ny
-                    + "," + plane;
-                appendLine(line);
-                annotateStatus.setText("added area " + (name.isEmpty() ? "(unnamed)" : name));
-                pendingAreaSw = null;
-                annotateNameField.setText("");
-                refreshOverlayFromText();
-            });
-        });
-    }
-
-    private void onMarkObject()
-    {
-        if (tileMarker == null || transportResolver == null)
-        {
-            annotateStatus.setText("not wired (need tile marker + resolver)");
-            return;
-        }
-        annotateStatus.setText("click an object (gate/stairs/ladder)…");
-        tileMarker.arm(wp -> {
-            if (wp == null) { annotateStatus.setText("click cancelled"); return; }
-            clientThread.invokeLater(() -> {
-                TransportResolver.AnyMatch m = transportResolver.findAnyTransport(wp);
-                javax.swing.SwingUtilities.invokeLater(() -> {
-                    if (m == null)
-                    {
-                        annotateStatus.setText("no known transport at "
-                            + wp.getX() + "," + wp.getY());
-                        return;
-                    }
-                    String name = annotateNameField.getText().trim();
-                    String prefix = name.isEmpty() ? "" : name + ": ";
-                    String body;
-                    switch (m.kind())
-                    {
-                        case OPEN:        body = "open:";        break;
-                        case CLIMB_UP:    body = "climb-up:";    break;
-                        case CLIMB_DOWN:  body = "climb-down:";  break;
-                        default:          body = "interact:";    break;
-                    }
-                    String tail = wp.getX() + "," + wp.getY() + "," + wp.getPlane();
-                    String line = m.kind() == Waypoint.TransportKind.INTERACT
-                        ? prefix + body + tail + ":" + m.verb() + "  # objId=" + m.objectId()
-                        : prefix + body + tail + "  # objId=" + m.objectId() + " verb=" + m.verb();
-                    appendLine(line);
-                    annotateStatus.setText("added " + body.replace(":", "")
-                        + " (" + m.verb() + ", id=" + m.objectId() + ")");
-                    annotateNameField.setText("");
-                    refreshOverlayFromText();
-                });
-            });
-        });
-    }
-
-    private void appendLine(String line)
-    {
-        String existing = testWalkArea.getText();
-        if (!existing.isEmpty() && !existing.endsWith("\n"))
-            testWalkArea.append("\n");
-        testWalkArea.append(line + "\n");
-    }
-
-    private void refreshOverlayFromText()
-    {
-        if (routeOverlay == null) return;
-        RouteParser.Result r = RouteParser.parse(testWalkArea.getText());
-        routeOverlay.setRoute(r.waypoints());
-    }
-
-    private void appendWaypoint(WorldPoint wp)
-    {
-        String existing = testWalkArea.getText();
-        StringBuilder line = new StringBuilder();
-        if (!existing.isEmpty() && !existing.endsWith("\n")) line.append("\n");
-        line.append(wp.getX()).append(",").append(wp.getY());
-        if (wp.getPlane() != 0) line.append(",").append(wp.getPlane());
-        testWalkArea.append(line.toString());
-    }
-
-    private void onSaveRoute()
-    {
-        String name = JOptionPane.showInputDialog(this, "Route name?",
-            "Save route", JOptionPane.PLAIN_MESSAGE);
-        if (name == null || name.isBlank()) return;
-        String safe = name.trim().replaceAll("[^a-zA-Z0-9_-]", "_");
-        try
-        {
-            Files.createDirectories(ROUTES_DIR);
-            Files.writeString(ROUTES_DIR.resolve(safe + ".txt"), testWalkArea.getText());
-            testWalkStatus.setText("saved → " + safe);
-        }
-        catch (IOException ex)
-        {
-            testWalkStatus.setText("save failed: " + ex.getMessage());
-        }
-    }
-
-    private void onLoadRoute()
-    {
-        try
-        {
-            if (!Files.isDirectory(ROUTES_DIR))
-            {
-                testWalkStatus.setText("no saved routes yet");
-                return;
-            }
-            java.util.List<String> names;
-            try (var stream = Files.list(ROUTES_DIR))
-            {
-                names = stream
-                    .filter(pp -> pp.toString().endsWith(".txt"))
-                    .map(pp -> pp.getFileName().toString().replaceFirst("\\.txt$", ""))
-                    .sorted()
-                    .collect(java.util.stream.Collectors.toList());
-            }
-            if (names.isEmpty()) { testWalkStatus.setText("no saved routes yet"); return; }
-            Object chosen = JOptionPane.showInputDialog(this, "Load which route?",
-                "Load route", JOptionPane.PLAIN_MESSAGE, null,
-                names.toArray(), names.get(0));
-            if (chosen == null) return;
-            String content = Files.readString(ROUTES_DIR.resolve(chosen + ".txt"));
-            testWalkArea.setText(content);
-            testWalkStatus.setText("loaded ← " + chosen);
-        }
-        catch (IOException ex)
-        {
-            testWalkStatus.setText("load failed: " + ex.getMessage());
-        }
-    }
-
     /** Wire the chicken combat loop. Called by the plugin during startUp once
      *  the dispatcher is constructed. The loop's status callback updates
      *  {@link #chickenStatusLabel} via the EDT. */
@@ -607,24 +445,6 @@ public final class RecorderPanel extends PluginPanel
      *  file loads successfully; stays null (panel reports "unavailable") if
      *  the route file is missing. */
     public void setFarmLoop(ChickenFarmLoop fl) { this.farmLoop = fl; }
-
-    private JComponent buildCombat()
-    {
-        // Manual start/stop for the chicken combat loop. The loop assumes the
-        // user has already walked the player to the chicken pen — this UI
-        // only triggers the combat orchestrator. Status string is updated by
-        // the loop itself; the timer below polls state + kill count.
-        JPanel p = new JPanel();
-        p.setLayout(new BoxLayout(p, BoxLayout.Y_AXIS));
-        p.setBorder(BorderFactory.createTitledBorder("Combat"));
-        JPanel row = new JPanel(new BorderLayout(4, 4));
-        row.add(chickenStartBtn, BorderLayout.CENTER);
-        row.add(chickenStopBtn, BorderLayout.EAST);
-        p.add(row);
-        p.add(chickenStatusLabel);
-        p.add(chickenKillsLabel);
-        return p;
-    }
 
     private void onChickenStart()
     {
@@ -642,41 +462,6 @@ public final class RecorderPanel extends PluginPanel
         if (farmLoop == null) return;
         farmLoop.stop();
         chickenStatusLabel.setText("Farm loop: stopping");
-    }
-
-    private JComponent buildLogin()
-    {
-        JPanel panel = new JPanel(new BorderLayout(4, 4));
-        panel.setBorder(BorderFactory.createTitledBorder("Login"));
-
-        credList.setSelectionMode(ListSelectionModel.SINGLE_SELECTION);
-        credList.setVisibleRowCount(4);
-        JScrollPane scroll = new JScrollPane(credList);
-
-        JPanel buttons = new JPanel(new java.awt.FlowLayout(java.awt.FlowLayout.LEFT, 4, 0));
-        buttons.add(addBtn);
-        buttons.add(deleteBtn);
-        buttons.add(loginBtn);
-        buttons.add(stopBtn);
-
-        JPanel south = new JPanel(new BorderLayout(4, 4));
-        south.add(buttons, BorderLayout.NORTH);
-        south.add(loginStatus, BorderLayout.CENTER);
-        south.add(dumpBtn, BorderLayout.SOUTH);
-
-        panel.add(new JLabel("Saved characters:"), BorderLayout.NORTH);
-        panel.add(scroll, BorderLayout.CENTER);
-        panel.add(south, BorderLayout.SOUTH);
-
-        addBtn.addActionListener(e -> onAddCredential());
-        deleteBtn.addActionListener(e -> onDeleteCredential());
-        loginBtn.addActionListener(e -> onLogin());
-        stopBtn.addActionListener(e -> onStopLogin());
-        dumpBtn.addActionListener(e -> onDumpWidgets());
-
-        credList.addListSelectionListener(e -> updateButtons());
-        updateButtons();
-        return panel;
     }
 
     private void updateButtons()
@@ -939,365 +724,6 @@ public final class RecorderPanel extends PluginPanel
         markerField.setText("");
     }
 
-    private void onTestWalk()
-    {
-        if (dispatcher == null) { testWalkStatus.setText("dispatcher unavailable"); return; }
-        if (testWalkThread != null && testWalkThread.isAlive())
-        {
-            testWalkStatus.setText("already running — Stop first");
-            return;
-        }
-        RouteParser.Result parsed = RouteParser.parse(testWalkArea.getText());
-        if (parsed.waypoints().isEmpty())
-        {
-            String msg = parsed.hasErrors()
-                ? "no valid waypoints (" + parsed.errors().get(0) + ")"
-                : "no valid waypoints";
-            testWalkStatus.setText(msg);
-            return;
-        }
-        if (parsed.hasErrors())
-        {
-            log.info("route parse skipped {} bad lines: {}",
-                parsed.errors().size(), parsed.errors());
-        }
-        java.util.List<Waypoint> waypoints = parsed.waypoints();
-        testWalkStatus.setText("walking " + waypoints.size() + " step(s)…");
-        testWalkThread = new Thread(() -> walkRoute(waypoints), "test-walk");
-        testWalkThread.setDaemon(true);
-        testWalkThread.start();
-    }
-
-    private void onTestWalkStop()
-    {
-        Thread t = testWalkThread;
-        if (t != null) t.interrupt();
-        testWalkStatus.setText("stop requested");
-    }
-
-    /** Maximum tile distance (Chebyshev, 2D) at which we consider ourselves
-     *  "in interaction range" of a transport object. Set to 2 because the
-     *  engine itself usually pathfinds to within 1 tile of the door before
-     *  triggering the open animation; a tolerance of 2 gives the dispatcher
-     *  a margin while still keeping the camera angle on the object. */
-    private static final int INTERACTION_RANGE = 2;
-
-    /** Walk a route, dispatching transports inline. For each waypoint:
-     *  if WALK, walk-with-subdivision until the player is on / near the tile;
-     *  if TRANSPORT, walk to within {@link #INTERACTION_RANGE}, then dispatch
-     *  a {@code CLICK_GAME_OBJECT} that opens the door / climbs the ladder /
-     *  generic interact, and wait for the corresponding state transition to
-     *  fire (object id changes for doors; plane changes for climb).
-     *
-     *  <p>The reach and hop-distance are read dynamically from the actual
-     *  minimap zoom on every loop iteration, so a zoomed-in minimap (where
-     *  the engine's projection radius shrinks) doesn't make us pick hops
-     *  the resolver can't project.
-     *
-     *  <p>Runs on a daemon thread so the EDT stays responsive. */
-    private void walkRoute(java.util.List<Waypoint> waypoints)
-    {
-        for (int i = 0; i < waypoints.size(); i++)
-        {
-            if (Thread.currentThread().isInterrupted()) break;
-            Waypoint wp = waypoints.get(i);
-            int idx = i;
-            boolean isFinal = (i == waypoints.size() - 1);
-            switch (wp.kind())
-            {
-                case WALK:
-                    if (!walkToTile(wp.tile(), idx, waypoints.size(), isFinal ? 0 : 3, false))
-                        return;
-                    break;
-                case WALK_AREA:
-                    // The legacy single-tile walker can't sample a tile from an area;
-                    // the area-aware RouteWalker (farm-loop scope) handles this. Fail
-                    // loudly so route files mixing walkbox: with the legacy "Walk" button
-                    // produce a deterministic error instead of an NPE.
-                    SwingUtilities.invokeLater(() -> testWalkStatus.setText(
-                        "WALK_AREA not supported by Walk button; use the farm loop"));
-                    return;
-                case TRANSPORT:
-                    // Approach with a generous tolerance so the dispatcher can
-                    // still see the object on screen. After arrival, fire the
-                    // transport click and wait for its state transition.
-                    if (!walkToTile(wp.tile(), idx, waypoints.size(), INTERACTION_RANGE, true))
-                        return;
-                    if (!doTransport(wp, idx, waypoints.size())) return;
-                    break;
-            }
-        }
-        SwingUtilities.invokeLater(() -> testWalkStatus.setText("done"));
-    }
-
-    /** Walk-with-subdivision toward {@code goal}, returning true when the
-     *  player is within {@code arrivalTolerance} tiles of it (Chebyshev),
-     *  false on failure (no player, plane mismatch, dispatcher error, stuck).
-     *  When {@code allowSamePlaneOnly} is true, plane mismatch reports a
-     *  transport-not-yet-handled error; the caller is expected to dispatch a
-     *  transport before the next walk leg.
-     *
-     *  <p>If {@code arrivalTolerance > 0} and we're already inside that
-     *  radius, returns immediately without dispatching anything. Used so a
-     *  transport waypoint can ask "are we close enough yet?" without
-     *  spinning when the previous leg already left us within range. */
-    private boolean walkToTile(WorldPoint goal, int idx, int total,
-                               int arrivalTolerance, boolean isTransportApproach)
-    {
-        int hopCount = 0;
-        int sameClickCount = 0;
-        WorldPoint lastClick = null;
-        while (true)
-        {
-            if (Thread.currentThread().isInterrupted()) return false;
-            WorldPoint here = onClient(() -> {
-                var pl = client.getLocalPlayer();
-                return pl == null ? null : pl.getWorldLocation();
-            });
-            if (here == null)
-            {
-                SwingUtilities.invokeLater(() -> testWalkStatus.setText(
-                    "step " + (idx + 1) + " — no local player"));
-                return false;
-            }
-            if (here.getPlane() != goal.getPlane())
-            {
-                SwingUtilities.invokeLater(() -> testWalkStatus.setText(
-                    "step " + (idx + 1) + " — different plane (" + here.getPlane()
-                        + " → " + goal.getPlane() + "); needs stair/ladder"));
-                return false;
-            }
-            int dist = here.distanceTo(goal);
-            if (dist <= arrivalTolerance) return true;
-            int reach = dispatcher.pixelResolver().minimapRangeTiles();
-            int hopDistance = Math.max(6, reach - 3);
-            // For transport approach, aim a little bit short so the cursor
-            // ends up close enough to interact but not standing on the door
-            // tile (which can resolve to "Open" already at hover and trigger
-            // a same-tile auto-open).
-            final WorldPoint next;
-            if (dist <= reach)
-            {
-                if (isTransportApproach && dist > arrivalTolerance + 1)
-                {
-                    next = stepToward(here, goal, Math.max(arrivalTolerance, dist - 1));
-                }
-                else
-                {
-                    next = goal;
-                }
-            }
-            else
-            {
-                next = stepToward(here, goal, hopDistance);
-            }
-            if (next.equals(lastClick)) sameClickCount++;
-            else sameClickCount = 0;
-            lastClick = next;
-            if (sameClickCount >= 4)
-            {
-                SwingUtilities.invokeLater(() -> testWalkStatus.setText(
-                    "step " + (idx + 1) + " — stuck at " + here.getX() + "," + here.getY()
-                        + " (no path); add an intermediate waypoint"));
-                return false;
-            }
-            final int hopIdx = ++hopCount;
-            SwingUtilities.invokeLater(() -> testWalkStatus.setText(
-                "step " + (idx + 1) + "/" + total
-                    + (next.equals(goal) ? " → " : " hop " + hopIdx + " → ")
-                    + next.getX() + "," + next.getY()
-                    + (next.equals(goal) ? "" : " (target " + dist + " away)")));
-            ActionRequest req = ActionRequest.builder()
-                .kind(ActionRequest.Kind.WALK)
-                .channel(ActionRequest.Channel.MOUSE)
-                .tile(next)
-                .build();
-            dispatcher.dispatch(req);
-            while (dispatcher.isBusy())
-            {
-                if (Thread.currentThread().isInterrupted()) return false;
-                try { Thread.sleep(50); } catch (InterruptedException ie)
-                { Thread.currentThread().interrupt(); return false; }
-            }
-            String err = dispatcher.lastErrorMessage();
-            if (err != null)
-            {
-                SwingUtilities.invokeLater(() -> testWalkStatus.setText(
-                    "step " + (idx + 1) + " — " + err));
-                return false;
-            }
-            // Wait until the player has arrived at the click target. Use the
-            // arrival tolerance for the goal (whatever the caller asked for);
-            // for intermediate hops, 3 tiles is fine because we re-aim next
-            // iteration anyway.
-            final WorldPoint nextFinal = next;
-            final int hopArrivalTolerance =
-                next.equals(goal) ? arrivalTolerance : 3;
-            long timeout = System.currentTimeMillis() + 30_000L;
-            while (System.currentTimeMillis() < timeout)
-            {
-                if (Thread.currentThread().isInterrupted()) return false;
-                Boolean arrived = onClient(() -> {
-                    var pl = client.getLocalPlayer();
-                    return pl != null && pl.getWorldLocation() != null
-                        && pl.getWorldLocation().distanceTo(nextFinal) <= hopArrivalTolerance;
-                });
-                if (Boolean.TRUE.equals(arrived)) break;
-                try { Thread.sleep(120); } catch (InterruptedException ie)
-                { Thread.currentThread().interrupt(); return false; }
-            }
-        }
-    }
-
-    /** Dispatch a {@code CLICK_GAME_OBJECT} for a transport waypoint and wait
-     *  for the resulting state change. Returns true on success (object id
-     *  changed for doors, plane changed for climbs, fixed wait elapsed for
-     *  generic interacts), false on resolution failure. */
-    private boolean doTransport(Waypoint wp, int idx, int total)
-    {
-        // Snapshot the pre-click state — we need the object id (for doors)
-        // and the plane (for climb) so the post-click poller can detect the
-        // transition. Also surface a clear error if the verb isn't on the
-        // tile right now (e.g., door already open).
-        TransportResolver tr = new TransportResolver(client);
-        TransportResolver.Match preMatch = onClient(() -> tr.findTransport(wp.tile(), wp.verb()));
-        if (preMatch == null || !preMatch.isSuccess())
-        {
-            String reason = preMatch == null ? "resolver returned null" : preMatch.failure();
-            SwingUtilities.invokeLater(() -> testWalkStatus.setText(
-                "step " + (idx + 1) + " — " + reason));
-            return false;
-        }
-        int preObjectId = preMatch.matchedObjectId();
-        Integer prePlane = onClient(() -> {
-            var pl = client.getLocalPlayer();
-            return pl == null || pl.getWorldLocation() == null ? null
-                : pl.getWorldLocation().getPlane();
-        });
-        SwingUtilities.invokeLater(() -> testWalkStatus.setText(
-            "step " + (idx + 1) + "/" + total + " " + wp.verb() + " → "
-                + wp.tile().getX() + "," + wp.tile().getY()));
-        ActionRequest req = ActionRequest.builder()
-            .kind(ActionRequest.Kind.CLICK_GAME_OBJECT)
-            .channel(ActionRequest.Channel.MOUSE)
-            .tile(wp.tile())
-            .verb(wp.verb())
-            .build();
-        dispatcher.dispatch(req);
-        while (dispatcher.isBusy())
-        {
-            if (Thread.currentThread().isInterrupted()) return false;
-            try { Thread.sleep(50); } catch (InterruptedException ie)
-            { Thread.currentThread().interrupt(); return false; }
-        }
-        String err = dispatcher.lastErrorMessage();
-        if (err != null)
-        {
-            SwingUtilities.invokeLater(() -> testWalkStatus.setText(
-                "step " + (idx + 1) + " — " + err));
-            return false;
-        }
-        // Wait for the state change appropriate to the transport kind.
-        Waypoint.TransportKind tk = wp.transportKind();
-        final WorldPoint tile = wp.tile();
-        final String verb = wp.verb();
-        if (tk == Waypoint.TransportKind.OPEN)
-        {
-            // Door: the object id flips when state changes. Cap at 4s.
-            return awaitDoorTransition(tile, verb, preObjectId, idx, 4000L);
-        }
-        else if (tk == Waypoint.TransportKind.CLIMB_UP || tk == Waypoint.TransportKind.CLIMB_DOWN)
-        {
-            // Climb: the player's plane changes. Cap at 6s.
-            int target = prePlane == null ? -1
-                : (tk == Waypoint.TransportKind.CLIMB_UP ? prePlane + 1 : prePlane - 1);
-            return awaitPlaneChange(prePlane, target, idx, 6000L);
-        }
-        else
-        {
-            // Generic interact — we can't detect the state change in the
-            // general case. Give the engine 1.5s to apply the action.
-            try { Thread.sleep(1500); }
-            catch (InterruptedException ie) { Thread.currentThread().interrupt(); return false; }
-            return true;
-        }
-    }
-
-    /** Poll the tile until either its matched-verb object id differs from
-     *  {@code preId} (door flipped state) or the verb is no longer present
-     *  (the menu option vanished — also an indication the door opened). */
-    private boolean awaitDoorTransition(WorldPoint tile, String verb, int preId,
-                                        int idx, long capMs)
-    {
-        TransportResolver tr = new TransportResolver(client);
-        long timeout = System.currentTimeMillis() + capMs;
-        while (System.currentTimeMillis() < timeout)
-        {
-            if (Thread.currentThread().isInterrupted()) return false;
-            try { Thread.sleep(120); }
-            catch (InterruptedException ie) { Thread.currentThread().interrupt(); return false; }
-            TransportResolver.Match cur = onClient(() -> tr.findTransport(tile, verb));
-            if (cur == null) continue;
-            if (!cur.isSuccess())
-            {
-                // Verb no longer matches anything on the tile — the door is
-                // open (its current state advertises "Close" instead).
-                return true;
-            }
-            if (cur.matchedObjectId() != preId)
-            {
-                // Object id flipped — definitively transitioned.
-                return true;
-            }
-        }
-        SwingUtilities.invokeLater(() -> testWalkStatus.setText(
-            "step " + (idx + 1) + " — door did not open within " + (capMs / 1000) + "s"));
-        return false;
-    }
-
-    /** Poll until the player's plane differs from {@code preplane}. If
-     *  {@code expectedPlane} is non-negative, requires that exact plane;
-     *  otherwise any change counts. */
-    private boolean awaitPlaneChange(Integer prePlane, int expectedPlane, int idx, long capMs)
-    {
-        if (prePlane == null) return false;
-        long timeout = System.currentTimeMillis() + capMs;
-        while (System.currentTimeMillis() < timeout)
-        {
-            if (Thread.currentThread().isInterrupted()) return false;
-            try { Thread.sleep(150); }
-            catch (InterruptedException ie) { Thread.currentThread().interrupt(); return false; }
-            Integer now = onClient(() -> {
-                var pl = client.getLocalPlayer();
-                return pl == null || pl.getWorldLocation() == null ? null
-                    : pl.getWorldLocation().getPlane();
-            });
-            if (now == null) continue;
-            if (expectedPlane >= 0 ? now == expectedPlane : !now.equals(prePlane)) return true;
-        }
-        SwingUtilities.invokeLater(() -> testWalkStatus.setText(
-            "step " + (idx + 1) + " — plane did not change within " + (capMs / 1000) + "s"));
-        return false;
-    }
-
-    /** Return a {@link WorldPoint} that is at most {@code maxDist} tiles
-     *  along the straight line from {@code from} toward {@code to}. If the
-     *  total distance is already &le; maxDist, returns {@code to}. Used to
-     *  generate intermediate hops for routes longer than the minimap can
-     *  reach in a single click. Plane is taken from {@code to}. */
-    private static WorldPoint stepToward(WorldPoint from, WorldPoint to, int maxDist)
-    {
-        int dx = to.getX() - from.getX();
-        int dy = to.getY() - from.getY();
-        double mag = Math.hypot(dx, dy);
-        if (mag <= maxDist) return to;
-        double scale = maxDist / mag;
-        return new WorldPoint(
-            from.getX() + (int) Math.round(dx * scale),
-            from.getY() + (int) Math.round(dy * scale),
-            to.getPlane());
-    }
-
     /** Run a value-returning task on the RuneLite client thread, blocking the
      *  caller until the result is available. Wraps scene/perspective reads
      *  ({@code Player.getWorldLocation()}, tile lookups, etc.) which assert
@@ -1322,34 +748,6 @@ public final class RecorderPanel extends PluginPanel
             log.warn("client-thread task failed", ex);
             return null;
         }
-    }
-
-    // Note: legacy parseWaypoints / reachabilityHint helpers were superseded
-    // by RouteParser + Waypoint. Removed to keep the panel focused on UI
-    // wiring and route execution; see net.runelite.client.plugins.recorder
-    // .transport.RouteParser for the line grammar.
-
-    @SuppressWarnings("unused")
-    private static java.util.List<WorldPoint> parseWaypoints(String text)
-    {
-        java.util.List<WorldPoint> out = new java.util.ArrayList<>();
-        if (text == null) return out;
-        for (String raw : text.split("\\R"))
-        {
-            String line = raw.trim();
-            if (line.isEmpty() || line.startsWith("#")) continue;
-            String[] parts = line.split("\\s*,\\s*");
-            if (parts.length < 2) continue;
-            try
-            {
-                int x = Integer.parseInt(parts[0]);
-                int y = Integer.parseInt(parts[1]);
-                int plane = parts.length >= 3 ? Integer.parseInt(parts[2]) : 0;
-                out.add(new WorldPoint(x, y, plane));
-            }
-            catch (NumberFormatException ignored) { /* skip malformed */ }
-        }
-        return out;
     }
 
     private void refresh()
@@ -1497,8 +895,7 @@ public final class RecorderPanel extends PluginPanel
     }
 
     // ----------------------------------------------------------------------
-    // Mining section. Added at the end of the class so it doesn't conflict
-    // with the parallel agent's edits to the Combat section above.
+    // Mining section
     // ----------------------------------------------------------------------
 
     /** Wire the mining loop. Called by the plugin during startUp once the
@@ -1512,30 +909,6 @@ public final class RecorderPanel extends PluginPanel
     {
         if (msg == null) return;
         SwingUtilities.invokeLater(() -> miningStatusLabel.setText("Mining: " + msg));
-    }
-
-    private JComponent buildMining()
-    {
-        // Manual Start / Stop, plus an "Add rock here" that captures the
-        // local player's current world tile as a rock candidate. Same idiom
-        // as the route's "Add current" button. The user is expected to
-        // stand next to the rock they want, click Add, repeat for 2-3
-        // rocks, then start.
-        JPanel p = new JPanel();
-        p.setLayout(new BoxLayout(p, BoxLayout.Y_AXIS));
-        p.setBorder(BorderFactory.createTitledBorder("Mining"));
-        JPanel row1 = new JPanel(new BorderLayout(4, 4));
-        row1.add(miningStartBtn, BorderLayout.CENTER);
-        row1.add(miningStopBtn, BorderLayout.EAST);
-        p.add(row1);
-        JPanel row2 = new JPanel(new BorderLayout(4, 4));
-        row2.add(miningAddRockBtn, BorderLayout.CENTER);
-        row2.add(miningClearRocksBtn, BorderLayout.EAST);
-        p.add(row2);
-        p.add(miningStatusLabel);
-        p.add(miningOreCountLabel);
-        p.add(miningRockCountLabel);
-        return p;
     }
 
     private void onMiningStart()
