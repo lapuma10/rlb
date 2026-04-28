@@ -125,20 +125,28 @@ public final class TrailPlanner
     /** Snap {@code p} to the nearest graph node within Chebyshev <= 1 on the
      *  same plane. Returns {@code p} unchanged if it is already on the
      *  graph, the closest within-1 node otherwise, or null if no node
-     *  qualifies. */
+     *  qualifies. Euclidean distance breaks ties between equal-Chebyshev
+     *  candidates so the result is deterministic. */
     private WorldPoint snapToGraph(WorldPoint p)
     {
         if (graph.nodes().contains(p)) return p;
         WorldPoint best = null;
-        int bestDist = Integer.MAX_VALUE;
+        int bestCheb = Integer.MAX_VALUE;
+        int bestEucSq = Integer.MAX_VALUE;
         for (WorldPoint n : graph.nodes())
         {
             if (n.getPlane() != p.getPlane()) continue;
             int dx = Math.abs(n.getX() - p.getX());
             int dy = Math.abs(n.getY() - p.getY());
-            int d = Math.max(dx, dy);
-            if (d > 1) continue;
-            if (d < bestDist) { best = n; bestDist = d; }
+            int cheb = Math.max(dx, dy);
+            if (cheb > 1) continue;
+            int eucSq = dx * dx + dy * dy;
+            if (cheb < bestCheb || (cheb == bestCheb && eucSq < bestEucSq))
+            {
+                best = n;
+                bestCheb = cheb;
+                bestEucSq = eucSq;
+            }
         }
         return best;
     }
