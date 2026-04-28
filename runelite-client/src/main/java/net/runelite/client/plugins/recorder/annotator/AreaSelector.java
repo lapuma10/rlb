@@ -11,6 +11,7 @@ import net.runelite.api.Client;
 import net.runelite.api.Perspective;
 import net.runelite.api.Tile;
 import net.runelite.api.WorldView;
+import net.runelite.api.coords.LocalPoint;
 import net.runelite.api.coords.WorldPoint;
 import net.runelite.client.callback.ClientThread;
 import net.runelite.client.input.MouseAdapter;
@@ -63,13 +64,13 @@ public final class AreaSelector
 	private final MouseManager mouseManager;
 
 	private final AtomicReference<Set<WorldPoint>> working = new AtomicReference<>(Set.of());
-	@Nullable private Listener listener;
-	@Nullable private MouseAdapter activeListener;
+	@Nullable private volatile Listener listener;
+	@Nullable private volatile MouseAdapter activeListener;
 
-	@Nullable private WorldPoint pressTile;
-	private int pressX, pressY;
-	private boolean pressShift;
-	@Nullable private WorldPoint hoverTile;
+	@Nullable private volatile WorldPoint pressTile;
+	private volatile int pressX, pressY;
+	private volatile boolean pressShift;
+	@Nullable private volatile WorldPoint hoverTile;
 
 	public AreaSelector(Client client, ClientThread clientThread, MouseManager mouseManager)
 	{
@@ -105,12 +106,17 @@ public final class AreaSelector
 		activeListener = adapter;
 	}
 
+	/** Fires {@link Listener#onCommit} with the working set, then resets internal
+	 *  state. The Set instance passed to {@code onCommit} remains valid for the
+	 *  caller; {@link #currentSet()} returns an empty set after this method returns. */
 	public void commit()
 	{
 		if (listener != null) listener.onCommit(working.get());
 		cleanup();
 	}
 
+	/** Fires {@link Listener#onCancel}, then resets internal state. After this
+	 *  method returns, {@link #currentSet()} returns an empty set. */
 	public void cancel()
 	{
 		if (listener != null) listener.onCancel();
@@ -200,7 +206,9 @@ public final class AreaSelector
 			{
 				Tile t = planeTiles[x][y];
 				if (t == null) continue;
-				java.awt.Polygon poly = Perspective.getCanvasTilePoly(client, t.getLocalLocation());
+				LocalPoint lp = t.getLocalLocation();
+				if (lp == null) continue;
+				java.awt.Polygon poly = Perspective.getCanvasTilePoly(client, lp);
 				if (poly != null && poly.contains(canvasX, canvasY))
 				{
 					return t.getWorldLocation();
