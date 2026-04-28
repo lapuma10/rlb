@@ -321,6 +321,24 @@ public final class UniversalWalker
             return Math.min(containedIdx + 1, wps.size());
         }
 
+        // STAY-ON-TRANSPORT — never skip past an unfinished transport.
+        // Without this, a player who has just left the previous landmark
+        // (e.g. walked north out of pen-approach toward the gate) gets
+        // snapped forward to the closest WALK_AREA on plane (the pen
+        // interior), bypassing the gate handler entirely. The L-click
+        // pathfind may still walk through if the gate's default action
+        // is "Open", but the walker's intent — explicit gate handling
+        // with isPlayerSettled + verb-pick — is lost. Stay on the gate
+        // until adjacency arrived.
+        if (minIdx < wps.size())
+        {
+            Waypoint cur = wps.get(minIdx);
+            if (cur.kind() == Waypoint.Kind.TRANSPORT && !arrived(cur, pos))
+            {
+                return minIdx;
+            }
+        }
+
         // Pass 2: highest TRANSPORT the player has passed (CLIMB
         // destination-plane reached, OPEN adjacency, etc.).
         int highestTransportArrived = -1;
@@ -334,11 +352,25 @@ public final class UniversalWalker
         }
         int searchFrom = Math.max(minIdx, highestTransportArrived + 1);
 
-        // Pass 3: closest WALK_AREA on the player's plane after the
-        // last transport.
+        // Cap forward scan at the next unfinished TRANSPORT — same
+        // reason as the STAY rule above: don't snap to a WALK_AREA past
+        // a gate / staircase the player still needs to traverse.
+        int upperBound = wps.size();
+        for (int i = searchFrom; i < wps.size(); i++)
+        {
+            Waypoint w = wps.get(i);
+            if (w.kind() == Waypoint.Kind.TRANSPORT && !arrived(w, pos))
+            {
+                upperBound = i;
+                break;
+            }
+        }
+
+        // Pass 3: closest WALK_AREA on the player's plane between
+        // searchFrom and upperBound.
         int closestIdx = -1;
         int closestDist = Integer.MAX_VALUE;
-        for (int i = searchFrom; i < wps.size(); i++)
+        for (int i = searchFrom; i < upperBound; i++)
         {
             Waypoint w = wps.get(i);
             if (w.kind() != Waypoint.Kind.WALK_AREA) continue;
@@ -356,8 +388,8 @@ public final class UniversalWalker
         }
         if (closestIdx >= 0) return closestIdx;
 
-        // No WALK_AREA on player's plane — must be mid-staircase.
-        // Stay on the next transport (typically a climb).
+        // No WALK_AREA on player's plane in the bounded range — must
+        // be mid-staircase or already at upperBound transport. Stay.
         return searchFrom;
     }
 
