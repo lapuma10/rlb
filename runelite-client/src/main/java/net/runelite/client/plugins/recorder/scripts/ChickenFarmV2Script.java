@@ -46,15 +46,15 @@ import net.runelite.client.sequence.dispatch.HumanizedInputDispatcher;
  *  └─────────────┘
  * </pre>
  *
- * <h2>What's intentionally simpler than V1</h2>
+ * <h2>What V2 changes from V1</h2>
  *
  * <ul>
- *   <li><b>Booth picking.</b> V1's {@code clickRandomBooth} scans both
- *       NPC bankers AND GameObject bank booths and randomises the choice.
- *       V2 uses {@link BankInteraction#clickBankBooth} (NPC-only, first
- *       match). Good enough at Lumbridge upstairs; we can promote to a
- *       shared {@code farm/BankFlow} class once a second bot needs the
- *       same flow.</li>
+ *   <li><b>Booth picking.</b> Both versions scan NPC bankers AND
+ *       GameObject bank booths within 15 tiles, prefer an adjacent
+ *       candidate (Chebyshev ≤ 1), pick uniformly at random otherwise.
+ *       V1 does it inline in private helpers; V2 delegates to
+ *       {@link BankInteraction#clickBankBoothRandom} so future bots
+ *       reuse the same logic without duplication.</li>
  *   <li><b>Stairs / gate.</b> V1 handles these as in-line state-machine
  *       branches at specific landmarks. V2 declares them as part of the
  *       {@link PathSpec} and lets {@link UniversalWalker} drive — gate is
@@ -298,7 +298,7 @@ public final class ChickenFarmV2Script
         if (!open && !empty)
         {
             status.set("clicking bank booth");
-            if (bank.clickBankBooth()) lastBankActionAtMs = now;
+            if (bank.clickBankBoothRandom()) lastBankActionAtMs = now;
             return;
         }
         if (open && !empty)
