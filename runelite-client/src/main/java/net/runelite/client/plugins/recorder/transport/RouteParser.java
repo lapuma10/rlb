@@ -102,7 +102,7 @@ public final class RouteParser
 
     /** Reserved verb prefixes that must never be treated as name tokens. */
     private static final Set<String> RESERVED_PREFIXES = new HashSet<>(Arrays.asList(
-        "walk", "walkbox", "open", "interact",
+        "walk", "walkbox", "walktiles", "open", "interact",
         "climb-up", "climbup", "climb-down", "climbdown"
     ));
 
@@ -165,6 +165,10 @@ public final class RouteParser
             case "walkbox":
             {
                 return Waypoint.walkArea(name, parseWalkbox(rest));
+            }
+            case "walktiles":
+            {
+                return Waypoint.walkArea(name, parseWalktiles(rest));
             }
             case "open":
             {
@@ -232,16 +236,78 @@ public final class RouteParser
                 throw new IllegalArgumentException(
                     "walkbox ne corner must be >= sw corner (got sw=" + sx + "," + sy
                         + " ne=" + nx + "," + ny + ")");
-            // plane lives on the ne side: "sw - ne,plane"
+            // plane lives on the ne side: "sw - ne,plane" or "sw - ne,p=N"
             int plane = 0;
-            if (ne.length >= 3) plane = Integer.parseInt(ne[2]);
-            else if (sw.length >= 3) plane = Integer.parseInt(sw[2]);
+            if (ne.length >= 3)
+            {
+                String p = ne[2].trim();
+                if (p.startsWith("p=")) p = p.substring(2);
+                plane = Integer.parseInt(p);
+            }
+            else if (sw.length >= 3)
+            {
+                String p = sw[2].trim();
+                if (p.startsWith("p=")) p = p.substring(2);
+                plane = Integer.parseInt(p);
+            }
             return new WorldArea(sx, sy, nx - sx + 1, ny - sy + 1, plane);
         }
         catch (NumberFormatException nfe)
         {
             throw new IllegalArgumentException("non-numeric coordinate in walkbox '" + s + "'");
         }
+    }
+
+    /** Parse {@code "x1,y1;x2,y2;...[,plane]"} into a tile set. The trailing
+     *  ",plane" applies to every tile; per-tile planes are not allowed. */
+    private static java.util.Set<WorldPoint> parseWalktiles(String s)
+    {
+        if (s == null || s.isBlank()) throw new IllegalArgumentException("missing tiles");
+        // The plane is everything after the LAST comma if it has the form
+        // "p=N" or a bare integer. Split off the plane first so we don't confuse
+        // it with a tile coord.
+        int plane = 0;
+        int lastComma = s.lastIndexOf(',');
+        String pairs = s;
+        if (lastComma >= 0)
+        {
+            String tail = s.substring(lastComma + 1).trim();
+            if (tail.startsWith("p=")) tail = tail.substring(2);
+            try
+            {
+                plane = Integer.parseInt(tail);
+                pairs = s.substring(0, lastComma).trim();
+            }
+            catch (NumberFormatException ignored)
+            {
+                // Last segment isn't a plane — treat the whole string as pairs.
+            }
+        }
+        String[] tokens = pairs.split("\\s*;\\s*");
+        if (tokens.length == 0) throw new IllegalArgumentException("walktiles needs at least one tile");
+        java.util.Set<WorldPoint> out = new java.util.HashSet<>(tokens.length);
+        for (String tok : tokens)
+        {
+            if (tok.isBlank()) continue;
+            String[] xy = tok.split("\\s*,\\s*");
+            if (xy.length != 2)
+                throw new IllegalArgumentException(
+                    "walktiles tile must be 'x,y' (got '" + tok + "')");
+            int x, y;
+            try
+            {
+                x = Integer.parseInt(xy[0]);
+                y = Integer.parseInt(xy[1]);
+            }
+            catch (NumberFormatException nfe)
+            {
+                throw new IllegalArgumentException("non-numeric coordinate in walktiles tile '" + tok + "'");
+            }
+            out.add(new WorldPoint(x, y, plane));
+        }
+        if (out.isEmpty())
+            throw new IllegalArgumentException("walktiles produced no tiles");
+        return out;
     }
 
     /** Parse {@code "x,y"} or {@code "x, y, plane"} into a {@link WorldPoint}.
