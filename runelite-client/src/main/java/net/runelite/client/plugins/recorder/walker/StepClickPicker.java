@@ -105,9 +105,22 @@ public final class StepClickPicker
 
     /** Pick the best click target heading TOWARD {@code target} — useful when
      *  the player is far from the next waypoint and can only reach part of
-     *  the way there in one BFS. Iterates every reachable tile (not just
-     *  tiles in the area), picks the one closest to {@code target} that
-     *  projects. */
+     *  the way there in one BFS. Iterates every reachable tile, picks the
+     *  one closest to {@code target} that strictly improves over the
+     *  player's current distance to {@code target}.
+     *
+     *  <p><b>Minimap-only on purpose.</b> A canvas click resolves through
+     *  whatever's rendered at the picked pixel — a tree there triggers
+     *  "Chop", a log "Take", an NPC "Attack". Minimap clicks always route
+     *  as "Walk here". Step-toward picks intermediate tiles by definition,
+     *  where pixel-overlap with clickable objects is the rule not the
+     *  exception. Direct-path {@link #pick} keeps canvas preference because
+     *  there the destination IS the click target.
+     *
+     *  <p><b>Strict progress.</b> Never returns a tile farther from
+     *  {@code target} than the player already is — would cause the bot to
+     *  walk away from the goal. Returns null when no reachable tile
+     *  improves toward target. */
     @Nullable
     public ClickTarget pickTowards(Reachability.ReachabilityMap reach, WorldPoint target)
     {
@@ -118,26 +131,25 @@ public final class StepClickPicker
         WorldView wv = client.getTopLevelWorldView();
         if (wv == null) return null;
 
-        ClickTarget bestCanvas = null;
-        ClickTarget bestMinimap = null;
+        // Player's current distance to target — every candidate must beat it.
+        int hereToTarget = chebyshev(origin.getX(), origin.getY(),
+                                     target.getX(), target.getY());
 
+        ClickTarget best = null;
         for (WorldPoint t : reach.reachableTiles())
         {
-            int distToTarget = chebyshev(t.getX(), t.getY(), target.getX(), target.getY());
-            ClickTarget c = projectTile(wv, t, reach.distance(t), distToTarget);
-            if (c == null) continue;
-            if (c.viaMinimap)
-            {
-                if (isBetter(c, bestMinimap)) bestMinimap = c;
-            }
-            else
-            {
-                if (isBetter(c, bestCanvas)) bestCanvas = c;
-            }
+            int distToTarget = chebyshev(t.getX(), t.getY(),
+                                         target.getX(), target.getY());
+            if (distToTarget >= hereToTarget) continue;       // strict progress
+            LocalPoint lp = LocalPoint.fromWorld(wv, t);
+            if (lp == null) continue;
+            Point mini = Perspective.localToMinimap(client, lp);
+            if (mini == null) continue;
+            ClickTarget c = new ClickTarget(t, mini, true,
+                reach.distance(t), distToTarget);
+            if (isBetter(c, best)) best = c;
         }
-
-        if (bestCanvas != null) return bestCanvas;
-        return bestMinimap;
+        return best;
     }
 
     /** True if {@code candidate} is strictly better than {@code current}
