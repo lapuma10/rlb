@@ -170,9 +170,12 @@ public final class LumbridgeBankPenScript
     private WorldPoint lastSeenPos;
     private long lastMoveAtMs;
     private long stateEnteredAtMs;
-    /** Throttle for bank booth clicks — bank widget takes ~600ms to load
-     *  after click, so we wait ≥ 3s between booth clicks before retrying. */
-    private long lastBankClickAtMs;
+    /** Throttle for ANY banking action — booth click, deposit, close.
+     *  Each click has to be processed by the engine (one game tick =
+     *  ~600ms minimum, plus animation + UI update). Spamming clicks
+     *  inside the same window cancels prior actions. We pace at ≥ 2s
+     *  between any two bank-related dispatches. */
+    private long lastBankActionAtMs;
     /** Throttle for stairs / gate menu invocations. Plane change after a
      *  staircase click takes ~1-2s; without this we'd re-invoke every
      *  tick during the animation. */
@@ -312,9 +315,23 @@ public final class LumbridgeBankPenScript
     // BANKING — at bank, inventory non-empty: open bank, deposit, advance
     // ────────────────────────────────────────────────────────────────
 
+    /**
+     * Bank workflow as a flat state machine driven by widget state +
+     * inventory state, paced at ≥ 2s between any bank-related dispatch:
+     * <ol>
+     *   <li>Not at bank → walk there.</li>
+     *   <li>Bank widget closed → click random booth/banker.</li>
+     *   <li>Bank widget open AND inventory non-empty → click deposit-inv.</li>
+     *   <li>Bank widget open AND inventory empty → click close (Esc).</li>
+     *   <li>Bank widget closed AND inventory empty → transition to OUTBOUND.</li>
+     * </ol>
+     * Each dispatch sets {@link #lastBankActionAtMs}; the next action is
+     * gated until ≥ 2s have passed so the engine can process the previous
+     * widget update (one game tick + UI lag). Without this we spam the
+     * deposit button repeatedly and the bank never closes before we walk.
+     */
     private void tickBanking() throws InterruptedException
     {
-        // 1. If we're not at the bank tiles yet, walk there (plane 2).
         if (!playerInArea(BANK_AREA))
         {
             WalkResult r = advanceWalk(BANK_AREA);
@@ -325,33 +342,46 @@ public final class LumbridgeBankPenScript
             }
             return;
         }
-        // 2. If bank widget not open, click a bank booth / banker.
-        boolean open = onClientThread(bank::isBankOpen);
-        if (!open)
+        long now = System.currentTimeMillis();
+        long sinceAction = lastBankActionAtMs == 0
+            ? Long.MAX_VALUE : now - lastBankActionAtMs;
+        if (sinceAction < 2000)
         {
-            // Throttle bank clicks: ≥ 3s between attempts so the bank
-            // widget has time to open and we don't spam.
-            long now = System.currentTimeMillis();
-            long sinceClick = lastBankClickAtMs == 0
-                ? Long.MAX_VALUE : now - lastBankClickAtMs;
-            if (sinceClick < 3000) return;
-            status.set("clicking bank booth");
-            if (clickRandomBooth()) lastBankClickAtMs = now;
+            status.set("bank — pacing (last action " + sinceAction + "ms ago)");
             return;
         }
-        // 3. Inventory empty? close bank, advance to OUTBOUND.
+
+        boolean open = onClientThread(bank::isBankOpen);
         boolean empty = onClientThread(() ->
             InventoryUtil.freeSlotCount(client) >= InventoryUtil.INVENTORY_SIZE);
-        if (empty)
+
+        if (!open && !empty)
         {
-            status.set("inventory empty — heading to pen");
-            closeBankSafe();
-            setState(State.OUTBOUND);
+            // Open the bank.
+            status.set("clicking bank booth");
+            if (clickRandomBooth()) lastBankActionAtMs = now;
             return;
         }
-        // 4. Deposit inventory.
-        status.set("depositing inventory");
-        clickDepositInventorySafe();
+        if (open && !empty)
+        {
+            // Deposit.
+            status.set("depositing inventory");
+            if (clickDepositInventorySafe()) lastBankActionAtMs = now;
+            return;
+        }
+        if (open && empty)
+        {
+            // Close the widget before walking — otherwise the next click
+            // (walk to stairs) might land on the bank UI instead of the
+            // game canvas.
+            status.set("closing bank");
+            closeBankSafe();
+            lastBankActionAtMs = now;
+            return;
+        }
+        // !open && empty — done.
+        status.set("bank closed — heading to pen");
+        setState(State.OUTBOUND);
     }
 
     /**
@@ -768,7 +798,7 @@ public final class LumbridgeBankPenScript
         lastSeenPos = null;
         lastMoveAtMs = System.currentTimeMillis();
         stateEnteredAtMs = System.currentTimeMillis();
-        lastBankClickAtMs = 0L;
+        lastBankActionAtMs = 0L;
         lastInteractionAtMs = 0L;
         lastVisitedIdx = -1;
     }
@@ -920,7 +950,12 @@ public final class LumbridgeBankPenScript
             }
         }
 
-        // Prefer canvas — more reliable.
+        // If both are available, alternate ~30% minimap for humanization
+        // (real players sometimes use the minimap for in-range walks too).
+        if (canvasPick != null && minimapPick != null)
+        {
+            return Math.random() < 0.3 ? minimapPick : canvasPick;
+        }
         if (canvasPick != null) return canvasPick;
         return minimapPick;
     }
@@ -997,8 +1032,29 @@ public final class LumbridgeBankPenScript
                         for (GameObject go : gos)
                         {
                             if (go == null) continue;
-                            ObjectComposition def = client.getObjectDefinition(go.getId());
-                            if (def == null) continue;
+                            ObjectComposition baseDef = client.getObjectDefinition(go.getId());
+                            if (baseDef == null) continue;
+                            // Multi-state objects (open/closed door, staircase
+                            // with extra "Top floor"/"Bottom floor" options
+                            // added by the April-2025 update) carry the
+                            // currently-visible actions on the IMPOSTOR, not
+                            // the base def. Mirror what TransportResolver
+                            // does for verb matching.
+                            ObjectComposition def = baseDef;
+                            int liveId = go.getId();
+                            if (baseDef.getImpostorIds() != null)
+                            {
+                                try
+                                {
+                                    ObjectComposition imp = baseDef.getImpostor();
+                                    if (imp != null)
+                                    {
+                                        def = imp;
+                                        liveId = imp.getId();
+                                    }
+                                }
+                                catch (Throwable ignored) { /* base def fallback */ }
+                            }
                             String[] actions = def.getActions();
                             if (actions == null) continue;
                             for (int i = 0; i < actions.length && i < 5; i++)
@@ -1012,9 +1068,13 @@ public final class LumbridgeBankPenScript
                                 if (lp == null) continue;
                                 int objSx = lp.getSceneX();
                                 int objSy = lp.getSceneY();
-                                log.info("script: invoking '{}' on object id={} '{}' (slot {}) at scene ({},{})",
-                                    a, go.getId(), def.getName(), i, objSx, objSy);
-                                client.menuAction(objSx, objSy, ma, go.getId(), -1,
+                                log.info("script: invoking '{}' on object baseId={} liveId={} '{}' (slot {}) at scene ({},{})",
+                                    a, go.getId(), liveId, def.getName(), i, objSx, objSy);
+                                // The engine looks up the object at scene
+                                // (sx, sy) and matches by id — pass the live
+                                // (impostor) id so the menu slot binds to
+                                // the impostor's action table.
+                                client.menuAction(objSx, objSy, ma, liveId, -1,
                                     a, def.getName());
                                 return true;
                             }
@@ -1274,11 +1334,19 @@ public final class LumbridgeBankPenScript
                         for (GameObject go : gos)
                         {
                             if (go == null) continue;
-                            ObjectComposition def = client.getObjectDefinition(go.getId());
-                            if (def == null) continue;
+                            ObjectComposition baseDef = client.getObjectDefinition(go.getId());
+                            if (baseDef == null) continue;
+                            ObjectComposition def = baseDef;
+                            if (baseDef.getImpostorIds() != null)
+                            {
+                                try
+                                {
+                                    ObjectComposition imp = baseDef.getImpostor();
+                                    if (imp != null) def = imp;
+                                }
+                                catch (Throwable ignored) { /* fall back */ }
+                            }
                             String name = def.getName();
-                            // Some object defs return "null" string; filter
-                            // by Bank action presence as the strict check.
                             String[] actions = def.getActions();
                             if (actions == null) continue;
                             int slot = bankActionSlot(actions);
