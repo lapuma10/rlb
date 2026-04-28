@@ -84,17 +84,15 @@ public final class TrailWalker
     static int chooseLegIndex(TrailPath path, int minIdx, WorldPoint pos)
     {
         List<Leg> legs = path.legs();
-        // Walk forward from minIdx; advance past any leg whose tile-set
-        // the player has already visited AND whose successor leg also
-        // contains the player.
+        // Single-step monotonic advance: only flip to leg i+1 if the
+        // player is in i+1's tile-set. Multi-step skipping (e.g. across
+        // a transport) requires re-entering tick after each advance —
+        // this prevents skipping past an unfinished transport when its
+        // post-tile aliases a tile in the active leg.
         int idx = minIdx;
-        for (int i = minIdx; i < legs.size() - 1; i++)
+        while (idx < legs.size() - 1 && legContainsTile(legs.get(idx + 1), pos))
         {
-            Leg next = legs.get(i + 1);
-            if (legContainsTile(next, pos))
-            {
-                idx = i + 1;
-            }
+            idx++;
         }
         return idx;
     }
