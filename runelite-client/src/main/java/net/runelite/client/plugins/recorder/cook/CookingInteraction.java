@@ -10,10 +10,7 @@ import net.runelite.api.Client;
 import net.runelite.api.GameObject;
 import net.runelite.api.Item;
 import net.runelite.api.ItemContainer;
-import net.runelite.api.ObjectComposition;
 import net.runelite.api.Player;
-import net.runelite.api.Scene;
-import net.runelite.api.Tile;
 import net.runelite.api.TileItem;
 import net.runelite.api.WorldView;
 import net.runelite.api.coords.LocalPoint;
@@ -23,6 +20,7 @@ import net.runelite.api.gameval.InventoryID;
 import net.runelite.api.gameval.ItemID;
 import net.runelite.api.widgets.Widget;
 import net.runelite.client.callback.ClientThread;
+import net.runelite.client.plugins.recorder.scene.SceneScanner;
 import net.runelite.client.sequence.dispatch.HumanizedInputDispatcher;
 import net.runelite.client.sequence.internal.ActionRequest;
 
@@ -62,6 +60,7 @@ public final class CookingInteraction
     private final Client client;
     private final ClientThread clientThread;
     private final HumanizedInputDispatcher dispatcher;
+    private final SceneScanner scanner;
 
     public CookingInteraction(Client client, ClientThread clientThread,
                               HumanizedInputDispatcher dispatcher)
@@ -69,6 +68,7 @@ public final class CookingInteraction
         this.client = client;
         this.clientThread = clientThread;
         this.dispatcher = dispatcher;
+        this.scanner = new SceneScanner(client);
     }
 
     // ────────────────────────────────────────────────────────────────
@@ -140,9 +140,10 @@ public final class CookingInteraction
     // Scene scans — heat source + ground logs
     // ────────────────────────────────────────────────────────────────
 
-    /** Result of a scene scan. World tile + the live GameObject (for
-     *  hull resolution) or TileItem (for ground items). One of the two
-     *  is non-null on success. */
+    /** Result of a scene scan. Alias for {@link SceneScanner.Match} —
+     *  kept here so existing callers (CookingScript) don't have to
+     *  switch import paths. New code should reach for
+     *  {@link SceneScanner.Match} directly. */
     public static final class Match
     {
         public final WorldPoint tile;
@@ -151,6 +152,9 @@ public final class CookingInteraction
 
         Match(WorldPoint t, GameObject go, TileItem ti)
         { tile = t; gameObject = go; tileItem = ti; }
+
+        static Match wrap(SceneScanner.Match s)
+        { return s == null ? null : new Match(s.tile, s.gameObject, s.tileItem); }
     }
 
     /** Find the closest GameObject within {@link #SEARCH_RADIUS} of the
@@ -159,129 +163,15 @@ public final class CookingInteraction
      *  Returns null if none in range. */
     public Match findHeatSource(String namePattern) throws InterruptedException
     {
-        return onClient(() -> findGameObjectByName(namePattern));
+        return onClient(() -> Match.wrap(scanner.findGameObjectByName(namePattern, SEARCH_RADIUS)));
     }
 
     /** Find the closest TileItem with {@code itemId} on the player's
      *  plane within {@link #SEARCH_RADIUS}. Used for "Logs" ground item
-     *  spawns. Returns null if none in range.
-     *
-     *  <p>Per the OSRS engine logs on the floor are TileItems (a.k.a.
-     *  ground items), not GameObjects — there is no separate "Logs"
-     *  GameObject id. */
+     *  spawns. Returns null if none in range. */
     public Match findGroundLogs(int itemId) throws InterruptedException
     {
-        return onClient(() -> findTileItemById(itemId));
-    }
-
-    private Match findGameObjectByName(String namePattern)
-    {
-        Player self = client.getLocalPlayer();
-        if (self == null) return null;
-        WorldPoint here = self.getWorldLocation();
-        if (here == null) return null;
-        WorldView wv = client.getTopLevelWorldView();
-        if (wv == null) return null;
-        Scene scene = wv.getScene();
-        if (scene == null) return null;
-        Tile[][][] tiles = scene.getTiles();
-        int plane = here.getPlane();
-        if (tiles == null || plane < 0 || plane >= tiles.length) return null;
-        Tile[][] planeTiles = tiles[plane];
-
-        int hereSx = here.getX() - wv.getBaseX();
-        int hereSy = here.getY() - wv.getBaseY();
-
-        Match best = null;
-        int bestDist = Integer.MAX_VALUE;
-        for (int dx = -SEARCH_RADIUS; dx <= SEARCH_RADIUS; dx++)
-        {
-            for (int dy = -SEARCH_RADIUS; dy <= SEARCH_RADIUS; dy++)
-            {
-                int sx = hereSx + dx, sy = hereSy + dy;
-                if (sx < 0 || sy < 0
-                    || sx >= planeTiles.length
-                    || sy >= planeTiles[0].length) continue;
-                Tile t = planeTiles[sx][sy];
-                if (t == null) continue;
-                GameObject[] gos = t.getGameObjects();
-                if (gos == null) continue;
-                for (GameObject go : gos)
-                {
-                    if (go == null) continue;
-                    ObjectComposition def = client.getObjectDefinition(go.getId());
-                    if (def == null) continue;
-                    if (def.getImpostorIds() != null)
-                    {
-                        try
-                        {
-                            ObjectComposition imp = def.getImpostor();
-                            if (imp != null) def = imp;
-                        }
-                        catch (Throwable ignored) { /* base def */ }
-                    }
-                    String name = def.getName();
-                    if (name == null) continue;
-                    if (!name.equalsIgnoreCase(namePattern)) continue;
-                    int cheb = Math.max(Math.abs(dx), Math.abs(dy));
-                    if (cheb >= bestDist) continue;
-                    LocalPoint lp = go.getLocalLocation();
-                    if (lp == null) continue;
-                    WorldPoint wp = WorldPoint.fromLocal(client, lp);
-                    bestDist = cheb;
-                    best = new Match(wp, go, null);
-                }
-            }
-        }
-        return best;
-    }
-
-    private Match findTileItemById(int itemId)
-    {
-        Player self = client.getLocalPlayer();
-        if (self == null) return null;
-        WorldPoint here = self.getWorldLocation();
-        if (here == null) return null;
-        WorldView wv = client.getTopLevelWorldView();
-        if (wv == null) return null;
-        Scene scene = wv.getScene();
-        if (scene == null) return null;
-        Tile[][][] tiles = scene.getTiles();
-        int plane = here.getPlane();
-        if (tiles == null || plane < 0 || plane >= tiles.length) return null;
-        Tile[][] planeTiles = tiles[plane];
-
-        int hereSx = here.getX() - wv.getBaseX();
-        int hereSy = here.getY() - wv.getBaseY();
-
-        Match best = null;
-        int bestDist = Integer.MAX_VALUE;
-        for (int dx = -SEARCH_RADIUS; dx <= SEARCH_RADIUS; dx++)
-        {
-            for (int dy = -SEARCH_RADIUS; dy <= SEARCH_RADIUS; dy++)
-            {
-                int sx = hereSx + dx, sy = hereSy + dy;
-                if (sx < 0 || sy < 0
-                    || sx >= planeTiles.length
-                    || sy >= planeTiles[0].length) continue;
-                Tile t = planeTiles[sx][sy];
-                if (t == null) continue;
-                java.util.List<TileItem> items = t.getGroundItems();
-                if (items == null) continue;
-                for (TileItem ti : items)
-                {
-                    if (ti == null) continue;
-                    if (ti.getId() != itemId) continue;
-                    int cheb = Math.max(Math.abs(dx), Math.abs(dy));
-                    if (cheb >= bestDist) continue;
-                    WorldPoint wp = new WorldPoint(
-                        here.getX() + dx, here.getY() + dy, plane);
-                    bestDist = cheb;
-                    best = new Match(wp, null, ti);
-                }
-            }
-        }
-        return best;
+        return onClient(() -> Match.wrap(scanner.findTileItemById(itemId, SEARCH_RADIUS)));
     }
 
     // ────────────────────────────────────────────────────────────────
