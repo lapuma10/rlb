@@ -14,6 +14,7 @@ import net.runelite.client.callback.ClientThread;
 import net.runelite.client.plugins.recorder.transport.TransportResolver;
 import net.runelite.client.plugins.recorder.transport.Waypoint;
 import net.runelite.client.sequence.dispatch.HumanizedInputDispatcher;
+import net.runelite.client.sequence.internal.ActionRequest;
 
 /**
  * Drives a {@link PathSpec} to completion. The caller pumps {@link #tick}
@@ -675,11 +676,21 @@ public final class UniversalWalker
             log.debug("walker: transport at {} verb '{}' not found yet", t, active.verb());
             return Status.IN_PROGRESS;
         }
-        int cx = pair.bounds.x + pair.bounds.width / 2;
-        int cy = pair.bounds.y + pair.bounds.height / 2;
-        log.info("walker: clicking transport at {} verb '{}' ({}px,{}px)",
-            t, active.verb(), cx, cy);
-        dispatcher.clickCanvas(cx, cy);
+        // Dispatch via CLICK_GAME_OBJECT — the dispatcher's pixel
+        // resolver samples a point INSIDE the convex hull (not just the
+        // bounds-rect centre, which can fall outside the hull for thin
+        // / diagonal models like fence gates and staircase rails),
+        // hovers, and either left-clicks (verb is L-click default) or
+        // right-clicks + selects the matching menu row.
+        log.info("walker: dispatching CLICK_GAME_OBJECT at {} verb '{}'",
+            t, active.verb());
+        ActionRequest req = ActionRequest.builder()
+            .kind(ActionRequest.Kind.CLICK_GAME_OBJECT)
+            .channel(ActionRequest.Channel.MOUSE)
+            .tile(t)
+            .verb(active.verb())
+            .build();
+        dispatcher.dispatch(req);
         lastInteractMs = now;
         lastClickedTransportIdx = stepIdx;
         lastClickMs = now;
@@ -714,12 +725,17 @@ public final class UniversalWalker
         throws InterruptedException
     {
         if (now - lastInteractMs < INTERACT_THROTTLE_MS) return false;
-        Rectangle b = obs.hullBounds;
-        int cx = b.x + b.width / 2;
-        int cy = b.y + b.height / 2;
-        log.info("walker: obstacle click — verb '{}' at {} ({}px,{}px)",
-            obs.match.matchedVerb(), obs.tile, cx, cy);
-        dispatcher.clickCanvas(cx, cy);
+        // Same hull-pixel concern as handleTransport — route through
+        // the dispatcher's CLICK_GAME_OBJECT instead of bounds-centre.
+        log.info("walker: obstacle dispatch CLICK_GAME_OBJECT at {} verb '{}'",
+            obs.tile, obs.match.matchedVerb());
+        ActionRequest req = ActionRequest.builder()
+            .kind(ActionRequest.Kind.CLICK_GAME_OBJECT)
+            .channel(ActionRequest.Channel.MOUSE)
+            .tile(obs.tile)
+            .verb(obs.match.matchedVerb())
+            .build();
+        dispatcher.dispatch(req);
         lastInteractMs = now;
         lastClickMs = now;
         return true;
