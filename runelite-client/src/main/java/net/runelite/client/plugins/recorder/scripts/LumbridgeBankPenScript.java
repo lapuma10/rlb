@@ -50,19 +50,6 @@ public final class LumbridgeBankPenScript
     // Tile constants — fill in / verify with Mark tile.
     // ────────────────────────────────────────────────────────────────
 
-    /** Top of the bank stairs, plane 2 (where you stand to climb down). */
-    private static final WorldPoint BANK_TOP = new WorldPoint(3209, 3220, 2);
-
-    /** Lumbridge castle staircase — same X,Y across every plane. */
-    private static final int STAIRS_X = 3205;
-    private static final int STAIRS_Y = 3229;
-
-    /** Tile right outside the chicken pen gate. */
-    private static final WorldPoint PEN_GATE_OUTSIDE = new WorldPoint(3239, 3296, 0);
-
-    /** Tile inside the chicken pen — destination after the gate. */
-    private static final WorldPoint PEN_INTERIOR = new WorldPoint(3234, 3295, 0);
-
     /** Bank tile area (plane 2). */
     private static final WorldArea BANK_AREA = new WorldArea(3208, 3218, 3, 3, 2);
 
@@ -163,6 +150,27 @@ public final class LumbridgeBankPenScript
     private final AtomicBoolean running = new AtomicBoolean(false);
     private final AtomicReference<Thread> worker = new AtomicReference<>();
 
+    // Walk-pacing state. The outer tick loop re-clicks every ~500ms, but
+    // the engine takes ~600ms per tile + only paths up to 25 tiles per
+    // click. Re-clicking on every tick spams the engine with redundant
+    // walk targets. We track:
+    //  - what we last clicked toward (so a target change forces a
+    //    re-click)
+    //  - when we last clicked
+    //  - the player position last time we polled (so we can tell if
+    //    they're actually moving)
+    //  - when the player last moved (so we can detect "stuck")
+    // Re-click only fires when target changed OR player has been still
+    // for ≥ 2.5s since the last click took effect.
+    private WorldArea lastWalkTarget;
+    private long lastClickAtMs;
+    private WorldPoint lastSeenPos;
+    private long lastMoveAtMs;
+    private long stateEnteredAtMs;
+    /** Throttle for bank booth clicks — bank widget takes ~600ms to load
+     *  after click, so we wait ≥ 3s between booth clicks before retrying. */
+    private long lastBankClickAtMs;
+
     public LumbridgeBankPenScript(Client client, ClientThread clientThread,
                                   HumanizedInputDispatcher dispatcher,
                                   TransportResolver resolver)
@@ -193,7 +201,7 @@ public final class LumbridgeBankPenScript
         if (!running.compareAndSet(false, true)) return;
         State decided = decideResume();
         log.info("script: resume → {} (status: {})", decided, status.get());
-        state.set(decided);
+        setState(decided);  // resets walk-pacing
         if (decided == State.ABORTED || decided == State.IDLE)
         {
             running.set(false);
@@ -246,7 +254,7 @@ public final class LumbridgeBankPenScript
     public void stop()
     {
         running.set(false);
-        state.set(State.IDLE);
+        setState(State.IDLE);
         status.set("stopped");
         Thread t = worker.getAndSet(null);
         if (t != null) t.interrupt();
@@ -296,15 +304,26 @@ public final class LumbridgeBankPenScript
         // 1. If we're not at the bank tiles yet, walk there (plane 2).
         if (!playerInArea(BANK_AREA))
         {
-            walkTo(BANK_AREA);
+            WalkResult r = advanceWalk(BANK_AREA);
+            if (r == WalkResult.STUCK)
+            {
+                log.warn("script: stuck walking to bank — aborting");
+                setState(State.ABORTED);
+            }
             return;
         }
         // 2. If bank widget not open, click a bank booth / banker.
         boolean open = onClientThread(bank::isBankOpen);
         if (!open)
         {
+            // Throttle bank clicks: ≥ 3s between attempts so the bank
+            // widget has time to open and we don't spam.
+            long now = System.currentTimeMillis();
+            long sinceClick = lastBankClickAtMs == 0
+                ? Long.MAX_VALUE : now - lastBankClickAtMs;
+            if (sinceClick < 3000) return;
             status.set("clicking bank booth");
-            clickRandomBooth();
+            if (clickRandomBooth()) lastBankClickAtMs = now;
             return;
         }
         // 3. Inventory empty? close bank, advance to OUTBOUND.
@@ -314,7 +333,7 @@ public final class LumbridgeBankPenScript
         {
             status.set("inventory empty — heading to pen");
             bank.closeBank();
-            state.set(State.OUTBOUND);
+            setState(State.OUTBOUND);
             return;
         }
         // 4. Deposit inventory.
@@ -337,18 +356,18 @@ public final class LumbridgeBankPenScript
         if (onClientThread(() -> InventoryUtil.isInventoryFull(client)))
         {
             status.set("inventory full mid-outbound — switching to RETURN");
-            state.set(State.RETURN);
+            setState(State.RETURN);
             return;
         }
 
         switch (plane)
         {
             case 2:
-                // Plane 2: walk to stairs, then climb down.
                 if (!playerInArea(STAIRS_AREA_P2))
                 {
                     status.set("walk → stairs (p2)");
-                    walkTo(STAIRS_AREA_P2);
+                    if (advanceWalk(STAIRS_AREA_P2) == WalkResult.STUCK)
+                        setState(State.ABORTED);
                     return;
                 }
                 status.set("climb down (p2 → p1)");
@@ -356,11 +375,11 @@ public final class LumbridgeBankPenScript
                 return;
 
             case 1:
-                // Plane 1: still on stairs landing, climb down again.
                 if (!playerInArea(STAIRS_AREA_P1))
                 {
                     status.set("walk → stairs (p1)");
-                    walkTo(STAIRS_AREA_P1);
+                    if (advanceWalk(STAIRS_AREA_P1) == WalkResult.STUCK)
+                        setState(State.ABORTED);
                     return;
                 }
                 status.set("climb down (p1 → p0)");
@@ -368,45 +387,37 @@ public final class LumbridgeBankPenScript
                 return;
 
             case 0:
-                // Plane 0 — walk through OUTBOUND_PATH_P0 in order, then
-                // gate, then pen interior.
                 if (areaContains(PEN_AREA, here))
                 {
                     status.set("arrived at pen");
-                    state.set(State.AT_PEN);
+                    setState(State.AT_PEN);
                     return;
                 }
                 int idx = currentLandmarkIndex(OUTBOUND_PATH_P0, here);
                 if (idx == OUTBOUND_PATH_P0.length - 1)
                 {
-                    // In the last landmark (PEN_APPROACH) — gate next.
                     status.set("opening gate (or already open)");
                     if (!openGate())
                     {
-                        // Couldn't see a gate verb — walk into the pen
-                        // anyway; if a gate's actually blocking, the
-                        // engine just stops at it and we retry next tick.
-                        walkTo(PEN_AREA);
+                        // No gate verb visible — try to walk into the pen
+                        // (the engine routes around what's blocking).
+                        if (advanceWalk(PEN_AREA) == WalkResult.STUCK)
+                            setState(State.ABORTED);
                     }
                     return;
                 }
-                if (idx >= 0)
-                {
-                    WorldArea next = OUTBOUND_PATH_P0[idx + 1];
-                    status.set("walk → landmark #" + (idx + 1));
-                    walkTo(next);
-                    return;
-                }
-                // Not in any landmark — converge on the closest one
-                // ahead so we rejoin the path.
-                WorldArea snap = closestLandmark(OUTBOUND_PATH_P0, here);
-                status.set("walk → nearest landmark");
-                walkTo(snap);
+                WorldArea next = idx >= 0
+                    ? OUTBOUND_PATH_P0[idx + 1]
+                    : closestLandmark(OUTBOUND_PATH_P0, here);
+                status.set(idx >= 0
+                    ? "walk → landmark #" + (idx + 1)
+                    : "walk → nearest landmark");
+                if (advanceWalk(next) == WalkResult.STUCK) setState(State.ABORTED);
                 return;
 
             default:
                 status.set("unexpected plane " + plane + " — aborting");
-                state.set(State.ABORTED);
+                setState(State.ABORTED);
         }
     }
 
@@ -421,7 +432,7 @@ public final class LumbridgeBankPenScript
         {
             status.set("inventory full — RETURN");
             combat.stop();
-            state.set(State.RETURN);
+            setState(State.RETURN);
             return;
         }
         // Combat idle → start it.
@@ -450,43 +461,38 @@ public final class LumbridgeBankPenScript
         switch (plane)
         {
             case 0:
-                // Leave the pen first.
                 if (areaContains(PEN_AREA, here))
                 {
                     status.set("opening gate to leave pen");
                     if (!openGate())
                     {
-                        walkTo(PEN_APPROACH);
+                        if (advanceWalk(PEN_APPROACH) == WalkResult.STUCK)
+                            setState(State.ABORTED);
                     }
                     return;
                 }
-                // Walk back through OUTBOUND_PATH_P0 in REVERSE.
                 int rIdx = currentLandmarkIndex(OUTBOUND_PATH_P0, here);
                 if (rIdx == 0)
                 {
-                    // At STAIRS_LANDING_P0 — climb up.
                     status.set("climb up (p0 → p1)");
                     climbUp();
                     return;
                 }
-                if (rIdx > 0)
-                {
-                    WorldArea prev = OUTBOUND_PATH_P0[rIdx - 1];
-                    status.set("walk back → landmark #" + (rIdx - 1));
-                    walkTo(prev);
-                    return;
-                }
-                // Not in any landmark on plane 0 — snap to closest.
-                WorldArea snapBack = closestLandmark(OUTBOUND_PATH_P0, here);
-                status.set("walk back → nearest landmark");
-                walkTo(snapBack);
+                WorldArea prev = rIdx > 0
+                    ? OUTBOUND_PATH_P0[rIdx - 1]
+                    : closestLandmark(OUTBOUND_PATH_P0, here);
+                status.set(rIdx > 0
+                    ? "walk back → landmark #" + (rIdx - 1)
+                    : "walk back → nearest landmark");
+                if (advanceWalk(prev) == WalkResult.STUCK) setState(State.ABORTED);
                 return;
 
             case 1:
                 if (!playerInArea(STAIRS_AREA_P1))
                 {
                     status.set("walk → stairs (p1)");
-                    walkTo(STAIRS_AREA_P1);
+                    if (advanceWalk(STAIRS_AREA_P1) == WalkResult.STUCK)
+                        setState(State.ABORTED);
                     return;
                 }
                 status.set("climb up (p1 → p2)");
@@ -494,22 +500,29 @@ public final class LumbridgeBankPenScript
                 return;
 
             case 2:
-                // Walk straight to the bank — skip the in-between area
-                // (per the spec: "go straight to the bank").
                 if (!playerInArea(BANK_AREA))
                 {
                     status.set("walk → bank");
-                    walkTo(BANK_AREA);
+                    if (advanceWalk(BANK_AREA) == WalkResult.STUCK)
+                        setState(State.ABORTED);
                     return;
                 }
                 status.set("at bank — switching to BANKING");
-                state.set(State.BANKING);
+                setState(State.BANKING);
                 return;
 
             default:
                 status.set("unexpected plane " + plane + " on return — aborting");
-                state.set(State.ABORTED);
+                setState(State.ABORTED);
         }
+    }
+
+    /** Atomic state transition + walk-pacing reset. Use this everywhere
+     *  except {@link #stop} (which already resets via cleanup). */
+    private void setState(State newState)
+    {
+        state.set(newState);
+        resetWalkState();
     }
 
     // ────────────────────────────────────────────────────────────────
@@ -531,6 +544,81 @@ public final class LumbridgeBankPenScript
         WorldPoint here = playerPos();
         if (here == null) return false;
         return areaContains(area, here);
+    }
+
+    /** Result of a single advanceWalk call. */
+    private enum WalkResult { ARRIVED, WAITING, STUCK }
+
+    /**
+     * Walk one tick toward {@code target} with click-spam suppression.
+     * Re-clicks only when the target changed OR the player has been
+     * still for ≥ 1.5s since the last click. Returns ARRIVED when the
+     * player tile is inside {@code target}, STUCK if no movement for
+     * ≥ 15s, otherwise WAITING.
+     */
+    private WalkResult advanceWalk(WorldArea target) throws InterruptedException
+    {
+        WorldPoint here = playerPos();
+        if (here == null) return WalkResult.WAITING;
+        if (areaContains(target, here)) return WalkResult.ARRIVED;
+
+        long now = System.currentTimeMillis();
+        if (lastSeenPos == null || !lastSeenPos.equals(here))
+        {
+            lastSeenPos = here;
+            lastMoveAtMs = now;
+        }
+        long sinceClick = lastClickAtMs == 0 ? Long.MAX_VALUE : now - lastClickAtMs;
+        long sinceMove = now - lastMoveAtMs;
+
+        boolean targetChanged = lastWalkTarget == null
+            || !sameArea(lastWalkTarget, target);
+        // Player is still walking from previous click while sinceMove
+        // is small. Don't re-click during that window.
+        boolean stillWalking = sinceMove < 1500;
+        boolean recentClick = sinceClick < 1500;
+
+        boolean shouldClick = targetChanged
+            || (!recentClick && !stillWalking);
+
+        if (shouldClick)
+        {
+            log.info("script: walking → {} (sinceClick={}ms, sinceMove={}ms)",
+                describeArea(target), sinceClick == Long.MAX_VALUE ? "never" : sinceClick + "",
+                sinceMove);
+            walkTo(target);
+            lastWalkTarget = target;
+            lastClickAtMs = now;
+        }
+
+        if (lastClickAtMs > 0 && sinceMove > 15000) return WalkResult.STUCK;
+        return WalkResult.WAITING;
+    }
+
+    private static boolean sameArea(WorldArea a, WorldArea b)
+    {
+        return a.getX() == b.getX() && a.getY() == b.getY()
+            && a.getWidth() == b.getWidth() && a.getHeight() == b.getHeight()
+            && a.getPlane() == b.getPlane();
+    }
+
+    private static String describeArea(WorldArea a)
+    {
+        return "(" + a.getX() + "," + a.getY() + " " + a.getWidth()
+            + "x" + a.getHeight() + ",p=" + a.getPlane() + ")";
+    }
+
+    /** Reset walk-pacing state — called on every state transition so
+     *  a fresh state starts cleanly without inheriting the prior walk's
+     *  stale "we just clicked here" counters. */
+    private void resetWalkState()
+    {
+        lastWalkTarget = null;
+        lastClickAtMs = 0L;
+        lastSeenPos = null;
+        lastMoveAtMs = System.currentTimeMillis();
+        stateEnteredAtMs = System.currentTimeMillis();
+        lastBankClickAtMs = 0L;
     }
 
     /** Bbox-bounds check: is the point inside the rectangle, on the
