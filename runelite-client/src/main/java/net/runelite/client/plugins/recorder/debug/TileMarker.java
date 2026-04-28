@@ -52,6 +52,7 @@ public final class TileMarker implements MouseListener
     private final Client client;
     private volatile boolean armed = false;
     private volatile Consumer<WorldPoint> onMark;
+    private volatile WorldPoint lastMarked;
 
     public TileMarker(Client client) { this.client = client; }
 
@@ -63,6 +64,11 @@ public final class TileMarker implements MouseListener
         this.onMark = callback;
         this.armed = true;
     }
+
+    /** Returns the most recently captured tile, or null if no tile has been
+     *  marked yet since this instance was created. */
+    @javax.annotation.Nullable
+    public WorldPoint lastMarked() { return lastMarked; }
 
     public void disarm()
     {
@@ -80,6 +86,7 @@ public final class TileMarker implements MouseListener
         Consumer<WorldPoint> cb = onMark;
         armed = false;
         onMark = null;
+        if (wp != null) lastMarked = wp;
         if (cb != null) SwingUtilities.invokeLater(() -> cb.accept(wp));
         // Consume both the press and (eventually) the release so the engine
         // never sees a "click" that would walk / interact.

@@ -28,15 +28,21 @@ import lombok.extern.slf4j.Slf4j;
 import net.runelite.api.Client;
 import net.runelite.api.coords.WorldPoint;
 import net.runelite.client.callback.ClientThread;
+import net.runelite.client.plugins.recorder.annotator.AnnotatorHudOverlay;
+import net.runelite.client.plugins.recorder.annotator.AreaSelector;
+import net.runelite.client.plugins.recorder.annotator.RoutesTab;
+import net.runelite.client.plugins.recorder.annotator.WaypointEditor;
 import net.runelite.client.plugins.recorder.combat.ChickenCombatLoop;
 import net.runelite.client.plugins.recorder.debug.DebugOverlay;
 import net.runelite.client.plugins.recorder.farm.ChickenFarmLoop;
+import net.runelite.client.plugins.recorder.farm.RouteWalker;
 import net.runelite.client.plugins.recorder.mining.MiningLoop;
 import net.runelite.client.plugins.recorder.debug.TileMarker;
 import net.runelite.client.plugins.recorder.events.Events;
 import net.runelite.client.plugins.recorder.events.RecordedEvent;
 import net.runelite.client.plugins.recorder.transport.RouteOverlay;
 import net.runelite.client.plugins.recorder.transport.TransportResolver;
+import net.runelite.client.plugins.recorder.transport.Waypoint;
 import net.runelite.client.sequence.dispatch.HumanizedInputDispatcher;
 import net.runelite.client.sequence.login.CredentialStore;
 import net.runelite.client.sequence.login.CredentialStoreException;
@@ -67,13 +73,21 @@ import java.awt.Dimension;
 import java.awt.FlowLayout;
 import java.awt.Point;
 import java.awt.event.ActionEvent;
+import java.awt.event.KeyEvent;
 import java.io.IOException;
+import java.nio.file.Path;
+import java.util.ArrayList;
 import java.util.List;
+import java.util.Set;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
+import java.util.function.Consumer;
 import java.util.function.Supplier;
+import javax.annotation.Nullable;
+import javax.swing.AbstractAction;
+import javax.swing.KeyStroke;
 
 @Slf4j
 public final class RecorderPanel extends PluginPanel
@@ -132,6 +146,10 @@ public final class RecorderPanel extends PluginPanel
     private final JLabel miningRockCountLabel = new JLabel("Rocks: 0");
     private MiningLoop miningLoop;
     private final JTabbedPane tabs = new JTabbedPane();
+    private AnnotatorHudOverlay hudOverlay;
+    private AreaSelector areaSelector;
+    private RoutesTab routesTab;
+    private final JPanel routesContainer = new JPanel(new BorderLayout());
 
     public RecorderPanel(RecorderManager manager, Client client)
     {
@@ -193,22 +211,21 @@ public final class RecorderPanel extends PluginPanel
     }
 
     // ------------------------------------------------------------------
-    // Routes tab — placeholder for Task 11; debug tile-mark tools live here
-    // until the WaypointEditor (Task 10) absorbs them.
+    // Routes tab — swaps between RoutesTab (list) and WaypointEditor
+    // (drilldown) inside a single container. Debug tile-mark surface
+    // sits underneath for parity with the legacy panel.
     // ------------------------------------------------------------------
 
     private JPanel buildRoutesTab()
     {
-        JPanel p = new JPanel();
-        p.setLayout(new BoxLayout(p, BoxLayout.Y_AXIS));
+        routesTab = new RoutesTab(this::openRouteEditor);
+        routesContainer.add(routesTab, BorderLayout.CENTER);
 
-        // Placeholder label — wired in Task 11.
-        p.add(new JLabel("Routes annotator — wired in Task 11"));
-        p.add(Box.createVerticalStrut(8));
+        JPanel p = new JPanel(new BorderLayout(0, 6));
+        p.add(routesContainer, BorderLayout.CENTER);
 
         // Debug + tile mark: compact testing surface — mark a tile, walk to
-        // it, or clear. The WaypointEditor (Task 10) will absorb this into
-        // its toolbar; until then the buttons live here.
+        // it, or clear. Lives underneath the routes drilldown.
         JPanel debug = new JPanel();
         debug.setLayout(new BoxLayout(debug, BoxLayout.Y_AXIS));
         debug.setBorder(BorderFactory.createTitledBorder("Debug + tile mark"));
@@ -218,9 +235,149 @@ public final class RecorderPanel extends PluginPanel
         row.add(clearMarkBtn, BorderLayout.EAST);
         debug.add(row);
         debug.add(markedLabel);
-        p.add(debug);
+        p.add(debug, BorderLayout.SOUTH);
 
         return p;
+    }
+
+    private void openRouteEditor(Path routeFile)
+    {
+        routesContainer.removeAll();
+        WaypointEditor editor = new WaypointEditor(routeFile, routeOverlay,
+            () -> {
+                routesContainer.removeAll();
+                routesTab.refresh();
+                routesContainer.add(routesTab, BorderLayout.CENTER);
+                if (routeOverlay != null) routeOverlay.setSelected(null);
+                routesContainer.revalidate();
+                routesContainer.repaint();
+            },
+            new WaypointEditor.Hooks()
+            {
+                @Override public void onMarkArea(@Nullable Waypoint editing,
+                                                 Consumer<Set<WorldPoint>> onCommit)
+                {
+                    if (areaSelector == null || hudOverlay == null) return;
+                    Set<WorldPoint> initial = editing == null
+                        ? Set.of()
+                        : editing.tiles();
+                    hudOverlay.show(editing == null ? "New area"
+                        : "Editing: " + (editing.name() == null ? "(unnamed)" : editing.name()));
+                    areaSelector.start(initial, new AreaSelector.Listener()
+                    {
+                        @Override public void onSetChanged(Set<WorldPoint> tiles)
+                        {
+                            // Live preview hook — MVP no-op.
+                        }
+                        @Override public void onCommit(Set<WorldPoint> tiles)
+                        {
+                            hudOverlay.show(null);
+                            onCommit.accept(tiles);
+                        }
+                        @Override public void onCancel()
+                        {
+                            hudOverlay.show(null);
+                        }
+                        @Override public void onDragPreview(@Nullable WorldPoint pressTile,
+                                                            @Nullable WorldPoint dragTile,
+                                                            boolean subtract)
+                        {
+                            // MVP: in-flight rectangle preview deferred.
+                        }
+                    });
+                    // Bind Enter / Esc on the panel so the user can commit/cancel.
+                    getInputMap(JComponent.WHEN_IN_FOCUSED_WINDOW)
+                        .put(KeyStroke.getKeyStroke(KeyEvent.VK_ENTER, 0), "annotator-commit");
+                    getInputMap(JComponent.WHEN_IN_FOCUSED_WINDOW)
+                        .put(KeyStroke.getKeyStroke(KeyEvent.VK_ESCAPE, 0), "annotator-cancel");
+                    getActionMap().put("annotator-commit", new AbstractAction()
+                    {
+                        @Override public void actionPerformed(ActionEvent e)
+                        { if (areaSelector.isActive()) areaSelector.commit(); }
+                    });
+                    getActionMap().put("annotator-cancel", new AbstractAction()
+                    {
+                        @Override public void actionPerformed(ActionEvent e)
+                        { if (areaSelector.isActive()) areaSelector.cancel(); }
+                    });
+                }
+
+                @Override public void onMarkObject(Consumer<Waypoint> onCommit)
+                {
+                    if (tileMarker == null || transportResolver == null) return;
+                    tileMarker.arm(wp -> {
+                        if (wp == null) return;
+                        clientThread.invokeLater(() -> {
+                            TransportResolver.AnyMatch match = transportResolver.findAnyTransport(wp);
+                            SwingUtilities.invokeLater(() -> {
+                                if (match == null) return;
+                                Waypoint t = Waypoint.transport(wp, match.kind(), match.verb());
+                                onCommit.accept(t);
+                            });
+                        });
+                    });
+                }
+
+                @Override public void onAddCurrent(Consumer<Waypoint> onCommit)
+                {
+                    if (clientThread == null || client == null) return;
+                    clientThread.invokeLater(() -> {
+                        net.runelite.api.Player self = client.getLocalPlayer();
+                        if (self == null) return;
+                        WorldPoint loc = self.getWorldLocation();
+                        if (loc == null) return;
+                        SwingUtilities.invokeLater(() -> onCommit.accept(Waypoint.walk(loc)));
+                    });
+                }
+
+                @Override public void onAddMarked(Consumer<Waypoint> onCommit)
+                {
+                    if (tileMarker == null) return;
+                    WorldPoint loc = tileMarker.lastMarked();
+                    if (loc != null) onCommit.accept(Waypoint.walk(loc));
+                }
+
+                @Override public void onWalkPath(List<Waypoint> wps)
+                {
+                    runWalker(wps, wps.size());
+                }
+
+                @Override public void onWalkToSelected(List<Waypoint> wps, int selectedIdx)
+                {
+                    runWalker(wps, selectedIdx + 1);
+                }
+            });
+        routesContainer.add(editor, BorderLayout.CENTER);
+        routesContainer.revalidate();
+        routesContainer.repaint();
+    }
+
+    /** Drive the walker over waypoints[0..endExclusive). Fork to a daemon
+     *  thread; mirrors the legacy walkRoute flow. */
+    private void runWalker(List<Waypoint> wps, int endExclusive)
+    {
+        if (client == null || dispatcher == null || transportResolver == null) return;
+        final List<Waypoint> slice = new ArrayList<>(
+            wps.subList(0, Math.max(0, Math.min(endExclusive, wps.size()))));
+        Thread t = new Thread(() -> {
+            try
+            {
+                RouteWalker w = new RouteWalker(client, dispatcher, transportResolver);
+                for (Waypoint wp : slice)
+                {
+                    if (Thread.currentThread().isInterrupted()) break;
+                    while (!w.arrived(wp))
+                    {
+                        if (Thread.currentThread().isInterrupted()) break;
+                        w.tick(wp);
+                        Thread.sleep(300 + (int)(Math.random() * 300));
+                    }
+                }
+            }
+            catch (InterruptedException ie) { Thread.currentThread().interrupt(); }
+        }, "annotator-test-walk");
+        t.setDaemon(true);
+        t.start();
     }
 
     // ------------------------------------------------------------------
@@ -366,6 +523,12 @@ public final class RecorderPanel extends PluginPanel
     /** Wire the route overlay. Task 6 will use this reference to push parsed
      *  routes via {@code routeOverlay.setRoute(...)} from the annotator buttons. */
     public void setRouteOverlay(RouteOverlay ro) { this.routeOverlay = ro; }
+
+    /** Wire the annotator HUD overlay (constructed by the plugin). */
+    public void setHudOverlay(AnnotatorHudOverlay h) { this.hudOverlay = h; }
+
+    /** Wire the area selector (constructed by the plugin). */
+    public void setAreaSelector(AreaSelector s) { this.areaSelector = s; }
 
     /** Wire the {@link LoginAssistant} so the Login button has somewhere to
      *  go. The plugin owns lifetime and constructs the assistant only when

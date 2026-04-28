@@ -36,6 +36,8 @@ import net.runelite.client.input.KeyManager;
 import net.runelite.client.input.MouseManager;
 import net.runelite.client.plugins.Plugin;
 import net.runelite.client.plugins.PluginDescriptor;
+import net.runelite.client.plugins.recorder.annotator.AnnotatorHudOverlay;
+import net.runelite.client.plugins.recorder.annotator.AreaSelector;
 import net.runelite.client.plugins.recorder.capture.CameraSampler;
 import net.runelite.client.plugins.recorder.capture.ChatFilter;
 import net.runelite.client.plugins.recorder.capture.ClickResolver;
@@ -109,6 +111,8 @@ public class RecorderPlugin extends Plugin
     private ChickenCombatLoop chickenLoop;
     private ChickenFarmLoop farmLoop;
     private MiningLoop miningLoop;
+    private AnnotatorHudOverlay hudOverlay;
+    private AreaSelector areaSelector;
 
     @Provides
     RecorderConfig provideConfig(ConfigManager cm)
@@ -145,9 +149,14 @@ public class RecorderPlugin extends Plugin
         tileMarker = new TileMarker(client);
         panel.setDebugOverlay(debugOverlay);
         panel.setTileMarker(tileMarker);
+        hudOverlay = new AnnotatorHudOverlay();
+        areaSelector = new AreaSelector(client, clientThread, mouseManager);
+        panel.setHudOverlay(hudOverlay);
+        panel.setAreaSelector(areaSelector);
         overlayManager.add(debugOverlay);
         overlayManager.add(chickenOverlay);
         overlayManager.add(routeOverlay);
+        overlayManager.add(hudOverlay);
 
         // Wire login assistant. We construct a fresh dispatcher here for
         // the assistant so its single-flight busy flag is independent from
@@ -263,6 +272,8 @@ public class RecorderPlugin extends Plugin
         if (chickenLoop != null) chickenLoop.stop();
         if (farmLoop != null) farmLoop.stop();
         if (miningLoop != null) miningLoop.stop();
+        if (hudOverlay != null) overlayManager.remove(hudOverlay);
+        if (areaSelector != null && areaSelector.isActive()) areaSelector.cancel();
         if (debugOverlay != null) overlayManager.remove(debugOverlay);
         if (chickenOverlay != null) overlayManager.remove(chickenOverlay);
         if (routeOverlay != null) overlayManager.remove(routeOverlay);
@@ -280,6 +291,7 @@ public class RecorderPlugin extends Plugin
         if (focusBridge != null) Toolkit.getDefaultToolkit().removeAWTEventListener(focusBridge);
         if (eventCapture != null) eventBus.unregister(eventCapture);
         panel = null; navButton = null; debugOverlay = null; chickenOverlay = null; routeOverlay = null; tileMarker = null;
+        hudOverlay = null; areaSelector = null;
         markerListener = null; toggleListener = null;
         mouseCapture = null; keyCapture = null; focusCapture = null;
         focusBridge = null;
