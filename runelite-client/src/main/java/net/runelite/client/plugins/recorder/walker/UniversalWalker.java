@@ -263,18 +263,38 @@ public final class UniversalWalker
      *  yet (i.e. "still need to reach this one"), and returns its index.
      *  This is monotonic — once we've passed a waypoint we never go
      *  back, even if the player drifts back into its bbox. */
+    /** Pick the active step. Monotonic forward — only ever returns
+     *  indices ≥ {@code minIdx}. Strategy:
+     *  <ol>
+     *    <li>Scan ALL steps from {@code minIdx} forward and find the
+     *        HIGHEST-indexed one the player has already arrived at.</li>
+     *    <li>If any, advance past it — return that index + 1.</li>
+     *    <li>If none, stick with {@code minIdx} — we haven't reached
+     *        anything yet.</li>
+     *  </ol>
+     *  This handles mid-route resume correctly: if the player starts at
+     *  PEN_APPROACH (step 7) instead of the bank, scanning finds step 7
+     *  as the highest "arrived" step (its area contains the player) and
+     *  the walker advances to step 8 (gate) instead of trying to walk
+     *  back to step 2 (stairs-landing) just because step 0 and 1 were
+     *  CLIMB_DOWN to planes the player is no longer on.
+     *
+     *  <p>Earlier this returned the FIRST not-arrived step. That meant
+     *  for a player on plane 0 starting at PEN_APPROACH:
+     *  step 0 (climbDown p2) → "arrived" (player on p0 not p2), skip;
+     *  step 1 (climbDown p1) → "arrived" (player on p0 not p1), skip;
+     *  step 2 (walk stairs-landing) → not arrived, return 2.
+     *  Walker tries to walk 80 tiles back to stairs-landing. Wrong. */
     private static int chooseStep(PathSpec spec, WorldPoint pos, int minIdx)
     {
         List<Waypoint> wps = spec.waypoints();
+        int highestArrived = -1;
         for (int i = minIdx; i < wps.size(); i++)
         {
-            Waypoint w = wps.get(i);
-            if (!arrived(w, pos)) return i;
-            // Already there — don't auto-advance; let the next tick check
-            // the next step. Actually do advance: if we've arrived we want
-            // the next step active. So fall through.
+            if (arrived(wps.get(i), pos)) highestArrived = i;
         }
-        return wps.size();
+        if (highestArrived >= 0) return Math.min(highestArrived + 1, wps.size());
+        return minIdx;
     }
 
     /** Has the player reached {@code w}? */
