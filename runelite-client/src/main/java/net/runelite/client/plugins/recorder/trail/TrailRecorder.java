@@ -114,6 +114,51 @@ public final class TrailRecorder
         recordTile(absoluteMs - s.startMs, tile);
     }
 
+    // ──────── transport capture (called by event-bus subscriber) ────────
+
+    /** Append a {@link TrailEvent.Transport} unconditionally. The caller
+     *  has already done verb filtering. */
+    public synchronized void recordTransport(long msSinceStart,
+        net.runelite.api.coords.WorldPoint tile,
+        String option, String target, int targetId, String targetKind,
+        int actionId, int param0, int param1, java.util.List<String> menuRowsAtClick)
+    {
+        Session s = session.get();
+        if (s == null) return;
+        s.events.add(new TrailEvent.Transport(msSinceStart, tile,
+            option == null ? "" : option,
+            target == null ? "" : target,
+            targetId, targetKind == null ? "" : targetKind,
+            actionId, param0, param1,
+            menuRowsAtClick == null ? java.util.List.of()
+                : java.util.List.copyOf(menuRowsAtClick)));
+    }
+
+    /** Append a transport iff the verb is in the whitelist. Returns true
+     *  if it was kept, false if filtered. */
+    public synchronized boolean recordTransportIfWhitelisted(long msSinceStart,
+        net.runelite.api.coords.WorldPoint tile,
+        String option, String target, int targetId, String targetKind,
+        int actionId, int param0, int param1, java.util.List<String> menuRowsAtClick)
+    {
+        if (!isTransportVerb(option)) return false;
+        recordTransport(msSinceStart, tile, option, target, targetId, targetKind,
+            actionId, param0, param1, menuRowsAtClick);
+        return true;
+    }
+
+    public synchronized boolean recordTransportAtAbsoluteMsIfWhitelisted(long absoluteMs,
+        net.runelite.api.coords.WorldPoint tile,
+        String option, String target, int targetId, String targetKind,
+        int actionId, int param0, int param1, java.util.List<String> menuRowsAtClick)
+    {
+        Session s = session.get();
+        if (s == null) return false;
+        return recordTransportIfWhitelisted(absoluteMs - s.startMs, tile,
+            option, target, targetId, targetKind, actionId, param0, param1,
+            menuRowsAtClick);
+    }
+
     static final class Session
     {
         final String name;
