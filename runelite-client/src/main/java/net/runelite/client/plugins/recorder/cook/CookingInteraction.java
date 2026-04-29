@@ -182,12 +182,18 @@ public final class CookingInteraction
         return onClient(() -> Match.wrap(scanner.findGameObjectByName(namePattern, SEARCH_RADIUS)));
     }
 
-    /** Find the closest TileItem with {@code itemId} on the player's
-     *  plane within {@link #SEARCH_RADIUS}. Used for "Logs" ground item
-     *  spawns. Returns null if none in range. */
+    /** Find a TileItem with {@code itemId} on the player's plane within
+     *  {@link #SEARCH_RADIUS}, picked uniformly at random among the
+     *  matches within 2 tiles of the closest match. Used for "Logs"
+     *  ground item spawns: a cluster of identical log piles surrounds
+     *  the cook spot, and always lighting the strict-closest pile is
+     *  bot-tell behaviour. The 2-tile jitter keeps the pick near us
+     *  (no walking past closer logs to reach a far one) but varies
+     *  WHICH near-pile we light each trip. */
     public Match findGroundLogs(int itemId) throws InterruptedException
     {
-        return onClient(() -> Match.wrap(scanner.findTileItemById(itemId, SEARCH_RADIUS)));
+        return onClient(() -> Match.wrap(
+            scanner.findTileItemByIdRandomNear(itemId, SEARCH_RADIUS, 2)));
     }
 
     /** Find a Fire game object whose composition name matches
@@ -314,7 +320,11 @@ public final class CookingInteraction
     public boolean clickLogsForLight(Match logsMatch) throws InterruptedException
     {
         if (logsMatch == null || logsMatch.tile == null) return false;
-        dispatcher.rotateCameraToward(logsMatch.tile);
+        // force=true: at e.g. Lumbridge Castle P2 the logs tile geometrically
+        // projects inside the viewport but is occluded by a wall — without a
+        // forced rotation the dispatcher's "already visible" short-circuit
+        // skips the pan and we click a tile the player can't actually see.
+        dispatcher.rotateCameraToward(logsMatch.tile, true);
         Rectangle b = onClient(() -> tileItemBounds(logsMatch));
         if (b == null) return false;
         int cx = b.x + b.width / 2;
@@ -365,7 +375,9 @@ public final class CookingInteraction
     public boolean clickHeatSourceForCook(Match heatMatch) throws InterruptedException
     {
         if (heatMatch == null || heatMatch.tile == null) return false;
-        dispatcher.rotateCameraToward(heatMatch.tile);
+        // force=true so the camera pans even when the fire's tile poly
+        // technically projects into the viewport (wall occlusion case).
+        dispatcher.rotateCameraToward(heatMatch.tile, true);
         Rectangle b = onClient(() -> {
             Rectangle hull = gameObjectBounds(heatMatch);
             if (hull != null) return hull;

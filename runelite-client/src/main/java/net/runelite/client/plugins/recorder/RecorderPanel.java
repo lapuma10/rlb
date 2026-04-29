@@ -174,6 +174,13 @@ public final class RecorderPanel extends PluginPanel
     private final JLabel v3StatusLabel = new JLabel("V3: idle");
     private final JLabel v3KillsLabel = new JLabel("Kills: 0");
     private net.runelite.client.plugins.recorder.scripts.ChickenFarmV3Script chickenFarmV3;
+    private final net.runelite.client.plugins.recorder.combat.TrainingPlanStore trainingPlanStore =
+        new net.runelite.client.plugins.recorder.combat.TrainingPlanStore();
+    /** Last username we restored saved training settings for. Tracked so we
+     *  re-load when the player logs into a different account (the panel's
+     *  initial restoreTrainingPanelState typically runs at plugin startup
+     *  when {@code client.getUsername()} is still empty / "default"). */
+    private volatile String lastRestoredUsername;
     // V3 training-mode controls.
     private final javax.swing.JCheckBox trainAttackCb   = new javax.swing.JCheckBox("Attack");
     private final javax.swing.JCheckBox trainStrengthCb = new javax.swing.JCheckBox("Strength");
@@ -1217,10 +1224,42 @@ public final class RecorderPanel extends PluginPanel
             retLeave
             ? new net.runelite.client.plugins.recorder.combat.TrainingPlan(
                 targets, false, true, 2, 5,
-                net.runelite.client.plugins.recorder.combat.TrainingPlan.DEFAULT_XP_HOVER_MS)
+                net.runelite.client.plugins.recorder.combat.TrainingPlan.DEFAULT_XP_HOVER_MIN_MS,
+                net.runelite.client.plugins.recorder.combat.TrainingPlan.DEFAULT_XP_HOVER_MAX_MS)
             : net.runelite.client.plugins.recorder.combat.TrainingPlan.basic(targets, retOn);
         chickenFarmV3.setTrainingPlan(plan);
+        persistTrainingPanelState();
         chickenFarmV3.start();
+    }
+
+    /** Capture the current training-tab UI selection and write it under
+     *  the active account's hash, so the next session restores the same
+     *  checkboxes / level fields / retaliate dropdown. */
+    private void persistTrainingPanelState()
+    {
+        net.runelite.client.plugins.recorder.combat.TrainingPlanStore.Settings s =
+            new net.runelite.client.plugins.recorder.combat.TrainingPlanStore.Settings();
+        s.attackEnabled   = trainAttackCb.isSelected();
+        s.strengthEnabled = trainStrengthCb.isSelected();
+        s.defenceEnabled  = trainDefenceCb.isSelected();
+        s.attackLevel     = parseLevelOrDefault(trainAttackLvlField,   s.attackLevel);
+        s.strengthLevel   = parseLevelOrDefault(trainStrengthLvlField, s.strengthLevel);
+        s.defenceLevel    = parseLevelOrDefault(trainDefenceLvlField,  s.defenceLevel);
+        Object sel = autoRetaliateCombo.getSelectedItem();
+        s.autoRetaliate = sel == null ? "Leave alone" : sel.toString();
+        try { trainingPlanStore.save(client, s); }
+        catch (RuntimeException ex)
+        {
+            // Don't block training-start on persistence failure — just log.
+            org.slf4j.LoggerFactory.getLogger(RecorderPanel.class)
+                .warn("training-plans: persist failed", ex);
+        }
+    }
+
+    private static int parseLevelOrDefault(JTextField f, int fallback)
+    {
+        try { return Integer.parseInt(f.getText().trim()); }
+        catch (NumberFormatException ex) { return fallback; }
     }
 
     private net.runelite.client.plugins.recorder.combat.SkillTarget parseSkillTarget(
@@ -1252,7 +1291,45 @@ public final class RecorderPanel extends PluginPanel
     public void setChickenFarmV3(net.runelite.client.plugins.recorder.scripts.ChickenFarmV3Script s)
     {
         this.chickenFarmV3 = s;
-        SwingUtilities.invokeLater(this::updateV3Controls);
+        SwingUtilities.invokeLater(() -> {
+            restoreTrainingPanelState();
+            updateV3Controls();
+        });
+    }
+
+    /** Restore the saved training-tab UI selection for the active
+     *  account, if any. Called when the panel is wired to the V3 script
+     *  AND on each refresh tick when we detect a username change (login,
+     *  account switch). The latter matters because the plugin wires the
+     *  panel at startup — long before the user logs in — so the initial
+     *  restore runs against {@code client.getUsername() == ""} and reads
+     *  the {@code "default"} key, which almost never matches what the
+     *  user actually wants. */
+    private void restoreTrainingPanelState()
+    {
+        String currentUsername = "";
+        try
+        {
+            if (client != null)
+            {
+                String u = client.getUsername();
+                if (u != null) currentUsername = u.trim();
+            }
+        }
+        catch (Throwable ignored) { /* not logged in yet */ }
+        if (currentUsername.equals(lastRestoredUsername)) return;
+        net.runelite.client.plugins.recorder.combat.TrainingPlanStore.Settings s =
+            trainingPlanStore.load(client);
+        lastRestoredUsername = currentUsername;
+        if (s == null) return;
+        trainAttackCb.setSelected(s.attackEnabled);
+        trainStrengthCb.setSelected(s.strengthEnabled);
+        trainDefenceCb.setSelected(s.defenceEnabled);
+        trainAttackLvlField.setText(Integer.toString(s.attackLevel));
+        trainStrengthLvlField.setText(Integer.toString(s.strengthLevel));
+        trainDefenceLvlField.setText(Integer.toString(s.defenceLevel));
+        autoRetaliateCombo.setSelectedItem(
+            s.autoRetaliate == null ? "Leave alone" : s.autoRetaliate);
     }
 
     private void updateV3Controls()
@@ -1996,6 +2073,10 @@ public final class RecorderPanel extends PluginPanel
 
     private void refresh()
     {
+        // If the user has just logged in (or switched accounts), pull the
+        // saved training plan for that account into the panel. Cheap — a
+        // no-op when the username hasn't changed since the last call.
+        if (chickenFarmV3 != null) restoreTrainingPanelState();
         RecorderState st = manager.getState();
         stateLabel.setText("State: " + st);
         recordBtn.setText(st == RecorderState.RECORDING ? "Stop" : "Record");

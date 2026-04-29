@@ -1,6 +1,5 @@
 package net.runelite.client.plugins.recorder.scripts;
 
-import java.util.Optional;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.Supplier;
@@ -17,9 +16,7 @@ import net.runelite.client.plugins.recorder.combat.TrainingPlan;
 import net.runelite.client.plugins.recorder.combat.TrainingSession;
 import net.runelite.client.plugins.recorder.farm.BankInteraction;
 import net.runelite.client.plugins.recorder.farm.InventoryUtil;
-import net.runelite.client.plugins.recorder.trail.TrailGraph;
 import net.runelite.client.plugins.recorder.trail.TrailPath;
-import net.runelite.client.plugins.recorder.trail.TrailPlanner;
 import net.runelite.client.plugins.recorder.trail.TrailRegistry;
 import net.runelite.client.plugins.recorder.trail.TrailWalker;
 import net.runelite.client.sequence.dispatch.HumanizedInputDispatcher;
@@ -79,6 +76,19 @@ public final class ChickenFarmV3Script
                                HumanizedInputDispatcher dispatcher,
                                TrailRegistry registry)
     {
+        this(client, clientThread, dispatcher, registry, null);
+    }
+
+    /** Full ctor — passes the {@link net.runelite.client.eventbus.EventBus}
+     *  through to {@link TrainingSession} so it can subscribe to
+     *  {@code StatChanged} events for instant level-up detection. The
+     *  3-arg ctor above retains the pre-EventBus signature for tests. */
+    public ChickenFarmV3Script(Client client, ClientThread clientThread,
+                               HumanizedInputDispatcher dispatcher,
+                               TrailRegistry registry,
+                               @javax.annotation.Nullable
+                               net.runelite.client.eventbus.EventBus eventBus)
+    {
         this.client = client;
         this.clientThread = clientThread;
         this.dispatcher = dispatcher;
@@ -86,7 +96,7 @@ public final class ChickenFarmV3Script
         this.walker = new TrailWalker(client, clientThread, dispatcher);
         this.bank = new BankInteraction(client, clientThread, dispatcher);
         this.combat = new ChickenCombatLoop(dispatcher, client, clientThread, PEN_AREA);
-        this.trainingSession = new TrainingSession(client, clientThread, dispatcher);
+        this.trainingSession = new TrainingSession(client, clientThread, dispatcher, eventBus);
         this.logoutHelper = new LogoutHelper(client, clientThread, dispatcher);
     }
 
@@ -109,6 +119,20 @@ public final class ChickenFarmV3Script
     public void start()
     {
         if (!running.compareAndSet(false, true)) return;
+        // All startup work runs on the worker thread, never on the caller.
+        // The Start Training button handler runs on the Swing EDT, and the
+        // resume path calls onClient() which awaits a CountDownLatch on the
+        // Client thread. On macOS the Client thread can be inside a native
+        // GPU swapBuffers that transitively waits on the EDT, deadlocking
+        // both. Hand the work to the worker and return immediately.
+        Thread t = new Thread(this::startupThenTick, "chicken-farm-v3");
+        t.setDaemon(true);
+        worker.set(t);
+        t.start();
+    }
+
+    private void startupThenTick()
+    {
         registry.load();
         if (registry.byName(OUTBOUND_TRAIL_NAME) == null
             || registry.byName(RETURN_TRAIL_NAME) == null)
@@ -130,10 +154,7 @@ public final class ChickenFarmV3Script
             running.set(false);
             return;
         }
-        Thread t = new Thread(this::tickLoop, "chicken-farm-v3");
-        t.setDaemon(true);
-        worker.set(t);
-        t.start();
+        tickLoop();
     }
 
     public void stop()
@@ -144,6 +165,10 @@ public final class ChickenFarmV3Script
         Thread t = worker.getAndSet(null);
         if (t != null) t.interrupt();
         combat.stop();
+        // Drop the EventBus subscription so a later restart does a clean
+        // re-register. Otherwise StatChanged events would still fire on the
+        // stale instance and could feed phantom level-ups across plans.
+        trainingSession.stop();
     }
 
     private State decideResume()
@@ -210,16 +235,30 @@ public final class ChickenFarmV3Script
         {
             while (running.get() && !Thread.currentThread().isInterrupted())
             {
-                switch (state.get())
+                try
                 {
-                    case BANKING:     tickBanking();      break;
-                    case OUTBOUND:    tickWalk(true);     break;
-                    case AT_PEN:      tickAtPen();        break;
-                    case RETURN:      tickWalk(false);    break;
-                    case LOGGING_OFF: tickLoggingOff();   break;
-                    case ABORTED:
-                    case IDLE:
-                    default:          running.set(false); break;
+                    switch (state.get())
+                    {
+                        case BANKING:     tickBanking();      break;
+                        case OUTBOUND:    tickWalk(true);     break;
+                        case AT_PEN:      tickAtPen();        break;
+                        case RETURN:      tickWalk(false);    break;
+                        case LOGGING_OFF: tickLoggingOff();   break;
+                        case ABORTED:
+                        case IDLE:
+                        default:          running.set(false); break;
+                    }
+                }
+                catch (RuntimeException re)
+                {
+                    // Don't let a bad tick kill the whole loop — log and
+                    // try the next tick. Otherwise the bot freezes mid-pen
+                    // (no retaliate, no attack) and looks like a stalled
+                    // bot. The user has to notice and restart manually.
+                    log.warn("v3: tick threw — continuing loop (state={})",
+                        state.get(), re);
+                    status.set("tick error: " + re.getClass().getSimpleName()
+                        + " — see log");
                 }
                 Thread.sleep(TICK_MS);
             }
@@ -230,6 +269,19 @@ public final class ChickenFarmV3Script
 
     private void tickWalk(boolean outbound) throws InterruptedException
     {
+        // Mid-walk inventory check: if we go full mid-OUTBOUND (rare —
+        // someone dropped loot we picked up, an event mob, etc.), pivot
+        // to RETURN immediately rather than continuing all the way to the
+        // pen and finding out we have no slots when combat tries to start.
+        // Same shape as V1's tickOutbound check.
+        if (outbound && Boolean.TRUE.equals(onClient(() -> InventoryUtil.isInventoryFull(client))))
+        {
+            status.set("inventory full mid-outbound — switching to RETURN");
+            walker.reset();
+            currentPath = null;
+            setState(State.RETURN);
+            return;
+        }
         if (currentPath == null) currentPath = planForCurrentPhase(outbound);
         if (currentPath == null) return;
         TrailWalker.Status st = walker.tick(currentPath);
@@ -261,34 +313,34 @@ public final class ChickenFarmV3Script
             return p == null ? null : p.getWorldLocation();
         });
         if (here == null) { status.set("no player — abort"); setState(State.ABORTED); return null; }
-        // Destination = the LAST tile of the matching trail. The trail's
-        // own end-tile is guaranteed to be on the graph (we built the
-        // graph from these trails), so the planner never has to snap
-        // through Chebyshev fuzziness on the destination side. The trail
-        // IS the truth — no centre-of-WorldArea hack.
+        // Replay the matching trail directly — no planner / A* / junction
+        // edges. The graph-based approach kept finding short-cut paths
+        // through "post-staircase" tiles (tiles the engine routes the
+        // player onto AS PART OF the climb action) and emitting them as
+        // ordinary WALK legs, so the bot tried to walk-click stair tiles
+        // instead of clicking the staircase object. V1/V2 worked by
+        // walking to a stairs landing area and triggering the action;
+        // TrailPath.fromTrail produces the same shape from the recording.
         String trailName = outbound ? OUTBOUND_TRAIL_NAME : RETURN_TRAIL_NAME;
         net.runelite.client.plugins.recorder.trail.Trail trail = registry.byName(trailName);
-        WorldPoint dest = lastTileOf(trail);
-        if (dest == null)
+        if (trail == null || trail.events().isEmpty())
         {
-            status.set("trail \"" + trailName + "\" has no tiles — re-record");
+            status.set("trail \"" + trailName + "\" missing or empty — re-record");
             setState(State.ABORTED);
             return null;
         }
-        TrailGraph graph = TrailGraph.build(registry.all());
-        TrailPlanner planner = new TrailPlanner(graph);
-        Optional<TrailPath> p = planner.plan(here, dest);
-        if (!p.isPresent())
+        TrailPath full = TrailPath.fromTrail(trail);
+        int entry = full.findEntryLeg(here);
+        TrailPath path = full.subPath(entry);
+        if (path.isEmpty())
         {
-            status.set("no trail covers " + here + "→" + dest
-                + " (planner returned empty)");
-            log.warn("v3: planner returned empty for {} → {} (graph nodes: {})",
-                here, dest, graph.nodes().size());
+            status.set("trail \"" + trailName + "\" has no usable legs from " + here);
             setState(State.ABORTED);
             return null;
         }
-        log.info("v3: planned {} legs from {} to {}", p.get().size(), here, dest);
-        return p.get();
+        log.info("v3: replay \"{}\" {} legs (entry leg {} of {}) from {}",
+            trailName, path.size(), entry, full.size(), here);
+        return path;
     }
 
     private void tickBanking() throws InterruptedException
@@ -299,6 +351,17 @@ public final class ChickenFarmV3Script
         if (since < BANK_PACE_MS)
         {
             status.set("bank — pacing (" + since + "ms)");
+            return;
+        }
+        // Bank PIN keypad up = STOP. Re-clicking the booth during PIN
+        // entry can lock the player out for 5 minutes. Surface the state
+        // and abort so the user can enter the PIN themselves and resume.
+        Boolean pin = onClient(bank::isBankPinUp);
+        if (Boolean.TRUE.equals(pin))
+        {
+            status.set("bank PIN keypad up — aborting (enter PIN, then restart V3)");
+            log.warn("v3: bank PIN up — aborting before lockout");
+            setState(State.ABORTED);
             return;
         }
         boolean open = onClient(bank::isBankOpen);
@@ -335,15 +398,20 @@ public final class ChickenFarmV3Script
         }
     }
 
-    private void tickAtPen()
+    private void tickAtPen() throws InterruptedException
     {
         if (trainingPlan != null)
         {
-            trainingSession.tick();
+            // TrainingSession.tick() reads varbits and varplayers (sidebar
+            // tab id, retaliate state, current style index). All of those
+            // call client.getVarbitValue / getVarpValue under -ea, which
+            // assert isClientThread(). We're on the chicken-farm-v3 worker
+            // thread here — invoke onto the client thread and wait.
+            onClient(() -> { trainingSession.tick(); return null; });
             if (trainingSession.isComplete())
             {
                 status.set("training complete — returning to bank");
-                combat.stop();
+                handoffFromCombatToWalk();
                 setState(State.RETURN);
                 return;
             }
@@ -352,7 +420,7 @@ public final class ChickenFarmV3Script
         if (onClient(() -> InventoryUtil.isInventoryFull(client)))
         {
             status.set("inventory full — RETURN");
-            combat.stop();
+            handoffFromCombatToWalk();
             setState(State.RETURN);
             return;
         }
@@ -366,6 +434,28 @@ public final class ChickenFarmV3Script
             status.set("combat: " + combat.latestStatus()
                 + " (kills=" + combat.killCount() + ")");
         }
+    }
+
+    /** Stop the combat loop and wait for both the worker thread to exit
+     *  AND any in-flight click chain to settle before the walking phase
+     *  starts dispatching. The combat loop and walker share one
+     *  HumanizedInputDispatcher; if we hand off mid-click the dispatcher's
+     *  busy guard silently drops the walker's first WALK request and the
+     *  bot stalls on a stale "leg-changed" log line until the 15s STUCK
+     *  timer trips. Bounded waits so a wedged combat thread can't hang
+     *  the whole script. */
+    private void handoffFromCombatToWalk() throws InterruptedException
+    {
+        combat.stop();
+        // Combat poll cadence is 600ms; 3000ms gives ~5 polls of grace.
+        long until = System.currentTimeMillis() + 3000L;
+        while (combat.state() != ChickenCombatLoop.State.IDLE
+            && System.currentTimeMillis() < until)
+        {
+            Thread.sleep(60);
+        }
+        try { dispatcher.awaitIdle(2000L); }
+        catch (InterruptedException ie) { Thread.currentThread().interrupt(); throw ie; }
     }
 
     private void tickLoggingOff() throws InterruptedException

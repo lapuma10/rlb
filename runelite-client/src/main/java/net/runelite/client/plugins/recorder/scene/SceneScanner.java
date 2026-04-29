@@ -119,6 +119,19 @@ public final class SceneScanner
      *  {@link Tile#getGroundItems()} list. */
     public Match findTileItemById(int itemId, int radius)
     {
+        return findTileItemByIdRandomNear(itemId, radius, 0);
+    }
+
+    /** Like {@link #findTileItemById} but, when multiple matches are in
+     *  range, picks uniformly at random among those within
+     *  {@code jitter} tiles (Chebyshev) of the closest match. With
+     *  {@code jitter == 0} this collapses to strict-closest. With a
+     *  small positive jitter (e.g. 2), repeat trips to a cluster of
+     *  identical ground items (log piles at a cooking spot) won't
+     *  always lock onto the same tile — kills the bot-tell of always
+     *  lighting on log #1. */
+    public Match findTileItemByIdRandomNear(int itemId, int radius, int jitter)
+    {
         Player self = client.getLocalPlayer();
         if (self == null) return null;
         WorldPoint here = self.getWorldLocation();
@@ -135,7 +148,8 @@ public final class SceneScanner
         int hereSx = here.getX() - wv.getBaseX();
         int hereSy = here.getY() - wv.getBaseY();
 
-        Match best = null;
+        java.util.List<Match> matches = new java.util.ArrayList<>();
+        java.util.List<Integer> dists = new java.util.ArrayList<>();
         int bestDist = Integer.MAX_VALUE;
         for (int dx = -radius; dx <= radius; dx++)
         {
@@ -154,14 +168,34 @@ public final class SceneScanner
                     if (ti == null) continue;
                     if (ti.getId() != itemId) continue;
                     int cheb = Math.max(Math.abs(dx), Math.abs(dy));
-                    if (cheb >= bestDist) continue;
                     WorldPoint wp = new WorldPoint(
                         here.getX() + dx, here.getY() + dy, plane);
-                    bestDist = cheb;
-                    best = new Match(wp, null, ti);
+                    matches.add(new Match(wp, null, ti));
+                    dists.add(cheb);
+                    if (cheb < bestDist) bestDist = cheb;
                 }
             }
         }
-        return best;
+        if (matches.isEmpty()) return null;
+        if (jitter <= 0 || matches.size() == 1)
+        {
+            // Strict-closest behaviour: find the one with bestDist.
+            for (int i = 0; i < matches.size(); i++)
+            {
+                if (dists.get(i) == bestDist) return matches.get(i);
+            }
+            return matches.get(0);
+        }
+        // Gather all matches within bestDist + jitter tiles, then pick
+        // uniformly. Same closest band → no surprise picks far away.
+        int cutoff = bestDist + jitter;
+        java.util.List<Match> nearBest = new java.util.ArrayList<>();
+        for (int i = 0; i < matches.size(); i++)
+        {
+            if (dists.get(i) <= cutoff) nearBest.add(matches.get(i));
+        }
+        if (nearBest.isEmpty()) return matches.get(0);
+        int idx = (int) (Math.random() * nearBest.size());
+        return nearBest.get(idx);
     }
 }

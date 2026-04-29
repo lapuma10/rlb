@@ -98,4 +98,55 @@ public class CombatStateTrackerTest
         t.observe(null, self);
         assertTrue(t.isDead());
     }
+
+    @Test
+    public void neverEngaged_npcLockedOnAnotherPlayer_flagsStolenAfterThreshold()
+    {
+        Player self = mock(Player.class);
+        Player otherPlayer = mock(Player.class);
+        CombatStateTracker t = new CombatStateTracker(13);
+        // Tick 1: chicken is interacting with another player. We've never
+        // engaged it. One observation is below threshold — don't bail yet.
+        t.observe(mockNpcWith(13, 30, otherPlayer), self);
+        assertFalse("one observation below threshold should not flag stolen",
+            t.isStolen(1));
+        // Tick 2: still locked onto the other player. Threshold passed.
+        t.observe(mockNpcWith(13, 30, otherPlayer), self);
+        assertTrue("two consecutive engaged-by-other observations should flag stolen",
+            t.isStolen(1));
+    }
+
+    @Test
+    public void engagedThenObservedOtherPlayer_doesNotFlagStolen()
+    {
+        Player self = mock(Player.class);
+        Player otherPlayer = mock(Player.class);
+        CombatStateTracker t = new CombatStateTracker(17);
+        // Mutual engagement first — this is OUR chicken.
+        t.observe(mockNpcWith(17, 30, self), self);
+        // Now the chicken's interaction transiently shows another player
+        // (e.g. multi-combat AoE, or stale tick). We've already engaged so
+        // this is not a kill steal — must not bail.
+        t.observe(mockNpcWith(17, 30, otherPlayer), self);
+        t.observe(mockNpcWith(17, 30, otherPlayer), self);
+        assertFalse("post-engagement other-player observations are not stolen",
+            t.isStolen(1));
+    }
+
+    @Test
+    public void mutualEngagementResetsEngagedByOtherCounter()
+    {
+        Player self = mock(Player.class);
+        Player otherPlayer = mock(Player.class);
+        CombatStateTracker t = new CombatStateTracker(21);
+        // One tick of "other player has it" — counter at 1.
+        t.observe(mockNpcWith(21, 30, otherPlayer), self);
+        // Mutual engagement establishes — must clear the engaged-by-other
+        // counter so subsequent ticks don't accumulate as if the chicken
+        // were still being stolen.
+        t.observe(mockNpcWith(21, 30, self), self);
+        t.observe(mockNpcWith(21, 30, otherPlayer), self);
+        assertFalse("mutual engagement clears engaged-by-other counter",
+            t.isStolen(1));
+    }
 }

@@ -19,10 +19,20 @@ public class TrainingPlanTest
         TrainingPlan plan = TrainingPlan.basic(SIMPLE, true);
         assertEquals(2, plan.minLevelsBeforeSwitch());
         assertEquals(5, plan.maxLevelsBeforeSwitch());
-        assertEquals(TrainingPlan.DEFAULT_XP_HOVER_MS, plan.xpHoverEveryMs());
+        assertEquals(TrainingPlan.DEFAULT_XP_HOVER_MIN_MS, plan.xpHoverMinMs());
+        assertEquals(TrainingPlan.DEFAULT_XP_HOVER_MAX_MS, plan.xpHoverMaxMs());
         assertTrue(plan.autoRetaliateOn());
         assertFalse(plan.autoRetaliateLeaveAlone());
         assertEquals(2, plan.targets().size());
+    }
+
+    @Test
+    public void defaultHoverRange_is5to20Minutes()
+    {
+        // Anti-detection cadence: between 5 and 20 minutes, randomised per
+        // hover so the next stat-check is never exactly at a fixed offset.
+        assertEquals(5L * 60 * 1000, TrainingPlan.DEFAULT_XP_HOVER_MIN_MS);
+        assertEquals(20L * 60 * 1000, TrainingPlan.DEFAULT_XP_HOVER_MAX_MS);
     }
 
     @Test
@@ -58,25 +68,34 @@ public class TrainingPlanTest
     @Test(expected = IllegalArgumentException.class)
     public void minGreaterThanMax_throws()
     {
-        new TrainingPlan(SIMPLE, true, false, 5, 2, TrainingPlan.DEFAULT_XP_HOVER_MS);
+        new TrainingPlan(SIMPLE, true, false, 5, 2,
+            TrainingPlan.DEFAULT_XP_HOVER_MIN_MS, TrainingPlan.DEFAULT_XP_HOVER_MAX_MS);
     }
 
     @Test(expected = IllegalArgumentException.class)
     public void minLessThanOne_throws()
     {
-        new TrainingPlan(SIMPLE, true, false, 0, 5, TrainingPlan.DEFAULT_XP_HOVER_MS);
+        new TrainingPlan(SIMPLE, true, false, 0, 5,
+            TrainingPlan.DEFAULT_XP_HOVER_MIN_MS, TrainingPlan.DEFAULT_XP_HOVER_MAX_MS);
     }
 
     @Test(expected = IllegalArgumentException.class)
-    public void negativeHoverMs_throws()
+    public void negativeHoverMinMs_throws()
     {
-        new TrainingPlan(SIMPLE, true, false, 2, 5, -1L);
+        new TrainingPlan(SIMPLE, true, false, 2, 5, -1L, 1_200_000L);
+    }
+
+    @Test(expected = IllegalArgumentException.class)
+    public void hoverMaxLessThanMin_throws()
+    {
+        new TrainingPlan(SIMPLE, true, false, 2, 5, 600_000L, 300_000L);
     }
 
     @Test
     public void autoRetaliateLeaveAlone_storedCorrectly()
     {
-        TrainingPlan plan = new TrainingPlan(SIMPLE, false, true, 2, 5, TrainingPlan.DEFAULT_XP_HOVER_MS);
+        TrainingPlan plan = new TrainingPlan(SIMPLE, false, true, 2, 5,
+            TrainingPlan.DEFAULT_XP_HOVER_MIN_MS, TrainingPlan.DEFAULT_XP_HOVER_MAX_MS);
         assertTrue(plan.autoRetaliateLeaveAlone());
         assertFalse(plan.autoRetaliateOn());
     }

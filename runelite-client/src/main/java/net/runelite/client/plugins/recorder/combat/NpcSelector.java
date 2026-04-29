@@ -49,9 +49,14 @@ import java.util.Objects;
 public final class NpcSelector
 {
     /**
-     * Default attack range in world tiles. Chickens stand still, so 6 is plenty.
+     * Default attack range in world tiles. Chickens stand still, but the
+     * trail-walker drops the player just past the pen gate — chickens
+     * cluster on the OPPOSITE side of the pen from the entrance, so 6
+     * tiles routinely missed every chicken (closest dist=8 in the user's
+     * trail). 14 covers the full pen interior from any reasonable entry
+     * point and still rejects chickens visible across a fence.
      */
-    public static final int DEFAULT_RANGE = 6;
+    public static final int DEFAULT_RANGE = 14;
 
     private final String nameFilter;
     private final int range;

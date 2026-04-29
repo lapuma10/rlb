@@ -16,9 +16,10 @@ import java.util.List;
  *   <li>{@code minLevelsBeforeSwitch} / {@code maxLevelsBeforeSwitch} — the
  *       rotation threshold is drawn uniformly at random from this range each
  *       cycle.</li>
- *   <li>{@code xpHoverEveryMs} — every this many milliseconds the bot should
- *       hover a skill icon in the stats tab to check remaining XP to the next
- *       level. Default 90 000 ms (≈90 s) for humanization.</li>
+ *   <li>{@code xpHoverMinMs} / {@code xpHoverMaxMs} — anti-detection cadence
+ *       for the periodic Skills-tab hover. Each cycle the bot picks a fresh
+ *       value uniformly at random from this range so checks never land on
+ *       the same offset twice. Defaults: 5 min to 20 min.</li>
  * </ul>
  */
 public record TrainingPlan(
@@ -27,10 +28,13 @@ public record TrainingPlan(
     boolean autoRetaliateLeaveAlone,
     int minLevelsBeforeSwitch,
     int maxLevelsBeforeSwitch,
-    long xpHoverEveryMs)
+    long xpHoverMinMs,
+    long xpHoverMaxMs)
 {
-    /** Default XP-check hover interval (90 s). */
-    public static final long DEFAULT_XP_HOVER_MS = 90_000L;
+    /** Lower bound of the randomised XP-check hover interval (5 min). */
+    public static final long DEFAULT_XP_HOVER_MIN_MS =  5L * 60 * 1000;
+    /** Upper bound of the randomised XP-check hover interval (20 min). */
+    public static final long DEFAULT_XP_HOVER_MAX_MS = 20L * 60 * 1000;
 
     /** Compact constructor — defensively copies the targets list. */
     public TrainingPlan
@@ -50,9 +54,15 @@ public record TrainingPlan(
                 "maxLevelsBeforeSwitch (" + maxLevelsBeforeSwitch
                     + ") must be >= minLevelsBeforeSwitch (" + minLevelsBeforeSwitch + ")");
         }
-        if (xpHoverEveryMs <= 0)
+        if (xpHoverMinMs <= 0)
         {
-            throw new IllegalArgumentException("xpHoverEveryMs must be positive");
+            throw new IllegalArgumentException("xpHoverMinMs must be positive");
+        }
+        if (xpHoverMaxMs < xpHoverMinMs)
+        {
+            throw new IllegalArgumentException(
+                "xpHoverMaxMs (" + xpHoverMaxMs
+                    + ") must be >= xpHoverMinMs (" + xpHoverMinMs + ")");
         }
     }
 
@@ -61,7 +71,8 @@ public record TrainingPlan(
      * <ul>
      *   <li>minLevelsBeforeSwitch = 2</li>
      *   <li>maxLevelsBeforeSwitch = 5</li>
-     *   <li>xpHoverEveryMs = {@value #DEFAULT_XP_HOVER_MS}</li>
+     *   <li>xpHoverMinMs = {@value #DEFAULT_XP_HOVER_MIN_MS} (5 min)</li>
+     *   <li>xpHoverMaxMs = {@value #DEFAULT_XP_HOVER_MAX_MS} (20 min)</li>
      *   <li>autoRetaliateLeaveAlone = false</li>
      * </ul>
      *
@@ -70,6 +81,7 @@ public record TrainingPlan(
      */
     public static TrainingPlan basic(List<SkillTarget> targets, boolean autoRetaliate)
     {
-        return new TrainingPlan(targets, autoRetaliate, false, 2, 5, DEFAULT_XP_HOVER_MS);
+        return new TrainingPlan(targets, autoRetaliate, false, 2, 5,
+            DEFAULT_XP_HOVER_MIN_MS, DEFAULT_XP_HOVER_MAX_MS);
     }
 }

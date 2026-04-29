@@ -112,6 +112,11 @@ public final class ChickenCombatLoop
     );
     /** Engagement-broken threshold (ticks). Spec says "&gt;2 ticks". */
     private static final int BROKEN_THRESHOLD_TICKS = 2;
+    /** Kill-steal threshold (ticks). One extra tick of confirmation before
+     *  bailing — guards against transient retarget mid-tick while still
+     *  reacting in ~1.2s, well before the bot looks like it's standing on
+     *  someone else's chicken. */
+    private static final int STOLEN_THRESHOLD_TICKS = 1;
     /** Polls of "player not loaded" we'll tolerate before aborting. ~1.8s at
      *  600ms cadence — covers a brief loading-screen flicker but bails fast
      *  if the user started the loop on the title screen. */
@@ -465,6 +470,20 @@ public final class ChickenCombatLoop
             if (lockedTile != null) lastKillTile.set(lockedTile);
             setStatus("killed " + ct.npcName() + " #" + ct.npcIndex());
             setState(State.KILLED);
+            return true;
+        }
+        if (tracker.isStolen(STOLEN_THRESHOLD_TICKS))
+        {
+            // Another player engaged this chicken before our click landed.
+            // Drop the lock without crediting a kill or attempting to loot —
+            // the corpse will spawn drops owned by the other player. Going
+            // back to SELECTING lets the selector pick a different chicken
+            // immediately, which is what a human would do.
+            log.info("kill stolen on chicken #{} — releasing lock, re-selecting",
+                ct.npcIndex());
+            target.set(null);
+            setStatus("kill stolen — re-selecting");
+            setState(State.SELECTING);
             return true;
         }
         if (tracker.isEngagementBroken(BROKEN_THRESHOLD_TICKS))

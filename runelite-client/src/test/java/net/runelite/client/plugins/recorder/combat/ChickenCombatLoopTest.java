@@ -103,6 +103,38 @@ public class ChickenCombatLoopTest
     }
 
     @Test
+    public void inCombatTick_chickenLockedOnAnotherPlayer_releasesLockAndReSelects()
+    {
+        Player self = mock(Player.class);
+        Player otherPlayer = mock(Player.class);
+        NPC chicken = mockChicken(13, 3231, 3296, 0);
+        Client client = clientWith(self, new WorldPoint(3230, 3296, 0), chicken);
+        CombatDispatcher dispatcher = mock(CombatDispatcher.class);
+        ChickenCombatLoop loop = new ChickenCombatLoop(dispatcher, client, null,
+            new NpcSelector(ChickenCombatLoop.CHICKEN_NAME),
+            TargetVisibility.alwaysVisible(), s -> {});
+        loop.setTargetForTesting(new CombatTarget(13, "Chicken", 0));
+        loop.setStateForTesting(ChickenCombatLoop.State.IN_COMBAT);
+        CombatStateTracker tracker = new CombatStateTracker(13);
+        CombatTarget ct = loop.currentTarget();
+
+        // Chicken is locked onto another player and we have never engaged.
+        // Two consecutive observations crosses the steal threshold.
+        when(chicken.getInteracting()).thenReturn(otherPlayer);
+        when(chicken.getHealthRatio()).thenReturn(30);
+        assertFalse("first stolen observation below threshold — keep polling",
+            loop.combatTick(ct, tracker));
+        assertEquals(ChickenCombatLoop.State.IN_COMBAT, loop.state());
+        // Second observation — bail.
+        assertTrue("second stolen observation should bail", loop.combatTick(ct, tracker));
+        assertEquals(ChickenCombatLoop.State.SELECTING, loop.state());
+        assertNull("lock must be released after kill steal", loop.currentTarget());
+        assertEquals("must NOT credit a stolen kill", 0, loop.killCount());
+        // Critical: never dispatched anything during the bail.
+        verify(dispatcher, never()).dispatch(any());
+    }
+
+    @Test
     public void doKilled_releasesLockAndReturnsToSelecting()
     {
         Client client = mock(Client.class);

@@ -199,17 +199,33 @@ public class HumanizedInputDispatcher implements InputDispatcher
      *  0 = south, increasing counter-clockwise from above. */
     public void rotateCameraToward(WorldPoint target) throws InterruptedException
     {
+        rotateCameraToward(target, false);
+    }
+
+    /** Force-variant: when {@code force} is true, the
+     *  "already comfortably visible" early-exit is skipped. The yaw-tolerance
+     *  check still applies, so we still no-op when already pointed at the
+     *  target. Use this for clicks where the target tile may project into
+     *  the viewport geometrically but be occluded by a wall (e.g. cooking
+     *  on a fire across a wall in Lumbridge Castle P2): real players turn
+     *  the camera to actually see the object before clicking, even if the
+     *  underlying tile poly is technically inside the viewport rect. */
+    public void rotateCameraToward(WorldPoint target, boolean force) throws InterruptedException
+    {
         if (target == null) return;
-        // If the target tile is already comfortably inside the viewport, a
-        // real player wouldn't pan the camera — they can already see it.
-        // Skipping here is the dominant humanization: after a kill, the
-        // loot tile is right under where we were just fighting, so the
-        // follow-up loot click rotates only when actually needed.
-        Boolean alreadyVisible = onClient(() -> isTileComfortablyVisible(target));
-        if (Boolean.TRUE.equals(alreadyVisible))
+        if (!force)
         {
-            log.debug("rotate camera skipped — target {} already on screen", target);
-            return;
+            // If the target tile is already comfortably inside the viewport, a
+            // real player wouldn't pan the camera — they can already see it.
+            // Skipping here is the dominant humanization: after a kill, the
+            // loot tile is right under where we were just fighting, so the
+            // follow-up loot click rotates only when actually needed.
+            Boolean alreadyVisible = onClient(() -> isTileComfortablyVisible(target));
+            if (Boolean.TRUE.equals(alreadyVisible))
+            {
+                log.debug("rotate camera skipped — target {} already on screen", target);
+                return;
+            }
         }
         Integer desired = onClient(() -> {
             var local = client.getLocalPlayer();
@@ -1095,6 +1111,36 @@ public class HumanizedInputDispatcher implements InputDispatcher
         moveCursorTo(x, y);
     }
 
+    /** Resolve a humanized pixel inside {@code widgetId}, move the cursor
+     *  there along a wind path, then dwell for a randomly-chosen duration
+     *  in [{@code minDwellMs}, {@code maxDwellMs}]. Returns true if the
+     *  hover landed (cursor reached the widget and we slept the full
+     *  dwell), false if the widget couldn't be resolved (hidden / not
+     *  present).
+     *
+     *  <p>Used to surface tooltips that the engine only renders while
+     *  the cursor is over a target — e.g. "X exp to next level" on a
+     *  Stats panel skill icon. Caller should typically wrap this in
+     *  {@link #runExclusive} so combat/walker dispatches back off
+     *  cleanly during the dwell. */
+    public boolean hoverWidget(int widgetId, long minDwellMs, long maxDwellMs)
+        throws InterruptedException
+    {
+        if (maxDwellMs < minDwellMs) maxDwellMs = minDwellMs;
+        Point pixel = onClient(() -> resolver.resolveWidget(widgetId));
+        if (pixel == null)
+        {
+            log.debug("hoverWidget({}) — widget not visible / not present", widgetId);
+            return false;
+        }
+        moveCursorTo(pixel.getX(), pixel.getY());
+        long dwell = minDwellMs == maxDwellMs
+            ? minDwellMs
+            : minDwellMs + rng.nextInt((int) Math.min(Integer.MAX_VALUE, maxDwellMs - minDwellMs + 1));
+        Thread.sleep(dwell);
+        return true;
+    }
+
     /** Scroll the mouse wheel at canvas position (x, y) by
      *  {@code notches} notches in {@code direction} (+1 = down,
      *  -1 = up). Each notch has a humanized 80-220ms gap before the
@@ -1139,6 +1185,41 @@ public class HumanizedInputDispatcher implements InputDispatcher
             Thread.sleep(50);
         }
         return true;
+    }
+
+    /** Acquire the busy flag, run {@code work} on the calling thread, then
+     *  release. Returns {@code true} if {@code work} ran (we held the flag
+     *  for its full duration), {@code false} if the dispatcher was already
+     *  busy and we did nothing.
+     *
+     *  <p>Use this to compose multi-step humanized sequences that mix the
+     *  fire-and-forget {@link #dispatch(ActionRequest)} API with the sync
+     *  helpers ({@link #moveCursor}, {@link #clickCanvas}). Inside the
+     *  closure you own the cursor — the combat / walker / etc. dispatchers
+     *  will see {@link #isBusy()} and back off until you return.
+     *
+     *  <p>The closure may itself call {@code dispatch(...)} (sub-clicks
+     *  that go through the async path) — they'll see the flag set, but
+     *  the closure can call {@link #awaitIdle} on entries from those
+     *  sub-paths if needed. The outer flag stays set throughout. */
+    public boolean runExclusive(ExclusiveTask work) throws InterruptedException
+    {
+        if (work == null) return false;
+        if (!busy.compareAndSet(false, true)) return false;
+        try
+        {
+            work.run();
+            return true;
+        }
+        finally { busy.set(false); }
+    }
+
+    /** Closure type for {@link #runExclusive}. Allowed to throw
+     *  {@link InterruptedException} so callers can sleep without wrapping. */
+    @FunctionalInterface
+    public interface ExclusiveTask
+    {
+        void run() throws InterruptedException;
     }
 
     /** Move to (x, y), then dispatch a humanized right-click + select the

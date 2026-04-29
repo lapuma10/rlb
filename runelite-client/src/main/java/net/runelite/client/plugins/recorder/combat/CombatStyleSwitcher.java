@@ -27,8 +27,12 @@ public class CombatStyleSwitcher
     /** VarPlayer 43 — which combat-style button is active (0/1/2/3). */
     private static final int VARP_ATTACK_STYLE = VarPlayerID.COM_MODE;
 
-    /** Minimum milliseconds between two successive click dispatches. */
-    private static final long THROTTLE_MS = 2_000L;
+    /** Minimum milliseconds between two successive click dispatches.
+     *  Long enough that a single missed dispatch (e.g. dispatcher busy
+     *  with an attack click) doesn't queue up a second toggle a tick
+     *  later — at the old 2s value the loop ate dropped clicks every
+     *  pass while combat owned the dispatcher. */
+    private static final long THROTTLE_MS = 8_000L;
 
     private static final int[] STYLE_WIDGET_IDS = {
         InterfaceID.CombatInterface._0,
@@ -84,6 +88,15 @@ public class CombatStyleSwitcher
             log.debug("combat style switch throttled ({}ms since last dispatch)",
                 now - lastDispatchMs);
             return true;   // treat as "already handled" — caller should not re-dispatch
+        }
+
+        // Skip if the shared dispatcher is mid-click (combat attack,
+        // walker hop, gate open, etc.). Without this, the click is
+        // silently dropped AND we burn the next 8s of throttle.
+        if (dispatcher.isBusy())
+        {
+            log.debug("combat style switch skipped — dispatcher busy");
+            return true;
         }
 
         int widgetId = STYLE_WIDGET_IDS[desired.widgetIndex()];

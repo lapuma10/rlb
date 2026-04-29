@@ -485,12 +485,22 @@ public final class PixelResolver
 
     /** Pick a pixel inside a widget's bounds, biased away from the centre and
      *  edges. For inventory-style widgets where you click an individual slot,
-     *  pass the child widget id (not the parent) so the bounds are correct. */
+     *  pass the child widget id (not the parent) so the bounds are correct.
+     *
+     *  <p>Returns null when the widget is hidden (or any of its ancestors are
+     *  hidden) — clicks at a hidden widget's stale bounds fall through to
+     *  whatever's behind it on the canvas, which for sidebar widgets like
+     *  combat-style buttons is the WORLD VIEW. The engine then treats the
+     *  click as a tile walk, drifting the player further with every dropped
+     *  call. The combat / training subsystems poll widgets every tick; one
+     *  un-guarded hidden-widget click per second moves the player tens of
+     *  tiles away from the pen in under a minute. */
     @Nullable
     public Point resolveWidget(int widgetId)
     {
         Widget w = client.getWidget(widgetId);
         if (w == null) return null;
+        if (isHiddenIncludingAncestors(w)) return null;
         Rectangle r = w.getBounds();
         if (r == null || r.width < 2 || r.height < 2) return null;
         // Reject samples too near the edge (clicks can land on adjacent slots)
@@ -519,6 +529,21 @@ public final class PixelResolver
             r.y + marginY + rng.nextInt(Math.max(1, r.height - 2 * marginY)));
         record(fallback);
         return fallback;
+    }
+
+    /** True when {@code w} or any of its parent widgets is hidden. The
+     *  engine flags a widget as visible only when the entire chain up to
+     *  the root layer is visible — checking just {@code w.isHidden()}
+     *  misses the case where a parent (e.g. the combat-tab content layer)
+     *  is collapsed but the child still reports {@code !isHidden()} from
+     *  its last layout. */
+    private static boolean isHiddenIncludingAncestors(Widget w)
+    {
+        for (Widget cur = w; cur != null; cur = cur.getParent())
+        {
+            if (cur.isHidden()) return true;
+        }
+        return false;
     }
 
     /** Sample a pixel uniformly inside the given polygon, retrying on

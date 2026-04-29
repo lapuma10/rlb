@@ -236,7 +236,7 @@ public class RecorderPlugin extends Plugin
         HumanizedInputDispatcher v3Dispatcher = new HumanizedInputDispatcher(client, clientThread);
         net.runelite.client.plugins.recorder.scripts.ChickenFarmV3Script chickenFarmV3 =
             new net.runelite.client.plugins.recorder.scripts.ChickenFarmV3Script(
-                client, clientThread, v3Dispatcher, trailRegistry);
+                client, clientThread, v3Dispatcher, trailRegistry, eventBus);
         panel.setChickenFarmV3(chickenFarmV3);
 
         // Mining loop: separate dispatcher, independent busy flag from

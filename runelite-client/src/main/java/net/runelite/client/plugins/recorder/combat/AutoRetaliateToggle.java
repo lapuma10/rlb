@@ -33,8 +33,12 @@ public class AutoRetaliateToggle
 
     private static final int WIDGET_RETALIATE = InterfaceID.CombatInterface.RETALIATE;
 
-    /** Minimum milliseconds between two successive click dispatches. */
-    private static final long THROTTLE_MS = 2_000L;
+    /** Minimum milliseconds between two successive click dispatches.
+     *  Long enough that a single missed dispatch (e.g. dispatcher busy
+     *  with an attack click) doesn't queue up a second toggle a tick
+     *  later — when the THROTTLE was 2s the loop ate ~30 dropped clicks
+     *  per minute while combat owned the dispatcher. */
+    private static final long THROTTLE_MS = 8_000L;
 
     private final Client client;
     private final CombatDispatcher dispatcher;
@@ -98,6 +102,19 @@ public class AutoRetaliateToggle
             log.debug("auto-retaliate toggle throttled ({}ms since last dispatch)",
                 now - lastDispatchMs);
             return true;   // treat as handled — caller should not re-dispatch
+        }
+
+        // Don't even attempt the dispatch if the shared dispatcher is busy
+        // with another click (combat attack, walker hop, gate open, etc.).
+        // The dispatcher's compareAndSet would silently drop our request,
+        // log "dispatcher busy, dropping CLICK_WIDGET", AND we'd advance
+        // lastDispatchMs — locking out the next 8s of legitimate retries.
+        // Better to skip cleanly and let the next training tick try again
+        // when the chain has settled.
+        if (dispatcher.isBusy())
+        {
+            log.debug("auto-retaliate toggle skipped — dispatcher busy");
+            return true;
         }
 
         ActionRequest req = ActionRequest.builder()

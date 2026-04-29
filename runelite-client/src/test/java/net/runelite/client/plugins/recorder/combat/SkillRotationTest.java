@@ -15,7 +15,8 @@ public class SkillRotationTest
             List.of(targets),
             true, false,
             minSwitch, maxSwitch,
-            TrainingPlan.DEFAULT_XP_HOVER_MS
+            TrainingPlan.DEFAULT_XP_HOVER_MIN_MS,
+            TrainingPlan.DEFAULT_XP_HOVER_MAX_MS
         );
     }
 

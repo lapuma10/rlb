@@ -51,6 +51,12 @@ public final class CombatStateTracker
     /** Set when {@link #observe} sees the locked NPC vanish from the world view
      *  (interpreted as "killed by someone else / despawned mid-combat"). */
     private boolean vanished = false;
+    /** Consecutive ticks where the locked NPC's interaction target was a Player
+     *  other than the local player AND we have never observed mutual engagement
+     *  ourselves. Reset on mutual engagement or when interaction is null. Used
+     *  by {@link #isStolen(int)} to detect "another player is killing our
+     *  selected chicken" before we waste 5-15s standing at a corpse. */
+    private int engagedByOtherTicks = 0;
 
     public CombatStateTracker(int npcIndex)
     {
@@ -67,11 +73,21 @@ public final class CombatStateTracker
         if (dead) return;   // sticky once we've decided
         if (lockedNpc == null)
         {
-            // NPC no longer in WorldView. If we never engaged, it might just
-            // have despawned out of range — treat as vanished but only flag
-            // dead if we actually started fighting it.
+            // NPC no longer in WorldView. Always flag dead — the combat
+            // loop only creates a tracker once doEngage has seen mutual
+            // engagement, so a vanish here means our target despawned. We
+            // used to require everEngaged=true (set from
+            // npc.getInteracting()==self during THIS tracker's lifetime)
+            // before flagging dead, but a 1-hit kill on a low-HP NPC like
+            // a chicken can drain the HP bar AND despawn the NPC inside a
+            // single 600ms tick — faster than our first observe call. That
+            // left the tracker pinned at dead=false, vanished=true forever
+            // and combat got stuck in IN_COMBAT polling a phantom NPC.
+            // Over-counting someone-else-killed-our-target as our kill is
+            // a minor issue (we just transition to LOOTING-skip → SELECT
+            // again); under-counting gets us stuck.
             vanished = true;
-            if (everEngaged) dead = true;
+            dead = true;
             return;
         }
         if (lockedNpc.getIndex() != npcIndex)
@@ -82,20 +98,41 @@ public final class CombatStateTracker
         }
         Actor interacting = lockedNpc.getInteracting();
         boolean engagedWithUs = interacting != null && self != null && interacting == self;
+        boolean engagedByOther = interacting instanceof Player && interacting != self;
         if (engagedWithUs) everEngaged = true;
 
         if (engagedWithUs) brokenTicks = 0;
         else if (everEngaged) brokenTicks++;
 
+        // Track "another player has it locked" only when we've never had
+        // mutual engagement of our own. After we engage once, retain the
+        // tick of the chicken's last targeting decision is moot — the
+        // chicken is committed to us and won't get poached.
+        if (engagedWithUs)
+        {
+            engagedByOtherTicks = 0;
+        }
+        else if (engagedByOther && !everEngaged)
+        {
+            engagedByOtherTicks++;
+        }
+        else if (!engagedByOther)
+        {
+            engagedByOtherTicks = 0;
+        }
+
         int hp = lockedNpc.getHealthRatio();
         if (hp == 0) zeroHpTicks++;
         else zeroHpTicks = 0;
 
-        // Death rule: HP bar empty for at least one tick (the kill animation
-        // plays on the same tick the bar drains). The +1 buffer matches the
-        // spec ("wait one more tick after healthRatio==0 to let the kill
-        // animation play"). Kill counts only when we ever engaged.
-        if (zeroHpTicks >= 1 && everEngaged) dead = true;
+        // Death rule: HP bar empty for at least one tick. Drop the
+        // everEngaged requirement — same reason as the vanish branch
+        // above. If the HP bar shows zero on our locked target index,
+        // it's dead, regardless of whether we caught the engagement
+        // tick. Kill credit goes to whoever's tracker confirms it; for
+        // our purposes the only thing that matters is unblocking the
+        // state machine.
+        if (zeroHpTicks >= 1) dead = true;
     }
 
     /** True when we have observed at least one tick of mutual engagement. */
@@ -120,6 +157,16 @@ public final class CombatStateTracker
     public boolean isAlive()
     {
         return !dead && !vanished;
+    }
+
+    /** True when the locked NPC has been engaged by another player for more
+     *  than {@code threshold} ticks AND we have never observed mutual
+     *  engagement ourselves. The combat loop bails to SELECTING in this
+     *  case so the bot doesn't stand at someone else's chicken waiting for
+     *  it to die. */
+    public boolean isStolen(int threshold)
+    {
+        return !everEngaged && !dead && !vanished && engagedByOtherTicks > threshold;
     }
 
     /** True if the NPC is confirmed dead (HP bar drained, or vanished from the
