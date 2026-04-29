@@ -41,6 +41,15 @@ public interface SequenceEngine {
     void registerReactive(Step reactive);
     void unregisterReactive(Step reactive);
 
+    /** Convenience overload — the priority parameter documents intent at the
+     *  call site (e.g. "I'm registering a high-priority preempting reactive").
+     *  Selection still uses {@link Step#priority()}. */
+    default void registerReactive(Step reactive, int priority) { registerReactive(reactive); }
+
+    /** Remove all registered reactive steps. Idempotent; safe to call when
+     *  none are registered. */
+    void clearReactives();
+
     /** Drive one tick of the loop. Production: invoked by SequencerPlugin.onGameTick.
      *  Tests may call this directly to drive the engine synchronously. */
     void advanceTick();

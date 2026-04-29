@@ -35,8 +35,10 @@ import net.runelite.client.sequence.Step;
 import net.runelite.client.sequence.WorldSnapshot;
 import net.runelite.client.sequence.blackboard.Blackboard;
 import net.runelite.client.sequence.blackboard.BlackboardScope;
+import net.runelite.client.sequence.affordance.DiagnosticReason;
 import net.runelite.client.sequence.composite.CompositeStep;
 import net.runelite.client.sequence.dispatch.InputDispatcher;
+import net.runelite.client.sequence.dispatch.InputOwnership;
 import net.runelite.client.sequence.telemetry.Telemetry;
 import net.runelite.client.sequence.telemetry.TelemetryRecord;
 
@@ -68,6 +70,13 @@ public final class StateDrivenEngine implements SequenceEngine {
 
     private SequenceState state = SequenceState.IDLE;
     private int currentTick = 0;
+
+    /** Optional input-ownership lease guarding mutating actions. When set, the
+     *  engine refuses to advance a tick that would dispatch on behalf of a
+     *  step while another owner holds the lease. Configured via
+     *  {@link #setInputOwnership(InputOwnership, String)}. */
+    private InputOwnership inputOwnership;
+    private String inputOwnerToken;
 
     public StateDrivenEngine(Observer observer, Planner planner, InputDispatcher dispatcher,
                              Telemetry telemetry, Blackboard blackboard) {
@@ -109,13 +118,37 @@ public final class StateDrivenEngine implements SequenceEngine {
 
     @Override public synchronized void registerReactive(Step r)   { reactives.add(r); }
     @Override public synchronized void unregisterReactive(Step r) { reactives.remove(r); }
+    @Override public synchronized void clearReactives()           { reactives.clear(); }
     @Override public synchronized SequenceState state() { return state; }
     @Override public synchronized void offerEvent(Object event)   { eventQueue.add(event); }
+
+    /** Wire an input-ownership lease + token. After this, every tick verifies
+     *  the lease is still held; if not, the run fails with
+     *  {@link DiagnosticReason.Unknown} mentioning lost ownership. */
+    public synchronized void setInputOwnership(InputOwnership ownership, String ownerToken) {
+        this.inputOwnership = ownership;
+        this.inputOwnerToken = ownerToken;
+    }
 
     @Override
     public synchronized void advanceTick() {
         if (state != SequenceState.RUNNING) return;
         currentTick++;
+
+        // Mid-sequence input-ownership defensive check (per spec §11.3): if the
+        // lease was lost between ticks we abort BEFORE running any step that
+        // could dispatch a click under the wrong owner. Defensively release on
+        // our side so we don't keep the lease stuck if the new owner misses it.
+        if (inputOwnership != null && inputOwnerToken != null
+            && !inputOwnership.isOwner(inputOwnerToken) && !frames.isEmpty()) {
+            DiagnosticReason d = new DiagnosticReason.Unknown("input ownership lost mid-sequence");
+            inputOwnership.release(inputOwnerToken);
+            StepFrame top = frames.top();
+            telemetry.record(rec(top, TelemetryRecord.Event.RECOVERY, d.toString()));
+            failRun();
+            return;
+        }
+
         WorldSnapshot snap = observer.snapshot(currentTick);
 
         // Drain pending events to all active frames

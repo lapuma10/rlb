@@ -29,6 +29,7 @@ import net.runelite.client.sequence.activities.StepRegistry;
 import net.runelite.client.sequence.blackboard.Blackboard;
 import net.runelite.client.sequence.blackboard.ScopedBlackboard;
 import net.runelite.client.sequence.dispatch.InputDispatcher;
+import net.runelite.client.sequence.dispatch.InputOwnership;
 import net.runelite.client.sequence.internal.*;
 import net.runelite.client.sequence.telemetry.RingBufferTelemetry;
 import net.runelite.client.sequence.telemetry.Telemetry;
@@ -50,6 +51,9 @@ public final class SequenceManager {
      *  thread, which is what tests want. Plugins set this to ClientThread::invoke
      *  so EDT/AWT-key callers don't touch Client state from the wrong thread. */
     private Consumer<Runnable> scheduler = Runnable::run;
+
+    private InputOwnership inputOwnership;
+    private String inputOwnerToken;
 
     private SequenceManager() {}
 
@@ -77,7 +81,11 @@ public final class SequenceManager {
         if (engine != null) return;   // explicit setEngine takes precedence
         if (observer != null && dispatcher != null && planner != null
             && telemetry != null && blackboard != null) {
-            engine = new StateDrivenEngine(observer, planner, dispatcher, telemetry, blackboard);
+            StateDrivenEngine sde = new StateDrivenEngine(observer, planner, dispatcher, telemetry, blackboard);
+            if (inputOwnership != null && inputOwnerToken != null) {
+                sde.setInputOwnership(inputOwnership, inputOwnerToken);
+            }
+            engine = sde;
         }
     }
 
@@ -91,6 +99,29 @@ public final class SequenceManager {
 
     public void register(Step reactive)   { scheduler.accept(() -> engine.registerReactive(reactive)); }
     public void unregister(Step reactive) { scheduler.accept(() -> engine.unregisterReactive(reactive)); }
+
+    /** Scheduler-marshalled passthrough to {@link SequenceEngine#registerReactive(Step, int)}. */
+    public void registerReactive(Step reactive, int priority) {
+        scheduler.accept(() -> engine.registerReactive(reactive, priority));
+    }
+
+    /** Scheduler-marshalled passthrough to {@link SequenceEngine#clearReactives()}. */
+    public void clearReactives() {
+        scheduler.accept(() -> engine.clearReactives());
+    }
+
+    /** Wire an input-ownership lease + token into the underlying engine. The
+     *  engine verifies the lease is held at the start of every tick; if not,
+     *  it fails the run with a typed diagnostic. Idempotent — set before
+     *  {@link #run(Step)} or after, but the lease must already exist for it
+     *  to take effect on the in-flight run. */
+    public void setInputOwnership(InputOwnership ownership, String ownerToken) {
+        this.inputOwnership = ownership;
+        this.inputOwnerToken = ownerToken;
+        if (engine instanceof StateDrivenEngine sde) {
+            sde.setInputOwnership(ownership, ownerToken);
+        }
+    }
 
     /** Plugins forward RuneLite events here; the engine routes them on the next tick.
      *  Forwarded from @Subscribe handlers which already run on ClientThread, so no
