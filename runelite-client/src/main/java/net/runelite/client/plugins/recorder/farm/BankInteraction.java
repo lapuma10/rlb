@@ -488,31 +488,165 @@ public final class BankInteraction
         return withdrawWithVerb(itemId, "Withdraw-1");
     }
 
+    /** Deposit all of {@code itemId} from the inventory via the slot's
+     *  right-click "Deposit-All" option. The bank must be open. Returns
+     *  true iff a click was dispatched (item was found in inventory and
+     *  the slot widget resolved); the caller checks
+     *  {@link HumanizedInputDispatcher#lastErrorMessage()} on the next
+     *  tick to see whether the menu pick actually landed.
+     *
+     *  <p>Use this instead of the deposit-inventory orb whenever any
+     *  inventory item must STAY across the bank → cook → bank loop
+     *  (tinderbox for cooking, pickaxe for mining, etc.) — the orb is
+     *  "deposit everything", and re-withdrawing a kept item every trip
+     *  is both wasteful and very bot-tell. */
+    public boolean depositAll(int itemId) throws InterruptedException
+    {
+        Rectangle b = onClient(() -> resolveInvSlotBoundsForDeposit(itemId));
+        if (b == null)
+        {
+            // Surface the silent failure so the FSM (and the user) can
+            // see why no deposit happened. Most common cause: bank not
+            // open / Bankside widget hidden, or item missing from inv.
+            log.warn("bank: depositAll itemId={} — inv slot widget unresolved"
+                + " (bank closed? Bankside.ITEMS hidden? item gone?)", itemId);
+            return false;
+        }
+        // Sample inside the slot bounds with a small margin — clicking
+        // dead-centre is mechanical, and a fuzzy edge can bleed into
+        // the adjacent slot under engine hit-test variance.
+        int marginX = Math.max(1, b.width / 6);
+        int marginY = Math.max(1, b.height / 6);
+        int cx = b.x + marginX
+            + (int) (Math.random() * Math.max(1, b.width - 2 * marginX));
+        int cy = b.y + marginY
+            + (int) (Math.random() * Math.max(1, b.height - 2 * marginY));
+        log.info("bank: deposit-all itemId={} via inv slot bounds={}", itemId, b);
+        dispatcher.rightClickAndPickMenu(cx, cy, "Deposit-All");
+        return true;
+    }
+
+    /** Client-thread: locate the inventory slot widget holding
+     *  {@code itemId} and return its bounds.
+     *
+     *  <p>While the bank is open, the standalone inventory tab at
+     *  {@link InterfaceID.Inventory#ITEMS} (group 149) is HIDDEN — the
+     *  engine renders the player's inventory under
+     *  {@link InterfaceID.Bankside#ITEMS} on the right side of the bank
+     *  UI, and that's where right-click "Deposit-1/5/10/X/All" entries
+     *  fire from. Clicking the standalone-tab bounds while the bank is
+     *  open silently resolves to a "Walk here" on the underlying tile.
+     *
+     *  <p>So: try the bank-side inventory first, fall back to the
+     *  standalone tab for any non-bank caller (none today, kept cheap). */
+    private Rectangle resolveInvSlotBoundsForDeposit(int itemId)
+    {
+        Widget parent = client.getWidget(InterfaceID.Bankside.ITEMS);
+        if (parent == null || parent.isHidden())
+        {
+            parent = client.getWidget(InterfaceID.Inventory.ITEMS);
+        }
+        if (parent == null || parent.isHidden()) return null;
+        ItemContainer inv = client.getItemContainer(InventoryID.INV);
+        if (inv == null) return null;
+        Item[] items = inv.getItems();
+        if (items == null) return null;
+        int slotIdx = -1;
+        for (int i = 0; i < items.length; i++)
+        {
+            Item it = items[i];
+            if (it != null && it.getId() == itemId) { slotIdx = i; break; }
+        }
+        if (slotIdx < 0) return null;
+        Widget child = parent.getChild(slotIdx);
+        if (child == null || child.isSelfHidden()) return null;
+        Rectangle r = child.getBounds();
+        return r == null || r.isEmpty() ? null : r;
+    }
+
+    /** True iff the bank slot for {@code itemId} is currently inside
+     *  the visible window of {@link InterfaceID.Bankmain#ITEMS} — i.e.
+     *  no scroll is needed before clicking it. Returns false if the
+     *  item isn't in the bank, the bank widget isn't loaded, or the
+     *  slot exists but is scrolled out.
+     *
+     *  <p>Used by callers that want to choose withdraw order based on
+     *  what's currently on screen (don't scroll past a visible item to
+     *  reach a hidden one — saves scroll cycles and looks more human). */
+    public boolean isItemVisible(int itemId) throws InterruptedException
+    {
+        Boolean v = onClient(() -> isItemVisibleClientThread(itemId));
+        return Boolean.TRUE.equals(v);
+    }
+
+    /** Client-thread half of {@link #isItemVisible}. Mirrors the
+     *  visibility test inside {@link #resolveBankSlotInfo} but without
+     *  computing scroll directives — pure observation. */
+    private boolean isItemVisibleClientThread(int itemId)
+    {
+        Widget container = client.getWidget(InterfaceID.Bankmain.ITEMS);
+        if (container == null || container.isHidden()) return false;
+        ItemContainer bankInv = client.getItemContainer(InventoryID.BANK);
+        if (bankInv == null) return false;
+        Item[] items = bankInv.getItems();
+        if (items == null) return false;
+        int slotIdx = -1;
+        for (int i = 0; i < items.length; i++)
+        {
+            Item it = items[i];
+            if (it != null && it.getId() == itemId) { slotIdx = i; break; }
+        }
+        if (slotIdx < 0) return false;
+        Widget match = container.getChild(slotIdx);
+        if (match == null || match.isSelfHidden()) return false;
+        int containerH = container.getHeight();
+        int relY = match.getRelativeY();
+        int slotH = match.getHeight() <= 0 ? 36 : match.getHeight();
+        int scrollY = container.getScrollY();
+        int top = relY - scrollY;
+        int bottom = top + slotH;
+        return top >= 0 && bottom <= containerH;
+    }
+
     private boolean withdrawWithVerb(int itemId, String verb) throws InterruptedException
     {
-        // Two-phase: first read the slot widget on the client thread.
-        // If it's not visible, dispatch a humanized mouse-wheel scroll
-        // off-thread (timing has Thread.sleep — must NOT run on client
-        // thread) and return false so the caller paces and retries.
-        ScrollOrBounds sb = onClient(() -> resolveBankSlotInfo(itemId));
-        if (sb == null) return false;
-        if (sb.bounds != null)
+        // Self-contained scroll-and-click. Loops internally: re-resolves
+        // visibility after each small wheel burst, scrolls again if still
+        // not visible, click+verb when it is. Small bursts (1-3 notches)
+        // with 150-400ms gaps mimic a real player flicking the wheel a
+        // few notches, glancing, flicking again — vs. one big 5-notch
+        // burst followed by a 2s caller-side pace, which reads as choppy.
+        // Returns true on click dispatched, false on item missing or
+        // scroll-find timeout.
+        long deadline = System.currentTimeMillis() + 10_000L;
+        int safety = 30;   // upper iter cap as belt-and-braces against
+                            // a runaway loop (scrollY mis-reporting, etc.)
+        while (safety-- > 0 && System.currentTimeMillis() < deadline)
         {
-            log.info("bank: withdraw '{}' itemId={} at bounds={}", verb, itemId, sb.bounds);
-            int cx = sb.bounds.x + sb.bounds.width / 2;
-            int cy = sb.bounds.y + sb.bounds.height / 2;
-            dispatcher.rightClickAndPickMenu(cx, cy, verb);
-            return true;
+            ScrollOrBounds sb = onClient(() -> resolveBankSlotInfo(itemId));
+            if (sb == null) return false;
+            if (sb.bounds != null)
+            {
+                log.info("bank: withdraw '{}' itemId={} at bounds={}",
+                    verb, itemId, sb.bounds);
+                int cx = sb.bounds.x + sb.bounds.width / 2;
+                int cy = sb.bounds.y + sb.bounds.height / 2;
+                dispatcher.rightClickAndPickMenu(cx, cy, verb);
+                return true;
+            }
+            // resolveBankSlotInfo caps at 5 per call; trim to 1-3 here so
+            // each visible burst is small and we re-look between bursts.
+            int notches = Math.max(1, Math.min(3, sb.scrollNotches));
+            log.info("bank: scroll burst toward itemId={} (dir={}, notches={})",
+                itemId, sb.scrollDirection, notches);
+            dispatcher.wheelScroll(sb.scrollX, sb.scrollY,
+                sb.scrollDirection, notches);
+            // Brief glance-pause before the next burst — the inter-burst
+            // beat is what makes wheel-scrolling look like a person
+            // searching, not an automated scrollbar drag.
+            Thread.sleep(150L + (long) (Math.random() * 250L));
         }
-        // Need to scroll. Move cursor over the bank items widget and
-        // flick the wheel — looks like the player scanning for the
-        // item rather than snap-jumping the scrollbar.
-        log.info("bank: scrolling toward itemId={} (dir={}, notches={})",
-            itemId, sb.scrollDirection, sb.scrollNotches);
-        dispatcher.wheelScroll(sb.scrollX, sb.scrollY,
-            sb.scrollDirection, sb.scrollNotches);
-        // Don't dispatch the withdraw this tick — bounds change after
-        // the scroll settles. Caller paces; next tick re-resolves.
+        log.warn("bank: scroll-to-find timed out for itemId={}", itemId);
         return false;
     }
 

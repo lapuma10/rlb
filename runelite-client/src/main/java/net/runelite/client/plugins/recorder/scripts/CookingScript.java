@@ -1,6 +1,5 @@
 package net.runelite.client.plugins.recorder.scripts;
 
-import java.awt.Rectangle;
 import java.util.concurrent.ThreadLocalRandom;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
@@ -11,9 +10,7 @@ import net.runelite.api.Client;
 import net.runelite.api.Player;
 import net.runelite.api.coords.WorldArea;
 import net.runelite.api.coords.WorldPoint;
-import net.runelite.api.gameval.InterfaceID;
 import net.runelite.api.gameval.ItemID;
-import net.runelite.api.widgets.Widget;
 import net.runelite.client.callback.ClientThread;
 import net.runelite.client.plugins.recorder.cook.CookingFood;
 import net.runelite.client.plugins.recorder.cook.CookingInteraction;
@@ -486,20 +483,31 @@ public final class CookingScript
             tallyDoneThisVisit = true;
         }
 
-        boolean hasCooked = inventoryHasAnyCooked();
-        boolean hasBurnt  = inventoryHasAnyBurnt();
-        if (hasCooked || hasBurnt)
+        // Per-item deposit, not the deposit-everything orb: tinderbox
+        // (and any other kept utility) must STAY in the inventory
+        // across the bank → cook → bank loop. We right-click each
+        // cooked / burnt food in turn and pick "Deposit-All", one
+        // food per tick (paced via lastBankActionAtMs).
+        int depositId = firstDepositTargetId();
+        if (depositId > 0)
         {
-            status.set("bank: depositing inventory");
-            if (clickDepositInventoryThreadSafe())
+            status.set("bank: deposit-all item " + depositId);
+            if (bank.depositAll(depositId))
             {
                 lastBankActionAtMs = now;
-                lastInventoryChangeAtMs = now;   // mark "we did something"
+                lastInventoryChangeAtMs = now;
                 bankFailCount = 0;
             }
             else
             {
                 bankFailCount++;
+                if (bankFailCount > BANK_MAX_FAIL)
+                {
+                    abortWithBankClosed("deposit-all itemId=" + depositId
+                        + " failed " + BANK_MAX_FAIL
+                        + "× — slot widget unresolvable, aborting");
+                    return;
+                }
             }
             return;
         }
@@ -524,7 +532,21 @@ public final class CookingScript
             return;
         }
 
-        if (needTinderbox)
+        // Withdraw-order preference: when both tinderbox and raw food
+        // are needed, take whichever is currently visible in the bank
+        // FIRST. The default order would be tinderbox → raw, but if the
+        // bank is scrolled such that raw is on screen and tinderbox is
+        // not, the tinderbox-first path scrolls UP for tinderbox, then
+        // back DOWN past where the food was sitting — wasted scroll and
+        // bot-tell. Tie-break: tinderbox first when both are visible
+        // (tinderbox is one slot, raw is the bulk withdraw — order
+        // doesn't matter visually). Falls through to default order if
+        // neither is visible (one will need scrolling either way).
+        boolean takeRawFirst = needTinderbox && rawInInv == 0
+            && !bank.isItemVisible(ItemID.TINDERBOX)
+            && bank.isItemVisible(rawId);
+
+        if (needTinderbox && !takeRawFirst)
         {
             if (!bank.bankContainsItem(ItemID.TINDERBOX))
             {
@@ -550,7 +572,8 @@ public final class CookingScript
                 abortWithBankClosed("bank missing " + name + " — aborting");
                 return;
             }
-            status.set("bank: withdrawing raw food");
+            status.set("bank: withdrawing raw food"
+                + (takeRawFirst ? " (visible — taking before tinderbox)" : ""));
             if (bank.withdrawAll(rawId))
             {
                 lastBankActionAtMs = now;
@@ -575,23 +598,6 @@ public final class CookingScript
             snapshotTripBaseline();
             setState(State.WALK_TO_COOK);
         }
-    }
-
-    /** Read the deposit-inv widget on the client thread, dispatch the
-     *  click off-thread. {@link BankInteraction#clickDepositInventory}
-     *  reads the widget on the caller's thread, which trips the engine's
-     *  client-thread assertion under -ea. */
-    private boolean clickDepositInventoryThreadSafe() throws InterruptedException
-    {
-        Rectangle b = onClient(() -> {
-            Widget w = client.getWidget(InterfaceID.Bankmain.DEPOSITINV);
-            if (w == null || w.isHidden()) return null;
-            Rectangle r = w.getBounds();
-            return r == null || r.isEmpty() ? null : r;
-        });
-        if (b == null) return false;
-        dispatcher.clickCanvas(b.x + b.width / 2, b.y + b.height / 2);
-        return true;
     }
 
     /** Close the bank (best effort) then transition to ABORTED with
@@ -988,8 +994,14 @@ public final class CookingScript
             return;
         }
         Thread.sleep(400);
-        // Re-resolve heat source after brief wait.
-        CookingInteraction.Match heat2 = cook.findHeatSource(l.heatSourceName());
+        // Re-resolve heat source after brief wait. FIRE_FROM_LOGS must
+        // target the tile we lit — generic by-name returns whatever
+        // fire is closest (incl. another player's), which is bot-tell
+        // behaviour and would also drift away from our tracked fire.
+        CookingInteraction.Match heat2 =
+            l.kind() == CookingLocation.SourceKind.FIRE_FROM_LOGS
+                ? cook.findFireAt(l.heatSourceName(), litFireTile)
+                : cook.findHeatSource(l.heatSourceName());
         if (heat2 == null)
         {
             status.set("cook: heat source vanished mid-use");
@@ -1014,22 +1026,22 @@ public final class CookingScript
         catch (Throwable th) { log.warn("cook: dismissLevelUp threw", th); return false; }
     }
 
-    private boolean inventoryHasAnyCooked() throws InterruptedException
+    /** First item id in the inventory that is a cooked or burnt food
+     *  (per {@link CookingFood}). Cooked is preferred when both are
+     *  present so the trip's "good" output goes to bank first. Returns
+     *  0 when nothing in the inventory is a deposit target — caller
+     *  treats that as "deposit phase complete, move on to withdraw". */
+    private int firstDepositTargetId() throws InterruptedException
     {
         for (CookingFood.Entry e : CookingFood.all())
         {
-            if (cook.inventoryAmount(e.cookedId) > 0) return true;
+            if (cook.inventoryAmount(e.cookedId) > 0) return e.cookedId;
         }
-        return false;
-    }
-
-    private boolean inventoryHasAnyBurnt() throws InterruptedException
-    {
         for (CookingFood.Entry e : CookingFood.all())
         {
-            if (cook.inventoryAmount(e.burntId) > 0) return true;
+            if (cook.inventoryAmount(e.burntId) > 0) return e.burntId;
         }
-        return false;
+        return 0;
     }
 
     /** Add the trip's cooked / burnt delta to the cumulative totals.
