@@ -29,6 +29,7 @@ import net.runelite.api.Client;
 import java.awt.Canvas;
 import java.awt.event.KeyEvent;
 import java.awt.event.MouseEvent;
+import java.awt.event.MouseWheelEvent;
 
 /**
  * Low-level synthetic input. Posts AWT events to the RuneLite canvas via
@@ -83,6 +84,20 @@ public final class CanvasInput
             t, mask, cursorX, cursorY, 1, false, button));
         c.dispatchEvent(new MouseEvent(c, MouseEvent.MOUSE_CLICKED,
             t, 0, cursorX, cursorY, 1, false, button));
+    }
+
+    /** Dispatch a single mouse-wheel notch at (x, y). {@code rotation}
+     *  is +1 for scroll-down (toward the user), -1 for scroll-up.
+     *  RuneLite's bank items widget consumes wheel events natively to
+     *  scroll the visible items — same mechanism a human uses. */
+    public void mouseWheel(int x, int y, int rotation)
+    {
+        Canvas c = client.getCanvas();
+        long t = System.currentTimeMillis();
+        cursorX = x; cursorY = y;
+        c.dispatchEvent(new MouseWheelEvent(c, MouseEvent.MOUSE_WHEEL,
+            t, 0, x, y, 1, false,
+            MouseWheelEvent.WHEEL_UNIT_SCROLL, 1, rotation));
     }
 
     /** Synth a key press → release pair with a held duration. */

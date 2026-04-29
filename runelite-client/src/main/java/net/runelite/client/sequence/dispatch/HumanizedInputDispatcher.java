@@ -1095,6 +1095,31 @@ public class HumanizedInputDispatcher implements InputDispatcher
         moveCursorTo(x, y);
     }
 
+    /** Scroll the mouse wheel at canvas position (x, y) by
+     *  {@code notches} notches in {@code direction} (+1 = down,
+     *  -1 = up). Each notch has a humanized 80-220ms gap before the
+     *  next so the scroll looks like a real player flicking the wheel,
+     *  not a snap-to-position. The cursor is moved to (x, y) first if
+     *  it isn't already there. */
+    public void wheelScroll(int x, int y, int direction, int notches)
+        throws InterruptedException
+    {
+        if (notches <= 0) return;
+        int sgn = direction >= 0 ? 1 : -1;
+        // Move cursor onto the target if it's far away — wheel events
+        // are consumed by whatever widget the cursor is over.
+        if (Math.abs(input.cursorX() - x) > 4 || Math.abs(input.cursorY() - y) > 4)
+        {
+            moveCursorTo(x, y);
+            Thread.sleep(60 + rng.nextInt(80));
+        }
+        for (int i = 0; i < notches; i++)
+        {
+            input.mouseWheel(x, y, sgn);
+            Thread.sleep(80 + rng.nextInt(140));
+        }
+    }
+
     /** Block the calling thread until the dispatcher's async worker is
      *  idle (or {@code timeoutMs} elapses). Useful when chaining
      *  {@link #dispatch(ActionRequest)} (async) into a follow-up

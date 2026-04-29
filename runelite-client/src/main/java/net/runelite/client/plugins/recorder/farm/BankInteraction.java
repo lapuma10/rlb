@@ -131,6 +131,15 @@ public final class BankInteraction
     {
         BoothCandidate pick = onClient(this::findBoothCandidate);
         if (pick == null) return false;
+        // Pan camera toward the chosen booth/banker BEFORE the click.
+        // clickCanvas / menuAction don't auto-rotate the way walkClick
+        // and npcClick do, so without this we'd send a click at hull
+        // bounds that may not currently project onto the camera, and
+        // the booth would appear "snapped to" rather than approached.
+        WorldPoint boothTile = pick.npc != null
+            ? pick.npc.getWorldLocation()
+            : pick.go.getWorldLocation();
+        if (boothTile != null) dispatcher.rotateCameraToward(boothTile);
         if (pick.npc != null)
         {
             return onClient(() -> {
@@ -144,6 +153,8 @@ public final class BankInteraction
             });
         }
         // GameObject — L-click default is already "Bank", hull click works.
+        // Re-resolve hull AFTER the camera pan so we click the booth
+        // in its now-on-screen position, not the pre-pan one.
         Rectangle b = onClient(() -> {
             Shape h = pick.go.getConvexHull();
             return h == null ? null : h.getBounds();
@@ -479,13 +490,49 @@ public final class BankInteraction
 
     private boolean withdrawWithVerb(int itemId, String verb) throws InterruptedException
     {
-        Rectangle bounds = onClient(() -> resolveBankSlotBounds(itemId));
-        if (bounds == null) return false;
-        log.info("bank: withdraw '{}' itemId={} at bounds={}", verb, itemId, bounds);
-        int cx = bounds.x + bounds.width / 2;
-        int cy = bounds.y + bounds.height / 2;
-        dispatcher.rightClickAndPickMenu(cx, cy, verb);
-        return true;
+        // Two-phase: first read the slot widget on the client thread.
+        // If it's not visible, dispatch a humanized mouse-wheel scroll
+        // off-thread (timing has Thread.sleep — must NOT run on client
+        // thread) and return false so the caller paces and retries.
+        ScrollOrBounds sb = onClient(() -> resolveBankSlotInfo(itemId));
+        if (sb == null) return false;
+        if (sb.bounds != null)
+        {
+            log.info("bank: withdraw '{}' itemId={} at bounds={}", verb, itemId, sb.bounds);
+            int cx = sb.bounds.x + sb.bounds.width / 2;
+            int cy = sb.bounds.y + sb.bounds.height / 2;
+            dispatcher.rightClickAndPickMenu(cx, cy, verb);
+            return true;
+        }
+        // Need to scroll. Move cursor over the bank items widget and
+        // flick the wheel — looks like the player scanning for the
+        // item rather than snap-jumping the scrollbar.
+        log.info("bank: scrolling toward itemId={} (dir={}, notches={})",
+            itemId, sb.scrollDirection, sb.scrollNotches);
+        dispatcher.wheelScroll(sb.scrollX, sb.scrollY,
+            sb.scrollDirection, sb.scrollNotches);
+        // Don't dispatch the withdraw this tick — bounds change after
+        // the scroll settles. Caller paces; next tick re-resolves.
+        return false;
+    }
+
+    /** Scroll directive returned to {@link #withdrawWithVerb} when the
+     *  slot isn't currently visible. Either {@link #bounds} is set
+     *  (slot is visible — caller can click directly) or the scroll
+     *  fields are populated (caller dispatches a wheel scroll). */
+    private static final class ScrollOrBounds
+    {
+        final Rectangle bounds;
+        final int scrollX;
+        final int scrollY;
+        final int scrollDirection;
+        final int scrollNotches;
+
+        ScrollOrBounds(Rectangle b)
+        { this.bounds = b; this.scrollX = this.scrollY = this.scrollDirection = this.scrollNotches = 0; }
+
+        ScrollOrBounds(int x, int y, int dir, int notches)
+        { this.bounds = null; this.scrollX = x; this.scrollY = y; this.scrollDirection = dir; this.scrollNotches = notches; }
     }
 
     /** Client-thread: count item {@code id} in the bank container.
@@ -504,21 +551,18 @@ public final class BankInteraction
         return n;
     }
 
-    /** Client-thread: locate the bank slot widget for {@code itemId},
-     *  scroll the items widget to make it visible if needed, and
-     *  return its canvas bounds. Returns null if item not in bank /
-     *  bank not open / scroll just happened (caller retries next tick).
+    /** Client-thread: locate the bank slot widget for {@code itemId}
+     *  and decide whether the caller should click it directly (bounds
+     *  visible) or scroll the bank widget toward it (visible after a
+     *  wheel scroll). Returns null only when the item isn't in the
+     *  bank container / bank widget isn't loaded.
      *
      *  <p>The bank's items widget is {@code Bankmain.ITEMS} (NOT
      *  {@code ITEMS_CONTAINER}, which is the surrounding layout
      *  group). Slots are accessed by index via {@code getChild(slot)},
      *  matching the bank-tags plugin's
-     *  {@code LayoutManager#layout} pattern. Each slot child carries
-     *  {@code getItemId()} and a {@code getRelativeY()} position
-     *  within the parent. We adjust {@code parent.setScrollY()} so the
-     *  child sits inside the visible window, then read the child's
-     *  post-scroll bounds on the next call. */
-    private Rectangle resolveBankSlotBounds(int itemId)
+     *  {@code LayoutManager#layout} pattern. */
+    private ScrollOrBounds resolveBankSlotInfo(int itemId)
     {
         // 0x000c_000c — Bankmain.ITEMS, the actual scrollable items
         // widget the bank-tags plugin treats as authoritative.
@@ -554,32 +598,31 @@ public final class BankInteraction
 
         if (!visible)
         {
-            // Aim to position the slot ~one row from the top — feels
-            // less robotic than slamming it to scrollY=0, and gives a
-            // few pixels of margin so a partial-row reveal isn't the
-            // first frame the user sees.
-            int target = Math.max(0, relY - slotH);
-            int maxScroll = Math.max(0, container.getScrollHeight() - containerH);
-            if (maxScroll > 0) target = Math.min(target, maxScroll);
-            container.setScrollY(target);
-            try { container.revalidateScroll(); } catch (Throwable ignored) { /* best-effort */ }
-            // The engine remembers the bank's scroll position via a
-            // varClientInt — without this the next widget rebuild
-            // snaps the items back to the engine-stored position and
-            // our bounds become stale. Pattern mirrored from the
-            // bank-tags plugin (LayoutManager#setScroll).
-            try { client.setVarcIntValue(VarClientID.BANK_SCROLLPOS, target); }
-            catch (Throwable ignored) { /* best-effort */ }
-            // Return null this tick — the engine relays out the items
-            // container on the next client tick, so our bounds read
-            // here would still be off-screen. Caller paces and retries;
-            // the next call sees the slot already visible and clicks
-            // the right pixel.
-            return null;
+            // Compute scroll direction + how many wheel notches to
+            // send. OSRS bank wheel = ~30px per notch (verified via
+            // engine source). We send a few notches per script tick so
+            // the scroll plays out over multiple ticks — matches a
+            // human flicking the wheel and looking for the item rather
+            // than snap-scrolling to the exact target. The next script
+            // tick re-reads bounds; if not visible yet, sends more
+            // notches.
+            int delta = top < 0 ? top : (bottom - containerH);
+            // Direction: positive delta (slot below view) → scroll
+            // toward the user (down) → wheel rotation +1.
+            // Negative (slot above view) → wheel rotation -1.
+            int direction = delta > 0 ? 1 : -1;
+            int approxNotches = Math.max(1, Math.min(5, Math.abs(delta) / 30 + 1));
+            // Wheel events are consumed at the cursor position — pick
+            // a point inside the bank items area.
+            Rectangle cb = container.getBounds();
+            if (cb == null || cb.isEmpty()) return null;
+            int wx = cb.x + cb.width / 2;
+            int wy = cb.y + cb.height / 2;
+            return new ScrollOrBounds(wx, wy, direction, approxNotches);
         }
         Rectangle r = match.getBounds();
         if (r == null || r.isEmpty()) return null;
-        return r;
+        return new ScrollOrBounds(r);
     }
 
     /** Recursive descent: return the first widget in the subtree of
