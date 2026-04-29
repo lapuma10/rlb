@@ -38,6 +38,7 @@ import net.runelite.api.TileItem;
 import net.runelite.api.WallObject;
 import net.runelite.api.coords.LocalPoint;
 import net.runelite.api.coords.WorldPoint;
+import net.runelite.api.widgets.Widget;
 import net.runelite.client.callback.ClientThread;
 import net.runelite.client.plugins.recorder.transport.TransportResolver;
 import net.runelite.client.plugins.recorder.transport.VerbMatcher;
@@ -325,12 +326,7 @@ public class HumanizedInputDispatcher implements InputDispatcher
             case CLICK_GAME_OBJECT -> gameObjectClick(req.getTile(), req.getVerb());
             case CLICK_GROUND_ITEM -> groundItemClick(req.getTile(), req.getItemId());
             case CLICK_WIDGET -> widgetClick(req.getWidgetId());
-            case CLICK_INV_ITEM -> {
-                // Inventory child widget id = parent (149) << 16 | slot.
-                int wid = (149 << 16) | Math.max(0, req.getSlot());
-                if (req.getVerb() == null || req.getVerb().isBlank()) widgetClick(wid);
-                else widgetVerbClick(wid, req.getVerb());
-            }
+            case CLICK_INV_ITEM -> invSlotClick(Math.max(0, req.getSlot()), req.getVerb());
             case KEY -> keyTap(req.getKeyCode());
             default -> log.debug("unhandled kind {}", req.getKind());
         }
@@ -953,6 +949,68 @@ public class HumanizedInputDispatcher implements InputDispatcher
         log.info("menu row pick: option='{}' visualRow={} menu=({},{} w={}) → ({},{})",
             matchedOption, visualRow, menuX, menuY, menuW, x, y);
         return new MenuRow(x, y, visualRow, matchedOption);
+    }
+
+    /** Click an inventory slot — slot widgets are NOT addressable by
+     *  {@code (149 << 16) | slot} (that resolves to the parent inventory
+     *  widget, whose bounds cover the whole inventory tab; the cursor
+     *  ends up on a random other slot). The slot widget itself is a
+     *  child of the parent — accessed via {@code parent.getChild(slot)}.
+     *  This was the root cause of "Use" tinderbox flow misclicking onto
+     *  whatever item happened to be near the inventory's center.
+     *
+     *  <p>Pattern mirrored from RuneLite's bank-tags
+     *  {@code LayoutManager#layout}, which uses
+     *  {@code itemContainer.getChild(i)} the same way. */
+    private void invSlotClick(int slot, String verb) throws InterruptedException
+    {
+        Rectangle bounds = onClient(() -> {
+            // 149 = WidgetInfo.INVENTORY group; child 0 = the inventory
+            // container parent. The slot widgets are dynamic children
+            // of that parent — accessed by index via getChild(slot).
+            Widget parent = client.getWidget(149, 0);
+            if (parent == null || parent.isHidden()) return null;
+            Widget child = parent.getChild(slot);
+            if (child == null || child.isSelfHidden()) return null;
+            Rectangle r = child.getBounds();
+            return r == null || r.isEmpty() ? null : r;
+        });
+        if (bounds == null)
+        {
+            lastError.set("inv slot " + slot + " not resolvable");
+            return;
+        }
+        // Sample a pixel inside the slot bounds, away from the edges so
+        // the click can't bleed into an adjacent slot. Don't aim dead
+        // centre — looks mechanical.
+        int marginX = Math.max(1, bounds.width / 6);
+        int marginY = Math.max(1, bounds.height / 6);
+        int x = bounds.x + marginX
+            + rng.nextInt(Math.max(1, bounds.width - 2 * marginX));
+        int y = bounds.y + marginY
+            + rng.nextInt(Math.max(1, bounds.height - 2 * marginY));
+        if (verb == null || verb.isBlank())
+        {
+            moveCursorTo(x, y);
+            clickPress(MouseEvent.BUTTON1);
+            return;
+        }
+        // Verb-aware: hover, check L-click default, fall back to right-click.
+        moveCursorTo(x, y);
+        Thread.sleep(60);
+        boolean isTop = onClient(() -> isTopMenuVerb(verb));
+        if (isTop)
+        {
+            clickPress(MouseEvent.BUTTON1);
+            return;
+        }
+        clickPress(MouseEvent.BUTTON3);
+        Thread.sleep(120);
+        boolean ok = selectMenuVerb(verb);
+        if (!ok)
+        {
+            lastError.set("inv slot " + slot + " menu open but verb '" + verb + "' not present");
+        }
     }
 
     private void widgetClick(int widgetId) throws InterruptedException

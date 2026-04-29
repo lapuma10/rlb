@@ -174,6 +174,75 @@ public final class CookingInteraction
         return onClient(() -> Match.wrap(scanner.findTileItemById(itemId, SEARCH_RADIUS)));
     }
 
+    /** Find a Fire game object whose composition name matches
+     *  {@code namePattern} and whose tile equals {@code targetTile}.
+     *  Used to verify the fire we just lit actually appeared — vs.
+     *  picking up a random nearby fire that someone else lit. Returns
+     *  null if no fire is on that tile.
+     *
+     *  <p>The OSRS engine sometimes spawns the fire on an adjacent tile
+     *  if the click landed on a no-walk tile, so accept fires within 1
+     *  tile of {@code targetTile} too. */
+    public Match findFireAt(String namePattern, WorldPoint targetTile)
+        throws InterruptedException
+    {
+        if (targetTile == null) return null;
+        return onClient(() -> {
+            Player self = client.getLocalPlayer();
+            if (self == null) return null;
+            WorldView wv = client.getTopLevelWorldView();
+            if (wv == null) return null;
+            net.runelite.api.Scene scene = wv.getScene();
+            if (scene == null) return null;
+            net.runelite.api.Tile[][][] tiles = scene.getTiles();
+            int plane = targetTile.getPlane();
+            if (tiles == null || plane < 0 || plane >= tiles.length) return null;
+            net.runelite.api.Tile[][] planeTiles = tiles[plane];
+            int tx = targetTile.getX() - wv.getBaseX();
+            int ty = targetTile.getY() - wv.getBaseY();
+            // Scan a 3x3 around the target tile to absorb the engine's
+            // 1-tile drift on a "spawn fire on adjacent tile" path.
+            for (int dx = -1; dx <= 1; dx++)
+            {
+                for (int dy = -1; dy <= 1; dy++)
+                {
+                    int sx = tx + dx, sy = ty + dy;
+                    if (sx < 0 || sy < 0
+                        || sx >= planeTiles.length
+                        || sy >= planeTiles[0].length) continue;
+                    net.runelite.api.Tile t = planeTiles[sx][sy];
+                    if (t == null) continue;
+                    net.runelite.api.GameObject[] gos = t.getGameObjects();
+                    if (gos == null) continue;
+                    for (net.runelite.api.GameObject go : gos)
+                    {
+                        if (go == null) continue;
+                        net.runelite.api.ObjectComposition def =
+                            client.getObjectDefinition(go.getId());
+                        if (def == null) continue;
+                        if (def.getImpostorIds() != null)
+                        {
+                            try
+                            {
+                                net.runelite.api.ObjectComposition imp = def.getImpostor();
+                                if (imp != null) def = imp;
+                            }
+                            catch (Throwable ignored) { /* base def */ }
+                        }
+                        String name = def.getName();
+                        if (name == null) continue;
+                        if (!name.equalsIgnoreCase(namePattern)) continue;
+                        LocalPoint lp = go.getLocalLocation();
+                        if (lp == null) continue;
+                        WorldPoint wp = WorldPoint.fromLocal(client, lp);
+                        return new Match(wp, go, null);
+                    }
+                }
+            }
+            return null;
+        });
+    }
+
     // ────────────────────────────────────────────────────────────────
     // Use-on flows — light fire, use food on heat source
     // ────────────────────────────────────────────────────────────────
@@ -194,6 +263,11 @@ public final class CookingInteraction
     {
         int slot = inventorySlotOf(ItemID.TINDERBOX);
         if (slot < 0) return false;
+        // Clear any prior dispatcher error so we observe THIS dispatch's
+        // outcome. Without this we'd inherit a stale error from a
+        // previous failed action and abort spuriously — or worse,
+        // proceed thinking the dispatch worked when it didn't.
+        dispatcher.lastErrorMessage();
         ActionRequest req = ActionRequest.builder()
             .kind(ActionRequest.Kind.CLICK_INV_ITEM)
             .channel(ActionRequest.Channel.MOUSE)
@@ -202,6 +276,12 @@ public final class CookingInteraction
             .build();
         dispatcher.dispatch(req);
         waitForDispatcherIdle();
+        String err = dispatcher.lastErrorMessage();
+        if (err != null)
+        {
+            log.info("cook: useTinderbox dispatch failed — {}", err);
+            return false;
+        }
         return true;
     }
 
@@ -238,6 +318,7 @@ public final class CookingInteraction
     {
         int slot = inventorySlotOf(rawFoodId);
         if (slot < 0) return false;
+        dispatcher.lastErrorMessage();   // clear stale error
         ActionRequest req = ActionRequest.builder()
             .kind(ActionRequest.Kind.CLICK_INV_ITEM)
             .channel(ActionRequest.Channel.MOUSE)
@@ -246,6 +327,12 @@ public final class CookingInteraction
             .build();
         dispatcher.dispatch(req);
         waitForDispatcherIdle();
+        String err = dispatcher.lastErrorMessage();
+        if (err != null)
+        {
+            log.info("cook: useRawFood dispatch failed — {}", err);
+            return false;
+        }
         return true;
     }
 

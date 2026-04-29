@@ -80,8 +80,12 @@ public final class CookingScript
     private static final long TICK_MS = 600;
     /** Throttle between any two banking dispatches. */
     private static final long BANK_PACE_MS = 2000;
-    /** Max time waiting for fire to spawn after we click logs. */
-    private static final long LIGHT_TIMEOUT_MS = 10_000;
+    /** Max wall-clock time waiting for a fire to spawn after we click
+     *  logs. Low-level firemaking can take a long string of failed
+     *  attempts (~3-7s each at lvl 1-15), so 30s covers a normal
+     *  worst-case. The starter-script reference also waits for the
+     *  fire object to materialise before continuing. */
+    private static final long LIGHT_TIMEOUT_MS = 30_000;
     /** Max time without inventory progress (raw count change) before we
      *  ABORT the cooking phase. Defensive: should not trip in practice. */
     private static final long COOK_STUCK_MS = 30_000;
@@ -121,6 +125,15 @@ public final class CookingScript
     private long lightingStartedAtMs;
     private long lastInventoryChangeAtMs;
     private int  lastRawCount = -1;
+    /** Tile we just clicked logs on for lighting. Set when the
+     *  use-tinderbox + click-logs sequence dispatches. Cleared when we
+     *  observe a Fire object on this tile (or an adjacent tile) — at
+     *  which point we treat it as "our fire" for the rest of the
+     *  cooking trip. Re-cleared when the fire dies. */
+    private WorldPoint litFireTile;
+    /** When we kicked off the current lighting attempt — used to time
+     *  out a no-fire-spawned attempt and back off. */
+    private long lightDispatchedAtMs;
     /** Set true once tallyCookedBurnt has run for the current banking
      *  visit. Prevents re-tallying every tick we sit at the bank
      *  waiting for withdraws to finish. Reset on every state change. */
@@ -572,23 +585,54 @@ public final class CookingScript
     private void tickLightingFire() throws InterruptedException
     {
         CookingLocation l = location.get();
-        // If a Fire is already in range, skip lighting.
-        CookingInteraction.Match fire = cook.findHeatSource(l.heatSourceName());
-        if (fire != null)
+        long now = System.currentTimeMillis();
+
+        // If we previously dispatched a light and are waiting for the
+        // fire to appear: verify ON THE TILE WE LIT, not by name search.
+        // A fire elsewhere in range is someone else's — we don't claim
+        // it. The starter-script reference does the same — wait until
+        // a Fire materialises on the lit tile (low-level firemaking can
+        // take many tries before success).
+        if (litFireTile != null)
         {
-            status.set("light: existing fire found — cooking");
-            setState(State.COOKING);
+            CookingInteraction.Match ours = cook.findFireAt(l.heatSourceName(), litFireTile);
+            if (ours != null)
+            {
+                status.set("light: fire spawned at " + litFireTile + " — cooking");
+                setState(State.COOKING);
+                // Keep litFireTile set so tickCooking targets only THIS fire.
+                litFireTile = ours.tile;
+                return;
+            }
+            if (cook.isFiremaking())
+            {
+                status.set("light: firemaking animation, waiting for fire");
+                return;
+            }
+            // No fire yet, no animation — engine may still be queueing
+            // the action. Hold up to LIGHT_TIMEOUT_MS, then back off.
+            if (now - lightDispatchedAtMs > LIGHT_TIMEOUT_MS)
+            {
+                String e = dispatcher.lastErrorMessage();
+                log.info("cook: no fire on {} after {}ms — retrying (last err: {})",
+                    litFireTile, LIGHT_TIMEOUT_MS, e);
+                litFireTile = null;
+                lightDispatchedAtMs = 0L;
+                lightingBackoffUntilMs = now + 2000L;
+                return;
+            }
+            status.set("light: waiting for fire on " + litFireTile);
             return;
         }
 
-        long now = System.currentTimeMillis();
+        // Backoff after a failed attempt — gives the engine time to
+        // settle and avoids hammering on a tile that won't light.
         if (now < lightingBackoffUntilMs)
         {
             status.set("light: backoff (" + (lightingBackoffUntilMs - now) + "ms)");
             return;
         }
 
-        // Need to light. If we don't have tinderbox or raw food, head back to bank.
         if (cook.inventoryAmount(ItemID.TINDERBOX) <= 0)
         {
             status.set("light: no tinderbox in inv — back to bank");
@@ -596,9 +640,6 @@ public final class CookingScript
             return;
         }
 
-        // Find ground logs near us. If none — wait (logs respawn ~few seconds).
-        // The location config drives which log type to look for; we
-        // never hard-code ItemID.LOGS here.
         int logsId = l.groundLogsItemId();
         CookingInteraction.Match logs = cook.findGroundLogs(logsId);
         if (logs == null)
@@ -607,22 +648,11 @@ public final class CookingScript
             return;
         }
 
-        // If we're already firemaking, wait for it to finish + a Fire to appear.
         if (cook.isFiremaking())
         {
-            status.set("light: firemaking animation");
-            return;
-        }
-
-        if (lightingStartedAtMs == 0) lightingStartedAtMs = now;
-        if (now - lightingStartedAtMs > LIGHT_TIMEOUT_MS)
-        {
-            // Took too long — back off and retry. Surface dispatcher
-            // error if any, so the panel shows context.
-            String e = dispatcher.lastErrorMessage();
-            log.info("cook: light timeout — backoff (last dispatcher err: {})", e);
-            lightingStartedAtMs = 0L;
-            lightingBackoffUntilMs = now + 2000L;
+            // Already firemaking — engine is animating a previous click.
+            // Don't fire another use-tinderbox until that finishes.
+            status.set("light: firemaking already in progress");
             return;
         }
 
@@ -631,18 +661,22 @@ public final class CookingScript
             status.set("light: dispatcher busy");
             return;
         }
+
         status.set("light: use tinderbox");
         if (!cook.useTinderbox())
         {
-            status.set("light: no tinderbox slot found — back to bank");
-            setState(State.WALK_TO_BANK);
+            // The use-tinderbox dispatch errored (e.g. cursor missed
+            // the slot, tinderbox briefly invisible). Back off and try
+            // again next tick — DO NOT click logs without use-mode
+            // engaged or the click resolves to "Take logs" and picks
+            // up our own fuel.
+            status.set("light: useTinderbox failed — backing off");
+            lightingBackoffUntilMs = now + 1500L;
             return;
         }
-        // Wait briefly for the use-mode to take effect, then click logs.
+
+        // Use-mode is engaged. Brief settle, re-resolve logs, click.
         Thread.sleep(400);
-        // Re-resolve logs and verify it's still the SAME tile we just
-        // armed — if the closest logs moved (someone took ours / a new
-        // pile appeared closer) we'd misclick. Bail and retry next tick.
         CookingInteraction.Match logs2 = cook.findGroundLogs(logsId);
         if (logs2 == null)
         {
@@ -656,10 +690,19 @@ public final class CookingScript
             lightingBackoffUntilMs = System.currentTimeMillis() + 800L;
             return;
         }
-        cook.clickLogsForLight(logs2);
-        // If the dispatcher reported an error during the canvas click,
-        // fall through next tick to retry — don't pile a follow-up
-        // dispatch in this tick.
+        if (!cook.clickLogsForLight(logs2))
+        {
+            status.set("light: logs tile didn't project — retry");
+            lightingBackoffUntilMs = System.currentTimeMillis() + 800L;
+            return;
+        }
+        // Dispatch sent. Remember THIS tile — next tick(s) verify a
+        // Fire spawns on it. If lighting fails the engine doesn't
+        // tell us; we just don't see a Fire on the tile, time out,
+        // and retry.
+        litFireTile = logs2.tile;
+        lightDispatchedAtMs = System.currentTimeMillis();
+        status.set("light: clicked logs at " + litFireTile + " — waiting for fire");
     }
 
     // ────────────────────────────────────────────────────────────────
@@ -716,22 +759,38 @@ public final class CookingScript
             return;
         }
 
-        // Heat source missing — for FIRE go re-light, for RANGE walk
-        // back to the cook spot (the range shouldn't move; this handles
-        // wandering off-tile).
-        CookingInteraction.Match heat = cook.findHeatSource(l.heatSourceName());
-        if (heat == null)
+        // For FIRE_FROM_LOGS: target ONLY the fire we lit (tracked by
+        // tile in litFireTile). A different fire nearby is someone
+        // else's — using their fire is bot-tell behavior. If our fire
+        // died (no Fire object on the lit tile any more), re-light.
+        // For RANGE: range objects are fixed-location; just find by name.
+        CookingInteraction.Match heat;
+        if (l.kind() == CookingLocation.SourceKind.FIRE_FROM_LOGS)
         {
-            if (l.kind() == CookingLocation.SourceKind.FIRE_FROM_LOGS)
+            if (litFireTile == null)
             {
-                status.set("cook: fire died — re-lighting");
-                lightingStartedAtMs = 0;
+                status.set("cook: no lit fire tracked — relighting");
                 setState(State.LIGHTING_FIRE);
                 return;
             }
-            status.set("cook: range out of view — walking back");
-            setState(State.WALK_TO_COOK);
-            return;
+            heat = cook.findFireAt(l.heatSourceName(), litFireTile);
+            if (heat == null)
+            {
+                status.set("cook: our fire died at " + litFireTile + " — relighting");
+                litFireTile = null;
+                setState(State.LIGHTING_FIRE);
+                return;
+            }
+        }
+        else
+        {
+            heat = cook.findHeatSource(l.heatSourceName());
+            if (heat == null)
+            {
+                status.set("cook: range out of view — walking back");
+                setState(State.WALK_TO_COOK);
+                return;
+            }
         }
 
         // OSRS interaction range cap: the engine refuses object
@@ -904,6 +963,16 @@ public final class CookingScript
         bankFailCount = 0;
         cookMenuConfirmAttempts = 0;
         lightingBackoffUntilMs = 0L;
+        // Clear the lit-fire tracking on any transition out of the
+        // LIGHTING_FIRE / COOKING pair. The next cook trip will light
+        // a fresh fire (or, if we're going BACK to LIGHTING_FIRE
+        // because our fire died, the entry path immediately picks a
+        // fresh log spawn so the tile gets re-set this tick).
+        if (s != State.LIGHTING_FIRE && s != State.COOKING)
+        {
+            litFireTile = null;
+            lightDispatchedAtMs = 0L;
+        }
     }
 
     private <T> T onClient(Supplier<T> s)
