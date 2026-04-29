@@ -81,6 +81,11 @@ public final class SequenceManager {
         if (engine != null) return;   // explicit setEngine takes precedence
         if (observer != null && dispatcher != null && planner != null
             && telemetry != null && blackboard != null) {
+            // Wire telemetry into the planner so canStart-rejection records reach
+            // the ring buffer alongside step-lifecycle events.
+            if (planner instanceof PriorityPlanner pp) {
+                pp.setTelemetry(telemetry);
+            }
             StateDrivenEngine sde = new StateDrivenEngine(observer, planner, dispatcher, telemetry, blackboard);
             if (inputOwnership != null && inputOwnerToken != null) {
                 sde.setInputOwnership(inputOwnership, inputOwnerToken);

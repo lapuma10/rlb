@@ -26,16 +26,41 @@ package net.runelite.client.sequence.internal;
 
 import net.runelite.client.sequence.Step;
 import net.runelite.client.sequence.WorldSnapshot;
+import net.runelite.client.sequence.affordance.DiagnosticReason;
 import net.runelite.client.sequence.blackboard.Blackboard;
+import net.runelite.client.sequence.blackboard.BlackboardScope;
+import net.runelite.client.sequence.blackboard.SequenceBlackboardKeys;
+import net.runelite.client.sequence.telemetry.Telemetry;
+import net.runelite.client.sequence.telemetry.TelemetryRecord;
 import javax.annotation.Nullable;
 import java.util.Collection;
 
 public final class PriorityPlanner implements Planner {
+
+    /** Optional telemetry sink for canStart-rejection records. Set via
+     *  {@link #setTelemetry(Telemetry)}; null means no recording. */
+    @Nullable private Telemetry telemetry;
+
+    public void setTelemetry(@Nullable Telemetry telemetry) {
+        this.telemetry = telemetry;
+    }
+
     @Override @Nullable
     public Step select(WorldSnapshot state, Blackboard bb, Collection<Step> candidates) {
         Step best = null;
         for (Step s : candidates) {
-            if (!s.canStart(state, bb)) continue;
+            if (!s.canStart(state, bb)) {
+                if (telemetry != null) {
+                    DiagnosticReason r = bb.scope(BlackboardScope.STEP)
+                        .get(SequenceBlackboardKeys.LAST_BLOCK_REASON).orElse(null);
+                    String payload = "canStart=false"
+                        + (r != null ? " reason=" + r : "");
+                    int tick = state == null ? 0 : state.tick();
+                    telemetry.record(new TelemetryRecord(
+                        tick, 0, s.name(), TelemetryRecord.Event.CHECK, payload));
+                }
+                continue;
+            }
             if (best == null || s.priority() > best.priority()) best = s;
         }
         return best;

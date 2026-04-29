@@ -159,7 +159,9 @@ public final class StateDrivenEngine implements SequenceEngine {
 
         // 1. Verify and pop completed/failed leaves (orchestration interleaves via popAndOrchestrate)
         for (StepFrame leaf : new ArrayList<>(frames.leaves())) {
+            if (state != SequenceState.RUNNING) break;     // run terminated mid-loop (e.g. failRun fired)
             if (!frames.all().contains(leaf)) continue;   // popped by recursion already
+            if (!leaf.isStarted()) continue;              // canStart gate: parked, no check yet
             Completion c;
             try {
                 c = leaf.getStep().check(snap, blackboard);
@@ -173,7 +175,13 @@ public final class StateDrivenEngine implements SequenceEngine {
                 popAndOrchestrate(leaf, s, snap);
             } else if (c instanceof Completion.Failed f) {
                 int elapsed = currentTick - leaf.getStartedTick();
-                handleLeafFailure(leaf, Failure.fromCheck(f.reason(), elapsed), snap);
+                // Pass through the typed DiagnosticReason if the step provided one,
+                // so onFailure can switch on Failure.diagnostic() without parsing
+                // the reason string.
+                Failure failure = (f.diagnostic() != null)
+                    ? Failure.fromDiagnostic(f.diagnostic(), elapsed)
+                    : Failure.fromCheck(f.reason(), elapsed);
+                handleLeafFailure(leaf, failure, snap);
             } else if (c instanceof Completion.Running) {
                 if (leaf.timedOut(currentTick)) {
                     int elapsed = currentTick - leaf.getStartedTick();
@@ -181,6 +189,11 @@ public final class StateDrivenEngine implements SequenceEngine {
                 }
             }
         }
+
+        // If a root frame failed mid-loop, the run is already FAILED — do not
+        // run planner/tick/drain steps (they would overwrite state to IDLE
+        // when no planner candidates exist).
+        if (state != SequenceState.RUNNING) return;
 
         // 3. Planner & preemption
         if (frames.isEmpty()) {
@@ -228,6 +241,16 @@ public final class StateDrivenEngine implements SequenceEngine {
     private void runPendingOnStarts(WorldSnapshot snap) {
         for (StepFrame f : new ArrayList<>(frames.all())) {
             if (!f.isStarted()) {
+                // canStart gate: do not call onStart on a leaf whose canStart
+                // returns false. Frame stays parked; engine re-evaluates next
+                // tick. Composite frames bypass the gate — their orchestration
+                // is unconditional; their leaves are evaluated independently.
+                if (!(f.getStep() instanceof CompositeStep)
+                    && !f.getStep().canStart(snap, blackboard)) {
+                    telemetry.record(rec(f, TelemetryRecord.Event.CHECK,
+                        "canStart=false (parked)"));
+                    continue;
+                }
                 f.setStartedTick(currentTick);
                 f.setStarted(true);
                 guarded(f, () -> f.getStep().onStart(makeCtx(snap, f)));
@@ -373,14 +396,19 @@ public final class StateDrivenEngine implements SequenceEngine {
         telemetry.record(rec(frame, TelemetryRecord.Event.RECOVERY, r.toString()));
         if (r instanceof Recovery.Retry retry) {
             frame.setRetryCount(frame.getRetryCount() + 1);
-            if (frame.getRetryCount() >= retry.maxAttempts()) {
-                // Exhausted — propagate Failed to parent (or fail run if root)
+            // Cumulative bound: Retry(N) permits N retries (N+1 total attempts).
+            // Use strict `>` so the Nth retry actually runs before exhaustion.
+            if (frame.getRetryCount() > retry.maxAttempts()) {
                 Completion.Failed propagated = new Completion.Failed("retry exhausted");
                 frame.setStatus(propagated);
                 popAndOrchestrate(frame, propagated, snap);
             } else {
+                // Clear STEP scope before re-running onStart: a retry is a fresh
+                // attempt, so prior K_PRECONDITION_FAILURE / K_OUTCOME / etc. must
+                // not leak into the next onStart-then-check cycle.
+                blackboard.clear(BlackboardScope.STEP);
                 frame.setStartedTick(currentTick);
-                frame.setStarted(false);   // onStart will re-fire at tick start of next advance
+                frame.setStarted(false);   // onStart will re-fire on next runPendingOnStarts
             }
         } else if (r instanceof Recovery.Skip s) {
             Completion.Succeeded synthetic = new Completion.Succeeded("skipped: " + s.reason());
