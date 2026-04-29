@@ -25,21 +25,33 @@
 package net.runelite.client.sequence;
 
 import javax.annotation.Nullable;
+import net.runelite.client.sequence.affordance.DiagnosticReason;
 
 public record Failure(
     String reason,
     int ticksElapsed,
-    @Nullable Throwable cause
+    @Nullable Throwable cause,
+    @Nullable DiagnosticReason diagnostic
 ) {
+    /** Source-compat constructor: legacy callers without a diagnostic. */
+    public Failure(String reason, int ticksElapsed, @Nullable Throwable cause) {
+        this(reason, ticksElapsed, cause, null);
+    }
+
     public static Failure timeout(int ticksElapsed) {
-        return new Failure("timeout", ticksElapsed, null);
+        return new Failure("timeout", ticksElapsed, null, null);
     }
 
     public static Failure fromCheck(String reason, int ticksElapsed) {
-        return new Failure(reason, ticksElapsed, null);
+        return new Failure(reason, ticksElapsed, null, null);
     }
 
     public static Failure fromException(Throwable t, int ticksElapsed) {
-        return new Failure(t.getClass().getSimpleName() + ": " + t.getMessage(), ticksElapsed, t);
+        return new Failure(t.getClass().getSimpleName() + ": " + t.getMessage(), ticksElapsed, t, null);
+    }
+
+    /** Build a {@link Failure} from a typed diagnostic. */
+    public static Failure fromDiagnostic(DiagnosticReason r, int ticksElapsed) {
+        return new Failure(r.toString(), ticksElapsed, null, r);
     }
 }

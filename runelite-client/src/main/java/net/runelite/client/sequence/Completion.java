@@ -24,10 +24,28 @@
  */
 package net.runelite.client.sequence;
 
+import javax.annotation.Nullable;
+import net.runelite.client.sequence.affordance.DiagnosticReason;
+
 public sealed interface Completion {
     record Running() implements Completion {}
     record Succeeded(String reason) implements Completion {}
-    record Failed(String reason) implements Completion {}
+
+    /**
+     * Failed completion. {@code diagnostic} is the typed reason when the step
+     * has one to share; legacy call sites that pass only a string have null.
+     */
+    record Failed(String reason, @Nullable DiagnosticReason diagnostic) implements Completion {
+        /** Source-compat: legacy {@code new Failed(reason)} keeps null diagnostic. */
+        public Failed(String reason) {
+            this(reason, null);
+        }
+    }
 
     Running RUNNING = new Running();
+
+    /** Build a {@link Failed} from a typed diagnostic; {@code reason} is the diagnostic's toString. */
+    static Failed failed(DiagnosticReason r) {
+        return new Failed(r.toString(), r);
+    }
 }
