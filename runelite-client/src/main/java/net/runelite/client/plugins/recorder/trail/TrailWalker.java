@@ -46,6 +46,7 @@ public final class TrailWalker
     private final Client client;
     private final ClientThread clientThread;
     private final HumanizedInputDispatcher dispatcher;
+    private final net.runelite.client.plugins.recorder.transport.TransportResolver transportResolver;
 
     private TrailPath currentPath;
     private int legIdx;
@@ -55,6 +56,13 @@ public final class TrailWalker
     private long lastInteractMs;
     private int lastClickLegIdx = -1;
     private WorldPoint lastWalkPick;
+    /** When the verb on a TRANSPORT leg can't be found on any object at the
+     *  recorded tile (e.g. "Open" on a gate that's already open and now
+     *  shows "Close"), we treat the transport as already done and advance
+     *  past it. This counter records how many ticks we've waited for the
+     *  verb to reappear before giving up; without a small grace window we
+     *  could skip a transport whose object hasn't loaded into the scene yet. */
+    private int transportVerbMissingTicks;
 
     public TrailWalker(Client client, ClientThread clientThread,
                        HumanizedInputDispatcher dispatcher)
@@ -62,6 +70,8 @@ public final class TrailWalker
         this.client = client;
         this.clientThread = clientThread;
         this.dispatcher = dispatcher;
+        this.transportResolver = client == null ? null
+            : new net.runelite.client.plugins.recorder.transport.TransportResolver(client);
         reset();
     }
 
@@ -75,6 +85,7 @@ public final class TrailWalker
         lastInteractMs = 0;
         lastClickLegIdx = -1;
         lastWalkPick = null;
+        transportVerbMissingTicks = 0;
     }
 
     public int currentLegIndex() { return legIdx; }
@@ -84,15 +95,65 @@ public final class TrailWalker
     static int chooseLegIndex(TrailPath path, int minIdx, WorldPoint pos)
     {
         List<Leg> legs = path.legs();
-        // Single-step monotonic advance: only flip to leg i+1 if the
-        // player is in i+1's tile-set. Multi-step skipping (e.g. across
-        // a transport) requires re-entering tick after each advance —
-        // this prevents skipping past an unfinished transport when its
-        // post-tile aliases a tile in the active leg.
+        // Single-step monotonic advance: flip to leg i+1 if either
+        //   (a) the player is already standing in leg i+1's tile-set, or
+        //   (b) leg i is a WALK and the player has reached its final tile
+        //       (otherwise the walker stalls at the end of a walk leg
+        //       whose successor is a TRANSPORT — the transport's tile is
+        //       not the same as the walk's last tile, so condition (a)
+        //       never fires).
         int idx = minIdx;
-        while (idx < legs.size() - 1 && legContainsTile(legs.get(idx + 1), pos))
+        while (idx < legs.size() - 1)
         {
-            idx++;
+            if (legContainsTile(legs.get(idx + 1), pos))
+            {
+                idx++;
+                continue;
+            }
+            Leg cur = legs.get(idx);
+            if (cur instanceof Leg.Walk w
+                && pos.equals(w.tiles().get(w.tiles().size() - 1)))
+            {
+                idx++;
+                continue;
+            }
+            // Forward-scan: the player's tile may live more than one leg
+            // ahead. Two cases this catches:
+            //   - After a TRANSPORT: the engine teleported the player past
+            //     a 1-tile post-stair WALK leg (the post-stair tile also
+            //     belongs to the next WALK leg). Without this the walker
+            //     sits on the transport leg whose action has already fired.
+            //   - After an unexpected plane change mid-WALK leg (user
+            //     manually climbed stairs, an external action moved us):
+            //     the current leg's tiles are on a plane the player is no
+            //     longer on, so the single-step checks above all miss. Hop
+            //     to the first future leg the player can be located on.
+            int hop = -1;
+            for (int j = idx + 2; j < legs.size(); j++)
+            {
+                if (legContainsTile(legs.get(j), pos)) { hop = j; break; }
+            }
+            // Plane-based fallback: no future leg contains the exact
+            // player tile, but the current leg has no tiles on the
+            // player's plane — means the player drifted off the trail's
+            // plane. Hop to the first future leg that has any tile on the
+            // player's plane so the walker can resume on the right floor.
+            if (hop < 0 && !legHasPlane(cur, pos.getPlane()))
+            {
+                for (int j = idx + 1; j < legs.size(); j++)
+                {
+                    if (legHasPlane(legs.get(j), pos.getPlane())) { hop = j; break; }
+                }
+            }
+            if (hop > idx)
+            {
+                log.warn("trail-walker: forward-scan recovered — leg {} → {} "
+                    + "(player at {}, current leg {})",
+                    idx, hop, pos, cur.kind());
+                idx = hop;
+                continue;
+            }
+            break;
         }
         return idx;
     }
@@ -110,6 +171,23 @@ public final class TrailWalker
         if (l instanceof Leg.Transport t)
         {
             return t.tile().equals(pos);
+        }
+        return false;
+    }
+
+    private static boolean legHasPlane(Leg l, int plane)
+    {
+        if (l instanceof Leg.Walk w)
+        {
+            for (WorldPoint t : w.tiles())
+            {
+                if (t.getPlane() == plane) return true;
+            }
+            return false;
+        }
+        if (l instanceof Leg.Transport t)
+        {
+            return t.tile().getPlane() == plane;
         }
         return false;
     }
@@ -170,15 +248,33 @@ public final class TrailWalker
             return tiles.get(tiles.size() - 1);
         }
 
-        // Humanization: jitter within the LAST quarter of the in-range
-        // window, never beyond farthestIdx. With a typical leg of 50+
-        // tiles and a 16-tile hop, this produces 4-5 candidate tiles —
-        // enough variety that consecutive passes click different tiles
-        // while still reliably advancing toward the leg's end.
+        // Humanization: pick uniformly within the LAST HALF of the
+        // in-range ahead window. This trades off:
+        //   - consistent far hops (always ~half the window or more —
+        //     for a typical 16-tile in-range window, every pick is at
+        //     least 8-9 game tiles ahead, never 3-5) so the bot doesn't
+        //     crawl when travelling
+        //   - enough candidate tiles (8 for a 16-tile window) that
+        //     consecutive cycles don't click the exact same tile,
+        //     breaking the "always (3220,3219) → (3232,3219) → ..."
+        //     pattern.
+        // Earlier iterations had a "mid hop" branch picking from the
+        // first half of the window — that produced the 3-5 tile hops
+        // the user flagged. Real players always click far when
+        // travelling; the only randomization that matters is WHICH
+        // far tile, not whether to click far at all.
         int windowSize = farthestIdx - firstAhead + 1;
-        int jitterSpan = Math.max(1, windowSize / 4);
-        int jitterStart = farthestIdx - jitterSpan + 1;
-        int pickIdx = jitterStart + rng.nextInt(jitterSpan);
+        int pickIdx;
+        if (windowSize <= 3)
+        {
+            pickIdx = firstAhead + rng.nextInt(windowSize);
+        }
+        else
+        {
+            int halfSpan = Math.max(2, windowSize / 2);
+            int halfStart = farthestIdx - halfSpan + 1;
+            pickIdx = halfStart + rng.nextInt(halfSpan);
+        }
         return tiles.get(pickIdx);
     }
 
@@ -253,6 +349,10 @@ public final class TrailWalker
             // advance to the next leg.
             return Status.IN_PROGRESS;
         }
+        // Don't dispatch while the previous click is still in flight; the
+        // dispatcher silently drops re-entrant requests and we'd burn the
+        // 3s reclick timer on dropped clicks.
+        if (dispatcher.isBusy()) return Status.IN_PROGRESS;
         // Click cadence: only re-pick + re-click when there's a real reason
         // to. Calling pickAheadTile every tick produces a NEW random target
         // each call (humanization), and dispatching a fresh WALK click on
@@ -294,10 +394,19 @@ public final class TrailWalker
         return Status.IN_PROGRESS;
     }
 
+    /** A transport that has been fired but whose effect we must wait for
+     *  (e.g. stair animation + plane change). After this many ms with no
+     *  observed player movement, retry the click. */
+    static final long TRANSPORT_VERB_GRACE_TICKS = 4;
+
     private Status handleTransportLeg(Leg.Transport leg, WorldPoint pos, long now)
         throws InterruptedException
     {
         WorldPoint t = leg.tile();
+        // Don't fire ANY clicks while the dispatcher's previous one is
+        // still in flight — its busy flag silently drops re-entrant
+        // dispatches and we'd block forever on the verb retry.
+        if (dispatcher.isBusy()) return Status.IN_PROGRESS;
         boolean adjacent = pos.getPlane() == t.getPlane()
             && Math.abs(pos.getX() - t.getX()) <= TRANSPORT_ADJACENCY
             && Math.abs(pos.getY() - t.getY()) <= TRANSPORT_ADJACENCY;
@@ -327,6 +436,32 @@ public final class TrailWalker
             return self != null && self.getPoseAnimation() == self.getIdlePoseAnimation();
         });
         if (settled == null || !settled) return Status.IN_PROGRESS;
+        // Pre-flight: is the verb actually present on any object at this
+        // tile? When a gate is already open, the recorded "Open" verb
+        // disappears (the impostor advertises "Close" instead). Without
+        // this check the dispatcher's findTransport silently fails and we
+        // burn the 3s INTERACT_THROTTLE_MS retrying forever. If the verb
+        // is missing for several consecutive ticks, treat the transport as
+        // already done and advance — the next leg's WALK will route the
+        // player through the now-open gate.
+        TransportVerbState verbState = checkVerbPresence(t, leg.verb());
+        if (verbState == TransportVerbState.MISSING)
+        {
+            transportVerbMissingTicks++;
+            if (transportVerbMissingTicks >= TRANSPORT_VERB_GRACE_TICKS)
+            {
+                log.info("trail-walker: verb '{}' absent at {} for {} ticks — "
+                    + "treating transport as already complete; advancing leg {}",
+                    leg.verb(), t, transportVerbMissingTicks, legIdx);
+                advanceLegAfterAlreadyDone();
+                return Status.IN_PROGRESS;
+            }
+            log.debug("trail-walker: verb '{}' not found at {} (tick {}/{}) — "
+                + "waiting for object", leg.verb(), t,
+                transportVerbMissingTicks, TRANSPORT_VERB_GRACE_TICKS);
+            return Status.IN_PROGRESS;
+        }
+        transportVerbMissingTicks = 0;
         log.info("trail-walker: CLICK_GAME_OBJECT verb '{}' tile {} id {}",
             leg.verb(), t, leg.objectId());
         ActionRequest req = ActionRequest.builder()
@@ -339,6 +474,60 @@ public final class TrailWalker
         lastInteractMs = now;
         lastClickMs = now;
         return Status.IN_PROGRESS;
+    }
+
+    /** Result of probing whether a given verb is callable at the given
+     *  tile. Used to short-circuit transports whose effect has already
+     *  taken place (open gates, doors that swung open last trip). */
+    enum TransportVerbState { PRESENT, MISSING, UNKNOWN }
+
+    /** Look at every object on {@code tile} and report whether {@code verb}
+     *  matches any of their actions. {@code UNKNOWN} when the scene isn't
+     *  loaded or the resolver is unavailable — caller treats UNKNOWN as
+     *  "dispatch anyway, the engine's hover will tell us the truth". Only
+     *  {@code MISSING} (tile loaded, no object on it advertises the verb)
+     *  triggers the already-completed advance path. */
+    private TransportVerbState checkVerbPresence(WorldPoint tile, String verb)
+    {
+        if (transportResolver == null || tile == null || verb == null) return TransportVerbState.UNKNOWN;
+        TransportVerbState s = onClient(() -> {
+            try
+            {
+                var match = transportResolver.findTransport(tile, verb);
+                if (match == null) return TransportVerbState.UNKNOWN;
+                if (match.isSuccess()) return TransportVerbState.PRESENT;
+                String fail = match.failure();
+                if (fail == null
+                    || fail.startsWith("no tile at")
+                    || fail.startsWith("null tile")
+                    || fail.startsWith("empty verb"))
+                {
+                    return TransportVerbState.UNKNOWN;
+                }
+                // Tile is loaded but no object on it has the verb —
+                // almost always means the transport is already in its
+                // post-state (gate already open).
+                return TransportVerbState.MISSING;
+            }
+            catch (Throwable th) { return TransportVerbState.UNKNOWN; }
+        });
+        return s == null ? TransportVerbState.UNKNOWN : s;
+    }
+
+    /** Mark the current TRANSPORT leg as already-done and bump the leg
+     *  pointer so the next tick handles the following leg. Resets the
+     *  transient verb-grace counter. */
+    private void advanceLegAfterAlreadyDone()
+    {
+        legIdx = Math.min(legIdx + 1, currentPath == null ? legIdx + 1 : currentPath.size());
+        lastWalkPick = null;
+        lastClickLegIdx = -1;
+        transportVerbMissingTicks = 0;
+        // Reset movement timer — we just made progress in the path even
+        // though the player didn't physically move. Without this the STUCK
+        // timer would fire if the next leg's first click is delayed by
+        // dispatcher idle / camera rotate.
+        lastMovementMs = System.currentTimeMillis();
     }
 
     private boolean shouldClick(long now, WorldPoint pick)
