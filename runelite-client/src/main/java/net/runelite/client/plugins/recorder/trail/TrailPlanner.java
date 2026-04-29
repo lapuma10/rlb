@@ -122,11 +122,19 @@ public final class TrailPlanner
         return new TrailPath(legs);
     }
 
-    /** Snap {@code p} to the nearest graph node within Chebyshev <= 1 on the
-     *  same plane. Returns {@code p} unchanged if it is already on the
-     *  graph, the closest within-1 node otherwise, or null if no node
-     *  qualifies. Euclidean distance breaks ties between equal-Chebyshev
-     *  candidates so the result is deterministic. */
+    /** Generous snap radius for the player's CURRENT tile — we don't need
+     *  the player to be standing exactly on a recorded trail tile; the
+     *  walker's WALK click will route the player to the snapped trail
+     *  tile via the OSRS pathfinder. 32 tiles is roughly minimap-walk
+     *  range; anything further means the user is in the wrong area
+     *  entirely. */
+    private static final int SNAP_RADIUS = 32;
+
+    /** Snap {@code p} to the nearest graph node on the same plane within
+     *  {@link #SNAP_RADIUS} tiles. Returns {@code p} unchanged if it is
+     *  already on the graph, the closest qualifying node otherwise, or
+     *  null if nothing on the same plane is within range. Euclidean
+     *  distance breaks Chebyshev ties for determinism. */
     private WorldPoint snapToGraph(WorldPoint p)
     {
         if (graph.nodes().contains(p)) return p;
@@ -139,7 +147,7 @@ public final class TrailPlanner
             int dx = Math.abs(n.getX() - p.getX());
             int dy = Math.abs(n.getY() - p.getY());
             int cheb = Math.max(dx, dy);
-            if (cheb > 1) continue;
+            if (cheb > SNAP_RADIUS) continue;
             int eucSq = dx * dx + dy * dy;
             if (cheb < bestCheb || (cheb == bestCheb && eucSq < bestEucSq))
             {

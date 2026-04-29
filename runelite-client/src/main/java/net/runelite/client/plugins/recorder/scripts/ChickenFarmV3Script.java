@@ -157,18 +157,51 @@ public final class ChickenFarmV3Script
         boolean invEmpty = onClient(() ->
             InventoryUtil.freeSlotCount(client) >= InventoryUtil.INVENTORY_SIZE);
 
-        if (areaContains(PEN_AREA, here))
+        // Trail-based landmark detection. We're "at the pen" if we're
+        // within 6 tiles of the recorded pen-end tile, "at the bank" if
+        // within 6 tiles of the recorded bank-end tile. The hardcoded
+        // PEN_AREA / BANK_AREA WorldAreas are kept as a fallback for
+        // when the registry hasn't loaded the trails yet.
+        WorldPoint penTile = lastTileOf(registry.byName(OUTBOUND_TRAIL_NAME));
+        WorldPoint bankTile = lastTileOf(registry.byName(RETURN_TRAIL_NAME));
+        boolean atPen = (penTile != null && near(here, penTile, 6))
+            || areaContains(PEN_AREA, here);
+        boolean atBank = (bankTile != null && near(here, bankTile, 6))
+            || areaContains(BANK_AREA, here);
+
+        if (atPen)
         {
             status.set("starting at pen");
             return invFull ? State.RETURN : State.AT_PEN;
         }
-        if (areaContains(BANK_AREA, here))
+        if (atBank)
         {
             status.set("starting at bank");
             return invEmpty ? State.OUTBOUND : State.BANKING;
         }
         status.set("starting mid-route");
         return invFull ? State.RETURN : State.OUTBOUND;
+    }
+
+    /** Last TILE event in a trail, or null if the trail is null/empty. */
+    private static WorldPoint lastTileOf(net.runelite.client.plugins.recorder.trail.Trail trail)
+    {
+        if (trail == null) return null;
+        for (int i = trail.events().size() - 1; i >= 0; i--)
+        {
+            net.runelite.client.plugins.recorder.trail.TrailEvent ev = trail.events().get(i);
+            if (ev instanceof net.runelite.client.plugins.recorder.trail.TrailEvent.Tile t)
+            {
+                return t.tile();
+            }
+        }
+        return null;
+    }
+
+    private static boolean near(WorldPoint a, WorldPoint b, int chebyshev)
+    {
+        return a.getPlane() == b.getPlane()
+            && Math.max(Math.abs(a.getX() - b.getX()), Math.abs(a.getY() - b.getY())) <= chebyshev;
     }
 
     private void tickLoop()
@@ -228,22 +261,33 @@ public final class ChickenFarmV3Script
             return p == null ? null : p.getWorldLocation();
         });
         if (here == null) { status.set("no player — abort"); setState(State.ABORTED); return null; }
-        WorldPoint dest = outbound
-            ? new WorldPoint(PEN_AREA.getX() + PEN_AREA.getWidth() / 2,
-                             PEN_AREA.getY() + PEN_AREA.getHeight() / 2,
-                             PEN_AREA.getPlane())
-            : new WorldPoint(BANK_AREA.getX() + BANK_AREA.getWidth() / 2,
-                             BANK_AREA.getY() + BANK_AREA.getHeight() / 2,
-                             BANK_AREA.getPlane());
+        // Destination = the LAST tile of the matching trail. The trail's
+        // own end-tile is guaranteed to be on the graph (we built the
+        // graph from these trails), so the planner never has to snap
+        // through Chebyshev fuzziness on the destination side. The trail
+        // IS the truth — no centre-of-WorldArea hack.
+        String trailName = outbound ? OUTBOUND_TRAIL_NAME : RETURN_TRAIL_NAME;
+        net.runelite.client.plugins.recorder.trail.Trail trail = registry.byName(trailName);
+        WorldPoint dest = lastTileOf(trail);
+        if (dest == null)
+        {
+            status.set("trail \"" + trailName + "\" has no tiles — re-record");
+            setState(State.ABORTED);
+            return null;
+        }
         TrailGraph graph = TrailGraph.build(registry.all());
         TrailPlanner planner = new TrailPlanner(graph);
         Optional<TrailPath> p = planner.plan(here, dest);
         if (!p.isPresent())
         {
-            status.set("no trail covers " + (outbound ? "bank→pen" : "pen→bank"));
+            status.set("no trail covers " + here + "→" + dest
+                + " (planner returned empty)");
+            log.warn("v3: planner returned empty for {} → {} (graph nodes: {})",
+                here, dest, graph.nodes().size());
             setState(State.ABORTED);
             return null;
         }
+        log.info("v3: planned {} legs from {} to {}", p.get().size(), here, dest);
         return p.get();
     }
 

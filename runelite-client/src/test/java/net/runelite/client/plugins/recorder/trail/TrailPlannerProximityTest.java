@@ -41,14 +41,27 @@ public class TrailPlannerProximityTest
     }
 
     @Test
-    public void offGraphEndpointBeyondOneTileFails()
+    public void offGraphEndpointBeyondSnapRadiusFails()
     {
         Trail t = new Trail("a", 0L, List.of(
             new TrailEvent.Tile(0L, new WorldPoint(10, 10, 0))));
         TrailGraph g = TrailGraph.build(List.of(t));
         TrailPlanner pl = new TrailPlanner(g);
-        // Target 3 tiles away — no graph node within Chebyshev <= 1.
-        Optional<TrailPath> p = pl.plan(new WorldPoint(10, 10, 0), new WorldPoint(13, 13, 0));
+        // SNAP_RADIUS = 32 — well outside it. No graph node within range
+        // on the same plane.
+        Optional<TrailPath> p = pl.plan(new WorldPoint(10, 10, 0), new WorldPoint(100, 100, 0));
+        assertFalse(p.isPresent());
+    }
+
+    @Test
+    public void offGraphEndpointAcrossPlaneFails()
+    {
+        Trail t = new Trail("a", 0L, List.of(
+            new TrailEvent.Tile(0L, new WorldPoint(10, 10, 0))));
+        TrailGraph g = TrailGraph.build(List.of(t));
+        TrailPlanner pl = new TrailPlanner(g);
+        // Same x/y but different plane — snap is plane-gated.
+        Optional<TrailPath> p = pl.plan(new WorldPoint(10, 10, 0), new WorldPoint(10, 10, 1));
         assertFalse(p.isPresent());
     }
 }
