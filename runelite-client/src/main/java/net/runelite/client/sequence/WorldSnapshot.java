@@ -25,8 +25,23 @@
 package net.runelite.client.sequence;
 
 import javax.annotation.Nullable;
+import net.runelite.client.sequence.views.GrandExchangeView;
+import net.runelite.client.sequence.views.InteractionView;
+import net.runelite.client.sequence.views.InventoryView;
 
 public interface WorldSnapshot {
     int tick();
     @Nullable PlayerView player();
+
+    /** Inventory view. Default returns {@link InventoryView#empty()} so
+     *  existing {@code WorldSnapshot} implementations compile unchanged. */
+    default InventoryView inventory()       { return InventoryView.empty(); }
+
+    /** Interaction view (mode + blocking interface). Default returns
+     *  {@link InteractionView#empty()}. */
+    default InteractionView interaction()   { return InteractionView.empty(); }
+
+    /** Grand Exchange view (slots + interface state). Default returns
+     *  {@link GrandExchangeView#empty()}. */
+    default GrandExchangeView grandExchange() { return GrandExchangeView.empty(); }
 }

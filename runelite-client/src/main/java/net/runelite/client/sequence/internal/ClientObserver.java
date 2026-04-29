@@ -24,25 +24,51 @@
  */
 package net.runelite.client.sequence.internal;
 
-import lombok.RequiredArgsConstructor;
 import net.runelite.api.Client;
 import net.runelite.api.Player;
 import net.runelite.api.coords.WorldPoint;
 import net.runelite.client.sequence.PlayerView;
 import net.runelite.client.sequence.WorldSnapshot;
+import net.runelite.client.sequence.views.GrandExchangeView;
+import net.runelite.client.sequence.views.InteractionView;
+import net.runelite.client.sequence.views.InventoryView;
 
-@RequiredArgsConstructor
+/**
+ * Production {@link Observer} composing the per-domain observers
+ * (player / inventory / interaction / grand-exchange). Reads happen on the
+ * client thread (caller marshals via {@code clientThread::invoke}).
+ *
+ * <p>{@code GrandExchangeObserver} arrives in Task 6 — until then {@code
+ * grandExchange()} returns {@link GrandExchangeView#empty()}. Banking will
+ * add {@code BankObserver} / {@code WidgetObserver} on rebase.
+ */
 public final class ClientObserver implements Observer {
     private final Client client;
+    private final InventoryObserver inventoryObserver;
+    private final InteractionObserver interactionObserver;
+    private final GrandExchangeObserver grandExchangeObserver;
+
+    public ClientObserver(Client client) {
+        this.client = client;
+        this.inventoryObserver = new InventoryObserver(client);
+        this.interactionObserver = new InteractionObserver(client);
+        this.grandExchangeObserver = new GrandExchangeObserver(client);
+    }
 
     @Override
     public WorldSnapshot snapshot(int currentTick) {
+        // Player view: preserve existing semantics (LoginRunner depends on it).
         Player p = client.getLocalPlayer();
         PlayerView pv = (p == null) ? null : new ClientPlayerView(
             p.getWorldLocation(), p.getAnimation(),
             client.getBoostedSkillLevel(net.runelite.api.Skill.HITPOINTS),
             client.getRealSkillLevel(net.runelite.api.Skill.HITPOINTS));
-        return new ClientWorldSnapshot(currentTick, pv);
+
+        InventoryView inv = inventoryObserver.read(currentTick);
+        InteractionView interaction = interactionObserver.read(currentTick);
+        GrandExchangeView ge = grandExchangeObserver.read(currentTick);
+
+        return new ImmutableWorldSnapshot(currentTick, pv, inv, interaction, ge);
     }
 
     private static final class ClientPlayerView implements PlayerView {
@@ -63,18 +89,5 @@ public final class ClientObserver implements Observer {
         @Override public boolean isIdle() { return animation == -1; }
         @Override public int health() { return health; }
         @Override public int maxHealth() { return maxHealth; }
-    }
-
-    private static final class ClientWorldSnapshot implements WorldSnapshot {
-        private final int tick;
-        private final PlayerView player;
-
-        ClientWorldSnapshot(int tick, PlayerView player) {
-            this.tick = tick;
-            this.player = player;
-        }
-
-        @Override public int tick() { return tick; }
-        @Override public PlayerView player() { return player; }
     }
 }
