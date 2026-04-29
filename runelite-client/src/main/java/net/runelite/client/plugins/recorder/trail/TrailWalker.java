@@ -124,9 +124,15 @@ public final class TrailWalker
      *  to the farthest tile (== the leg's destination), matching the
      *  spec's "farthest tile in this leg that is still ahead of the
      *  player". */
+    /** Maximum Chebyshev distance the engine's minimap walk-click reliably
+     *  routes (default OSRS minimap zoom). Picks beyond this are out of
+     *  range — the click would resolve to "Cancel". */
+    static final int MAX_HOP_TILES = 16;
+
     static WorldPoint pickAheadTile(Leg.Walk leg, WorldPoint player, java.util.Random rng)
     {
         List<WorldPoint> tiles = leg.tiles();
+        // Closest tile to the player on the same plane.
         int closestIdx = -1;
         int closestDist = Integer.MAX_VALUE;
         for (int i = 0; i < tiles.size(); i++)
@@ -141,14 +147,38 @@ public final class TrailWalker
         if (closestIdx < 0) return tiles.get(tiles.size() - 1);
         int firstAhead = closestIdx + 1;
         if (firstAhead >= tiles.size()) return tiles.get(tiles.size() - 1);
-        // Bias toward the END of the ahead window (real players don't
-        // click 1-step ahead unless they have to). Pick uniformly from
-        // the back HALF of the ahead window (rounded up) so we still vary
-        // the click but stay forward-leaning.
-        int aheadCount = tiles.size() - firstAhead;
-        int windowStart = firstAhead + Math.max(0, aheadCount / 2);
-        int windowSize = tiles.size() - windowStart;
-        int pickIdx = windowStart + rng.nextInt(Math.max(1, windowSize));
+
+        // Walk forward through the leg, tracking the FARTHEST tile in the
+        // leg that is still within minimap walk range of the player. That
+        // tile is our preferred click target — beyond it the engine drops
+        // the click. If the leg's last tile is within range, we want to
+        // be able to pick IT (which advances the walker past this leg).
+        int farthestIdx = closestIdx;
+        for (int i = firstAhead; i < tiles.size(); i++)
+        {
+            WorldPoint t = tiles.get(i);
+            int dx = Math.abs(t.getX() - player.getX());
+            int dy = Math.abs(t.getY() - player.getY());
+            int d = Math.max(dx, dy);
+            if (d > MAX_HOP_TILES) break;
+            farthestIdx = i;
+        }
+        if (farthestIdx <= closestIdx)
+        {
+            // No tile ahead is within hop range — the leg is far away or
+            // we're at the very end. Fall back to the leg's last tile.
+            return tiles.get(tiles.size() - 1);
+        }
+
+        // Humanization: jitter within the LAST quarter of the in-range
+        // window, never beyond farthestIdx. With a typical leg of 50+
+        // tiles and a 16-tile hop, this produces 4-5 candidate tiles —
+        // enough variety that consecutive passes click different tiles
+        // while still reliably advancing toward the leg's end.
+        int windowSize = farthestIdx - firstAhead + 1;
+        int jitterSpan = Math.max(1, windowSize / 4);
+        int jitterStart = farthestIdx - jitterSpan + 1;
+        int pickIdx = jitterStart + rng.nextInt(jitterSpan);
         return tiles.get(pickIdx);
     }
 
@@ -223,21 +253,44 @@ public final class TrailWalker
             // advance to the next leg.
             return Status.IN_PROGRESS;
         }
-        WorldPoint pick = pickAheadTile(leg,
-            pos, ThreadLocalRandom.current());
-        if (shouldClick(now, pick))
+        // Click cadence: only re-pick + re-click when there's a real reason
+        // to. Calling pickAheadTile every tick produces a NEW random target
+        // each call (humanization), and dispatching a fresh WALK click on
+        // each new target redirects the engine's pathfinder mid-walk —
+        // the player oscillates between tiles and never makes progress.
+        // Reasons to click:
+        //   1. Leg changed (we just advanced past a transport / another leg)
+        //   2. Player reached the previous pick tile (advance the target)
+        //   3. RECLICK_AFTER_MS elapsed AND player has been still for
+        //      STILL_THRESHOLD_MS (engine dropped our previous click).
+        boolean legChanged = legIdx != lastClickLegIdx;
+        boolean reachedPrevPick = lastWalkPick != null && pos.equals(lastWalkPick);
+        long sinceClick = lastClickMs == 0 ? Long.MAX_VALUE : now - lastClickMs;
+        long sinceMove = now - lastMovementMs;
+        boolean stillWalking = sinceMove < STILL_THRESHOLD_MS;
+        boolean recentClick = sinceClick < RECLICK_AFTER_MS;
+        boolean staleClick = !recentClick && !stillWalking;
+        if (!legChanged && !reachedPrevPick && !staleClick)
         {
-            log.info("trail-walker: WALK leg {} → tile {}", legIdx, pick);
-            ActionRequest req = ActionRequest.builder()
-                .kind(ActionRequest.Kind.WALK)
-                .channel(ActionRequest.Channel.MOUSE)
-                .tile(pick)
-                .build();
-            dispatcher.dispatch(req);
-            lastClickMs = now;
-            lastClickLegIdx = legIdx;
-            lastWalkPick = pick;
+            // Engine is still walking the player toward our previous click.
+            // Don't pick a new tile and don't click — wait.
+            return Status.IN_PROGRESS;
         }
+        WorldPoint pick = pickAheadTile(leg, pos, ThreadLocalRandom.current());
+        log.info("trail-walker: WALK leg {} → tile {} ({})",
+            legIdx, pick,
+            legChanged ? "leg-changed"
+                : reachedPrevPick ? "reached-prev"
+                : "stale");
+        ActionRequest req = ActionRequest.builder()
+            .kind(ActionRequest.Kind.WALK)
+            .channel(ActionRequest.Channel.MOUSE)
+            .tile(pick)
+            .build();
+        dispatcher.dispatch(req);
+        lastClickMs = now;
+        lastClickLegIdx = legIdx;
+        lastWalkPick = pick;
         return Status.IN_PROGRESS;
     }
 
