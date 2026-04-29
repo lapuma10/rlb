@@ -121,6 +121,10 @@ public final class CookingScript
     private long lightingStartedAtMs;
     private long lastInventoryChangeAtMs;
     private int  lastRawCount = -1;
+    /** Set true once tallyCookedBurnt has run for the current banking
+     *  visit. Prevents re-tallying every tick we sit at the bank
+     *  waiting for withdraws to finish. Reset on every state change. */
+    private boolean tallyDoneThisVisit;
     /** When the bank widget first opened this BANKING entry. Gates the
      *  "missing item" check until the engine has had a tick to populate
      *  {@code InventoryID.BANK}. */
@@ -396,9 +400,14 @@ public final class CookingScript
             }
         }
 
-        // Tally cooked/burnt for the trip we just finished — only on
-        // the FIRST bank-open tick so we don't re-count after a deposit.
-        if (lastInventoryChangeAtMs == 0L) tallyCookedBurnt();
+        // Tally cooked/burnt for the trip we just finished — only once
+        // per banking visit, on the FIRST bank-open tick. setState()
+        // resets the flag so the next visit tallies fresh.
+        if (!tallyDoneThisVisit)
+        {
+            tallyCookedBurnt();
+            tallyDoneThisVisit = true;
+        }
 
         boolean hasCooked = inventoryHasAnyCooked();
         boolean hasBurnt  = inventoryHasAnyBurnt();
@@ -890,6 +899,11 @@ public final class CookingScript
         lightingStartedAtMs = 0L;
         lastInventoryChangeAtMs = 0L;
         lastRawCount = -1;
+        tallyDoneThisVisit = false;
+        bankOpenedAtMs = 0L;
+        bankFailCount = 0;
+        cookMenuConfirmAttempts = 0;
+        lightingBackoffUntilMs = 0L;
     }
 
     private <T> T onClient(Supplier<T> s)
