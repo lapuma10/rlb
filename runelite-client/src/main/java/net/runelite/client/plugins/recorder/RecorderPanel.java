@@ -41,6 +41,8 @@ import net.runelite.client.plugins.recorder.farm.RouteWalker;
 import net.runelite.client.plugins.recorder.mining.MiningLoop;
 import net.runelite.client.plugins.recorder.scripts.ChickenFarmV2Script;
 import net.runelite.client.plugins.recorder.scripts.CookingScript;
+import net.runelite.client.plugins.recorder.scripts.GrandExchangeScript;
+import net.runelite.client.plugins.recorder.scripts.GrandExchangeTab;
 import net.runelite.client.plugins.recorder.scripts.LumbridgeBankPenScript;
 import net.runelite.client.plugins.recorder.trail.TrailGraph;
 import net.runelite.client.plugins.recorder.trail.TrailPath;
@@ -210,6 +212,8 @@ public final class RecorderPanel extends PluginPanel
     private final JComboBox<CookingFood.Entry> cookFoodBox = new JComboBox<>();
     private final JLabel cookStatusLabel = new JLabel("Cooking: idle");
     private final JLabel cookCountsLabel = new JLabel("Cooked: 0  Burnt: 0");
+    // GE Core (Phase A): wired by RecorderPlugin via setGrandExchangeScript.
+    private GrandExchangeTab grandExchangeTab;
     private final JTabbedPane tabs = new JTabbedPane();
     private AnnotatorHudOverlay hudOverlay;
     private AreaSelector areaSelector;
@@ -1646,6 +1650,19 @@ public final class RecorderPanel extends PluginPanel
     public void setCookingScript(CookingScript script)
     {
         this.cookingScript = script;
+    }
+
+    /** Wire the GE Core script. RecorderPlugin constructs it after CookingScript
+     *  and registers it on the eventBus for GameTick forwarding. The panel
+     *  builds the GE Core tab on first wiring. */
+    public void setGrandExchangeScript(GrandExchangeScript script)
+    {
+        if (script == null) return;
+        if (grandExchangeTab == null)
+        {
+            grandExchangeTab = new GrandExchangeTab(script);
+            tabs.addTab("GE Core", new javax.swing.JScrollPane(grandExchangeTab));
+        }
     }
 
     private void onCookStart()

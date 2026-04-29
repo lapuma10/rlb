@@ -40,6 +40,9 @@ import net.runelite.client.plugins.recorder.annotator.AnnotatorHudOverlay;
 import net.runelite.client.plugins.recorder.annotator.AreaSelector;
 import net.runelite.client.plugins.recorder.scripts.ChickenFarmV2Script;
 import net.runelite.client.plugins.recorder.scripts.CookingScript;
+import net.runelite.client.plugins.recorder.scripts.GrandExchangeScript;
+import net.runelite.client.sequence.dispatch.InputOwnership;
+import net.runelite.api.coords.WorldArea;
 import net.runelite.client.plugins.recorder.scripts.LumbridgeBankPenScript;
 import net.runelite.client.plugins.recorder.trail.TrailRecorder;
 import net.runelite.client.plugins.recorder.trail.TrailRegistry;
@@ -115,6 +118,7 @@ public class RecorderPlugin extends Plugin
     private TileMarker tileMarker;
     private ChickenCombatLoop chickenLoop;
     private MiningLoop miningLoop;
+    private GrandExchangeScript grandExchangeScript;
     private TrailRecorder trailRecorder;
     private TrailRegistry trailRegistry;
     private AnnotatorHudOverlay hudOverlay;
@@ -256,6 +260,19 @@ public class RecorderPlugin extends Plugin
             client, clientThread, cookingDispatcher, cookingResolver);
         panel.setCookingScript(cookingScript);
 
+        // GE Core (Phase A): independent dispatcher + InputOwnership lease.
+        // Banking will share this lease at rebase time; for now the GE script
+        // owns its own. Varrock GE area: rough rectangle centered at the
+        // exchange. The user must already be inside this area for
+        // EnsureAtGrandExchangeStep to succeed.
+        HumanizedInputDispatcher geDispatcher = new HumanizedInputDispatcher(client, clientThread);
+        InputOwnership geInputOwnership = new InputOwnership();
+        WorldArea geArea = new WorldArea(3140, 3470, 30, 30, 0);
+        grandExchangeScript = new GrandExchangeScript(
+            client, clientThread, geDispatcher, geInputOwnership, geArea);
+        eventBus.register(grandExchangeScript);
+        panel.setGrandExchangeScript(grandExchangeScript);
+
         BufferedImage icon = ImageUtil.loadImageResource(getClass(), "/util/reset.png");
         navButton = NavigationButton.builder()
             .tooltip("Recorder")
@@ -332,6 +349,11 @@ public class RecorderPlugin extends Plugin
         if (trailRecorder != null) eventBus.unregister(trailRecorder);
         trailRecorder = null;
         trailRegistry = null;
+        if (grandExchangeScript != null) {
+            try { grandExchangeScript.stop(); } catch (Exception ignore) {}
+            eventBus.unregister(grandExchangeScript);
+            grandExchangeScript = null;
+        }
         if (eventCapture != null) eventBus.unregister(eventCapture);
         panel = null; navButton = null; debugOverlay = null; chickenOverlay = null; routeOverlay = null; tileMarker = null;
         hudOverlay = null; areaSelector = null;
