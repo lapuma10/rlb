@@ -51,6 +51,13 @@ public final class CookingInteraction
     public static final int ANIM_FIREMAKING    = AnimationID.FIREMAKING;     // 733
     /** Newer "cooking loop" animation that some food types use. */
     public static final int ANIM_COOKING_LOOP  = 11735;
+    /** Walk-merge cooking variant — engine plays this between cooks
+     *  when the player has slight residual movement queued. Without
+     *  it, isCooking() reports false during the gap and the script
+     *  spuriously re-dispatches use-raw-on-fire, which by then locks
+     *  onto a slot the engine already converted to cooked food.
+     *  HUMAN_COOKING_WALKMERGE_NORESTART = 10795 per gameval. */
+    public static final int ANIM_COOKING_WALKMERGE = 10795;
 
     /** Search radius for heat sources / ground logs (Chebyshev tiles,
      *  same plane as player). 12 covers a reasonable working area without
@@ -114,13 +121,22 @@ public final class CookingInteraction
         return n == null ? 0 : n;
     }
 
-    /** True if the local player is actively cooking on a fire OR range. */
+    /** True if the local player is actively cooking on a fire OR range.
+     *  Recognises ALL known cooking animations: COOKING_FIRE (897),
+     *  COOKING_RANGE (896), COOKING_LOOP (11735), and the walk-merge
+     *  variant (10795) the engine plays between cooks during a Cook-All
+     *  queue. Missing any one of them causes the script to think
+     *  cooking has stopped mid-batch and to re-dispatch use-raw — which
+     *  then locks use-mode onto a slot that the engine has already
+     *  converted from raw to cooked. */
     public boolean isCooking() throws InterruptedException
     {
         Integer a = onClient(this::playerAnimationOnClient);
         if (a == null || a == -1) return false;
-        return a == ANIM_COOKING_FIRE || a == ANIM_COOKING_RANGE
-            || a == ANIM_COOKING_LOOP;
+        return a == ANIM_COOKING_FIRE
+            || a == ANIM_COOKING_RANGE
+            || a == ANIM_COOKING_LOOP
+            || a == ANIM_COOKING_WALKMERGE;
     }
 
     /** True if the local player is currently lighting a fire. */

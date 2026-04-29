@@ -94,6 +94,12 @@ public final class CookingScript
      *  chat". */
     private static final long FIRE_DEATH_PAUSE_MIN_MS = 2_000;
     private static final long FIRE_DEATH_PAUSE_MAX_MS = 10_000;
+    /** How long after the last raw-count decrease we keep treating the
+     *  cook-all queue as "still running". One cook = ~1.8s; we wait
+     *  ~5s to absorb pauses + animation gaps without re-dispatching.
+     *  If no raw decrease within this window, the batch genuinely
+     *  stalled and we re-issue use-raw-on-fire. */
+    private static final long COOK_BATCH_SETTLE_MS = 5_000;
     /** Max time without inventory progress (raw count change) before we
      *  ABORT the cooking phase. Defensive: should not trip in practice. */
     private static final long COOK_STUCK_MS = 30_000;
@@ -154,6 +160,14 @@ public final class CookingScript
     /** Consecutive cook-stuck cycles. Reset on inventory progress and
      *  on state transitions; capped via {@link #COOK_MAX_STUCK}. */
     private int cookStuckCount;
+    /** Wall-clock time of the last raw-count DECREASE — i.e. an actual
+     *  successful cook by the engine (raw → cooked or raw → burnt).
+     *  Cooking is considered "actively running" while this is recent
+     *  (within {@link #COOK_BATCH_SETTLE_MS}). Used as a second safety
+     *  net beyond isCooking() so that an animation gap during a
+     *  Cook-All queue can't trigger us to spuriously click an
+     *  inventory slot that's already been converted to cooked food. */
+    private long lastRawDecreaseAtMs;
     /** When the bank widget first opened this BANKING entry. Gates the
      *  "missing item" check until the engine has had a tick to populate
      *  {@code InventoryID.BANK}. */
@@ -822,10 +836,16 @@ public final class CookingScript
 
         // Track inventory progress for stuck detection. Any change in
         // raw count (a successful cook, a fire dying mid-batch, etc.)
-        // counts as progress — reset the stuck counter.
+        // counts as progress — reset the stuck counter. A DECREASE
+        // specifically means the engine just cooked one (raw → cooked
+        // or burnt), which is the signal "cook-all queue is running".
         int raw = cook.inventoryAmount(rawId);
         if (raw != lastRawCount)
         {
+            if (lastRawCount >= 0 && raw < lastRawCount)
+            {
+                lastRawDecreaseAtMs = now;
+            }
             lastRawCount = raw;
             lastInventoryChangeAtMs = now;
             cookStuckCount = 0;
@@ -908,7 +928,22 @@ public final class CookingScript
         if (cook.isCooking())
         {
             status.set("cook: cooking (" + raw + " raw left)");
-            // Refresh stuck tracker.
+            return;
+        }
+
+        // Animation-based "cooking" detection has gaps: between cooks
+        // in a Cook-All queue the engine briefly swaps to no-animation
+        // or a transient pose, and isCooking() returns false even
+        // though the engine is still processing the queue. If we
+        // re-dispatch use-raw during that gap, the cursor lands on a
+        // slot that the engine has converted to cooked food by the
+        // time it arrives — locking use-mode onto cooked chicken.
+        // Second safety net: if a raw count decrease happened recently,
+        // treat the batch as still active and just wait.
+        if (lastRawDecreaseAtMs > 0 && (now - lastRawDecreaseAtMs) < COOK_BATCH_SETTLE_MS)
+        {
+            status.set("cook: batch in progress (" + raw
+                + " raw, last cook " + (now - lastRawDecreaseAtMs) + "ms ago)");
             return;
         }
 
@@ -1071,6 +1106,7 @@ public final class CookingScript
         lightingBackoffUntilMs = 0L;
         walkerStuckCount = 0;
         cookStuckCount = 0;
+        lastRawDecreaseAtMs = 0L;
         // Clear the lit-fire tracking on any transition out of the
         // LIGHTING_FIRE / COOKING pair. The next cook trip will light
         // a fresh fire (or, if we're going BACK to LIGHTING_FIRE
