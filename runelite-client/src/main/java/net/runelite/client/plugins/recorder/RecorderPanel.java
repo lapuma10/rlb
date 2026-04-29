@@ -1522,24 +1522,46 @@ public final class RecorderPanel extends PluginPanel
         for (CookingLocation l : CookingLocations.all()) cookLocationBox.addItem(l);
         for (CookingFood.Entry e : CookingFood.all())     cookFoodBox.addItem(e);
 
-        JPanel locationRow = new JPanel(new BorderLayout(4, 4));
-        locationRow.add(new JLabel("Location:"), BorderLayout.WEST);
-        locationRow.add(cookLocationBox, BorderLayout.CENTER);
-        p.add(locationRow);
-
-        JPanel foodRow = new JPanel(new BorderLayout(4, 4));
-        foodRow.add(new JLabel("Food:"), BorderLayout.WEST);
-        foodRow.add(cookFoodBox, BorderLayout.CENTER);
-        p.add(foodRow);
-
-        JPanel buttons = new JPanel(new BorderLayout(4, 4));
+        // BoxLayout.Y_AXIS stretches every child to fill leftover height
+        // unless the child has a bounded maximum. JComboBox doesn't bound
+        // itself, so the dropdowns balloon to ~33% of the tab. Pin each
+        // row's max height to its preferred height with unbounded width.
+        JPanel locationRow = labelledRow("Location:", cookLocationBox);
+        JPanel foodRow     = labelledRow("Food:",     cookFoodBox);
+        JPanel buttons     = new JPanel(new BorderLayout(4, 4));
         buttons.add(cookStartBtn, BorderLayout.CENTER);
         buttons.add(cookStopBtn, BorderLayout.EAST);
-        p.add(buttons);
+        capHeight(buttons);
 
+        p.add(locationRow);
+        p.add(foodRow);
+        p.add(buttons);
         p.add(cookStatusLabel);
         p.add(cookCountsLabel);
+        // Glue absorbs the remaining vertical space so the rows above
+        // don't get pushed apart.
+        p.add(Box.createVerticalGlue());
         return p;
+    }
+
+    /** Build a "Label: <field>" row whose max height is pinned to its
+     *  preferred height — needed inside Y_AXIS BoxLayouts so JComboBox
+     *  doesn't stretch to fill available vertical space. */
+    private static JPanel labelledRow(String labelText, JComponent field)
+    {
+        JPanel row = new JPanel(new BorderLayout(4, 4));
+        row.add(new JLabel(labelText), BorderLayout.WEST);
+        row.add(field, BorderLayout.CENTER);
+        capHeight(row);
+        return row;
+    }
+
+    /** Pin a component's maximum height to its preferred height — fixes
+     *  the BoxLayout-stretching behavior for any non-button child. */
+    private static void capHeight(JComponent c)
+    {
+        Dimension pref = c.getPreferredSize();
+        c.setMaximumSize(new Dimension(Integer.MAX_VALUE, pref.height));
     }
 
     /** Wire the cooking script. The plugin constructs the script in
