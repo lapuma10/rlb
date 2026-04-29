@@ -24,6 +24,7 @@
  */
 package net.runelite.client.sequence.internal;
 
+import javax.annotation.Nullable;
 import lombok.extern.slf4j.Slf4j;
 import net.runelite.client.sequence.Completion;
 import net.runelite.client.sequence.Failure;
@@ -34,6 +35,7 @@ import net.runelite.client.sequence.SequenceState;
 import net.runelite.client.sequence.Step;
 import net.runelite.client.sequence.WorldSnapshot;
 import net.runelite.client.sequence.blackboard.Blackboard;
+import net.runelite.client.sequence.blackboard.BlackboardKey;
 import net.runelite.client.sequence.blackboard.BlackboardScope;
 import net.runelite.client.sequence.affordance.DiagnosticReason;
 import net.runelite.client.sequence.composite.CompositeStep;
@@ -49,6 +51,7 @@ import java.util.Deque;
 import java.util.HashSet;
 import java.util.LinkedHashSet;
 import java.util.List;
+import java.util.Map;
 import java.util.Set;
 
 @Slf4j
@@ -61,8 +64,19 @@ public final class StateDrivenEngine implements SequenceEngine {
     private final Blackboard blackboard;
 
     private final FrameStack frames = new FrameStack();
-    /** Stack of suspended frame chains. Topmost is restored when current chain empties. */
-    private final Deque<List<StepFrame>> suspended = new ArrayDeque<>();
+    /** Stack of suspended frame chains plus the STEP+SEQUENCE blackboard scope contents
+     *  captured at suspend time. Topmost is restored when current chain empties. */
+    private final Deque<SuspendedFrame> suspended = new ArrayDeque<>();
+
+    /** Snapshot of a suspended chain plus its scoped blackboard state.
+     *  Captured at preempt time, applied at resume time so a reactive's STEP/SEQUENCE
+     *  scope clears (in popAndOrchestrate / failed run) cannot wipe the suspended
+     *  chain's working memory (the typed K_TARGET / K_INV_START / etc. that
+     *  WithdrawItemStep.check() depends on). */
+    private record SuspendedFrame(
+        List<StepFrame> chain,
+        Map<BlackboardKey<?>, Object> stepScope,
+        Map<BlackboardKey<?>, Object> sequenceScope) {}
     private final Set<Step> reactives = new LinkedHashSet<>();
     private final DirectActions.Sink sink = new DirectActions.Sink();
     private final Executor executor;
@@ -71,12 +85,9 @@ public final class StateDrivenEngine implements SequenceEngine {
     private SequenceState state = SequenceState.IDLE;
     private int currentTick = 0;
 
-    /** Optional input-ownership lease guarding mutating actions. When set, the
-     *  engine refuses to advance a tick that would dispatch on behalf of a
-     *  step while another owner holds the lease. Configured via
-     *  {@link #setInputOwnership(InputOwnership, String)}. */
-    private InputOwnership inputOwnership;
-    private String inputOwnerToken;
+    // Input ownership — optional; null means no ownership check is applied.
+    @Nullable private InputOwnership inputOwnership;
+    @Nullable private String ownerToken;
 
     public StateDrivenEngine(Observer observer, Planner planner, InputDispatcher dispatcher,
                              Telemetry telemetry, Blackboard blackboard) {
@@ -116,39 +127,23 @@ public final class StateDrivenEngine implements SequenceEngine {
         state = SequenceState.IDLE;
     }
 
-    @Override public synchronized void registerReactive(Step r)   { reactives.add(r); }
-    @Override public synchronized void unregisterReactive(Step r) { reactives.remove(r); }
-    @Override public synchronized void clearReactives()           { reactives.clear(); }
-    @Override public synchronized SequenceState state() { return state; }
-    @Override public synchronized void offerEvent(Object event)   { eventQueue.add(event); }
+    @Override public synchronized void registerReactive(Step r)              { reactives.add(r); }
+    @Override public synchronized void registerReactive(Step r, int priority) { reactives.add(r); }
+    @Override public synchronized void unregisterReactive(Step r)            { reactives.remove(r); }
+    @Override public synchronized void clearReactives()                      { reactives.clear(); }
+    @Override public synchronized SequenceState state()                      { return state; }
+    @Override public synchronized void offerEvent(Object event)              { eventQueue.add(event); }
 
-    /** Wire an input-ownership lease + token. After this, every tick verifies
-     *  the lease is still held; if not, the run fails with
-     *  {@link DiagnosticReason.Unknown} mentioning lost ownership. */
-    public synchronized void setInputOwnership(InputOwnership ownership, String ownerToken) {
+    /** Set the input ownership pair. Thread-safe; may be called before or after construction. */
+    public synchronized void setInputOwnership(@Nullable InputOwnership ownership, @Nullable String token) {
         this.inputOwnership = ownership;
-        this.inputOwnerToken = ownerToken;
+        this.ownerToken = token;
     }
 
     @Override
     public synchronized void advanceTick() {
         if (state != SequenceState.RUNNING) return;
         currentTick++;
-
-        // Mid-sequence input-ownership defensive check (per spec §11.3): if the
-        // lease was lost between ticks we abort BEFORE running any step that
-        // could dispatch a click under the wrong owner. Defensively release on
-        // our side so we don't keep the lease stuck if the new owner misses it.
-        if (inputOwnership != null && inputOwnerToken != null
-            && !inputOwnership.isOwner(inputOwnerToken) && !frames.isEmpty()) {
-            DiagnosticReason d = new DiagnosticReason.Unknown("input ownership lost mid-sequence");
-            inputOwnership.release(inputOwnerToken);
-            StepFrame top = frames.top();
-            telemetry.record(rec(top, TelemetryRecord.Event.RECOVERY, d.toString()));
-            failRun();
-            return;
-        }
-
         WorldSnapshot snap = observer.snapshot(currentTick);
 
         // Drain pending events to all active frames
@@ -159,13 +154,14 @@ public final class StateDrivenEngine implements SequenceEngine {
 
         // 1. Verify and pop completed/failed leaves (orchestration interleaves via popAndOrchestrate)
         for (StepFrame leaf : new ArrayList<>(frames.leaves())) {
-            if (state != SequenceState.RUNNING) break;     // run terminated mid-loop (e.g. failRun fired)
             if (!frames.all().contains(leaf)) continue;   // popped by recursion already
-            if (!leaf.isStarted()) continue;              // canStart gate: parked, no check yet
             Completion c;
+            Throwable checkThrew = null;
             try {
                 c = leaf.getStep().check(snap, blackboard);
             } catch (Throwable t) {
+                log.warn("step {} threw in check: {}", leaf.getStep().name(), t.toString());
+                checkThrew = t;
                 c = new Completion.Failed(t.getClass().getSimpleName() + ": " + t.getMessage());
             }
             telemetry.record(rec(leaf, TelemetryRecord.Event.CHECK, completionDesc(c)));
@@ -175,12 +171,13 @@ public final class StateDrivenEngine implements SequenceEngine {
                 popAndOrchestrate(leaf, s, snap);
             } else if (c instanceof Completion.Failed f) {
                 int elapsed = currentTick - leaf.getStartedTick();
-                // Pass through the typed DiagnosticReason if the step provided one,
-                // so onFailure can switch on Failure.diagnostic() without parsing
-                // the reason string.
-                Failure failure = (f.diagnostic() != null)
+                // Preserve the underlying Throwable so handlers can read Failure.cause();
+                // typed diagnostic still wins when one is provided.
+                Failure failure = f.diagnostic() != null
                     ? Failure.fromDiagnostic(f.diagnostic(), elapsed)
-                    : Failure.fromCheck(f.reason(), elapsed);
+                    : checkThrew != null
+                        ? Failure.fromException(checkThrew, elapsed)
+                        : Failure.fromCheck(f.reason(), elapsed);
                 handleLeafFailure(leaf, failure, snap);
             } else if (c instanceof Completion.Running) {
                 if (leaf.timedOut(currentTick)) {
@@ -190,17 +187,20 @@ public final class StateDrivenEngine implements SequenceEngine {
             }
         }
 
-        // If a root frame failed mid-loop, the run is already FAILED — do not
-        // run planner/tick/drain steps (they would overwrite state to IDLE
-        // when no planner candidates exist).
+        // 3. Planner & preemption (guard: step 1 may have called failRun() → state=FAILED;
+        //    skip planner/preempt so FAILED state is not overwritten with IDLE)
         if (state != SequenceState.RUNNING) return;
-
-        // 3. Planner & preemption
         if (frames.isEmpty()) {
-            // Try to resume a suspended chain first
+            // Try to resume a suspended chain first. Restore STEP+SEQUENCE
+            // scopes captured at suspend time BEFORE re-pushing the chain so
+            // any tick that fires before the resumed step's onStart re-runs
+            // (e.g. its check() if started flag is preserved) sees its
+            // original working memory.
             if (!suspended.isEmpty()) {
-                List<StepFrame> resumed = suspended.pop();
-                for (StepFrame f : resumed) frames.push(f);
+                SuspendedFrame sf = suspended.pop();
+                blackboard.restore(BlackboardScope.STEP, sf.stepScope());
+                blackboard.restore(BlackboardScope.SEQUENCE, sf.sequenceScope());
+                for (StepFrame f : sf.chain()) frames.push(f);
                 telemetry.record(rec(frames.top(), TelemetryRecord.Event.RESUMED, ""));
             } else {
                 Step next = planner.select(snap, blackboard, eligibleReactives());
@@ -234,21 +234,31 @@ public final class StateDrivenEngine implements SequenceEngine {
             }
         }
 
-        // 5. Drain action queue
+        // 5. Input-ownership pre-dispatch guard (defensive mid-sequence check).
+        //    Normally the owner never changes while a sequence is running; this guard
+        //    protects against the pathological case where the lease was lost externally.
+        if (inputOwnership != null && ownerToken != null && !inputOwnership.isOwner(ownerToken)) {
+            DiagnosticReason reason = new DiagnosticReason.Unknown("input ownership lost mid-sequence");
+            log.warn("input ownership lost mid-sequence (token={}); failing run", ownerToken);
+            telemetry.record(new TelemetryRecord(currentTick, 0,
+                "engine", TelemetryRecord.Event.FAILED, reason.toString()));
+            inputOwnership.release(ownerToken);
+            sink.drain();   // discard any queued actions — they must NOT reach the dispatcher
+            failRun();
+            return;
+        }
+
+        // 6. Drain action queue
         executor.drain(sink);
     }
 
     private void runPendingOnStarts(WorldSnapshot snap) {
+        Blackboard bb = blackboard;
         for (StepFrame f : new ArrayList<>(frames.all())) {
             if (!f.isStarted()) {
-                // canStart gate: do not call onStart on a leaf whose canStart
-                // returns false. Frame stays parked; engine re-evaluates next
-                // tick. Composite frames bypass the gate — their orchestration
-                // is unconditional; their leaves are evaluated independently.
-                if (!(f.getStep() instanceof CompositeStep)
-                    && !f.getStep().canStart(snap, blackboard)) {
-                    telemetry.record(rec(f, TelemetryRecord.Event.CHECK,
-                        "canStart=false (parked)"));
+                // canStart gate: leaf frames (non-composite) must pass canStart before being started.
+                // Composite frames bypass the gate — their leaves are evaluated independently.
+                if (!(f.getStep() instanceof CompositeStep) && !f.getStep().canStart(snap, bb)) {
                     continue;
                 }
                 f.setStartedTick(currentTick);
@@ -319,10 +329,19 @@ public final class StateDrivenEngine implements SequenceEngine {
         Step candidate = planner.select(snap, blackboard, eligibleReactives());
         if (candidate == null || candidate.priority() <= top.getStep().priority()) return;
 
-        // Suspend whole chain, push reactive at depth 0
+        // Suspend whole chain along with its STEP+SEQUENCE scope contents — the
+        // reactive runs with a clean STEP scope, but when we resume we restore
+        // the suspended chain's working memory so e.g. WithdrawItemStep.check()
+        // can still find K_TARGET / K_INV_START.
         List<StepFrame> chain = new ArrayList<>(frames.all());
-        suspended.push(chain);
+        Map<BlackboardKey<?>, Object> savedStep = blackboard.snapshot(BlackboardScope.STEP);
+        Map<BlackboardKey<?>, Object> savedSeq  = blackboard.snapshot(BlackboardScope.SEQUENCE);
+        suspended.push(new SuspendedFrame(chain, savedStep, savedSeq));
         while (!frames.isEmpty()) frames.pop();
+        // Reactive starts with a clean STEP scope (its own working memory).
+        // SEQUENCE remains visible because the reactive may legitimately read it
+        // (and we restore the saved SEQUENCE on resume regardless).
+        blackboard.clear(BlackboardScope.STEP);
         StepFrame f = makeFrame(candidate, 0);
         frames.push(f);
         telemetry.record(rec(top, TelemetryRecord.Event.PREEMPTED, "by " + candidate.name()));
@@ -338,7 +357,12 @@ public final class StateDrivenEngine implements SequenceEngine {
             // Root finished. Suspended-chain resumption happens in advanceTick step 3.
             if (status instanceof Completion.Failed) {
                 failRun();
-            } else {
+            } else if (suspended.isEmpty()) {
+                // Only wipe SEQUENCE when no suspended chain is waiting — otherwise
+                // the resumed chain would lose its sequence-scoped state. The resume
+                // path restores from the snapshot taken at suspend time anyway, but
+                // we still avoid the clear so behavior is consistent with the
+                // STEP-scope handling in tryPreempt.
                 blackboard.clear(BlackboardScope.SEQUENCE);
             }
             return;
@@ -396,19 +420,14 @@ public final class StateDrivenEngine implements SequenceEngine {
         telemetry.record(rec(frame, TelemetryRecord.Event.RECOVERY, r.toString()));
         if (r instanceof Recovery.Retry retry) {
             frame.setRetryCount(frame.getRetryCount() + 1);
-            // Cumulative bound: Retry(N) permits N retries (N+1 total attempts).
-            // Use strict `>` so the Nth retry actually runs before exhaustion.
             if (frame.getRetryCount() > retry.maxAttempts()) {
+                // Exhausted — propagate Failed to parent (or fail run if root)
                 Completion.Failed propagated = new Completion.Failed("retry exhausted");
                 frame.setStatus(propagated);
                 popAndOrchestrate(frame, propagated, snap);
             } else {
-                // Clear STEP scope before re-running onStart: a retry is a fresh
-                // attempt, so prior K_PRECONDITION_FAILURE / K_OUTCOME / etc. must
-                // not leak into the next onStart-then-check cycle.
-                blackboard.clear(BlackboardScope.STEP);
                 frame.setStartedTick(currentTick);
-                frame.setStarted(false);   // onStart will re-fire on next runPendingOnStarts
+                frame.setStarted(false);   // onStart will re-fire at tick start of next advance
             }
         } else if (r instanceof Recovery.Skip s) {
             Completion.Succeeded synthetic = new Completion.Succeeded("skipped: " + s.reason());

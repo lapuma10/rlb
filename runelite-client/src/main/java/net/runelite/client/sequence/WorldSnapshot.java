@@ -25,9 +25,12 @@
 package net.runelite.client.sequence;
 
 import javax.annotation.Nullable;
+import net.runelite.client.sequence.views.BankView;
+import net.runelite.client.sequence.views.EventFacts;
 import net.runelite.client.sequence.views.GrandExchangeView;
 import net.runelite.client.sequence.views.InteractionView;
 import net.runelite.client.sequence.views.InventoryView;
+import net.runelite.client.sequence.views.WidgetView;
 
 public interface WorldSnapshot {
     int tick();
@@ -37,11 +40,20 @@ public interface WorldSnapshot {
      *  existing {@code WorldSnapshot} implementations compile unchanged. */
     default InventoryView inventory()       { return InventoryView.empty(); }
 
+    /** Bank view. Default returns {@link BankView#empty()}. */
+    default BankView bank()                 { return BankView.empty(); }
+
+    /** Widget view. Default returns {@link WidgetView#empty()}. */
+    default WidgetView widgets()            { return WidgetView.empty(); }
+
     /** Interaction view (mode + blocking interface). Default returns
-     *  {@link InteractionView#empty()}. */
+     *  {@link InteractionView#empty()} (alias of {@code world()}). */
     default InteractionView interaction()   { return InteractionView.empty(); }
 
     /** Grand Exchange view (slots + interface state). Default returns
      *  {@link GrandExchangeView#empty()}. */
     default GrandExchangeView grandExchange() { return GrandExchangeView.empty(); }
+
+    /** Per-tick event facts (inventory/widget changes since last snapshot). */
+    default EventFacts events()             { return EventFacts.none(); }
 }

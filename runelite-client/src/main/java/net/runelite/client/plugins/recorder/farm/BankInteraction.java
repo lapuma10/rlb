@@ -28,6 +28,7 @@ import net.runelite.api.gameval.InventoryID;
 import net.runelite.api.gameval.VarClientID;
 import net.runelite.api.widgets.Widget;
 import net.runelite.client.callback.ClientThread;
+import net.runelite.client.sequence.activities.banking.BankActions;
 import net.runelite.client.sequence.dispatch.HumanizedInputDispatcher;
 
 /**
@@ -46,7 +47,7 @@ import net.runelite.client.sequence.dispatch.HumanizedInputDispatcher;
  * widget reads happen on the client thread).
  */
 @Slf4j
-public final class BankInteraction
+public final class BankInteraction implements BankActions
 {
     /** Search radius for booths/bankers (Chebyshev tiles, same plane).
      *  15 tiles covers every Lumbridge bank position from any reasonable
@@ -127,7 +128,7 @@ public final class BankInteraction
      * was visible (caller can retry next tick — the player may need to
      * walk closer).
      */
-    public boolean clickBankBoothRandom() throws InterruptedException
+    public boolean tryClickBankBoothRandom() throws InterruptedException
     {
         BoothCandidate pick = onClient(this::findBoothCandidate);
         if (pick == null) return false;
@@ -171,6 +172,15 @@ public final class BankInteraction
             pick.go.getId(), cx, cy);
         dispatcher.clickCanvas(cx, cy);
         return true;
+    }
+
+    /** {@inheritDoc} — dispatches a booth click, discarding the boolean result.
+     *  Call {@link #tryClickBankBoothRandom()} directly when the boolean return
+     *  matters for fail-counting. */
+    @Override
+    public void clickBankBoothRandom() throws InterruptedException
+    {
+        tryClickBankBoothRandom();
     }
 
     /** Either an NPC banker or a GameObject bank booth, plus the slot
@@ -404,7 +414,7 @@ public final class BankInteraction
      *  <p>Self-contained on threading: the widget probe hops to the
      *  client thread internally, the click dispatch goes through the
      *  dispatcher's own queue. Safe to call from any worker thread. */
-    public boolean closeBank() throws InterruptedException
+    public boolean tryCloseBank() throws InterruptedException
     {
         Rectangle b = onClient(() -> {
             Widget root = client.getWidget(InterfaceID.Bankmain.UNIVERSE);
@@ -427,6 +437,13 @@ public final class BankInteraction
         log.warn("bank: X close button not found — falling back to Escape");
         dispatcher.tapKey(KeyEvent.VK_ESCAPE);
         return true;
+    }
+
+    /** {@inheritDoc} */
+    @Override
+    public void closeBank() throws InterruptedException
+    {
+        tryCloseBank();
     }
 
     // ────────────────────────────────────────────────────────────────
@@ -477,15 +494,70 @@ public final class BankInteraction
      *    <li>bank slot widget is scrolled out and we couldn't make it
      *        visible — caller falls back to a different strategy.</li>
      *  </ul> */
-    public boolean withdrawAll(int itemId) throws InterruptedException
+    public boolean tryWithdrawAll(int itemId) throws InterruptedException
     {
         return withdrawWithVerb(itemId, "Withdraw-All");
     }
 
-    /** Withdraw 1 of {@code itemId}. Same shape as {@link #withdrawAll}. */
-    public boolean withdrawOne(int itemId) throws InterruptedException
+    /** {@inheritDoc} */
+    @Override
+    public void withdrawAll(int itemId) throws InterruptedException
+    {
+        tryWithdrawAll(itemId);
+    }
+
+    /** Withdraw 1 of {@code itemId}. Same shape as {@link #tryWithdrawAll}.
+     *  Returns true iff a click was dispatched. */
+    public boolean tryWithdrawOne(int itemId) throws InterruptedException
     {
         return withdrawWithVerb(itemId, "Withdraw-1");
+    }
+
+    /** {@inheritDoc} */
+    @Override
+    public void withdrawOne(int itemId) throws InterruptedException
+    {
+        tryWithdrawOne(itemId);
+    }
+
+    /** Withdraw exactly {@code qty} of {@code itemId} via "Withdraw-X".
+     *
+     *  <p>Flow: right-click the bank slot → pick "Withdraw-X" → the game
+     *  opens a chatbox quantity dialog → type the quantity as individual
+     *  characters → press Enter to confirm.
+     *
+     *  <p>Uses {@link HumanizedInputDispatcher#rightClickAndPickMenu} to
+     *  scroll-and-right-click the slot (same as {@link #tryWithdrawAll} /
+     *  {@link #tryWithdrawOne}), then {@link HumanizedInputDispatcher#typeChar}
+     *  per digit and {@link HumanizedInputDispatcher#tapKey} for Enter.
+     *
+     *  <p>Returns true iff the slot was found, the "Withdraw-X" menu pick
+     *  was dispatched, and the quantity was typed. The caller should wait
+     *  for the quantity dialog to appear before expecting inventory change. */
+    public boolean tryWithdrawX(int itemId, int qty) throws InterruptedException
+    {
+        if (qty <= 0) return false;
+        boolean picked = withdrawWithVerb(itemId, "Withdraw-X");
+        if (!picked) return false;
+        // After "Withdraw-X" is picked, the game opens a chatbox input
+        // dialog asking for the quantity. Brief wait for the dialog
+        // to appear before we start typing.
+        Thread.sleep(300L + (long) (Math.random() * 300L));
+        String qtyStr = Integer.toString(qty);
+        for (char ch : qtyStr.toCharArray())
+        {
+            dispatcher.typeChar(ch);
+            Thread.sleep(40L + (long) (Math.random() * 60L));
+        }
+        dispatcher.tapKey(java.awt.event.KeyEvent.VK_ENTER);
+        return true;
+    }
+
+    /** {@inheritDoc} */
+    @Override
+    public void withdrawX(int itemId, int qty) throws InterruptedException
+    {
+        tryWithdrawX(itemId, qty);
     }
 
     /** Deposit all of {@code itemId} from the inventory via the slot's
@@ -500,7 +572,7 @@ public final class BankInteraction
      *  (tinderbox for cooking, pickaxe for mining, etc.) — the orb is
      *  "deposit everything", and re-withdrawing a kept item every trip
      *  is both wasteful and very bot-tell. */
-    public boolean depositAll(int itemId) throws InterruptedException
+    public boolean tryDepositAll(int itemId) throws InterruptedException
     {
         Rectangle b = onClient(() -> resolveInvSlotBoundsForDeposit(itemId));
         if (b == null)
@@ -524,6 +596,13 @@ public final class BankInteraction
         log.info("bank: deposit-all itemId={} via inv slot bounds={}", itemId, b);
         dispatcher.rightClickAndPickMenu(cx, cy, "Deposit-All");
         return true;
+    }
+
+    /** {@inheritDoc} */
+    @Override
+    public void depositAll(int itemId) throws InterruptedException
+    {
+        tryDepositAll(itemId);
     }
 
     /** Client-thread: locate the inventory slot widget holding

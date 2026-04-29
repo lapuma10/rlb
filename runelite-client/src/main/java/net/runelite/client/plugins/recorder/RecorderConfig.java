@@ -204,4 +204,24 @@ public interface RecorderConfig extends Config
 	{
 		return true;
 	}
+
+	@ConfigSection(
+		name = "Experimental",
+		description = "Experimental features that are not yet production-ready.",
+		position = 200,
+		closedByDefault = true
+	)
+	String experimentalSection = "experimental";
+
+	@ConfigItem(
+		keyName = "useEngineBanking",
+		name = "Use engine banking",
+		description = "Route cooking-script banking through the sequence engine (experimental).",
+		section = experimentalSection,
+		position = 0
+	)
+	default boolean useEngineBanking()
+	{
+		return false;
+	}
 }

@@ -37,11 +37,11 @@ public interface InventoryView {
     static InventoryView empty() { return EMPTY; }
 
     InventoryView EMPTY = new InventoryView() {
-        public int size()                        { return 28; }
-        public int freeSlots()                   { return 28; }
-        public boolean isFull()                  { return false; }
-        public List<ItemStack> items()           { return List.of(); }
-        public boolean contains(int itemId)      { return false; }
-        public int count(int itemId)             { return 0; }
+        @Override public int size()                  { return 28; }
+        @Override public int freeSlots()             { return 28; }
+        @Override public boolean isFull()            { return false; }
+        @Override public List<ItemStack> items()     { return List.of(); }
+        @Override public boolean contains(int id)    { return false; }
+        @Override public int count(int id)           { return 0; }
     };
 }

@@ -1,3 +1,19 @@
+## Sequence engine — read FIRST for any NEW gameplay scripting
+
+The repo has a state-driven sequence engine under
+`runelite-client/.../sequence/`. New gameplay scripts MUST use it, not
+the enum-FSM `tickLoop` pattern in `recorder/scripts/`.
+
+See `runelite-client/src/main/java/net/runelite/client/sequence/ARCHITECTURE.md`
+for the engine map, step lifecycle, and the cooking-banking case study.
+
+The legacy enum-FSM scripts in `recorder/scripts/` (CookingScript banking-legacy
+path, ChickenFarmV3, LumbridgeBankPenScript) predate engine adoption. Read them
+for domain knowledge (widget IDs, dispatch semantics) but DO NOT copy their FSM
+shape for new flows.
+
+---
+
 # File map — read this BEFORE searching
 
 All bot code lives under one directory. Subpackages map 1-to-1 with

@@ -299,7 +299,7 @@ public final class ChickenFarmV2Script
         if (!open && !empty)
         {
             status.set("clicking bank booth");
-            if (bank.clickBankBoothRandom()) lastBankActionAtMs = now;
+            if (bank.tryClickBankBoothRandom()) lastBankActionAtMs = now;
             return;
         }
         if (open && !empty)
@@ -311,7 +311,7 @@ public final class ChickenFarmV2Script
         if (open && empty)
         {
             status.set("closing bank");
-            if (bank.closeBank()) lastBankActionAtMs = now;
+            if (bank.tryCloseBank()) lastBankActionAtMs = now;
             return;
         }
         // !open && empty — done.

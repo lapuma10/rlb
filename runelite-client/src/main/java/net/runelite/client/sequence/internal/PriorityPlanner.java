@@ -32,6 +32,7 @@ import net.runelite.client.sequence.blackboard.BlackboardScope;
 import net.runelite.client.sequence.blackboard.SequenceBlackboardKeys;
 import net.runelite.client.sequence.telemetry.Telemetry;
 import net.runelite.client.sequence.telemetry.TelemetryRecord;
+
 import javax.annotation.Nullable;
 import java.util.Collection;
 
@@ -41,6 +42,10 @@ public final class PriorityPlanner implements Planner {
      *  {@link #setTelemetry(Telemetry)}; null means no recording. */
     @Nullable private Telemetry telemetry;
 
+    /** Default constructor — no telemetry. Existing tests keep compiling. */
+    public PriorityPlanner() {}
+
+    /** Inject telemetry so canStart rejections are recorded. */
     public void setTelemetry(@Nullable Telemetry telemetry) {
         this.telemetry = telemetry;
     }
@@ -50,19 +55,27 @@ public final class PriorityPlanner implements Planner {
         Step best = null;
         for (Step s : candidates) {
             if (!s.canStart(state, bb)) {
-                if (telemetry != null) {
-                    DiagnosticReason r = bb.scope(BlackboardScope.STEP)
-                        .get(SequenceBlackboardKeys.LAST_BLOCK_REASON).orElse(null);
-                    String payload = "canStart=false"
-                        + (r != null ? " reason=" + r : "");
-                    int tick = state == null ? 0 : state.tick();
-                    telemetry.record(new TelemetryRecord(
-                        tick, 0, s.name(), TelemetryRecord.Event.CHECK, payload));
-                }
+                recordRejection(s, state, bb);
                 continue;
             }
             if (best == null || s.priority() > best.priority()) best = s;
         }
         return best;
+    }
+
+    /** Push a (stepName, reason) tuple to telemetry when {@code canStart} returns
+     *  false, so non-running rejections are visible in the ring buffer alongside
+     *  step-lifecycle events. Reads {@link SequenceBlackboardKeys#LAST_BLOCK_REASON}
+     *  from STEP scope; if absent the reason field is empty. */
+    private void recordRejection(Step step, WorldSnapshot state, Blackboard bb) {
+        if (telemetry == null) return;
+        DiagnosticReason reason = bb.scope(BlackboardScope.STEP)
+            .get(SequenceBlackboardKeys.LAST_BLOCK_REASON)
+            .orElse(null);
+        String payload = "canStart=false"
+            + (reason != null ? " reason=" + reason : "");
+        int tick = state == null ? 0 : state.tick();
+        telemetry.record(new TelemetryRecord(
+            tick, 0, step.name(), TelemetryRecord.Event.CHECK, payload));
     }
 }

@@ -9,43 +9,57 @@ import java.util.concurrent.atomic.AtomicReference;
  * orthogonal panel button can't both push clicks to the dispatcher without
  * coordination.
  *
- * <p>Acquisitions are last-writer-takes-nothing — a second {@link #tryAcquire}
- * while held returns {@code false} and leaves the existing owner in place.
- * Only the current owner can {@link #release}; double-release is a harmless
- * no-op (returns {@code false}).
+ * <p>{@link AtomicReference}-backed; safe to call from any thread.
+ *
+ * <p>Acquisitions are last-writer-takes-nothing — a {@link #tryAcquire} by a
+ * <em>different</em> token while another owner holds the lease returns
+ * {@code false} and leaves the existing owner in place. Same-owner
+ * re-acquire is idempotent (returns {@code true}). Only the current owner
+ * can {@link #release}; double-release is a harmless no-op (returns
+ * {@code false}).
  *
  * <p>Owners identify themselves with a string token of their choice
  * ({@code "cooking-banking"}, {@code "ge-script"}, …). Tokens are
  * case-sensitive equality.
  *
- * <p>Thread-safe via {@link AtomicReference#compareAndSet}.
+ * <p>Null tokens are never valid — all three operations
+ * ({@code tryAcquire}, {@code isOwner}, {@code release}) return
+ * {@code false} for null rather than NPE-ing.
  */
 public final class InputOwnership {
 
     private final AtomicReference<String> owner = new AtomicReference<>();
 
-    /** Try to take the lease. Returns {@code true} on success, {@code false}
-     *  if another owner already holds it. */
-    public boolean tryAcquire(String name) {
-        if (name == null) throw new IllegalArgumentException("owner name must not be null");
-        return owner.compareAndSet(null, name);
+    /**
+     * Attempt to acquire the lease for the given token.
+     * Succeeds if no current owner OR the same owner re-acquires (idempotent).
+     * A null token is invalid and always fails.
+     */
+    public boolean tryAcquire(String token) {
+        if (token == null) return false;
+        // Idempotent re-acquire by same owner.
+        if (token.equals(owner.get())) return true;
+        return owner.compareAndSet(null, token);
     }
 
-    /** True iff {@code name} is the current owner. */
-    public boolean isOwner(String name) {
-        return name != null && name.equals(owner.get());
+    /** Returns true iff this token is the current lease holder.
+     *  A null token is never the owner. */
+    public boolean isOwner(String token) {
+        return token != null && token.equals(owner.get());
     }
 
-    /** Current owner if any, otherwise empty. */
+    /** Returns the current owner token, or empty if the lease is free. */
     public Optional<String> currentOwner() {
         return Optional.ofNullable(owner.get());
     }
 
-    /** Release the lease. Returns {@code true} only if {@code name} was the
-     *  current owner. Releases by a non-owner (or after a previous release)
-     *  return {@code false} without error. */
-    public boolean release(String name) {
-        if (name == null) return false;
-        return owner.compareAndSet(name, null);
+    /**
+     * Release the lease. Only succeeds when the caller is the current owner.
+     * Returns false (harmless no-op) when called by a non-owner, when already
+     * released, or when {@code token} is null.
+     */
+    public boolean release(String token) {
+        if (token == null) return false;
+        return owner.compareAndSet(token, null);
     }
 }

@@ -65,6 +65,7 @@ import net.runelite.client.plugins.recorder.mining.MiningLoop;
 import net.runelite.client.plugins.recorder.session.SessionDirectory;
 import net.runelite.client.plugins.recorder.transport.RouteOverlay;
 import net.runelite.client.sequence.dispatch.HumanizedInputDispatcher;
+import net.runelite.client.sequence.dispatch.InputOwnership;
 import net.runelite.client.sequence.login.CredentialStore;
 import net.runelite.client.sequence.login.EncryptedFileCredentialStore;
 import net.runelite.client.sequence.login.KeychainCredentialStore;
@@ -254,22 +255,28 @@ public class RecorderPlugin extends Plugin
         // Cooking script — independent dispatcher + transport resolver.
         // The script is location- and food-agnostic; the panel feeds it
         // a CookingLocation + raw food item id and starts.
+        // InputOwnership is shared across the banking sub-paths so the
+        // sequence engine and the legacy banking path don't clash.
         HumanizedInputDispatcher cookingDispatcher = new HumanizedInputDispatcher(client, clientThread);
         TransportResolver cookingResolver = new TransportResolver(client);
+        InputOwnership cookingInputOwnership = new InputOwnership();
         CookingScript cookingScript = new CookingScript(
-            client, clientThread, cookingDispatcher, cookingResolver);
+            client, clientThread, cookingDispatcher, cookingResolver, config, cookingInputOwnership);
         panel.setCookingScript(cookingScript);
 
-        // GE Core (Phase A): independent dispatcher + InputOwnership lease.
-        // Banking will share this lease at rebase time; for now the GE script
-        // owns its own. Varrock GE area: rough rectangle centered at the
-        // exchange. The user must already be inside this area for
-        // EnsureAtGrandExchangeStep to succeed.
+        // GE Core + Phase B bank-prep: independent dispatcher + InputOwnership
+        // lease. The bank-prep variants withdraw coins / sell items from a GE
+        // bank booth before placing the offer; we wire a BankInteraction
+        // backed by the GE script's own dispatcher so bank clicks coordinate
+        // with the rest of the GE flow.
         HumanizedInputDispatcher geDispatcher = new HumanizedInputDispatcher(client, clientThread);
         InputOwnership geInputOwnership = new InputOwnership();
         WorldArea geArea = new WorldArea(3140, 3470, 30, 30, 0);
+        net.runelite.client.plugins.recorder.farm.BankInteraction geBank =
+            new net.runelite.client.plugins.recorder.farm.BankInteraction(
+                client, clientThread, geDispatcher);
         grandExchangeScript = new GrandExchangeScript(
-            client, clientThread, geDispatcher, geInputOwnership, geArea);
+            client, clientThread, geDispatcher, geInputOwnership, geArea, geBank);
         eventBus.register(grandExchangeScript);
         panel.setGrandExchangeScript(grandExchangeScript);
 

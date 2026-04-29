@@ -13,27 +13,36 @@ public class InputOwnershipTest {
     @Test
     public void firstAcquireWins() {
         InputOwnership io = new InputOwnership();
-        assertTrue(io.tryAcquire("alice"));
+        assertTrue("first acquire must succeed", io.tryAcquire("alice"));
         assertEquals(Optional.of("alice"), io.currentOwner());
         assertTrue(io.isOwner("alice"));
     }
 
     @Test
-    public void secondAcquireWhileHeldFails() {
+    public void secondAcquireWhileHeldByDifferentTokenFails() {
         InputOwnership io = new InputOwnership();
         assertTrue(io.tryAcquire("alice"));
-        assertFalse(io.tryAcquire("bob"));
+        assertFalse("second different-token acquire must fail", io.tryAcquire("bob"));
+        // lease still held by alice
         assertEquals(Optional.of("alice"), io.currentOwner());
         assertFalse(io.isOwner("bob"));
+    }
+
+    @Test
+    public void sameOwnerReAcquireIsIdempotent() {
+        InputOwnership io = new InputOwnership();
+        assertTrue(io.tryAcquire("alice"));
+        assertTrue("same-owner re-acquire must return true", io.tryAcquire("alice"));
+        assertEquals(Optional.of("alice"), io.currentOwner());
     }
 
     @Test
     public void onlyOwnerCanRelease() {
         InputOwnership io = new InputOwnership();
         io.tryAcquire("alice");
-        assertFalse(io.release("bob"));      // wrong owner
+        assertFalse("non-owner release must return false", io.release("bob"));
         assertEquals(Optional.of("alice"), io.currentOwner());
-        assertTrue(io.release("alice"));
+        assertTrue("owner release must succeed", io.release("alice"));
         assertEquals(Optional.empty(), io.currentOwner());
     }
 
@@ -42,7 +51,17 @@ public class InputOwnershipTest {
         InputOwnership io = new InputOwnership();
         io.tryAcquire("alice");
         assertTrue(io.release("alice"));
-        assertFalse(io.release("alice"));    // already released
+        // second release: lease already null, compareAndSet("alice", null) returns false — no-op
+        assertFalse("double-release must return false (no-op)", io.release("alice"));
+        assertFalse("lease must remain free", io.currentOwner().isPresent());
+    }
+
+    @Test
+    public void releaseByNonOwnerDoesNotClearLease() {
+        InputOwnership io = new InputOwnership();
+        assertTrue(io.tryAcquire("alice"));
+        io.release("bob");   // no-op
+        assertTrue("alice still owns after non-owner release attempt", io.isOwner("alice"));
     }
 
     @Test
@@ -58,6 +77,23 @@ public class InputOwnershipTest {
     public void noOwnerInitially() {
         InputOwnership io = new InputOwnership();
         assertEquals(Optional.empty(), io.currentOwner());
-        assertFalse(io.isOwner("alice"));
+        assertFalse("isOwner returns false on empty lease", io.isOwner("alice"));
+    }
+
+    @Test
+    public void nullTokenOperationsAreSafe() {
+        // Regression for NPE: tryAcquire(null) / isOwner(null) / release(null) must
+        // all be defined and return false rather than throw.
+        InputOwnership io = new InputOwnership();
+        assertFalse("tryAcquire(null) must return false", io.tryAcquire(null));
+        assertFalse("isOwner(null) must return false on empty lease", io.isOwner(null));
+        assertFalse("release(null) must return false on empty lease", io.release(null));
+        assertFalse("lease still free after null operations", io.currentOwner().isPresent());
+
+        // Same with a held lease
+        assertTrue(io.tryAcquire("alice"));
+        assertFalse("isOwner(null) must return false even when held", io.isOwner(null));
+        assertFalse("release(null) must return false even when held", io.release(null));
+        assertEquals("lease still held by alice", Optional.of("alice"), io.currentOwner());
     }
 }

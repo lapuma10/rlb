@@ -52,8 +52,9 @@ public final class SequenceManager {
      *  so EDT/AWT-key callers don't touch Client state from the wrong thread. */
     private Consumer<Runnable> scheduler = Runnable::run;
 
+    // Optional input ownership — stored so they survive engine rebuilds.
     private InputOwnership inputOwnership;
-    private String inputOwnerToken;
+    private String ownerToken;
 
     private SequenceManager() {}
 
@@ -72,10 +73,28 @@ public final class SequenceManager {
     public void setEngine(SequenceEngine e) { this.engine = e; }
 
     public void setDispatcher(InputDispatcher d) { this.dispatcher = d; rebuildEngineIfReady(); }
-    public void setTelemetry(Telemetry t) { this.telemetry = t; rebuildEngineIfReady(); }
+    public void setTelemetry(Telemetry t) {
+        this.telemetry = t;
+        wirePlannerTelemetry();
+        rebuildEngineIfReady();
+    }
     public void setObserver(Observer o) { this.observer = o; rebuildEngineIfReady(); }
-    public void setPlanner(Planner p) { this.planner = p; rebuildEngineIfReady(); }
+    public void setPlanner(Planner p) {
+        this.planner = p;
+        wirePlannerTelemetry();
+        rebuildEngineIfReady();
+    }
     public void setBlackboard(Blackboard b) { this.blackboard = b; rebuildEngineIfReady(); }
+
+    /** Forward the current telemetry to the planner if it accepts one. Idempotent —
+     *  safe to call from any of the setters or the engine-rebuild path. Consolidates
+     *  what was previously three nearly-identical {@code if (planner instanceof PriorityPlanner pp ...)}
+     *  blocks. */
+    private void wirePlannerTelemetry() {
+        if (planner instanceof PriorityPlanner pp && telemetry != null) {
+            pp.setTelemetry(telemetry);
+        }
+    }
 
     private void rebuildEngineIfReady() {
         if (engine != null) return;   // explicit setEngine takes precedence
@@ -83,12 +102,10 @@ public final class SequenceManager {
             && telemetry != null && blackboard != null) {
             // Wire telemetry into the planner so canStart-rejection records reach
             // the ring buffer alongside step-lifecycle events.
-            if (planner instanceof PriorityPlanner pp) {
-                pp.setTelemetry(telemetry);
-            }
+            wirePlannerTelemetry();
             StateDrivenEngine sde = new StateDrivenEngine(observer, planner, dispatcher, telemetry, blackboard);
-            if (inputOwnership != null && inputOwnerToken != null) {
-                sde.setInputOwnership(inputOwnership, inputOwnerToken);
+            if (inputOwnership != null && ownerToken != null) {
+                sde.setInputOwnership(inputOwnership, ownerToken);
             }
             engine = sde;
         }
@@ -105,26 +122,33 @@ public final class SequenceManager {
     public void register(Step reactive)   { scheduler.accept(() -> engine.registerReactive(reactive)); }
     public void unregister(Step reactive) { scheduler.accept(() -> engine.unregisterReactive(reactive)); }
 
-    /** Scheduler-marshalled passthrough to {@link SequenceEngine#registerReactive(Step, int)}. */
+    /** Scheduler-marshalled passthrough to {@link SequenceEngine#registerReactive(Step, int)}.
+     *  The {@code priority} parameter is advisory documentation; selection still uses
+     *  {@link Step#priority()}. */
     public void registerReactive(Step reactive, int priority) {
         scheduler.accept(() -> engine.registerReactive(reactive, priority));
     }
 
-    /** Scheduler-marshalled passthrough to {@link SequenceEngine#clearReactives()}. */
+    /** Scheduler-marshalled passthrough to {@link SequenceEngine#clearReactives()}. Idempotent. */
     public void clearReactives() {
         scheduler.accept(() -> engine.clearReactives());
     }
 
-    /** Wire an input-ownership lease + token into the underlying engine. The
-     *  engine verifies the lease is held at the start of every tick; if not,
-     *  it fails the run with a typed diagnostic. Idempotent — set before
-     *  {@link #run(Step)} or after, but the lease must already exist for it
-     *  to take effect on the in-flight run. */
-    public void setInputOwnership(InputOwnership ownership, String ownerToken) {
+    /**
+     * Wire an input-ownership lease + token into the underlying engine. Stored
+     * here so it survives engine rebuilds. Forwarded to the engine immediately
+     * if the engine is already built.
+     *
+     * <p>The engine verifies the lease is held at the start of every tick; if
+     * not, it fails the run with a typed diagnostic. Idempotent — set before
+     * {@link #run(Step)} or after, but the lease must already exist for it to
+     * take effect on the in-flight run.
+     */
+    public void setInputOwnership(InputOwnership ownership, String token) {
         this.inputOwnership = ownership;
-        this.inputOwnerToken = ownerToken;
+        this.ownerToken = token;
         if (engine instanceof StateDrivenEngine sde) {
-            sde.setInputOwnership(ownership, ownerToken);
+            sde.setInputOwnership(ownership, token);
         }
     }
 

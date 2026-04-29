@@ -40,6 +40,15 @@ public final class LinearSequence extends CompositeStep {
 
     public LinearSequence(String name) { this.name = name; }
 
+    /** Convenience constructor that pre-populates children in order.
+     *  Equivalent to calling {@link #then(Step)} for each element of
+     *  {@code steps}. */
+    public LinearSequence(String name, List<Step> steps)
+    {
+        this.name = name;
+        if (steps != null) children.addAll(steps);
+    }
+
     public LinearSequence then(Step child) { children.add(child); return this; }
     public LinearSequence anchor(String anchorName) {
         anchors.put(anchorName, children.size());

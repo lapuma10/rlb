@@ -62,8 +62,16 @@ public final class GrandExchangeTab extends JPanel {
         add(buildBody(), BorderLayout.CENTER);
         add(buildFooter(), BorderLayout.SOUTH);
 
-        bankPrep.setEnabled(false);
-        bankPrep.setToolTipText("Available after sequence banking proof lands.");
+        // Phase B: bank-prep is enabled when the script was constructed with
+        // a BankActions impl. Otherwise leave it disabled with the original
+        // tooltip so users on a Phase-A-only build aren't confused.
+        if (script.bankPrepAvailable()) {
+            bankPrep.setEnabled(true);
+            bankPrep.setToolTipText("If checked, the bot opens a bank booth at the GE and withdraws coins (for buy) or items (for sell) before placing the offer.");
+        } else {
+            bankPrep.setEnabled(false);
+            bankPrep.setToolTipText("Available after sequence banking proof lands.");
+        }
 
         buyBtn.addActionListener(e -> onBuy());
         sellBtn.addActionListener(e -> onSell());
@@ -143,7 +151,9 @@ public final class GrandExchangeTab extends JPanel {
         try {
             BuyItemIntent intent = buildBuyIntent();
             if (script == null) { statusLabel.setText("script not wired"); return; }
-            boolean ok = script.startBuy(intent);
+            boolean ok = bankPrep.isSelected()
+                ? script.startBuyWithPrep(intent)
+                : script.startBuy(intent);
             statusLabel.setText(ok ? script.status() : ("rejected: " + script.status()));
         } catch (Exception ex) {
             statusLabel.setText("error: " + ex.getMessage());
@@ -155,7 +165,9 @@ public final class GrandExchangeTab extends JPanel {
         try {
             SellItemIntent intent = buildSellIntent();
             if (script == null) { statusLabel.setText("script not wired"); return; }
-            boolean ok = script.startSell(intent);
+            boolean ok = bankPrep.isSelected()
+                ? script.startSellWithPrep(intent)
+                : script.startSell(intent);
             statusLabel.setText(ok ? script.status() : ("rejected: " + script.status()));
         } catch (Exception ex) {
             statusLabel.setText("error: " + ex.getMessage());

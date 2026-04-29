@@ -13,6 +13,7 @@ import net.runelite.client.eventbus.Subscribe;
 import net.runelite.client.sequence.SequenceManager;
 import net.runelite.client.sequence.SequenceState;
 import net.runelite.client.sequence.Step;
+import net.runelite.client.sequence.activities.banking.BankActions;
 import net.runelite.client.sequence.activities.ge.BuyItemIntent;
 import net.runelite.client.sequence.activities.ge.GeActions;
 import net.runelite.client.sequence.activities.ge.GeInteraction;
@@ -49,24 +50,43 @@ public final class GrandExchangeScript {
     private final InputOwnership inputOwnership;
     private final WorldArea geArea;
     private final GeActions geActions;
+    /** Optional — set by Phase B integration once BankInteraction is wired.
+     *  null means bank-prep variants are not supported in this instance. */
+    private final BankActions bankActions;
 
     private SequenceManager geManager;          // lazy
     private final AtomicBoolean intentStartRequested = new AtomicBoolean();
     private final AtomicBoolean tickInFlight = new AtomicBoolean();
     private final AtomicReference<String> status = new AtomicReference<>("idle");
 
+    /** Phase A constructor — no bank-prep support. */
     public GrandExchangeScript(Client client,
                                ClientThread clientThread,
                                HumanizedInputDispatcher dispatcher,
                                InputOwnership inputOwnership,
                                WorldArea geArea) {
+        this(client, clientThread, dispatcher, inputOwnership, geArea, null);
+    }
+
+    /** Phase B constructor — pass a BankActions impl to enable bank-prep variants. */
+    public GrandExchangeScript(Client client,
+                               ClientThread clientThread,
+                               HumanizedInputDispatcher dispatcher,
+                               InputOwnership inputOwnership,
+                               WorldArea geArea,
+                               BankActions bankActions) {
         this.client = client;
         this.clientThread = clientThread;
         this.dispatcher = dispatcher;
         this.inputOwnership = inputOwnership;
         this.geArea = geArea;
         this.geActions = new GeInteraction(client, clientThread, dispatcher);
+        this.bankActions = bankActions;
     }
+
+    /** True iff this script was constructed with a {@link BankActions} impl,
+     *  enabling {@link #startBuyWithPrep} / {@link #startSellWithPrep}. */
+    public boolean bankPrepAvailable() { return bankActions != null; }
 
     // ─── Public API (called from RecorderPanel buttons) ─────────────────
 
@@ -82,6 +102,35 @@ public final class GrandExchangeScript {
         if (intent == null) return false;
         return startPlan(GrandExchangeSequenceFactory.sellCore(intent, geArea, geActions),
             "sell " + intent.quantity() + "x " + intent.displayName() + " @ "
+                + ((net.runelite.client.sequence.activities.ge.PricePolicy.Exact)
+                    intent.pricePolicy()).coinsEach());
+    }
+
+    /** Phase B: buy with bank-prep — withdraws coins from a bank booth at
+     *  the GE first, then runs the GE Core buy sequence. Requires a
+     *  {@link BankActions} impl to have been provided at construction time. */
+    public boolean startBuyWithPrep(BuyItemIntent intent) {
+        if (intent == null) return false;
+        if (bankActions == null) {
+            status.set("bank-prep unavailable: BankActions not wired");
+            return false;
+        }
+        return startPlan(GrandExchangeSequenceFactory.buyWithBankPrep(intent, geArea, bankActions, geActions),
+            "buy-with-prep " + intent.quantity() + "x " + intent.displayName() + " @ "
+                + ((net.runelite.client.sequence.activities.ge.PricePolicy.Exact)
+                    intent.pricePolicy()).coinsEach());
+    }
+
+    /** Phase B: sell with bank-prep — withdraws the sell items from a bank
+     *  booth at the GE first, then runs the GE Core sell sequence. */
+    public boolean startSellWithPrep(SellItemIntent intent) {
+        if (intent == null) return false;
+        if (bankActions == null) {
+            status.set("bank-prep unavailable: BankActions not wired");
+            return false;
+        }
+        return startPlan(GrandExchangeSequenceFactory.sellWithBankPrep(intent, geArea, bankActions, geActions),
+            "sell-with-prep " + intent.quantity() + "x " + intent.displayName() + " @ "
                 + ((net.runelite.client.sequence.activities.ge.PricePolicy.Exact)
                     intent.pricePolicy()).coinsEach());
     }

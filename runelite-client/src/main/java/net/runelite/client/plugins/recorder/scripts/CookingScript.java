@@ -1,8 +1,10 @@
 package net.runelite.client.plugins.recorder.scripts;
 
+import java.util.List;
 import java.util.concurrent.ThreadLocalRandom;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.Supplier;
 import lombok.extern.slf4j.Slf4j;
@@ -12,13 +14,22 @@ import net.runelite.api.coords.WorldArea;
 import net.runelite.api.coords.WorldPoint;
 import net.runelite.api.gameval.ItemID;
 import net.runelite.client.callback.ClientThread;
+import net.runelite.client.plugins.recorder.RecorderConfig;
 import net.runelite.client.plugins.recorder.cook.CookingFood;
 import net.runelite.client.plugins.recorder.cook.CookingInteraction;
 import net.runelite.client.plugins.recorder.cook.CookingLocation;
 import net.runelite.client.plugins.recorder.farm.BankInteraction;
 import net.runelite.client.plugins.recorder.transport.TransportResolver;
 import net.runelite.client.plugins.recorder.walker.UniversalWalker;
+import net.runelite.client.sequence.SequenceState;
+import net.runelite.client.sequence.SequenceManager;
+import net.runelite.client.sequence.Step;
+import net.runelite.client.sequence.activities.banking.BankingSequenceFactory;
+import net.runelite.client.sequence.activities.banking.BankingSequencePlan;
 import net.runelite.client.sequence.dispatch.HumanizedInputDispatcher;
+import net.runelite.client.sequence.dispatch.InputOwnership;
+import net.runelite.client.sequence.internal.ClientObserver;
+import net.runelite.client.sequence.telemetry.TelemetryRecord;
 
 /**
  * Cooking bot script.
@@ -106,7 +117,10 @@ public final class CookingScript
     public enum State
     {
         IDLE,
-        BANKING,
+        /** Legacy hand-coded banking flow. */
+        BANKING_LEGACY,
+        /** Banking via the sequence engine (experimental; gated by config.useEngineBanking()). */
+        BANKING_VIA_ENGINE,
         WALK_TO_COOK,
         LIGHTING_FIRE,
         COOKING,
@@ -114,12 +128,32 @@ public final class CookingScript
         ABORTED
     }
 
+    /** Owner token for the sequence-engine banking path. */
+    static final String OWNER_TOKEN = "cooking-banking";
+
     private final Client client;
     private final ClientThread clientThread;
     private final HumanizedInputDispatcher dispatcher;
+    private final RecorderConfig config;
+    private final InputOwnership inputOwnership;
     private final UniversalWalker walker;
     private final BankInteraction bank;
     private final CookingInteraction cook;
+
+    // ── Engine-banking fields ────────────────────────────────────────
+    /** Lazily built on first BANKING_VIA_ENGINE entry. */
+    private SequenceManager bankingManager;
+    /** True while a bankingManager.run() call is pending / in-flight.
+     *  Prevents a second run() before the engine transitions to RUNNING. */
+    private final AtomicBoolean bankingStartRequested = new AtomicBoolean();
+    /** Guards scheduleEngineTick() against double-scheduling within one
+     *  script tick when the engine is still RUNNING. */
+    private final AtomicBoolean tickInFlight = new AtomicBoolean();
+    /** Wall-clock millis when {@link #tickInFlight} was last latched true.
+     *  Watchdog: if a tick has been "in flight" for more than 30s the engine
+     *  is wedged (a step's onStart / check threw and never released the
+     *  flag); force-reset and log so the next tick can proceed. */
+    private final AtomicLong tickInFlightStartMs = new AtomicLong();
 
     private final AtomicReference<CookingLocation> location = new AtomicReference<>();
     private final AtomicInteger rawFoodId = new AtomicInteger(0);
@@ -211,11 +245,15 @@ public final class CookingScript
 
     public CookingScript(Client client, ClientThread clientThread,
                          HumanizedInputDispatcher dispatcher,
-                         TransportResolver resolver)
+                         TransportResolver resolver,
+                         RecorderConfig config,
+                         InputOwnership inputOwnership)
     {
         this.client = client;
         this.clientThread = clientThread;
         this.dispatcher = dispatcher;
+        this.config = config;
+        this.inputOwnership = inputOwnership;
         this.walker = new UniversalWalker(client, clientThread, dispatcher, resolver);
         this.bank = new BankInteraction(client, clientThread, dispatcher);
         this.cook = new CookingInteraction(client, clientThread, dispatcher);
@@ -301,7 +339,7 @@ public final class CookingScript
             // tinderbox + raw food are sufficient before walking to
             // cook. The banking pass is idempotent.
             status.set("starting at bank");
-            return State.BANKING;
+            return bankingState();
         }
         if (atCook && raw > 0)
         {
@@ -343,14 +381,15 @@ public final class CookingScript
                 }
                 switch (state.get())
                 {
-                    case BANKING:        tickBanking();        break;
-                    case WALK_TO_COOK:   tickWalk(true);       break;
-                    case LIGHTING_FIRE:  tickLightingFire();   break;
-                    case COOKING:        tickCooking();        break;
-                    case WALK_TO_BANK:   tickWalk(false);      break;
+                    case BANKING_LEGACY:     tickBankingLegacy();     break;
+                    case BANKING_VIA_ENGINE: tickBankingViaEngine();  break;
+                    case WALK_TO_COOK:       tickWalk(true);          break;
+                    case LIGHTING_FIRE:      tickLightingFire();      break;
+                    case COOKING:            tickCooking();           break;
+                    case WALK_TO_BANK:       tickWalk(false);         break;
                     case ABORTED:
                     case IDLE:
-                    default:             running.set(false);   break;
+                    default:                 running.set(false);      break;
                 }
                 Thread.sleep(TICK_MS);
             }
@@ -381,8 +420,12 @@ public final class CookingScript
      *       WALK_TO_COOK.</li>
      * </ol>
      * Paced at ≥ {@link #BANK_PACE_MS} between any two dispatches.
+     *
+     * @deprecated Use {@link #tickBankingViaEngine()} when
+     *     {@code config.useEngineBanking()} is enabled.
      */
-    private void tickBanking() throws InterruptedException
+    @Deprecated
+    private void tickBankingLegacy() throws InterruptedException
     {
         CookingLocation l = location.get();
         if (!playerInArea(l.bankArea()))
@@ -438,7 +481,7 @@ public final class CookingScript
             bankOpenedAtMs = 0L;
             status.set("bank: opening");
             dispatcher.lastErrorMessage();   // clear pre-existing error
-            boolean clicked = bank.clickBankBoothRandom();
+            boolean clicked = bank.tryClickBankBoothRandom();
             if (clicked)
             {
                 lastBankActionAtMs = now;
@@ -492,7 +535,7 @@ public final class CookingScript
         if (depositId > 0)
         {
             status.set("bank: deposit-all item " + depositId);
-            if (bank.depositAll(depositId))
+            if (bank.tryDepositAll(depositId))
             {
                 lastBankActionAtMs = now;
                 lastInventoryChangeAtMs = now;
@@ -554,7 +597,7 @@ public final class CookingScript
                 return;
             }
             status.set("bank: withdrawing tinderbox");
-            if (bank.withdrawOne(ItemID.TINDERBOX))
+            if (bank.tryWithdrawOne(ItemID.TINDERBOX))
             {
                 lastBankActionAtMs = now;
                 bankFailCount = 0;
@@ -574,7 +617,7 @@ public final class CookingScript
             }
             status.set("bank: withdrawing raw food"
                 + (takeRawFirst ? " (visible — taking before tinderbox)" : ""));
-            if (bank.withdrawAll(rawId))
+            if (bank.tryWithdrawAll(rawId))
             {
                 lastBankActionAtMs = now;
                 bankFailCount = 0;
@@ -585,7 +628,7 @@ public final class CookingScript
 
         // Inventory is ready — close bank and head out.
         status.set("bank: closing");
-        if (bank.closeBank())
+        if (bank.tryCloseBank())
         {
             lastBankActionAtMs = now;
             bankFailCount = 0;
@@ -618,7 +661,7 @@ public final class CookingScript
         try
         {
             Boolean isOpen = onClient(bank::isBankOpen);
-            if (Boolean.TRUE.equals(isOpen)) bank.closeBank();
+            if (Boolean.TRUE.equals(isOpen)) bank.tryCloseBank();
         }
         catch (Throwable th)
         {
@@ -630,6 +673,247 @@ public final class CookingScript
     {
         status.set(s);
         setState(State.ABORTED);
+    }
+
+    // ────────────────────────────────────────────────────────────────
+    // BANKING_VIA_ENGINE
+    // ────────────────────────────────────────────────────────────────
+
+    /**
+     * Engine-backed banking flow. Delegates the full open → deposit → withdraw →
+     * verify → close pipeline to the sequence engine via
+     * {@link BankingSequenceFactory#prepareCookingLoadout}.
+     *
+     * <p>State machine on {@link SequenceState}:
+     * <ul>
+     *   <li>IDLE (never started / just completed) → build plan, acquire lease, start engine.</li>
+     *   <li>RUNNING → schedule an engine tick; update status from telemetry.</li>
+     *   <li>FAILED → release lease, abort script.</li>
+     *   <li>PAUSED → no-op (engine resumes externally or on next lease check).</li>
+     * </ul>
+     */
+    private void tickBankingViaEngine() throws InterruptedException
+    {
+        CookingLocation l = location.get();
+        if (!playerInArea(l.bankArea()))
+        {
+            setState(State.WALK_TO_BANK);
+            return;
+        }
+
+        // Lazy-build the manager once and reuse across ticks.
+        if (bankingManager == null)
+        {
+            bankingManager = buildBankingManager();
+        }
+
+        SequenceState engineState = bankingManager.state();
+
+        switch (engineState)
+        {
+            case IDLE:
+            {
+                // IDLE can mean two things:
+                //  (a) Never started yet — bankingStartRequested is false and
+                //      we haven't seen a RUNNING state this visit.
+                //  (b) Just completed (RUNNING → IDLE on success) — detected by
+                //      bankingStartRequested having been cleared by the RUNNING branch
+                //      on the previous tick but the engine not having transitioned to
+                //      FAILED.  We distinguish via the inputOwnership lease: if we
+                //      still hold the lease after clearing bankingStartRequested,
+                //      that means a run completed successfully.
+                if (bankingStartRequested.get())
+                {
+                    // run() dispatched but not yet processed — wait.
+                    return;
+                }
+                if (inputOwnership.isOwner(OWNER_TOKEN))
+                {
+                    // We hold the lease but engine is IDLE → completed successfully.
+                    releaseLeaseLogged();
+                    setState(State.WALK_TO_COOK);
+                    return;
+                }
+
+                // Initial state: acquire lease and start the engine.
+                if (!inputOwnership.tryAcquire(OWNER_TOKEN))
+                {
+                    status.set("bank-engine: waiting for input lease");
+                    return;
+                }
+
+                // Build the plan.
+                CookingFood.Entry food = CookingFood.byRawId(rawFoodId.get());
+                if (food == null)
+                {
+                    releaseLeaseLogged();
+                    abortWithStatus("bank-engine: unknown food id=" + rawFoodId.get());
+                    return;
+                }
+                boolean needsTinderbox =
+                    l.kind() == CookingLocation.SourceKind.FIRE_FROM_LOGS;
+                BankingSequencePlan plan = BankingSequenceFactory.prepareCookingLoadout(
+                    l, food, needsTinderbox, bank);
+
+                // Register reactives, then start the root.
+                bankingManager.clearReactives();
+                for (Step r : plan.reactiveSteps())
+                {
+                    bankingManager.registerReactive(r, 200);
+                }
+
+                bankingStartRequested.set(true);
+                try
+                {
+                    bankingManager.run(plan.root());
+                }
+                catch (Throwable t)
+                {
+                    // run() threw before the engine could accept the step —
+                    // release lease and allow a retry next tick.
+                    releaseLeaseLogged();
+                    bankingStartRequested.set(false);
+                    throw t;
+                }
+                status.set("bank-engine: started");
+                break;
+            }
+
+            case RUNNING:
+            {
+                // Clear the in-flight start guard once we see RUNNING.
+                bankingStartRequested.set(false);
+                scheduleEngineTick();
+                // Surface the most recent telemetry record as status.
+                String last = readLastTelemetry(bankingManager);
+                if (last != null) status.set("bank-engine: " + last);
+                break;
+            }
+
+            case FAILED:
+            {
+                bankingStartRequested.set(false);
+                releaseLeaseLogged();
+                String reason = lastFailureReason(bankingManager);
+                abortWithStatus("bank-engine failed: " + (reason != null ? reason : "unknown"));
+                break;
+            }
+
+            case PAUSED:
+                // Engine paused externally — do nothing, wait for resume.
+                break;
+
+            default:
+                break;
+        }
+    }
+
+    /**
+     * Build a fresh {@link SequenceManager} wired for production banking.
+     * Called once lazily on the first entry to BANKING_VIA_ENGINE.
+     *
+     * <p><b>Threading:</b> the manager's scheduler is {@code Runnable::run} so
+     * {@code run/pause/stop/register*} all execute synchronously on the calling
+     * (daemon worker) thread. {@link #scheduleEngineTick()} then drives
+     * {@link net.runelite.client.sequence.SequenceEngine#advanceTick()} directly
+     * on the daemon thread — {@link ClientObserver} marshals its client reads
+     * via {@link ClientThread#invokeLater} + latch internally. This avoids the
+     * client-thread deadlock that would otherwise occur when a step's onStart
+     * (e.g. {@link BankInteraction#depositAll}) tries to hop back to the client
+     * thread while the engine itself is blocking the client thread on a snapshot.
+     */
+    private SequenceManager buildBankingManager()
+    {
+        SequenceManager m = SequenceManager.withDefaults();
+        m.setObserver(new ClientObserver(client, clientThread));
+        m.setDispatcher(dispatcher);
+        m.setScheduler(Runnable::run);
+        m.setInputOwnership(inputOwnership, OWNER_TOKEN);
+        return m;
+    }
+
+    /**
+     * Drive one engine tick on the calling (daemon worker) thread. Guards
+     * against re-entry via {@link #tickInFlight}; if the flag has been latched
+     * for more than 30s a wedged tick is assumed and the flag is force-reset
+     * (best-effort recovery — caller will retry next iteration).
+     */
+    private void scheduleEngineTick()
+    {
+        long now = System.currentTimeMillis();
+        if (!tickInFlight.compareAndSet(false, true))
+        {
+            long stuckFor = now - tickInFlightStartMs.get();
+            if (stuckFor > 30_000)
+            {
+                log.warn("cook bank-engine: tick in flight for {}ms — force-resetting watchdog", stuckFor);
+                tickInFlight.set(false);
+            }
+            return;
+        }
+        tickInFlightStartMs.set(now);
+        try
+        {
+            if (bankingManager != null)
+            {
+                bankingManager.getEngine().advanceTick();
+            }
+        }
+        catch (Throwable t)
+        {
+            log.warn("cook bank-engine: advanceTick threw", t);
+        }
+        finally
+        {
+            tickInFlight.set(false);
+        }
+    }
+
+    /**
+     * Release the banking input lease and warn-log if release returns false.
+     * False indicates the lease was not held by us at the moment of release —
+     * either it was never acquired or another holder claimed it (which would
+     * be a logic bug worth seeing in the log). Centralized so all four
+     * release sites observe the return value uniformly.
+     */
+    private void releaseLeaseLogged()
+    {
+        if (!inputOwnership.release(OWNER_TOKEN))
+        {
+            log.warn("cook bank-engine: failed to release lease (current owner={})",
+                inputOwnership.currentOwner().orElse("none"));
+        }
+    }
+
+    /**
+     * Return a one-line summary from the most recent telemetry record, or
+     * {@code null} if the ring buffer is empty.
+     */
+    private static String readLastTelemetry(SequenceManager m)
+    {
+        List<TelemetryRecord> tail = m.getTelemetry().tail(1);
+        if (tail.isEmpty()) return null;
+        TelemetryRecord r = tail.get(0);
+        return r.event() + " " + r.stepName()
+            + (r.payload() != null && !r.payload().isEmpty() ? ": " + r.payload() : "");
+    }
+
+    /**
+     * Return the failure payload from the most recent FAILED telemetry record,
+     * or {@code null} if none is found in the last 20 records.
+     */
+    private static String lastFailureReason(SequenceManager m)
+    {
+        List<TelemetryRecord> tail = m.getTelemetry().tail(20);
+        for (int i = tail.size() - 1; i >= 0; i--)
+        {
+            TelemetryRecord r = tail.get(i);
+            if (r.event() == TelemetryRecord.Event.FAILED)
+            {
+                return r.stepName() + ": " + r.payload();
+            }
+        }
+        return null;
     }
 
     // ────────────────────────────────────────────────────────────────
@@ -653,7 +937,7 @@ public final class CookingScript
                 }
                 else
                 {
-                    setState(State.BANKING);
+                    setState(bankingState());
                 }
                 break;
             case STUCK:
@@ -1101,6 +1385,12 @@ public final class CookingScript
         return p.getPlane() == a.getPlane()
             && p.getX() >= a.getX() && p.getX() < a.getX() + a.getWidth()
             && p.getY() >= a.getY() && p.getY() < a.getY() + a.getHeight();
+    }
+
+    /** Returns BANKING_VIA_ENGINE or BANKING_LEGACY depending on config. */
+    private State bankingState()
+    {
+        return config.useEngineBanking() ? State.BANKING_VIA_ENGINE : State.BANKING_LEGACY;
     }
 
     private void setState(State s)

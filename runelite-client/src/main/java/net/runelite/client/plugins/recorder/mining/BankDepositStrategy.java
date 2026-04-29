@@ -225,7 +225,7 @@ public final class BankDepositStrategy implements BankingStrategy
                     openedAtMs = now;
                 }
                 dispatcher.lastErrorMessage();   // clear
-                if (bank.clickBankBoothRandom())
+                if (bank.tryClickBankBoothRandom())
                 {
                     lastDispatch = now;
                     failCount = 0;
@@ -291,7 +291,7 @@ public final class BankDepositStrategy implements BankingStrategy
                     pickaxeDone = true;
                     continue;
                 }
-                if (bank.withdrawOne(pickaxeItemId))
+                if (bank.tryWithdrawOne(pickaxeItemId))
                 {
                     lastDispatch = now;
                     pickaxeDone = true;
@@ -306,7 +306,7 @@ public final class BankDepositStrategy implements BankingStrategy
             }
 
             // 5) Close bank.
-            if (bank.closeBank()) lastDispatch = now;
+            if (bank.tryCloseBank()) lastDispatch = now;
             // Wait one cycle for the close to flush.
             Thread.sleep(WALK_TICK_MS);
             Boolean stillOpenBoxed = onClient(bank::isBankOpen);
@@ -335,7 +335,7 @@ public final class BankDepositStrategy implements BankingStrategy
         try
         {
             Boolean isOpen = onClient(bank::isBankOpen);
-            if (Boolean.TRUE.equals(isOpen)) bank.closeBank();
+            if (Boolean.TRUE.equals(isOpen)) bank.tryCloseBank();
         }
         catch (Throwable th) { log.warn("BankDepositStrategy: closeBank threw", th); }
     }

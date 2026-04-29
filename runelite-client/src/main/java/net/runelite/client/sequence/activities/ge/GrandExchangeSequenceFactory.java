@@ -1,11 +1,18 @@
 package net.runelite.client.sequence.activities.ge;
 
+import java.util.HashSet;
 import java.util.List;
 import java.util.Set;
 import net.runelite.api.coords.WorldArea;
 import net.runelite.api.gameval.InterfaceID;
 import net.runelite.client.sequence.Step;
 import net.runelite.client.sequence.activities.EnsureNoBlockingInterfaceStep;
+import net.runelite.client.sequence.activities.banking.BankActions;
+import net.runelite.client.sequence.activities.banking.CloseBankStep;
+import net.runelite.client.sequence.activities.banking.OpenBankStep;
+import net.runelite.client.sequence.activities.banking.WaitForBankReadyStep;
+import net.runelite.client.sequence.activities.banking.WithdrawItemStep;
+import net.runelite.client.sequence.activities.banking.WithdrawQuantity;
 import net.runelite.client.sequence.composite.LinearSequence;
 import net.runelite.client.sequence.views.OfferSide;
 
@@ -21,14 +28,28 @@ import net.runelite.client.sequence.views.OfferSide;
  */
 public final class GrandExchangeSequenceFactory {
 
-    /** Allow-list of widget root ids that the reactive
-     *  {@link EnsureNoBlockingInterfaceStep} treats as "expected" rather than
-     *  blockers to dismiss. Phase A: GE-only. Phase B will add
-     *  {@code Bankmain.UNIVERSE}. */
+    /** Allow-list of widget root ids the GE-Core reactive treats as expected
+     *  (not blockers). */
     public static final Set<Integer> GE_ROOTS = Set.of(
         InterfaceID.GeOffers.UNIVERSE,
         InterfaceID.GeCollect.UNIVERSE
     );
+
+    /** Bank-Phase-B reactive allow-list adds the bank widget so the reactive
+     *  doesn't try to dismiss the bank itself while WithdrawItemStep is
+     *  running. */
+    public static final Set<Integer> BANK_ROOTS = Set.of(
+        InterfaceID.Bankmain.UNIVERSE
+    );
+
+    /** Combined allow-list for bank-prep variants: GE roots + bank root. */
+    private static final Set<Integer> GE_AND_BANK_ROOTS = unionOf(GE_ROOTS, BANK_ROOTS);
+
+    private static Set<Integer> unionOf(Set<Integer> a, Set<Integer> b) {
+        Set<Integer> out = new HashSet<>(a);
+        out.addAll(b);
+        return Set.copyOf(out);
+    }
 
     private GrandExchangeSequenceFactory() {}
 
@@ -112,5 +133,103 @@ public final class GrandExchangeSequenceFactory {
     private static int exactPrice(PricePolicy p) {
         if (p instanceof PricePolicy.Exact e) return e.coinsEach();
         throw new UnsupportedOperationException("only PricePolicy.Exact is supported in this proof");
+    }
+
+    // ─── Phase B: bank-prep variants ────────────────────────────────────────
+
+    /** OSRS coin item id (used for the buy-side bank withdraw). */
+    private static final int COINS_ITEM_ID = 995;
+
+    /**
+     * Buy with bank prep: withdraw coins from a bank booth at the GE first,
+     * then run the GE Core buy sequence. Player must already be in
+     * {@code geArea} (covers the bank booths inside the GE).
+     */
+    public static GrandExchangeSequencePlan buyWithBankPrep(
+            BuyItemIntent intent,
+            WorldArea geArea,
+            BankActions bank,
+            GeActions ge) {
+        if (intent == null) throw new IllegalArgumentException("intent must not be null");
+        if (geArea == null) throw new IllegalArgumentException("geArea must not be null");
+        if (bank == null)   throw new IllegalArgumentException("BankActions must not be null");
+        if (ge == null)     throw new IllegalArgumentException("GeActions must not be null");
+
+        int priceEach = exactPrice(intent.pricePolicy());
+        long totalCost = (long) intent.quantity() * (long) priceEach;
+        if (totalCost > Integer.MAX_VALUE) {
+            throw new IllegalArgumentException(
+                "totalCost overflows int: " + intent.quantity() + " * " + priceEach);
+        }
+        int totalCostInt = (int) totalCost;
+
+        Step createOffer = new LinearSequence("CreateBuyOffer")
+            .then(new StartOfferStep(OfferSide.BUY, ge))
+            .then(new SelectItemStep(intent.itemId(), intent.displayName(), ge))
+            .then(new SetQuantityStep(intent.quantity(), ge))
+            .then(new SetPriceStep(priceEach, ge))
+            .then(new ConfirmOfferStep(intent.itemId(), OfferSide.BUY, intent.quantity(), priceEach, ge));
+
+        Step root = new LinearSequence("BuyItemAtGEWithBankPrep")
+            .then(new EnsureAtGrandExchangeStep(geArea))
+            // Bank sub-flow
+            .then(new OpenBankStep(Set.of(), bank))
+            .then(new WaitForBankReadyStep())
+            .then(new WithdrawItemStep(COINS_ITEM_ID, new WithdrawQuantity.AtLeast(totalCostInt), bank))
+            .then(new CloseBankStep(bank))
+            // GE Core sub-flow
+            .then(new OpenGrandExchangeStep(ge))
+            .then(new EnsureInventoryForBuyStep(intent.quantity(), priceEach))
+            .then(new EnsureNoConflictingOfferStep(intent.itemId(), OfferSide.BUY))
+            .then(createOffer)
+            .then(new WaitForOfferStep(intent.waitPolicy()))
+            .then(new CollectOfferStep(ge));
+
+        // Reactive needs to allow BOTH bank and GE roots so it doesn't try to
+        // dismiss whichever interface is open during the active sub-flow.
+        List<Step> reactives = List.of(new EnsureNoBlockingInterfaceStep(GE_AND_BANK_ROOTS));
+        return new GrandExchangeSequencePlan(root, reactives);
+    }
+
+    /**
+     * Sell with bank prep: withdraw the sell items from a bank booth at the
+     * GE first, then run the GE Core sell sequence.
+     */
+    public static GrandExchangeSequencePlan sellWithBankPrep(
+            SellItemIntent intent,
+            WorldArea geArea,
+            BankActions bank,
+            GeActions ge) {
+        if (intent == null) throw new IllegalArgumentException("intent must not be null");
+        if (geArea == null) throw new IllegalArgumentException("geArea must not be null");
+        if (bank == null)   throw new IllegalArgumentException("BankActions must not be null");
+        if (ge == null)     throw new IllegalArgumentException("GeActions must not be null");
+
+        int priceEach = exactPrice(intent.pricePolicy());
+
+        Step createOffer = new LinearSequence("CreateSellOffer")
+            .then(new StartOfferStep(OfferSide.SELL, ge))
+            .then(new SelectItemStep(intent.itemId(), intent.displayName(), ge))
+            .then(new SetQuantityStep(intent.quantity(), ge))
+            .then(new SetPriceStep(priceEach, ge))
+            .then(new ConfirmOfferStep(intent.itemId(), OfferSide.SELL, intent.quantity(), priceEach, ge));
+
+        Step root = new LinearSequence("SellItemAtGEWithBankPrep")
+            .then(new EnsureAtGrandExchangeStep(geArea))
+            // Bank sub-flow — withdraw the sell items.
+            .then(new OpenBankStep(Set.of(), bank))
+            .then(new WaitForBankReadyStep())
+            .then(new WithdrawItemStep(intent.itemId(), new WithdrawQuantity.AtLeast(intent.quantity()), bank))
+            .then(new CloseBankStep(bank))
+            // GE Core sub-flow
+            .then(new OpenGrandExchangeStep(ge))
+            .then(new EnsureInventoryForSellStep(intent.itemId(), intent.quantity()))
+            .then(new EnsureNoConflictingOfferStep(intent.itemId(), OfferSide.SELL))
+            .then(createOffer)
+            .then(new WaitForOfferStep(intent.waitPolicy()))
+            .then(new CollectOfferStep(ge));
+
+        List<Step> reactives = List.of(new EnsureNoBlockingInterfaceStep(GE_AND_BANK_ROOTS));
+        return new GrandExchangeSequencePlan(root, reactives);
     }
 }

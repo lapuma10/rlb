@@ -76,4 +76,19 @@ public final class ScopedBlackboard implements Blackboard {
     public void clear(BlackboardScope scope) {
         stores.get(scope).clear();
     }
+
+    @Override
+    public Map<BlackboardKey<?>, Object> snapshot(BlackboardScope scope) {
+        // Defensive copy — callers must be free to mutate the scope after snapshotting.
+        return new HashMap<>(stores.get(scope));
+    }
+
+    @Override
+    public void restore(BlackboardScope scope, Map<BlackboardKey<?>, Object> snap) {
+        Map<BlackboardKey<?>, Object> store = stores.get(scope);
+        store.clear();
+        if (snap != null && !snap.isEmpty()) {
+            store.putAll(snap);
+        }
+    }
 }

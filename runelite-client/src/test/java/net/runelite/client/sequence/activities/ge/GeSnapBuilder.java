@@ -140,7 +140,11 @@ public final class GeSnapBuilder {
     private record BuiltInteractionView(
         InteractionMode mode, boolean worldInteractionAvailable, boolean movementAvailable,
         Optional<BlockingInterface> blockingInterface
-    ) implements InteractionView {}
+    ) implements InteractionView {
+        @Override public net.runelite.client.sequence.affordance.AffordanceReport affordances() {
+            return net.runelite.client.sequence.affordance.AffordanceReport.allAllowed();
+        }
+    }
 
     private record BuiltGrandExchangeView(
         boolean open, boolean offerSetupOpen, boolean collectOpen,

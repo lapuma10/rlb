@@ -1,8 +1,9 @@
 package net.runelite.client.sequence.affordance;
 
 /**
- * Description of a blocking interface (modal, dialog, full-screen widget, …)
- * that prevents normal world interaction.
+ * Snapshot of a blocking UI interface — e.g. a dialog, the bank widget, a right-click menu.
+ * Used by {@link BlockReason.WorldInteractionBlocked} and
+ * {@link net.runelite.client.sequence.views.InteractionView}.
  *
  * <p>{@code rootWidgetId} identifies the topmost widget that, when visible,
  * indicates this interface is up. Steps consult the id against allow-lists

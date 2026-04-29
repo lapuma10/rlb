@@ -36,6 +36,10 @@ public final class CookingLocation
      *  same way but have distinct ids — locations that pick a tier
      *  set this to the matching {@code ItemID} constant. */
     private final int groundLogsItemId;
+    /** {@code ObjectID} constants for the bank booths at this location.
+     *  Used by the sequence-engine banking steps to find a booth to click
+     *  when the NPC scan finds no bankers.  Empty array = NPC-only location. */
+    private final int[] bankBoothIds;
 
     private CookingLocation(Builder b)
     {
@@ -47,6 +51,7 @@ public final class CookingLocation
         this.cookToBank = b.cookToBank;
         this.heatSourceName = b.heatSourceName;
         this.groundLogsItemId = b.groundLogsItemId;
+        this.bankBoothIds = b.bankBoothIds.clone();
     }
 
     public String label() { return label; }
@@ -57,6 +62,8 @@ public final class CookingLocation
     public PathSpec cookToBank() { return cookToBank; }
     public String heatSourceName() { return heatSourceName; }
     public int groundLogsItemId() { return groundLogsItemId; }
+    /** Defensive copy of the bank-booth ObjectID array. */
+    public int[] bankBoothIds() { return bankBoothIds.clone(); }
 
     public static Builder builder() { return new Builder(); }
 
@@ -72,6 +79,7 @@ public final class CookingLocation
         private PathSpec cookToBank;
         private String heatSourceName;
         private int groundLogsItemId;
+        private int[] bankBoothIds = new int[0];
 
         public Builder label(String s) { this.label = s; return this; }
         public Builder kind(SourceKind k) { this.kind = k; return this; }
@@ -81,6 +89,7 @@ public final class CookingLocation
         public Builder cookToBank(PathSpec p) { this.cookToBank = p; return this; }
         public Builder heatSourceName(String s) { this.heatSourceName = s; return this; }
         public Builder groundLogsItemId(int id) { this.groundLogsItemId = id; return this; }
+        public Builder bankBoothIds(int... ids) { this.bankBoothIds = ids == null ? new int[0] : ids; return this; }
 
         public CookingLocation build()
         {

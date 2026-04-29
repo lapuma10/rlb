@@ -24,6 +24,7 @@
  */
 package net.runelite.client.sequence.blackboard;
 
+import java.util.Map;
 import java.util.Optional;
 
 public interface Blackboard {
@@ -32,4 +33,23 @@ public interface Blackboard {
     <T> void remove(BlackboardKey<T> key);
     Blackboard scope(BlackboardScope scope);
     void clear(BlackboardScope scope);
+
+    /**
+     * Snapshot the contents of {@code scope} into an opaque map. Callers must
+     * treat the returned map as opaque — keys are typed internally and the
+     * map is intended to be passed back to {@link #restore(BlackboardScope, Map)}.
+     *
+     * <p>Implementations should return a defensive copy so subsequent
+     * {@link #put}/{@link #remove}/{@link #clear} calls do not mutate it.
+     */
+    Map<BlackboardKey<?>, Object> snapshot(BlackboardScope scope);
+
+    /**
+     * Replace the contents of {@code scope} with the given map (which must be
+     * the result of an earlier {@link #snapshot(BlackboardScope)} call on the
+     * same {@link Blackboard} instance — passing a foreign map is undefined).
+     *
+     * <p>Existing keys in the scope are cleared before the snapshot is applied.
+     */
+    void restore(BlackboardScope scope, Map<BlackboardKey<?>, Object> snapshot);
 }

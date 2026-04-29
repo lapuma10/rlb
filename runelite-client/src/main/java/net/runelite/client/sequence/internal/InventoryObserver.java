@@ -10,65 +10,72 @@ import net.runelite.client.sequence.views.InventoryView;
 import net.runelite.client.sequence.views.ItemStack;
 
 /**
- * Reads {@link InventoryID#INV} on the client thread to produce an
- * immutable {@link InventoryView} snapshot. Caller marshals onto the client
- * thread via the engine's observer pipeline.
+ * Per-tick observer for the player's inventory container.
+ * Tracks content hash to detect changes and report {@link #lastChangeTick()}.
+ *
+ * <p>All client reads happen on the caller's thread — callers must be on the
+ * client thread (same invariant as {@link ClientObserver}).
  */
-public final class InventoryObserver {
-
-    private static final int INVENTORY_SIZE = 28;
-
+final class InventoryObserver {
     private final Client client;
 
-    public InventoryObserver(Client client) {
+    private long prevHash = Long.MIN_VALUE;
+    private int lastChangeTick = -1;
+
+    InventoryObserver(Client client) {
         this.client = client;
     }
 
-    public InventoryView read(int tick) {
-        ItemContainer inv = client.getItemContainer(InventoryID.INV);
-        if (inv == null) return InventoryView.empty();
-
-        Item[] raw = inv.getItems();
-        if (raw == null) return InventoryView.empty();
-
-        List<ItemStack> items = new ArrayList<>(raw.length);
-        int filled = 0;
-        for (int slot = 0; slot < raw.length; slot++) {
-            Item it = raw[slot];
-            if (it == null || it.getId() <= 0) continue;
-            items.add(new ItemStack(slot, it.getId(), it.getQuantity()));
-            filled++;
-        }
-        int captured = filled;
-        List<ItemStack> immutable = List.copyOf(items);
-        int free = Math.max(0, INVENTORY_SIZE - captured);
-        return new SnapshotInventoryView(immutable, free, captured);
+    /** Returns the last tick on which inventory contents changed, or -1 if never. */
+    int lastChangeTick() {
+        return lastChangeTick;
     }
 
-    /** Immutable {@link InventoryView} backed by a copy of the inventory at snapshot time. */
-    private static final class SnapshotInventoryView implements InventoryView {
-        private final List<ItemStack> items;
-        private final int freeSlots;
-        private final int filled;
-
-        SnapshotInventoryView(List<ItemStack> items, int freeSlots, int filled) {
-            this.items = items;
-            this.freeSlots = freeSlots;
-            this.filled = filled;
+    /** Reads the current inventory state and updates change-tracking. */
+    InventoryView snapshot(int currentTick) {
+        ItemContainer container = client.getItemContainer(InventoryID.INV);
+        if (container == null) {
+            // No container — treat as empty inventory; don't update hash/tick so
+            // a future container appearance correctly fires a change event.
+            return InventoryView.empty();
         }
 
-        @Override public int size()                    { return INVENTORY_SIZE; }
-        @Override public int freeSlots()               { return freeSlots; }
-        @Override public boolean isFull()              { return freeSlots == 0; }
-        @Override public List<ItemStack> items()       { return items; }
-        @Override public boolean contains(int itemId)  {
-            for (ItemStack s : items) if (s.itemId() == itemId) return true;
-            return false;
+        Item[] raw = container.getItems();
+        List<ItemStack> items = new ArrayList<>(raw.length);
+        for (int slot = 0; slot < raw.length; slot++) {
+            Item it = raw[slot];
+            if (it != null && it.getId() != -1 && it.getQuantity() > 0) {
+                items.add(new ItemStack(slot, it.getId(), it.getQuantity()));
+            }
         }
-        @Override public int count(int itemId) {
-            int n = 0;
-            for (ItemStack s : items) if (s.itemId() == itemId) n += s.quantity();
-            return n;
+
+        long hash = computeHash(items);
+        if (hash != prevHash) {
+            prevHash = hash;
+            lastChangeTick = currentTick;
         }
+
+        final List<ItemStack> snapshot = List.copyOf(items);
+        final int totalSlots = container.size();
+
+        return new InventoryView() {
+            @Override public int size()               { return totalSlots; }
+            @Override public int freeSlots()          { return totalSlots - snapshot.size(); }
+            @Override public boolean isFull()         { return snapshot.size() >= totalSlots; }
+            @Override public List<ItemStack> items()  { return snapshot; }
+            @Override public boolean contains(int id) { return snapshot.stream().anyMatch(s -> s.itemId() == id); }
+            @Override public int count(int id)        { return snapshot.stream().filter(s -> s.itemId() == id).mapToInt(ItemStack::quantity).sum(); }
+        };
+    }
+
+    /** Stable hash of all (slot, itemId, quantity) triples in the list. */
+    private static long computeHash(List<ItemStack> items) {
+        long h = 1L;
+        for (ItemStack s : items) {
+            h = 31L * h + s.slot();
+            h = 31L * h + s.itemId();
+            h = 31L * h + s.quantity();
+        }
+        return h;
     }
 }

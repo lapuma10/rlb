@@ -3,6 +3,7 @@ package net.runelite.client.plugins.recorder.cook;
 import java.util.List;
 import net.runelite.api.coords.WorldArea;
 import net.runelite.api.gameval.ItemID;
+import net.runelite.api.gameval.ObjectID;
 import net.runelite.client.plugins.recorder.walker.PathSpec;
 
 /**
@@ -43,6 +44,11 @@ public final class CookingLocations
             .build())
         .heatSourceName("Fire")
         .groundLogsItemId(ItemID.LOGS)
+        // Lumbridge Castle P2 bank uses the Newbie-area bank booths
+        // (ObjectID.NEWBIEBANKBOOTH = 10083).  The generic booth ids
+        // (BANKBOOTH = 10355, BANKBOOTH_MULTI = 10356) cover multi-world
+        // overrides of the same object and are included as fallbacks.
+        .bankBoothIds(ObjectID.NEWBIEBANKBOOTH, ObjectID.BANKBOOTH, ObjectID.BANKBOOTH_MULTI)
         .build();
 
     public static List<CookingLocation> all()
