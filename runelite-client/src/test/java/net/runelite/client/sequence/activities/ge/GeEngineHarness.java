@@ -46,9 +46,12 @@ public final class GeEngineHarness {
     public void run(Step root) {
         if (manager != null) throw new IllegalStateException("harness already started");
         manager = SequenceManager.withDefaults();
+        // setTelemetry must happen BEFORE setDispatcher: rebuildEngineIfReady
+        // captures the current telemetry reference, and setTelemetry on an
+        // already-built engine is a no-op.
+        manager.setTelemetry(telemetry);
         manager.setObserver(new FixtureObserver(queued));
         manager.setDispatcher(dispatcher);
-        manager.setTelemetry(telemetry);
         manager.run(root);
     }
 
