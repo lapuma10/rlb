@@ -85,7 +85,11 @@ public final class MiningLoop
     private final Client client;
     private final ClientThread clientThread;
     private final RockSelector selector = new RockSelector();
-    private final BankingStrategy strategy;
+    /** Inventory-emptying strategy. Mutable so the panel can swap
+     *  between PowerMine (drop in place) and Bank (walk-to-bank +
+     *  deposit) without rebuilding the loop. Only safe to swap when
+     *  the loop is IDLE — see {@link #setStrategy}. */
+    private final AtomicReference<BankingStrategy> strategy = new AtomicReference<>();
     private final Consumer<String> statusCallback;
 
     private final AtomicBoolean running = new AtomicBoolean(false);
@@ -103,13 +107,26 @@ public final class MiningLoop
         this.dispatcher = dispatcher;
         this.client = client;
         this.clientThread = clientThread;
-        this.strategy = strategy == null ? new PowerMineStrategy() : strategy;
+        this.strategy.set(strategy == null ? new PowerMineStrategy() : strategy);
         this.statusCallback = statusCallback == null ? s -> { } : statusCallback;
     }
 
     public State state() { return state.get(); }
     public int oresMined() { return oresMined.get(); }
-    public BankingStrategy strategy() { return strategy; }
+    public BankingStrategy strategy() { return strategy.get(); }
+
+    /** Swap the inventory-emptying strategy. Refused if the loop is
+     *  active (state is anything other than IDLE / ABORTED) — calling
+     *  during SWINGING would race with the strategy's empty() flow.
+     *  Returns true on success, false if the swap was rejected. */
+    public boolean setStrategy(BankingStrategy s)
+    {
+        if (s == null) return false;
+        State current = state.get();
+        if (current != State.IDLE && current != State.ABORTED) return false;
+        strategy.set(s);
+        return true;
+    }
 
     public synchronized void addCandidate(WorldPoint tile, @Nullable OreType type)
     {
@@ -327,11 +344,12 @@ public final class MiningLoop
 
     private void doInventoryFull() throws InterruptedException
     {
-        statusCallback.accept(strategy.label() + " emptying…");
+        BankingStrategy s = strategy.get();
+        statusCallback.accept(s.label() + " emptying…");
         MiningLoopContext ctx = new MiningLoopContext(dispatcher, client, clientThread);
         try
         {
-            strategy.empty(ctx);
+            s.empty(ctx);
         }
         catch (InterruptedException ie) { throw ie; }
         catch (Throwable th)
@@ -345,7 +363,7 @@ public final class MiningLoop
         // bail rather than spinning forever.
         if (inventoryFull())
         {
-            statusCallback.accept(strategy.label() + " did not free space — abort");
+            statusCallback.accept(s.label() + " did not free space — abort");
             state.set(State.ABORTED);
             return;
         }

@@ -39,6 +39,7 @@ import net.runelite.client.plugins.PluginDescriptor;
 import net.runelite.client.plugins.recorder.annotator.AnnotatorHudOverlay;
 import net.runelite.client.plugins.recorder.annotator.AreaSelector;
 import net.runelite.client.plugins.recorder.scripts.ChickenFarmV2Script;
+import net.runelite.client.plugins.recorder.scripts.CookingScript;
 import net.runelite.client.plugins.recorder.scripts.LumbridgeBankPenScript;
 import net.runelite.client.plugins.recorder.trail.TrailRecorder;
 import net.runelite.client.plugins.recorder.trail.TrailRegistry;
@@ -245,6 +246,15 @@ public class RecorderPlugin extends Plugin
         miningLoop = new MiningLoop(miningDispatcher, client, clientThread, null,
             msg -> panel.onMiningStatus(msg));
         panel.setMiningLoop(miningLoop);
+
+        // Cooking script — independent dispatcher + transport resolver.
+        // The script is location- and food-agnostic; the panel feeds it
+        // a CookingLocation + raw food item id and starts.
+        HumanizedInputDispatcher cookingDispatcher = new HumanizedInputDispatcher(client, clientThread);
+        TransportResolver cookingResolver = new TransportResolver(client);
+        CookingScript cookingScript = new CookingScript(
+            client, clientThread, cookingDispatcher, cookingResolver);
+        panel.setCookingScript(cookingScript);
 
         BufferedImage icon = ImageUtil.loadImageResource(getClass(), "/util/reset.png");
         navButton = NavigationButton.builder()
