@@ -102,6 +102,25 @@ public final class ConfirmOfferStep implements Step {
             }
         }
 
+        // No (itemId, side) match. Check whether the slot we clicked into in
+        // StartOfferStep now holds a non-empty offer with a DIFFERENT itemId
+        // — that's a wrong-item surface, not a generic rejection. We can
+        // detect that without timing out, so surface GeOfferItemMismatch
+        // immediately. (Wrong-side mismatch is covered by the same check.)
+        Integer tentativeSlot = bb.scope(BlackboardScope.SEQUENCE)
+            .get(GeBlackboardKeys.K_GE_TENTATIVE_SLOT).orElse(null);
+        if (tentativeSlot != null) {
+            int slot = tentativeSlot;
+            var offers = s.grandExchange().offers();
+            if (slot >= 0 && slot < offers.size()) {
+                GrandExchangeOfferView o = offers.get(slot);
+                if (!o.isEmpty() && o.itemId() != itemId) {
+                    return Completion.failed(new GeBlockReason.GeOfferItemMismatch(
+                        slot, itemId, o.itemId()));
+                }
+            }
+        }
+
         // No offer for our (itemId, side) yet — keep waiting until timeout.
         int startTick = step.get(K_START_TICK).orElse(s.tick());
         if (s.tick() - startTick >= timeoutTicks()) {

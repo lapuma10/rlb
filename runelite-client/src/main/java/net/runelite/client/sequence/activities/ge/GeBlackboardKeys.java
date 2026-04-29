@@ -19,4 +19,15 @@ public final class GeBlackboardKeys {
      */
     public static final BlackboardKey<Integer> K_GE_OFFER_SLOT =
         BlackboardKey.of("ge.offerSlot", Integer.class);
+
+    /**
+     * SEQUENCE-scoped: the slot index (0..7) {@code StartOfferStep} clicked
+     * the BUY/SELL slot button on. Written before any offer surfaces — used
+     * by {@code ConfirmOfferStep} to detect a wrong-item offer landing in the
+     * slot we just clicked into (so we can surface
+     * {@link net.runelite.client.sequence.affordance.GeBlockReason.GeOfferItemMismatch}
+     * instead of timing out as {@code GeOfferRejected}).
+     */
+    public static final BlackboardKey<Integer> K_GE_TENTATIVE_SLOT =
+        BlackboardKey.of("ge.tentativeSlot", Integer.class);
 }

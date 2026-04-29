@@ -64,6 +64,11 @@ public final class StartOfferStep implements Step {
             step.put(K_PRECONDITION, new GeBlockReason.GeSlotsFull());
             return;
         }
+        // Persist the slot we click into so ConfirmOfferStep can detect a
+        // wrong-item offer landing in our slot (and surface
+        // GeOfferItemMismatch) instead of timing out as GeOfferRejected.
+        ctx.bb().scope(BlackboardScope.SEQUENCE)
+            .put(GeBlackboardKeys.K_GE_TENTATIVE_SLOT, slot.getAsInt());
         ge.clickOfferSlotButton(slot.getAsInt(), side);
     }
 
