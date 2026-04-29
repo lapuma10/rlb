@@ -505,33 +505,43 @@ public final class BankInteraction
     }
 
     /** Client-thread: locate the bank slot widget for {@code itemId},
-     *  scroll the items container to make it visible if needed, and
+     *  scroll the items widget to make it visible if needed, and
      *  return its canvas bounds. Returns null if item not in bank /
-     *  bank not open / scroll failed.
+     *  bank not open / scroll just happened (caller retries next tick).
      *
-     *  <p>The bank's {@code Bankmain.ITEMS_CONTAINER} is a scrollable
-     *  parent whose dynamic children are the per-slot widgets. Each
-     *  child carries {@code getItemId()} and a {@code getRelativeY()}
-     *  position within the parent. We adjust {@code parent.setScrollY()}
-     *  so the child sits inside the visible window, then read the
-     *  child's post-scroll bounds. */
+     *  <p>The bank's items widget is {@code Bankmain.ITEMS} (NOT
+     *  {@code ITEMS_CONTAINER}, which is the surrounding layout
+     *  group). Slots are accessed by index via {@code getChild(slot)},
+     *  matching the bank-tags plugin's
+     *  {@code LayoutManager#layout} pattern. Each slot child carries
+     *  {@code getItemId()} and a {@code getRelativeY()} position
+     *  within the parent. We adjust {@code parent.setScrollY()} so the
+     *  child sits inside the visible window, then read the child's
+     *  post-scroll bounds on the next call. */
     private Rectangle resolveBankSlotBounds(int itemId)
     {
-        // 0x000c_0009 — Bankmain.ITEMS_CONTAINER (scrollable items area).
-        Widget container = client.getWidget(InterfaceID.Bankmain.ITEMS_CONTAINER);
+        // 0x000c_000c — Bankmain.ITEMS, the actual scrollable items
+        // widget the bank-tags plugin treats as authoritative.
+        Widget container = client.getWidget(InterfaceID.Bankmain.ITEMS);
         if (container == null || container.isHidden()) return null;
-        Widget[] children = container.getDynamicChildren();
-        if (children == null || children.length == 0) return null;
 
-        Widget match = null;
-        for (Widget c : children)
+        // Resolve the bank slot index from the ItemContainer (not the
+        // widget tree), so we don't have to scan every child by id.
+        // Bank items can be on different tabs — the widget at slot N
+        // in ITEMS corresponds 1:1 with the ItemContainer's slot N.
+        ItemContainer bankInv = client.getItemContainer(InventoryID.BANK);
+        if (bankInv == null) return null;
+        Item[] items = bankInv.getItems();
+        if (items == null) return null;
+        int slotIdx = -1;
+        for (int i = 0; i < items.length; i++)
         {
-            if (c == null) continue;
-            if (c.getItemId() != itemId) continue;
-            match = c;
-            break;
+            Item it = items[i];
+            if (it != null && it.getId() == itemId) { slotIdx = i; break; }
         }
-        if (match == null) return null;
+        if (slotIdx < 0) return null;
+        Widget match = container.getChild(slotIdx);
+        if (match == null || match.isSelfHidden()) return null;
 
         // Visible window of the items container in widget-local coords.
         int containerH = container.getHeight();
