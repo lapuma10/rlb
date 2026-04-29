@@ -44,6 +44,14 @@ public final class CollectOfferStep implements Step {
         BlackboardKey.of("collectOffer.startTick", Integer.class);
     private static final BlackboardKey<Boolean> K_ALREADY_EMPTY =
         BlackboardKey.of("collectOffer.alreadyEmpty", Boolean.class);
+    /** SEQUENCE-scope so it survives Retry(N) STEP-scope clears: the expected
+     *  item id from the FIRST attempt. Used when a retry encounters an
+     *  already-empty slot — we still need to verify delta from the original
+     *  baseline rather than treating it as already-collected. */
+    private static final BlackboardKey<Integer> K_DELTA_ITEM_ID_PERSISTED =
+        BlackboardKey.of("collectOffer.deltaItemIdPersisted", Integer.class);
+    private static final BlackboardKey<Integer> K_DELTA_START_PERSISTED =
+        BlackboardKey.of("collectOffer.deltaStartPersisted", Integer.class);
 
     private final GeActions ge;
 
@@ -83,17 +91,45 @@ public final class CollectOfferStep implements Step {
         }
         GrandExchangeOfferView o = offers.get(slot);
 
-        // Compute expected delta target.
+        // If a previous attempt persisted expected item / baseline (Retry path),
+        // reuse them instead of re-deriving from the now-empty slot. This
+        // prevents the "already-empty + lost-context" bug where a retry would
+        // see slot=EMPTY, derive expectedItemId=0, and short-circuit to
+        // Succeeded — bypassing the delta verification that the FIRST attempt
+        // failed on.
+        Integer persistedItemId = ctx.bb().scope(BlackboardScope.SEQUENCE)
+            .get(K_DELTA_ITEM_ID_PERSISTED).orElse(null);
+        Integer persistedStart = ctx.bb().scope(BlackboardScope.SEQUENCE)
+            .get(K_DELTA_START_PERSISTED).orElse(null);
+        if (persistedItemId != null && persistedStart != null) {
+            step.put(K_EXPECTED_DELTA_ITEM_ID, persistedItemId);
+            step.put(K_EXPECTED_DELTA_START, persistedStart);
+            step.put(K_START_TICK, s.tick());
+            // On retry, only re-dispatch if the slot still has an offer to
+            // collect; an already-EMPTY slot means the original click landed
+            // — we just need to keep watching for the inventory delta.
+            if (!o.isEmpty()) {
+                ge.collect(slot);
+            }
+            return;
+        }
+
+        // First attempt: compute expected delta target from the live slot.
         int expectedItemId = (o.side() == OfferSide.SELL) ? COINS_ITEM_ID : o.itemId();
         if (expectedItemId == 0 && o.isEmpty()) {
-            // Slot is already EMPTY at onStart — already-satisfied path. Use
-            // a sentinel so check returns Succeeded immediately.
+            // Slot is already EMPTY at onStart with no prior context — treat
+            // as already-satisfied (collect happened externally before we
+            // started).
             step.put(K_ALREADY_EMPTY, true);
             return;
         }
+        int startCount = s.inventory().count(expectedItemId);
         step.put(K_EXPECTED_DELTA_ITEM_ID, expectedItemId);
-        step.put(K_EXPECTED_DELTA_START, s.inventory().count(expectedItemId));
+        step.put(K_EXPECTED_DELTA_START, startCount);
         step.put(K_START_TICK, s.tick());
+        // Persist into SEQUENCE so retries reuse the same expected target.
+        ctx.bb().scope(BlackboardScope.SEQUENCE).put(K_DELTA_ITEM_ID_PERSISTED, expectedItemId);
+        ctx.bb().scope(BlackboardScope.SEQUENCE).put(K_DELTA_START_PERSISTED, startCount);
 
         // Already-satisfied: slot is empty AND we already know what to look
         // for. (e.g., collect happened externally between Wait and Collect.)
