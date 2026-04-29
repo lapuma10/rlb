@@ -1,6 +1,7 @@
 package net.runelite.client.plugins.recorder.scripts;
 
 import java.awt.Rectangle;
+import java.util.concurrent.ThreadLocalRandom;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
@@ -86,6 +87,13 @@ public final class CookingScript
      *  worst-case. The starter-script reference also waits for the
      *  fire object to materialise before continuing. */
     private static final long LIGHT_TIMEOUT_MS = 30_000;
+    /** Min/max random pause after our fire dies before we re-light.
+     *  Real players take a beat to notice the fire's gone, look for
+     *  fresh logs, and decide to keep going. 2-10s feels human; the
+     *  range covers both "I was paying attention" and "I was reading
+     *  chat". */
+    private static final long FIRE_DEATH_PAUSE_MIN_MS = 2_000;
+    private static final long FIRE_DEATH_PAUSE_MAX_MS = 10_000;
     /** Max time without inventory progress (raw count change) before we
      *  ABORT the cooking phase. Defensive: should not trip in practice. */
     private static final long COOK_STUCK_MS = 30_000;
@@ -138,6 +146,14 @@ public final class CookingScript
      *  visit. Prevents re-tallying every tick we sit at the bank
      *  waiting for withdraws to finish. Reset on every state change. */
     private boolean tallyDoneThisVisit;
+    /** Consecutive walker-stuck count. Reset on ARRIVED or any
+     *  movement-based progress; capped via {@link #WALKER_MAX_STUCK}.
+     *  Across that cap we abort — but most transient stucks self-recover
+     *  on the next walker.tick. */
+    private int walkerStuckCount;
+    /** Consecutive cook-stuck cycles. Reset on inventory progress and
+     *  on state transitions; capped via {@link #COOK_MAX_STUCK}. */
+    private int cookStuckCount;
     /** When the bank widget first opened this BANKING entry. Gates the
      *  "missing item" check until the engine has had a tick to populate
      *  {@code InventoryID.BANK}. */
@@ -158,9 +174,21 @@ public final class CookingScript
      *  our use-mode click. */
     private long lightingBackoffUntilMs;
 
-    /** Max retries before a banking sub-step (open / deposit / withdraw /
-     *  close) gives up and aborts. */
+    /** Max retries on a banking sub-step (booth click / deposit /
+     *  withdraw / close) before aborting. 3 tries covers transient
+     *  widget races; beyond that something is genuinely wrong and we
+     *  surface the failure rather than spam clicks forever. */
     private static final int BANK_MAX_FAIL = 3;
+    /** Max consecutive walker STUCK / ERROR before aborting. Each
+     *  STUCK represents ~15s of no movement, so 3 in a row is ~45s of
+     *  failed walking — enough to know the player is genuinely
+     *  blocked, not just one transient mis-click. */
+    private static final int WALKER_MAX_STUCK = 3;
+    /** Max consecutive cook-stuck cycles before aborting. The stuck
+     *  timer fires after COOK_STUCK_MS (30s) of no inventory progress;
+     *  we let the FSM re-issue use-on-fire that many times before
+     *  surfacing the failure. */
+    private static final int COOK_MAX_STUCK = 3;
     /** After this many Space-press attempts that don't close Skillmulti,
      *  fall back to clicking the ALL widget directly. */
     private static final int COOK_MENU_FALLBACK_AFTER = 2;
@@ -350,11 +378,29 @@ public final class CookingScript
         {
             UniversalWalker.Status s = walker.tick(l.cookToBank());
             status.set("bank: walking to bank (" + s + ")");
-            if (s == UniversalWalker.Status.ARRIVED) walker.reset();
+            if (s == UniversalWalker.Status.ARRIVED)
+            {
+                walker.reset();
+                walkerStuckCount = 0;
+            }
             else if (s == UniversalWalker.Status.STUCK
-                  || s == UniversalWalker.Status.ERROR) abortWithStatus("walker stuck during BANKING");
+                  || s == UniversalWalker.Status.ERROR)
+            {
+                walkerStuckCount++;
+                log.info("cook bank: walker {} (count={})", s, walkerStuckCount);
+                walker.reset();
+                if (walkerStuckCount > WALKER_MAX_STUCK)
+                {
+                    // Genuinely can't make progress to bank — only abort
+                    // here, since this is a long-term unrecoverable
+                    // location issue (player blocked behind a wall, etc).
+                    abortWithStatus("walker repeatedly stuck heading to bank — aborting");
+                }
+            }
             return;
         }
+        // Reset walker counter — we made it to the bank area.
+        walkerStuckCount = 0;
 
         long now = System.currentTimeMillis();
         long since = lastBankActionAtMs == 0 ? Long.MAX_VALUE : now - lastBankActionAtMs;
@@ -391,7 +437,10 @@ public final class CookingScript
             {
                 bankFailCount++;
                 if (bankFailCount > BANK_MAX_FAIL)
-                    abortWithStatus("no bank booth in range — aborting");
+                {
+                    abortWithStatus("no bank booth in range after "
+                        + BANK_MAX_FAIL + " attempts — aborting");
+                }
             }
             return;
         }
@@ -408,7 +457,8 @@ public final class CookingScript
             bankFailCount++;
             if (bankFailCount > BANK_MAX_FAIL)
             {
-                abortWithBankClosed("bank dispatcher errors > " + BANK_MAX_FAIL + " ('" + dispErr + "') — aborting");
+                abortWithBankClosed("bank dispatcher errors > " + BANK_MAX_FAIL
+                    + " ('" + dispErr + "') — aborting");
                 return;
             }
         }
@@ -455,7 +505,8 @@ public final class CookingScript
         }
         if (!ready)
         {
-            abortWithBankClosed("bank container did not populate in " + BANK_LOAD_GRACE_MS + "ms — aborting");
+            abortWithBankClosed("bank container did not populate in "
+                + BANK_LOAD_GRACE_MS + "ms — aborting");
             return;
         }
 
@@ -535,9 +586,24 @@ public final class CookingScript
     private void abortWithBankClosed(String reason) throws InterruptedException
     {
         log.warn("cook: {}", reason);
-        try { if (onClient(bank::isBankOpen)) bank.closeBank(); }
-        catch (Throwable th) { log.warn("cook: closeBank during abort threw", th); }
+        tryCloseBankBestEffort();
         abortWithStatus(reason);
+    }
+
+    /** Best-effort bank close — ignores errors. Used when recovering
+     *  from transient errors (we want the bank closed before the next
+     *  retry attempt, but we don't want a close failure to escalate). */
+    private void tryCloseBankBestEffort()
+    {
+        try
+        {
+            Boolean isOpen = onClient(bank::isBankOpen);
+            if (Boolean.TRUE.equals(isOpen)) bank.closeBank();
+        }
+        catch (Throwable th)
+        {
+            log.warn("cook: best-effort closeBank threw", th);
+        }
     }
 
     private void abortWithStatus(String s)
@@ -559,6 +625,7 @@ public final class CookingScript
         {
             case ARRIVED:
                 walker.reset();
+                walkerStuckCount = 0;
                 if (toCook)
                 {
                     setState(l.kind() == CookingLocation.SourceKind.FIRE_FROM_LOGS
@@ -571,7 +638,18 @@ public final class CookingScript
                 break;
             case STUCK:
             case ERROR:
-                abortWithStatus("walker " + st + " on " + (toCook ? "outbound" : "return"));
+                walkerStuckCount++;
+                log.info("cook walk: walker {} on {} (count={})",
+                    st, toCook ? "outbound" : "return", walkerStuckCount);
+                walker.reset();
+                if (walkerStuckCount > WALKER_MAX_STUCK)
+                {
+                    // Truly stuck — player blocked, plane mismatch, etc.
+                    // Abort here (this is unrecoverable in practice).
+                    abortWithStatus("walker stuck " + walkerStuckCount
+                        + "× on " + (toCook ? "outbound" : "return"));
+                }
+                // else: transient stuck, next tick resumes naturally.
                 break;
             default:
                 break;
@@ -742,12 +820,15 @@ public final class CookingScript
         // Skillmulti closed — reset confirm attempts for the next open.
         cookMenuConfirmAttempts = 0;
 
-        // Track inventory progress for stuck detection.
+        // Track inventory progress for stuck detection. Any change in
+        // raw count (a successful cook, a fire dying mid-batch, etc.)
+        // counts as progress — reset the stuck counter.
         int raw = cook.inventoryAmount(rawId);
         if (raw != lastRawCount)
         {
             lastRawCount = raw;
             lastInventoryChangeAtMs = now;
+            cookStuckCount = 0;
         }
         if (lastInventoryChangeAtMs == 0) lastInventoryChangeAtMs = now;
 
@@ -762,7 +843,8 @@ public final class CookingScript
         // For FIRE_FROM_LOGS: target ONLY the fire we lit (tracked by
         // tile in litFireTile). A different fire nearby is someone
         // else's — using their fire is bot-tell behavior. If our fire
-        // died (no Fire object on the lit tile any more), re-light.
+        // died (no Fire object on the lit tile any more), pause a few
+        // seconds (real players don't snap-relight) and re-light.
         // For RANGE: range objects are fixed-location; just find by name.
         CookingInteraction.Match heat;
         if (l.kind() == CookingLocation.SourceKind.FIRE_FROM_LOGS)
@@ -776,9 +858,19 @@ public final class CookingScript
             heat = cook.findFireAt(l.heatSourceName(), litFireTile);
             if (heat == null)
             {
-                status.set("cook: our fire died at " + litFireTile + " — relighting");
-                litFireTile = null;
+                long pause = FIRE_DEATH_PAUSE_MIN_MS
+                    + ThreadLocalRandom.current().nextLong(
+                        FIRE_DEATH_PAUSE_MAX_MS - FIRE_DEATH_PAUSE_MIN_MS);
+                status.set("cook: fire died at " + litFireTile
+                    + " — pausing " + pause + "ms before relight");
+                WorldPoint deadTile = litFireTile;
                 setState(State.LIGHTING_FIRE);
+                // setState() reset lightingBackoffUntilMs, so set it
+                // AFTER. Don't preserve litFireTile — the fire's gone,
+                // the lit-tile-watcher in tickLightingFire would never
+                // find a fire on it. We'll pick a fresh log spawn.
+                lightingBackoffUntilMs = System.currentTimeMillis() + pause;
+                log.info("cook: fire at {} died, backing off {}ms", deadTile, pause);
                 return;
             }
         }
@@ -820,11 +912,25 @@ public final class CookingScript
             return;
         }
 
-        // Stuck check.
+        // Stuck check — no inventory progress for COOK_STUCK_MS. Reset
+        // and retry — but cap at COOK_MAX_STUCK consecutive cycles.
+        // Most "stuck" cases are recoverable (camera shifted, click
+        // missed, fire briefly out of LOS); a few real ones aren't
+        // (use-mode dropped silently, server lag pile-up) and we want
+        // the user to see an abort then.
         if (now - lastInventoryChangeAtMs > COOK_STUCK_MS)
         {
-            abortWithStatus("cook: no progress for " + COOK_STUCK_MS + "ms");
-            return;
+            cookStuckCount++;
+            log.info("cook: no progress for {}ms (count={})", COOK_STUCK_MS, cookStuckCount);
+            if (cookStuckCount > COOK_MAX_STUCK)
+            {
+                abortWithStatus("cook: stuck " + cookStuckCount + "× — aborting");
+                return;
+            }
+            lastInventoryChangeAtMs = now;
+            lastCookActionAtMs = 0L;
+            lastRawCount = -1;
+            // Stay in COOKING; next iteration re-issues use-raw-on-fire.
         }
 
         if (dispatcher.isBusy())
@@ -963,6 +1069,8 @@ public final class CookingScript
         bankFailCount = 0;
         cookMenuConfirmAttempts = 0;
         lightingBackoffUntilMs = 0L;
+        walkerStuckCount = 0;
+        cookStuckCount = 0;
         // Clear the lit-fire tracking on any transition out of the
         // LIGHTING_FIRE / COOKING pair. The next cook trip will light
         // a fresh fire (or, if we're going BACK to LIGHTING_FIRE
