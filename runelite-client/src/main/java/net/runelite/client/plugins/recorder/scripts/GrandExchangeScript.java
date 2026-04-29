@@ -139,9 +139,13 @@ public final class GrandExchangeScript {
             String last = recentTelemetryLine();
             status.set("failed" + (last.isEmpty() ? "" : ": " + last));
             taskInFlight.set(false);
-        } else if (st == SequenceState.IDLE && taskInFlight.get()) {
+        } else if (st == SequenceState.IDLE && taskInFlight.get()
+                   && !intentStartRequested.get()) {
             // Just transitioned from RUNNING → IDLE = success.
-            intentStartRequested.set(false);
+            // We wait for intentStartRequested to clear (set false on the
+            // first RUNNING tick) before treating IDLE as "done", so a tick
+            // that fires BEFORE the scheduler-marshalled engine.start has
+            // run doesn't get misinterpreted as success.
             if (inputOwnership != null) inputOwnership.release(OWNER_TOKEN);
             status.set("done");
             taskInFlight.set(false);
