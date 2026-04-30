@@ -89,10 +89,20 @@ public final class GrandExchangeTab extends JPanel {
         JPanel p = new JPanel();
         p.setLayout(new BoxLayout(p, BoxLayout.Y_AXIS));
         p.setBackground(ColorScheme.DARK_GRAY_COLOR);
-        p.setBorder(BorderFactory.createTitledBorder("GE Core Mode (Phase A)"));
-        JLabel hint = new JLabel("<html>Requires you to already be at the Grand Exchange "
-            + "and have coins (for buy) or items (for sell) in inventory.<br>"
-            + "Bank-prep is Phase B and currently disabled.</html>");
+        boolean phaseB = script != null && script.bankPrepAvailable();
+        p.setBorder(BorderFactory.createTitledBorder(
+            phaseB ? "GE Core Mode (Phase B — bank-prep available)"
+                   : "GE Core Mode (Phase A)"));
+        String hintHtml = phaseB
+            ? "<html>Requires you to already be at the Grand Exchange.<br>"
+                + "If \"Prepare from bank first\" is checked, the bot opens a "
+                + "bank booth at the GE and withdraws coins (buy) or items (sell) "
+                + "before placing the offer; otherwise inventory must already "
+                + "contain coins (buy) or items (sell).</html>"
+            : "<html>Requires you to already be at the Grand Exchange "
+                + "and have coins (for buy) or items (for sell) in inventory.<br>"
+                + "Bank-prep is Phase B and currently disabled.</html>";
+        JLabel hint = new JLabel(hintHtml);
         p.add(hint);
         return p;
     }
