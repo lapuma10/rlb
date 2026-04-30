@@ -23,11 +23,16 @@ public final class RecordingGeActions implements GeActions {
     @Override public void clickOfferSlotButton(int slot, OfferSide side) {
         calls.add("clickOfferSlotButton(slot=" + slot + ", side=" + side + ")");
     }
-    @Override public void selectItem(int itemId, String displayName) {
+    @Override public boolean selectItem(int itemId, String displayName) {
         calls.add("selectItem(itemId=" + itemId + ", name=" + displayName + ")");
+        return true;
     }
-    @Override public void setQuantity(int qty)                { calls.add("setQuantity(" + qty + ")"); }
-    @Override public void setPrice(int priceEach)             { calls.add("setPrice(" + priceEach + ")"); }
+    @Override public boolean pickSearchResult(int itemId) {
+        calls.add("pickSearchResult(itemId=" + itemId + ")");
+        return true;
+    }
+    @Override public boolean setQuantity(int qty)             { calls.add("setQuantity(" + qty + ")"); return true; }
+    @Override public boolean setPrice(int priceEach)          { calls.add("setPrice(" + priceEach + ")"); return true; }
     @Override public void confirmOffer()                      { calls.add("confirmOffer()"); }
     @Override public void collect(int slot)                   { calls.add("collect(slot=" + slot + ")"); }
     @Override public void closeGrandExchange()                { calls.add("closeGrandExchange()"); }

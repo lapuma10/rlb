@@ -200,6 +200,7 @@ public class GrandExchangeBankPrepFactoryTest {
         @Override public void withdrawOne(int itemId)       {}
         @Override public void withdrawAll(int itemId)       {}
         @Override public void withdrawX(int itemId, int qty){}
+        @Override public void withdrawAsNoteX(int itemId, int qty){}
         @Override public void closeBank()                   {}
     }
 }

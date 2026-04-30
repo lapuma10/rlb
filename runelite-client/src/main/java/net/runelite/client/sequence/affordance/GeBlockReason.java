@@ -19,6 +19,8 @@ public sealed interface GeBlockReason extends DiagnosticReason
     permits GeBlockReason.NotAtGrandExchange,
             GeBlockReason.GeNotOpen,
             GeBlockReason.GeOfferSetupNotOpen,
+            GeBlockReason.GeChatboxPromptTimeout,
+            GeBlockReason.GeSearchResultNotFound,
             GeBlockReason.GeCollectNotOpen,
             GeBlockReason.GeSlotsFull,
             GeBlockReason.GeExistingOfferConflict,
@@ -35,6 +37,16 @@ public sealed interface GeBlockReason extends DiagnosticReason
     record NotAtGrandExchange(WorldArea required) implements GeBlockReason {}
     record GeNotOpen() implements GeBlockReason {}
     record GeOfferSetupNotOpen() implements GeBlockReason {}
+    /** A chatbox numeric / search prompt didn't appear within the configured
+     *  timeout, so the typing step couldn't complete. {@code stage} is one
+     *  of "selectItem", "setQuantity", "setPrice" — diagnostic only. */
+    record GeChatboxPromptTimeout(String stage) implements GeBlockReason {}
+    /** Search results rendered, but no row carried the requested item id —
+     *  the typed name partial-matched the wrong items, the item is not
+     *  tradeable on this account, or the search failed silently. We never
+     *  fall back to the engine's auto-pick: an unfound row aborts the
+     *  offer rather than buying/selling whatever the search decides. */
+    record GeSearchResultNotFound(int itemId, String typedName) implements GeBlockReason {}
     record GeCollectNotOpen() implements GeBlockReason {}
     record GeSlotsFull() implements GeBlockReason {}
     record GeExistingOfferConflict(int slot, OfferSide side, int itemId, OfferStatus status) implements GeBlockReason {}

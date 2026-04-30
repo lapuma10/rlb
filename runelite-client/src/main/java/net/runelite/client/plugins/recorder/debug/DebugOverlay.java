@@ -28,6 +28,7 @@ import net.runelite.api.Client;
 import net.runelite.api.MenuEntry;
 import net.runelite.api.Tile;
 import net.runelite.api.coords.WorldPoint;
+import net.runelite.api.widgets.Widget;
 import net.runelite.client.ui.overlay.Overlay;
 import net.runelite.client.ui.overlay.OverlayLayer;
 import net.runelite.client.ui.overlay.OverlayPosition;
@@ -38,6 +39,7 @@ import java.awt.Font;
 import java.awt.FontMetrics;
 import java.awt.Graphics2D;
 import java.awt.Polygon;
+import java.awt.Rectangle;
 import java.awt.Stroke;
 import java.util.ArrayList;
 import java.util.List;
@@ -89,14 +91,27 @@ public final class DebugOverlay extends Overlay
 
         List<String> lines = new ArrayList<>();
         lines.add("mouse: " + mouse.getX() + "," + mouse.getY());
-        if (sel != null && sel.getWorldLocation() != null)
+
+        // Widget-hover mode: when the cursor sits over any visible widget,
+        // surface widget metadata INSTEAD of tile/world info. Visibility
+        // walks the parent chain (see WidgetActions.isVisible) — a leaf-
+        // only check would falsely accept widgets under collapsed tabs.
+        Widget hovered = findWidgetUnderCursor(mouse.getX(), mouse.getY());
+        if (hovered != null)
         {
-            WorldPoint wp = sel.getWorldLocation();
-            lines.add("tile: " + wp.getX() + "," + wp.getY() + " p=" + wp.getPlane());
+            appendWidgetLines(lines, hovered);
         }
         else
         {
-            lines.add("tile: -");
+            if (sel != null && sel.getWorldLocation() != null)
+            {
+                WorldPoint wp = sel.getWorldLocation();
+                lines.add("tile: " + wp.getX() + "," + wp.getY() + " p=" + wp.getPlane());
+            }
+            else
+            {
+                lines.add("tile: -");
+            }
         }
         if (markedWp != null)
         {
@@ -151,6 +166,91 @@ public final class DebugOverlay extends Overlay
     private static String stripTags(String s)
     {
         return s.replaceAll("<[^>]+>", "");
+    }
+
+    /** Walk widget roots and return the deepest visible widget whose
+     *  bounds contain the cursor. Visibility uses the same parent-chain
+     *  walk as {@code WidgetActions.isVisible} — checking the leaf alone
+     *  would falsely accept widgets sitting under collapsed sidebar tabs.
+     *  Caller must be on the client thread (overlays render on it). */
+    private Widget findWidgetUnderCursor(int mx, int my)
+    {
+        Widget[] roots = client.getWidgetRoots();
+        if (roots == null) return null;
+        // Track best (deepest) match so far.
+        Widget[] best = new Widget[1];
+        int[] bestDepth = { -1 };
+        for (Widget r : roots)
+        {
+            walkForHover(r, mx, my, 0, best, bestDepth);
+        }
+        return best[0];
+    }
+
+    private static void walkForHover(Widget w, int mx, int my, int depth,
+                                     Widget[] best, int[] bestDepth)
+    {
+        if (w == null || w.isHidden()) return;
+        Rectangle b;
+        try { b = w.getBounds(); } catch (Exception ignored) { b = null; }
+        boolean contains = b != null && b.width > 0 && b.height > 0
+            && b.contains(mx, my);
+        if (contains && depth > bestDepth[0])
+        {
+            best[0] = w;
+            bestDepth[0] = depth;
+        }
+        Widget[] children = w.getChildren();
+        if (children != null) for (Widget c : children) walkForHover(c, mx, my, depth + 1, best, bestDepth);
+        Widget[] dynamic = w.getDynamicChildren();
+        if (dynamic != null) for (Widget c : dynamic) walkForHover(c, mx, my, depth + 1, best, bestDepth);
+        Widget[] nested = w.getNestedChildren();
+        if (nested != null) for (Widget c : nested) walkForHover(c, mx, my, depth + 1, best, bestDepth);
+        Widget[] statics = w.getStaticChildren();
+        if (statics != null) for (Widget c : statics) walkForHover(c, mx, my, depth + 1, best, bestDepth);
+    }
+
+    private static void appendWidgetLines(List<String> lines, Widget w)
+    {
+        int id = w.getId();
+        int group = id >>> 16;
+        int child = id & 0xFFFF;
+        lines.add(String.format("widget: 0x%04x_%04x", group, child));
+
+        String text = w.getText();
+        if (text != null && !text.isEmpty())
+        {
+            String stripped = stripTags(text).replace('\n', ' ');
+            if (stripped.length() > 40) stripped = stripped.substring(0, 40) + "…";
+            lines.add("text: \"" + stripped + "\"");
+        }
+
+        int spriteId = w.getSpriteId();
+        if (spriteId != -1) lines.add("sprite: " + spriteId);
+
+        Rectangle b = null;
+        try { b = w.getBounds(); } catch (Exception ignored) {}
+        if (b != null)
+        {
+            lines.add("bounds: " + b.x + "," + b.y + " " + b.width + "x" + b.height);
+        }
+
+        String[] actions = w.getActions();
+        if (actions != null)
+        {
+            StringBuilder sb = new StringBuilder();
+            int shown = 0;
+            for (String a : actions)
+            {
+                if (a == null || a.isEmpty()) continue;
+                if (shown > 0) sb.append(" | ");
+                sb.append(stripTags(a));
+                if (++shown >= 3) break;
+            }
+            if (shown > 0) lines.add("actions: " + sb);
+        }
+
+        lines.add("hidden: " + w.isHidden());
     }
 
     private void drawTileOutline(Graphics2D g, WorldPoint wp, Color colour)

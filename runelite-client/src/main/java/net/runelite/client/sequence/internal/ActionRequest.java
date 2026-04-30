@@ -24,6 +24,7 @@
  */
 package net.runelite.client.sequence.internal;
 
+import java.awt.Rectangle;
 import lombok.Value;
 import net.runelite.api.coords.WorldPoint;
 import javax.annotation.Nullable;
@@ -31,7 +32,7 @@ import javax.annotation.Nullable;
 @Value
 @lombok.Builder(toBuilder = true)
 public class ActionRequest {
-    public enum Kind { WALK, CLICK_TILE, CLICK_NPC, CLICK_GAME_OBJECT, CLICK_GROUND_ITEM, CLICK_WIDGET, CLICK_INV_ITEM, KEY }
+    public enum Kind { WALK, CLICK_TILE, CLICK_NPC, CLICK_GAME_OBJECT, CLICK_GROUND_ITEM, CLICK_WIDGET, CLICK_INV_ITEM, CLICK_BOUNDS, KEY }
     public enum Channel { CLIENT, MOUSE, KEYBOARD }
 
     Kind kind;
@@ -55,4 +56,11 @@ public class ActionRequest {
      *  (e.g. "Open", "Climb-up", "Use"). Case-insensitive; whitespace and
      *  hyphen tolerant. Null means "first available action / left-click default". */
     @Nullable String verb;
+    /** Pre-resolved canvas bounds for {@link Kind#CLICK_BOUNDS}. Caller computed
+     *  the rectangle on the client thread (e.g. from a specific child Widget's
+     *  {@code getBounds()}); the dispatcher samples a humanized pixel inside
+     *  with edge margins. Use this when a packed widget id can't address the
+     *  click target uniquely — e.g. dynamic children of a parent that all
+     *  return the parent's packed id from {@code Widget.getId()}. */
+    @Nullable Rectangle bounds;
 }

@@ -90,11 +90,22 @@ final class BankObserver {
                         total += it.getQuantity();
                     }
                 }
+                if (total <= 0) return BankItemAvailability.absent();
+                // Stackability of the un-noted form decides whether a withdraw
+                // of qty>1 needs one or qty inventory slots. Item def reads are
+                // safe here — caller is on the client thread (BankObserver
+                // contract).
+                boolean stackable = false;
+                try {
+                    var def = client.getItemDefinition(itemId);
+                    if (def != null) stackable = def.isStackable();
+                } catch (Exception ignored) {
+                    // Definition unavailable for some reason — assume non-
+                    // stackable (the safe pessimistic default).
+                }
                 // visible=true: per spec §5.2 full scroll-visibility tracking is deferred;
                 // every present item is reported as visible.
-                return total > 0
-                    ? BankItemAvailability.present(total, true)
-                    : BankItemAvailability.absent();
+                return BankItemAvailability.present(total, true, stackable);
             }
         };
     }

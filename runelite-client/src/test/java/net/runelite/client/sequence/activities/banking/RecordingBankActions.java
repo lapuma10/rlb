@@ -50,6 +50,11 @@ public final class RecordingBankActions implements BankActions {
     }
 
     @Override
+    public void withdrawAsNoteX(int itemId, int qty) {
+        calls.add("withdrawAsNoteX(" + itemId + "," + qty + ")");
+    }
+
+    @Override
     public void closeBank() {
         calls.add("closeBank()");
     }

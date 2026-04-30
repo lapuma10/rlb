@@ -1654,13 +1654,15 @@ public final class RecorderPanel extends PluginPanel
 
     /** Wire the GE Core script. RecorderPlugin constructs it after CookingScript
      *  and registers it on the eventBus for GameTick forwarding. The panel
-     *  builds the GE Core tab on first wiring. */
-    public void setGrandExchangeScript(GrandExchangeScript script)
+     *  builds the GE Core tab on first wiring. {@code itemManager} powers the
+     *  name → id lookup when the user types an item name. */
+    public void setGrandExchangeScript(GrandExchangeScript script,
+                                       net.runelite.client.game.ItemManager itemManager)
     {
         if (script == null) return;
         if (grandExchangeTab == null)
         {
-            grandExchangeTab = new GrandExchangeTab(script);
+            grandExchangeTab = new GrandExchangeTab(script, itemManager);
             tabs.addTab("GE Core", new javax.swing.JScrollPane(grandExchangeTab));
         }
     }

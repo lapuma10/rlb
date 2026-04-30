@@ -26,10 +26,12 @@ import net.runelite.api.coords.WorldPoint;
 import net.runelite.api.gameval.InterfaceID;
 import net.runelite.api.gameval.InventoryID;
 import net.runelite.api.gameval.VarClientID;
+import net.runelite.api.gameval.VarbitID;
 import net.runelite.api.widgets.Widget;
 import net.runelite.client.callback.ClientThread;
 import net.runelite.client.sequence.activities.banking.BankActions;
 import net.runelite.client.sequence.dispatch.HumanizedInputDispatcher;
+import net.runelite.client.sequence.internal.ActionRequest;
 
 /**
  * Drives bank-booth interactions (open, deposit, close).
@@ -539,17 +541,15 @@ public final class BankInteraction implements BankActions
         if (qty <= 0) return false;
         boolean picked = withdrawWithVerb(itemId, "Withdraw-X");
         if (!picked) return false;
-        // After "Withdraw-X" is picked, the game opens a chatbox input
-        // dialog asking for the quantity. Brief wait for the dialog
-        // to appear before we start typing.
-        Thread.sleep(300L + (long) (Math.random() * 300L));
-        String qtyStr = Integer.toString(qty);
-        for (char ch : qtyStr.toCharArray())
+        // Withdraw-X opens a chatbox numeric prompt. Use the dispatcher's
+        // shared helper that gates on VarClientID.MESLAYERMODE — widget
+        // visibility on Chatbox.MES_LAYER lies for these prompts (the
+        // hidden chain reports false even when the dialog is on screen).
+        if (!dispatcher.typeChatboxAndEnter(Integer.toString(qty), 3500L))
         {
-            dispatcher.typeChar(ch);
-            Thread.sleep(40L + (long) (Math.random() * 60L));
+            log.warn("bank: withdraw-X chatbox prompt did not appear within 3.5s — aborting type");
+            return false;
         }
-        dispatcher.tapKey(java.awt.event.KeyEvent.VK_ENTER);
         return true;
     }
 
@@ -558,6 +558,56 @@ public final class BankInteraction implements BankActions
     public void withdrawX(int itemId, int qty) throws InterruptedException
     {
         tryWithdrawX(itemId, qty);
+    }
+
+    /** Withdraw {@code qty} of {@code itemId} as a noted stack — flips the
+     *  bank's "Note" toggle on first if needed, then runs the same right-
+     *  click "Withdraw-X" flow as {@link #tryWithdrawX}. The result lands
+     *  in a single inventory slot (a noted stack) regardless of qty. */
+    public boolean tryWithdrawAsNoteX(int itemId, int qty) throws InterruptedException
+    {
+        if (qty <= 0) return false;
+        if (!ensureNoteModeOn()) return false;
+        return tryWithdrawX(itemId, qty);
+    }
+
+    /** {@inheritDoc} */
+    @Override
+    public void withdrawAsNoteX(int itemId, int qty) throws InterruptedException
+    {
+        tryWithdrawAsNoteX(itemId, qty);
+    }
+
+    /** If the bank's withdraw-mode varbit is not in "note" state, click the
+     *  Bankmain.NOTE toggle and wait for the varbit to flip. Returns true
+     *  iff note mode is on (or successfully turned on) when this returns. */
+    private boolean ensureNoteModeOn() throws InterruptedException
+    {
+        Integer state = onClient(() -> client.getVarbitValue(VarbitID.BANK_WITHDRAWNOTES));
+        if (state != null && state == 1) return true;
+
+        // Wait for any in-flight click chain to land — otherwise dispatch
+        // is silently dropped by the busy guard and our varbit poll just
+        // times out.
+        dispatcher.awaitIdle(2000);
+        ActionRequest req = ActionRequest.builder()
+            .kind(ActionRequest.Kind.CLICK_WIDGET)
+            .channel(ActionRequest.Channel.MOUSE)
+            .widgetId(InterfaceID.Bankmain.NOTE)
+            .build();
+        dispatcher.dispatch(req);
+
+        // Poll the varbit briefly — clicking the toggle bumps it within a
+        // tick or two; if it doesn't, bail rather than withdraw in item mode.
+        long deadline = System.currentTimeMillis() + 1500L;
+        while (System.currentTimeMillis() < deadline)
+        {
+            Thread.sleep(80L);
+            Integer cur = onClient(() -> client.getVarbitValue(VarbitID.BANK_WITHDRAWNOTES));
+            if (cur != null && cur == 1) return true;
+        }
+        log.warn("bank: note-mode toggle did not flip after click — aborting noted withdraw");
+        return false;
     }
 
     /** Deposit all of {@code itemId} from the inventory via the slot's

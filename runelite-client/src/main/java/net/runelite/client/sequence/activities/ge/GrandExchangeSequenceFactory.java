@@ -78,6 +78,7 @@ public final class GrandExchangeSequenceFactory {
         Step createOffer = new LinearSequence("CreateBuyOffer")
             .then(new StartOfferStep(OfferSide.BUY, ge))
             .then(new SelectItemStep(intent.itemId(), intent.displayName(), ge))
+            .then(new PickSearchResultStep(intent.itemId(), intent.displayName(), ge))
             .then(new SetQuantityStep(intent.quantity(), ge))
             .then(new SetPriceStep(priceEach, ge))
             .then(new ConfirmOfferStep(intent.itemId(), OfferSide.BUY, intent.quantity(), priceEach, ge));
@@ -85,6 +86,7 @@ public final class GrandExchangeSequenceFactory {
         Step root = new LinearSequence("BuyItemAtGECore")
             .then(new EnsureAtGrandExchangeStep(geArea))
             .then(new OpenGrandExchangeStep(ge))
+            .then(new CollectAllCompletedOffersStep(ge))
             .then(new EnsureInventoryForBuyStep(intent.quantity(), priceEach))
             .then(new EnsureNoConflictingOfferStep(intent.itemId(), OfferSide.BUY))
             .then(createOffer)
@@ -113,6 +115,7 @@ public final class GrandExchangeSequenceFactory {
         Step createOffer = new LinearSequence("CreateSellOffer")
             .then(new StartOfferStep(OfferSide.SELL, ge))
             .then(new SelectItemStep(intent.itemId(), intent.displayName(), ge))
+            .then(new PickSearchResultStep(intent.itemId(), intent.displayName(), ge))
             .then(new SetQuantityStep(intent.quantity(), ge))
             .then(new SetPriceStep(priceEach, ge))
             .then(new ConfirmOfferStep(intent.itemId(), OfferSide.SELL, intent.quantity(), priceEach, ge));
@@ -120,6 +123,7 @@ public final class GrandExchangeSequenceFactory {
         Step root = new LinearSequence("SellItemAtGECore")
             .then(new EnsureAtGrandExchangeStep(geArea))
             .then(new OpenGrandExchangeStep(ge))
+            .then(new CollectAllCompletedOffersStep(ge))
             .then(new EnsureInventoryForSellStep(intent.itemId(), intent.quantity()))
             .then(new EnsureNoConflictingOfferStep(intent.itemId(), OfferSide.SELL))
             .then(createOffer)
@@ -166,6 +170,7 @@ public final class GrandExchangeSequenceFactory {
         Step createOffer = new LinearSequence("CreateBuyOffer")
             .then(new StartOfferStep(OfferSide.BUY, ge))
             .then(new SelectItemStep(intent.itemId(), intent.displayName(), ge))
+            .then(new PickSearchResultStep(intent.itemId(), intent.displayName(), ge))
             .then(new SetQuantityStep(intent.quantity(), ge))
             .then(new SetPriceStep(priceEach, ge))
             .then(new ConfirmOfferStep(intent.itemId(), OfferSide.BUY, intent.quantity(), priceEach, ge));
@@ -179,6 +184,7 @@ public final class GrandExchangeSequenceFactory {
             .then(new CloseBankStep(bank))
             // GE Core sub-flow
             .then(new OpenGrandExchangeStep(ge))
+            .then(new CollectAllCompletedOffersStep(ge))
             .then(new EnsureInventoryForBuyStep(intent.quantity(), priceEach))
             .then(new EnsureNoConflictingOfferStep(intent.itemId(), OfferSide.BUY))
             .then(createOffer)
@@ -210,6 +216,7 @@ public final class GrandExchangeSequenceFactory {
         Step createOffer = new LinearSequence("CreateSellOffer")
             .then(new StartOfferStep(OfferSide.SELL, ge))
             .then(new SelectItemStep(intent.itemId(), intent.displayName(), ge))
+            .then(new PickSearchResultStep(intent.itemId(), intent.displayName(), ge))
             .then(new SetQuantityStep(intent.quantity(), ge))
             .then(new SetPriceStep(priceEach, ge))
             .then(new ConfirmOfferStep(intent.itemId(), OfferSide.SELL, intent.quantity(), priceEach, ge));
@@ -223,6 +230,7 @@ public final class GrandExchangeSequenceFactory {
             .then(new CloseBankStep(bank))
             // GE Core sub-flow
             .then(new OpenGrandExchangeStep(ge))
+            .then(new CollectAllCompletedOffersStep(ge))
             .then(new EnsureInventoryForSellStep(intent.itemId(), intent.quantity()))
             .then(new EnsureNoConflictingOfferStep(intent.itemId(), OfferSide.SELL))
             .then(createOffer)

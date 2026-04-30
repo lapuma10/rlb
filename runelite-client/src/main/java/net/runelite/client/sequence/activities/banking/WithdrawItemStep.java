@@ -95,9 +95,24 @@ public final class WithdrawItemStep implements Step {
         int knownBankCount = a.knownCount().orElse(Integer.MAX_VALUE);
         int target = resolveTargetCount(currentCount, i.freeSlots(), knownBankCount);
         int delta = target - currentCount;
-        if (delta > i.freeSlots()) {
-            step.put(K_PRECONDITION_FAILURE, new BlockReason.InventoryFull(delta - i.freeSlots()));
-            return;
+
+        // Slot-need calc: stackable items (incl. coins, runes, noted stacks
+        // already held) collapse into one slot; non-stackables need one
+        // slot each. If non-stackable bulk doesn't fit, fall back to
+        // noted-form withdraw (always 1 slot) since GE accepts noted offers
+        // and the user's typical bank-prep flow is feeding the GE.
+        boolean stackable = a.stackable();
+        int slotsNeeded = stackable ? (currentCount > 0 ? 0 : 1) : delta;
+        boolean useNote = false;
+        if (slotsNeeded > i.freeSlots()) {
+            // Try noted form before giving up — single slot for any qty.
+            int notedSlotsNeeded = currentCount > 0 ? 0 : 1;
+            if (!stackable && notedSlotsNeeded <= i.freeSlots()) {
+                useNote = true;
+            } else {
+                step.put(K_PRECONDITION_FAILURE, new BlockReason.InventoryFull(slotsNeeded - i.freeSlots()));
+                return;
+            }
         }
 
         // Fresh work — persist target/startTick and dispatch with the delta (NOT the original q).
@@ -109,9 +124,15 @@ public final class WithdrawItemStep implements Step {
         if (delta == 0) return;   // defensive belt-and-braces; alreadySatisfied should have caught this
 
         try {
-            if (delta == 1)                          bank.withdrawOne(itemId);
-            else if (delta == knownBankCount)        bank.withdrawAll(itemId);
-            else                                     bank.withdrawX(itemId, delta);
+            if (useNote) {
+                bank.withdrawAsNoteX(itemId, delta);
+            } else if (delta == 1) {
+                bank.withdrawOne(itemId);
+            } else if (delta == knownBankCount) {
+                bank.withdrawAll(itemId);
+            } else {
+                bank.withdrawX(itemId, delta);
+            }
         } catch (InterruptedException ie) {
             Thread.currentThread().interrupt();
             step.put(K_PRECONDITION_FAILURE, new DiagnosticReason.Unknown("interrupted"));

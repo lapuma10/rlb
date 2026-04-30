@@ -13,34 +13,35 @@ import net.runelite.client.sequence.blackboard.BlackboardKey;
 import net.runelite.client.sequence.blackboard.BlackboardScope;
 
 /**
- * Selects the item being traded in the offer-setup interface. Dispatches
- * {@code GeActions.selectItem} on onStart; verifies the chosen item id
- * matches the intent.
+ * Validate-then-click step for the GE search result list. Runs immediately
+ * after {@link SelectItemStep} (which types the name without Enter) and
+ * before {@link SetQuantityStep}. The pre-validation is the whole point —
+ * we never trust the engine's auto-pick because the search will partial-
+ * match unintended items ("25" picks "Team cape 25", "bread" picks the
+ * first bread-something).
  *
- * <p>Verification of the "currently-selected item id" widget is deferred —
- * Phase A treats reaching {@code offerSetupOpen} again with no further
- * widgets-popup as success. Phase B / banking can refine to read a varc
- * once we identify the right one in {@code InterfaceID.GeOffers}.
+ * <p>Mechanism: walks {@code Chatbox.MES_LAYER_SCROLLCONTENTS} dynamic
+ * children in groups of 3 (icon / name / price), finds the row whose
+ * icon's {@code getItemId()} equals the intent's {@code itemId}, clicks
+ * that row's combined bounds via {@code CLICK_BOUNDS}. Aborts with
+ * {@link GeBlockReason.GeSearchResultNotFound} when no row matches —
+ * better to fail loudly than buy/sell the wrong item.
  */
-public final class SelectItemStep implements Step {
+public final class PickSearchResultStep implements Step {
 
     private static final BlackboardKey<GeBlockReason> K_PRECONDITION =
-        BlackboardKey.of("selectItem.precondition", GeBlockReason.class);
-    private static final BlackboardKey<Integer> K_START_TICK =
-        BlackboardKey.of("selectItem.startTick", Integer.class);
-    /** Set to true after {@code GeActions.selectItem} returns true (chatbox
-     *  prompt arrived and the name was typed). The check() guard treats
-     *  {@code offerSetupOpen()} as success ONLY when this flag is set —
-     *  otherwise a timeout-failed selectItem would silently cascade and
-     *  the next step's typing would land in the still-open search box. */
-    private static final BlackboardKey<Boolean> K_TYPED =
-        BlackboardKey.of("selectItem.typed", Boolean.class);
+        BlackboardKey.of("pickResult.precondition", GeBlockReason.class);
+    /** Set to true after {@code GeActions.pickSearchResult} confirms a
+     *  match-and-click. The check() guard requires this — without it a
+     *  not-found result would silently cascade into the next step. */
+    private static final BlackboardKey<Boolean> K_PICKED =
+        BlackboardKey.of("pickResult.picked", Boolean.class);
 
     private final int itemId;
     private final String displayName;
     private final GeActions ge;
 
-    public SelectItemStep(int itemId, String displayName, GeActions ge) {
+    public PickSearchResultStep(int itemId, String displayName, GeActions ge) {
         if (itemId <= 0) throw new IllegalArgumentException("itemId must be > 0");
         if (ge == null)  throw new IllegalArgumentException("GeActions must not be null");
         this.itemId = itemId;
@@ -48,7 +49,7 @@ public final class SelectItemStep implements Step {
         this.ge = ge;
     }
 
-    @Override public String name()                              { return "SelectItem(" + displayName + ")"; }
+    @Override public String name()                              { return "PickSearchResult(" + displayName + ")"; }
     @Override public int priority()                             { return 100; }
     @Override public int timeoutTicks()                         { return 6; }
     @Override public PreemptionPolicy preemptionPolicy()        { return PreemptionPolicy.WHEN_SAFE; }
@@ -63,12 +64,11 @@ public final class SelectItemStep implements Step {
             step.put(K_PRECONDITION, new GeBlockReason.GeOfferSetupNotOpen());
             return;
         }
-        step.put(K_START_TICK, s.tick());
-        boolean typed = ge.selectItem(itemId, displayName);
-        step.put(K_TYPED, typed);
-        if (!typed) {
+        boolean picked = ge.pickSearchResult(itemId);
+        step.put(K_PICKED, picked);
+        if (!picked) {
             step.put(K_PRECONDITION,
-                new GeBlockReason.GeChatboxPromptTimeout("selectItem"));
+                new GeBlockReason.GeSearchResultNotFound(itemId, displayName));
         }
     }
 
@@ -80,13 +80,9 @@ public final class SelectItemStep implements Step {
         Blackboard step = bb.scope(BlackboardScope.STEP);
         GeBlockReason pre = step.get(K_PRECONDITION).orElse(null);
         if (pre != null) return Completion.failed(pre);
-        // Only treat "offer-setup still open" as success when the typing
-        // path actually succeeded (chatbox prompt opened and we submitted
-        // the name). Otherwise the search prompt is still up and the next
-        // step's typing would land in it — exactly the bug we're guarding.
-        if (Boolean.TRUE.equals(step.get(K_TYPED).orElse(null))
+        if (Boolean.TRUE.equals(step.get(K_PICKED).orElse(null))
             && s.grandExchange().offerSetupOpen()) {
-            return new Completion.Succeeded("search list rendered");
+            return new Completion.Succeeded("search result picked");
         }
         return Completion.RUNNING;
     }
@@ -96,8 +92,8 @@ public final class SelectItemStep implements Step {
         if (f.diagnostic() instanceof GeBlockReason.GeOfferSetupNotOpen) {
             return new Recovery.Abort("offer-setup not open");
         }
-        if (f.diagnostic() instanceof GeBlockReason.GeChatboxPromptTimeout) {
-            return new Recovery.Abort("chatbox prompt did not open");
+        if (f.diagnostic() instanceof GeBlockReason.GeSearchResultNotFound) {
+            return new Recovery.Abort("search result not found");
         }
         return new Recovery.Retry(2);
     }

@@ -278,7 +278,7 @@ public class RecorderPlugin extends Plugin
         grandExchangeScript = new GrandExchangeScript(
             client, clientThread, geDispatcher, geInputOwnership, geArea, geBank);
         eventBus.register(grandExchangeScript);
-        panel.setGrandExchangeScript(grandExchangeScript);
+        panel.setGrandExchangeScript(grandExchangeScript, itemManager);
 
         BufferedImage icon = ImageUtil.loadImageResource(getClass(), "/util/reset.png");
         navButton = NavigationButton.builder()

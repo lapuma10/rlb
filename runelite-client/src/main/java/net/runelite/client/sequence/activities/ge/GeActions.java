@@ -23,18 +23,32 @@ public interface GeActions {
      *  surfacing the offer-setup interface for that slot. */
     void clickOfferSlotButton(int slot, OfferSide side);
 
-    /** In the offer-setup interface, set the item being traded. The impl
-     *  may type-and-click-result or use the direct varc-set shortcut; the
-     *  step verifies via {@code GrandExchangeView.offerSetupOpen()} +
-     *  the selected-item widget value. */
-    void selectItem(int itemId, String displayName);
+    /** Type the item name into the GE search chatbox WITHOUT submitting.
+     *  Returns true if the chatbox-search prompt opened, the name was
+     *  typed, and the result list rendered with at least one group of 3
+     *  dynamic children. The caller is expected to follow up with
+     *  {@link #pickSearchResult(int)} to validate the list contains the
+     *  intended item id and click that specific row — never trust the
+     *  engine's auto-pick (Enter), which can land on a partial match like
+     *  "Team cape 25" for an input of "25". */
+    boolean selectItem(int itemId, String displayName);
 
-    /** Click the quantity *X widget and submit the typed quantity via the
-     *  humanized dispatcher's chatbox helper. */
-    void setQuantity(int qty);
+    /** Walk the search-result rows in {@code Chatbox.MES_LAYER_SCROLLCONTENTS}
+     *  and click the row whose icon's {@code getItemId()} equals
+     *  {@code itemId}. Returns true on a confirmed match-and-click, false
+     *  if no result row carries the requested item id (typo, mistyped name,
+     *  or item not tradeable on this account). */
+    boolean pickSearchResult(int itemId);
 
-    /** Click the price *X widget and submit the typed coin-per-item price. */
-    void setPrice(int priceEach);
+    /** Type the quantity into the chatbox numeric prompt and submit.
+     *  Returns true on type+submit success; false if the prompt never
+     *  appeared. */
+    boolean setQuantity(int qty);
+
+    /** Type the per-item price into the chatbox numeric prompt and submit.
+     *  Returns true on type+submit success; false if the prompt never
+     *  appeared. */
+    boolean setPrice(int priceEach);
 
     /** Click the "Confirm Offer" button on the offer-setup interface. */
     void confirmOffer();

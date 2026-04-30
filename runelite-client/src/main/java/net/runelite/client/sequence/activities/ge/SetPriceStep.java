@@ -20,6 +20,9 @@ public final class SetPriceStep implements Step {
 
     private static final BlackboardKey<GeBlockReason> K_PRECONDITION =
         BlackboardKey.of("setPrice.precondition", GeBlockReason.class);
+    /** Set to true after {@code GeActions.setPrice} returns true. */
+    private static final BlackboardKey<Boolean> K_TYPED =
+        BlackboardKey.of("setPrice.typed", Boolean.class);
 
     private final int priceEach;
     private final GeActions ge;
@@ -46,7 +49,12 @@ public final class SetPriceStep implements Step {
             step.put(K_PRECONDITION, new GeBlockReason.GeOfferSetupNotOpen());
             return;
         }
-        ge.setPrice(priceEach);
+        boolean typed = ge.setPrice(priceEach);
+        step.put(K_TYPED, typed);
+        if (!typed) {
+            step.put(K_PRECONDITION,
+                new GeBlockReason.GeChatboxPromptTimeout("setPrice"));
+        }
     }
 
     @Override public void onEvent(Object event, StepContext ctx) {}
@@ -57,7 +65,8 @@ public final class SetPriceStep implements Step {
         Blackboard step = bb.scope(BlackboardScope.STEP);
         GeBlockReason pre = step.get(K_PRECONDITION).orElse(null);
         if (pre != null) return Completion.failed(pre);
-        if (s.grandExchange().offerSetupOpen()) {
+        if (Boolean.TRUE.equals(step.get(K_TYPED).orElse(null))
+            && s.grandExchange().offerSetupOpen()) {
             return new Completion.Succeeded("price set");
         }
         return Completion.RUNNING;
@@ -67,6 +76,9 @@ public final class SetPriceStep implements Step {
     public Recovery onFailure(Failure f, WorldSnapshot s, Blackboard bb) {
         if (f.diagnostic() instanceof GeBlockReason.GeOfferSetupNotOpen) {
             return new Recovery.Abort("offer-setup not open");
+        }
+        if (f.diagnostic() instanceof GeBlockReason.GeChatboxPromptTimeout) {
+            return new Recovery.Abort("chatbox prompt did not open");
         }
         return new Recovery.Retry(2);
     }

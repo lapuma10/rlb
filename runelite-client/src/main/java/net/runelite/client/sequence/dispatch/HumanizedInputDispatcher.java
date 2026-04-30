@@ -341,8 +341,13 @@ public class HumanizedInputDispatcher implements InputDispatcher
                 req.getVerb() == null || req.getVerb().isBlank() ? "Attack" : req.getVerb());
             case CLICK_GAME_OBJECT -> gameObjectClick(req.getTile(), req.getVerb());
             case CLICK_GROUND_ITEM -> groundItemClick(req.getTile(), req.getItemId());
-            case CLICK_WIDGET -> widgetClick(req.getWidgetId());
+            case CLICK_WIDGET -> {
+                String verb = req.getVerb();
+                if (verb != null && !verb.isBlank()) widgetVerbClick(req.getWidgetId(), verb);
+                else widgetClick(req.getWidgetId());
+            }
             case CLICK_INV_ITEM -> invSlotClick(Math.max(0, req.getSlot()), req.getVerb());
+            case CLICK_BOUNDS -> boundsClick(req.getBounds(), req.getVerb());
             case KEY -> keyTap(req.getKeyCode());
             default -> log.debug("unhandled kind {}", req.getKind());
         }
@@ -1037,6 +1042,52 @@ public class HumanizedInputDispatcher implements InputDispatcher
         clickPress(MouseEvent.BUTTON1);
     }
 
+    /** Click inside a pre-resolved canvas rectangle with optional verb match.
+     *  Caller has already located the exact bounds (typically by walking a
+     *  parent widget's children and reading {@code child.getBounds()} on the
+     *  client thread) — useful when the click target is a dynamic child whose
+     *  {@code getId()} returns the parent's packed id, so packed-id resolution
+     *  would land somewhere inside the parent rather than the specific child.
+     *
+     *  <p>Sampling and verb behaviour mirror {@link #invSlotClick}: humanized
+     *  pixel inside the rect with edge margins, then either left-click (if
+     *  the verb is the engine's L-click default) or right-click + menu
+     *  select. */
+    private void boundsClick(java.awt.Rectangle bounds, String verb) throws InterruptedException
+    {
+        if (bounds == null || bounds.isEmpty())
+        {
+            lastError.set("boundsClick: null or empty bounds");
+            return;
+        }
+        int marginX = Math.max(1, bounds.width / 6);
+        int marginY = Math.max(1, bounds.height / 6);
+        int x = bounds.x + marginX
+            + rng.nextInt(Math.max(1, bounds.width - 2 * marginX));
+        int y = bounds.y + marginY
+            + rng.nextInt(Math.max(1, bounds.height - 2 * marginY));
+        moveCursorTo(x, y);
+        if (verb == null || verb.isBlank())
+        {
+            clickPress(MouseEvent.BUTTON1);
+            return;
+        }
+        Thread.sleep(60);
+        boolean isTop = onClient(() -> isTopMenuVerb(verb));
+        if (isTop)
+        {
+            clickPress(MouseEvent.BUTTON1);
+            return;
+        }
+        clickPress(MouseEvent.BUTTON3);
+        Thread.sleep(120);
+        boolean ok = selectMenuVerb(verb);
+        if (!ok)
+        {
+            lastError.set("boundsClick: menu open but verb '" + verb + "' not present");
+        }
+    }
+
     /** Click a widget (typically an inventory slot) with a non-default verb
      *  via right-click → menu select → verb row. If the verb is the engine's
      *  current left-click default, falls through to a plain left-click on
@@ -1269,6 +1320,126 @@ public class HumanizedInputDispatcher implements InputDispatcher
     public void tapKey(int keyCode) throws InterruptedException
     {
         keyTap(keyCode);
+    }
+
+    /** Wait until any chatbox text/numeric input prompt is open
+     *  ({@code VarClientID.MESLAYERMODE != 0}). The OSRS client toggles
+     *  this varc when "Enter amount:" / "Set price:" / item-search /
+     *  any chatbox input dialog opens — we use it instead of walking
+     *  widget {@code isHidden()} up the parent chain because that
+     *  signal is unreliable for these prompts (the layer's hidden
+     *  flag flickers across script-driven sub-states). Returns true
+     *  if a prompt was visible before the deadline; false on timeout. */
+    public boolean awaitChatboxInputPrompt(long timeoutMs) throws InterruptedException
+    {
+        // Let any in-flight click chain land before we poll, otherwise
+        // we race the right-click → menu pick that opened the dialog.
+        awaitIdle(Math.min(timeoutMs, 2000L));
+        long deadline = System.currentTimeMillis() + timeoutMs;
+        while (System.currentTimeMillis() < deadline)
+        {
+            Integer mode = onClient(() -> client.getVarcIntValue(
+                net.runelite.api.gameval.VarClientID.MESLAYERMODE));
+            if (mode != null && mode != 0) return true;
+            Thread.sleep(80L);
+        }
+        return false;
+    }
+
+    /** Wait for a chatbox input prompt, then type {@code text} with
+     *  humanized inter-key pacing and submit with Enter. The text is
+     *  whatever the OSRS prompt accepts as a raw string — digits for
+     *  bank/GE quantity & price (so {@code "10000"}, {@code "10k"},
+     *  {@code "4m"} all work), the item name for GE search.
+     *
+     *  <p>Uses the same keystroke path as login (per-char {@link #typeChar}
+     *  + final {@link #tapKey}({@code VK_ENTER})). Returns true on a
+     *  successful type+Enter; false if the prompt never appeared within
+     *  {@code awaitMs}. */
+    public boolean typeChatboxAndEnter(String text, long awaitMs) throws InterruptedException
+    {
+        return typeChatboxAndEnter(text, awaitMs, 0L, 0L);
+    }
+
+    /** Like {@link #typeChatboxAndEnter(String, long)} but inserts a
+     *  randomized human-dwell delay {@code [minDwellMs, maxDwellMs]}
+     *  AFTER the prompt is detected and BEFORE the first keystroke —
+     *  modelling a player reading the prompt and reaching for the
+     *  keyboard. Use this for GE typings (search / quantity / price)
+     *  where instant-typing-bot behaviour is the most obvious tell.
+     *
+     *  <p>{@code awaitMs} is the safety-net cap on prompt-open polling
+     *  only; passing a generous value (e.g. 15s) is fine because the
+     *  poll exits as soon as {@code MESLAYERMODE != 0}. The dwell is
+     *  deterministic in expected duration (uniform in the given range)
+     *  regardless of how fast the prompt actually opened.
+     *
+     *  <p>Pass {@code minDwellMs == maxDwellMs == 0} to skip the dwell. */
+    public boolean typeChatboxAndEnter(String text, long awaitMs,
+                                        long minDwellMs, long maxDwellMs)
+        throws InterruptedException
+    {
+        return typeChatboxInternal(text, awaitMs, minDwellMs, maxDwellMs, true);
+    }
+
+    /** Type into the chatbox prompt WITHOUT submitting Enter. Use for the
+     *  GE search where we want to inspect the result list before picking
+     *  a row instead of letting the engine auto-pick the first match.
+     *  Same dwell + per-key humanization as
+     *  {@link #typeChatboxAndEnter(String, long, long, long)}. */
+    public boolean typeChatbox(String text, long awaitMs,
+                                long minDwellMs, long maxDwellMs)
+        throws InterruptedException
+    {
+        return typeChatboxInternal(text, awaitMs, minDwellMs, maxDwellMs, false);
+    }
+
+    private boolean typeChatboxInternal(String text, long awaitMs,
+                                         long minDwellMs, long maxDwellMs,
+                                         boolean pressEnter)
+        throws InterruptedException
+    {
+        if (text == null || text.isEmpty()) return false;
+        if (!awaitChatboxInputPrompt(awaitMs)) return false;
+        if (maxDwellMs > 0 && maxDwellMs >= minDwellMs)
+        {
+            long dwell = minDwellMs
+                + (maxDwellMs > minDwellMs
+                    ? rng.nextInt((int) Math.min(Integer.MAX_VALUE, maxDwellMs - minDwellMs + 1))
+                    : 0L);
+            Thread.sleep(dwell);
+        }
+        for (char ch : text.toCharArray())
+        {
+            typeChar(ch);
+            Thread.sleep(40L + rng.nextInt(60));
+        }
+        if (pressEnter) tapKey(java.awt.event.KeyEvent.VK_ENTER);
+        return true;
+    }
+
+    /** Poll until the GE search results widget
+     *  ({@code Chatbox.MES_LAYER_SCROLLCONTENTS}) has at least one
+     *  result group rendered (groups of 3 dynamic children per row —
+     *  see RuneLite's GrandExchangePlugin#highlightSearchMatches).
+     *  Returns true if results were visible before the deadline; false
+     *  on timeout (no results yet, or widget never rendered). */
+    public boolean awaitSearchResultsPopulated(long timeoutMs) throws InterruptedException
+    {
+        long deadline = System.currentTimeMillis() + timeoutMs;
+        while (System.currentTimeMillis() < deadline)
+        {
+            Boolean ready = onClient(() -> {
+                net.runelite.api.widgets.Widget r = client.getWidget(
+                    net.runelite.api.gameval.InterfaceID.Chatbox.MES_LAYER_SCROLLCONTENTS);
+                if (r == null || r.isHidden()) return false;
+                net.runelite.api.widgets.Widget[] kids = r.getDynamicChildren();
+                return kids != null && kids.length >= 3;
+            });
+            if (Boolean.TRUE.equals(ready)) return true;
+            Thread.sleep(80L);
+        }
+        return false;
     }
 
     /** Tap a chord key while {@code modifierKeyCode} is held. Used for

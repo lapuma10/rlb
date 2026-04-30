@@ -24,6 +24,12 @@ public interface BankActions {
     /** Withdraw a specific quantity of the given item from the bank. */
     void withdrawX(int itemId, int qty) throws InterruptedException;
 
+    /** Withdraw {@code qty} of {@code itemId} as a noted stack — single
+     *  inventory slot regardless of qty. The implementation is responsible
+     *  for ensuring the bank's "Note" toggle is on for this withdraw and
+     *  restoring it afterwards if it changed it. */
+    void withdrawAsNoteX(int itemId, int qty) throws InterruptedException;
+
     /** Close the bank widget. */
     void closeBank() throws InterruptedException;
 }

@@ -6,6 +6,7 @@ import java.util.OptionalInt;
 import net.runelite.api.Client;
 import net.runelite.api.GrandExchangeOffer;
 import net.runelite.api.GrandExchangeOfferState;
+import net.runelite.api.WorldType;
 import net.runelite.api.gameval.InterfaceID;
 import net.runelite.api.widgets.Widget;
 import net.runelite.client.sequence.views.GrandExchangeOfferView;
@@ -25,6 +26,10 @@ import net.runelite.client.sequence.views.OfferStatus;
 public final class GrandExchangeObserver {
 
     private static final int SLOT_COUNT = 8;
+    /** Slots 0-2 are usable for everyone (free + members); slots 3-7 are
+     *  members-only. The OSRS UI hides the +/buttons for the locked slots
+     *  on F2P, so {@code firstEmptySlot()} must not return them. */
+    private static final int F2P_SLOT_COUNT = 3;
 
     private final Client client;
 
@@ -40,6 +45,12 @@ public final class GrandExchangeObserver {
         boolean setupOpen = offersOpen && isVisible(InterfaceID.GeOffers.SETUP);
         boolean collectOpen = isVisible(InterfaceID.GeCollect.UNIVERSE);
 
+        // Members detection: cap usable slots to 3 for F2P. Worlds without
+        // the MEMBERS flag are F2P; the locked slot widgets aren't clickable
+        // there, so picking firstEmptySlot()=3 would silently no-op.
+        int usableSlots = client.getWorldType().contains(WorldType.MEMBERS)
+            ? SLOT_COUNT : F2P_SLOT_COUNT;
+
         GrandExchangeOffer[] raw = client.getGrandExchangeOffers();
         List<GrandExchangeOfferView> slots = new ArrayList<>(SLOT_COUNT);
         if (raw == null) {
@@ -50,7 +61,8 @@ public final class GrandExchangeObserver {
                 slots.add(o == null ? GrandExchangeOfferView.empty(i) : map(i, o));
             }
         }
-        return new SnapshotGrandExchangeView(offersOpen, setupOpen, collectOpen, List.copyOf(slots));
+        return new SnapshotGrandExchangeView(offersOpen, setupOpen, collectOpen,
+            List.copyOf(slots), usableSlots);
     }
 
     private static GrandExchangeOfferView map(int slot, GrandExchangeOffer o) {
@@ -85,18 +97,26 @@ public final class GrandExchangeObserver {
 
     private boolean isVisible(int widgetId) {
         Widget w = client.getWidget(widgetId);
-        return w != null && !w.isHidden();
+        if (w == null) return false;
+        // Walk the ancestor chain — a leaf-only check misses tabs collapsed
+        // at the root layer (CLAUDE.md §1).
+        for (Widget cur = w; cur != null; cur = cur.getParent()) {
+            if (cur.isHidden()) return false;
+        }
+        return true;
     }
 
     private record SnapshotGrandExchangeView(
         boolean open,
         boolean offerSetupOpen,
         boolean collectOpen,
-        List<GrandExchangeOfferView> offers
+        List<GrandExchangeOfferView> offers,
+        int usableSlots
     ) implements GrandExchangeView {
 
         @Override public OptionalInt firstEmptySlot() {
-            for (GrandExchangeOfferView o : offers) {
+            for (int i = 0; i < usableSlots && i < offers.size(); i++) {
+                GrandExchangeOfferView o = offers.get(i);
                 if (o.isEmpty()) return OptionalInt.of(o.slot());
             }
             return OptionalInt.empty();
@@ -104,7 +124,9 @@ public final class GrandExchangeObserver {
 
         @Override public int emptySlotCount() {
             int n = 0;
-            for (GrandExchangeOfferView o : offers) if (o.isEmpty()) n++;
+            for (int i = 0; i < usableSlots && i < offers.size(); i++) {
+                if (offers.get(i).isEmpty()) n++;
+            }
             return n;
         }
 
