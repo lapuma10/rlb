@@ -1,6 +1,7 @@
 package net.runelite.client.sequence.activities.banking;
 
 import java.util.Optional;
+import java.util.concurrent.atomic.AtomicBoolean;
 
 import net.runelite.client.sequence.*;
 import net.runelite.client.sequence.affordance.BlockReason;
@@ -36,7 +37,21 @@ public final class WithdrawItemStep implements Step {
 
     @Override public String name()                                  { return "WithdrawItem(" + displayName + ", " + desired + ")"; }
     @Override public int priority()                                 { return 100; }
-    @Override public int timeoutTicks()                             { return 6; }
+    /**
+     * 30 ticks ≈ 18s — generous because the dispatcher worker may need to:
+     *   right-click the slot (~1s)
+     *   pick "Withdraw-X" (~0.5s)
+     *   wait for chatbox numeric prompt (~0.5s)
+     *   type up to ~10 digits with humanized inter-key dwell (~6-8s for
+     *     1.5M coins; longer for 100M+ stacks)
+     *   press Enter and wait for inventory to update (~0.5s)
+     * Earlier value (6 ticks ≈ 3.6s) caused the engine to externally time
+     * out the step mid-type for any quantity >999 — see CLAUDE.md
+     * "Threading model" / 2026-04-30 1.5M coins withdraw regression.
+     * The typed WithdrawNoOp guard (suppressed via K_DISPATCH_DONE while
+     * the RUN_TASK is in flight) still catches genuine no-ops faster.
+     */
+    @Override public int timeoutTicks()                             { return 30; }
     @Override public PreemptionPolicy preemptionPolicy()            { return PreemptionPolicy.WHEN_SAFE; }
     @Override public boolean isSafeToPause(WorldSnapshot s, Blackboard bb) { return true; }
 
@@ -134,25 +149,38 @@ public final class WithdrawItemStep implements Step {
         final int qty = delta;
         final int knownBank = knownBankCount;
         final boolean note = useNote;
-        final BlockingTask task;
+        // Wrap the bank lambda so the worker thread flips this flag on
+        // completion. check() reads it to suppress the typed timeout
+        // while our task is still running — typing 7-digit numbers
+        // (e.g. 1.5M coins) takes ~7s, well past timeoutTicks=6, so
+        // without this the engine fires WithdrawNoOp and retries
+        // mid-type, dropping the duplicate dispatch and confusing the
+        // state machine.
+        final AtomicBoolean dispatchDone = new AtomicBoolean(false);
+        final BlockingTask inner;
         final String taskName;
         if (note) {
-            task = () -> bank.withdrawAsNoteX(id, qty);
+            inner = () -> bank.withdrawAsNoteX(id, qty);
             taskName = "BANK_WITHDRAW_NOTE_X(" + id + "," + qty + ")";
         } else if (qty == 1) {
-            task = () -> bank.withdrawOne(id);
+            inner = () -> bank.withdrawOne(id);
             taskName = "BANK_WITHDRAW_ONE(" + id + ")";
         } else if (qty == knownBank) {
-            task = () -> bank.withdrawAll(id);
+            inner = () -> bank.withdrawAll(id);
             taskName = "BANK_WITHDRAW_ALL(" + id + ")";
         } else {
-            task = () -> bank.withdrawX(id, qty);
+            inner = () -> bank.withdrawX(id, qty);
             taskName = "BANK_WITHDRAW_X(" + id + "," + qty + ")";
         }
+        BlockingTask wrapped = () -> {
+            try { inner.run(); }
+            finally { dispatchDone.set(true); }
+        };
+        step.put(K_DISPATCH_DONE, dispatchDone);
         ActionRequest req = ActionRequest.builder()
             .kind(ActionRequest.Kind.RUN_TASK)
             .channel(ActionRequest.Channel.MOUSE)
-            .task(task)
+            .task(wrapped)
             .taskName(taskName)
             .build();
         ctx.dispatcher().dispatch(req);
@@ -190,6 +218,15 @@ public final class WithdrawItemStep implements Step {
         // Typed timeout — deterministic, fires before the engine's generic timeoutTicks() (§10.6).
         // Engine post-processes check() result before applying timeoutTicks(), so returning Failed here
         // means Failure.diagnostic carries WithdrawNoOp, not the engine's untyped Failure.timeout.
+        //
+        // Suppress the typed timeout while our RUN_TASK is still in flight on
+        // the dispatcher worker — typing 7-digit quantities (1.5M coins,
+        // etc.) takes ~7s, longer than timeoutTicks=6 (3.6s). Time out only
+        // after the worker has finished AND inventory still hasn't changed.
+        AtomicBoolean dispatchDone = step.get(K_DISPATCH_DONE).orElse(null);
+        boolean dispatchInFlight = dispatchDone != null && !dispatchDone.get();
+        if (dispatchInFlight) return Completion.RUNNING;
+
         int startTick = step.get(K_START_TICK).orElse(s.tick());
         if (s.tick() - startTick >= timeoutTicks() && now == invStart) {
             return Completion.failed(new BlockReason.WithdrawNoOp(itemId, timeoutTicks()));
@@ -244,4 +281,5 @@ public final class WithdrawItemStep implements Step {
     private static final BlackboardKey<Integer>          K_START_TICK           = BlackboardKey.of("withdraw.startTick",            Integer.class);
     private static final BlackboardKey<Outcome>          K_OUTCOME              = BlackboardKey.of("withdraw.outcome",              Outcome.class);
     private static final BlackboardKey<DiagnosticReason> K_PRECONDITION_FAILURE = BlackboardKey.of("withdraw.preconditionFailure",  DiagnosticReason.class);
+    private static final BlackboardKey<AtomicBoolean>    K_DISPATCH_DONE        = BlackboardKey.of("withdraw.dispatchDone",         AtomicBoolean.class);
 }

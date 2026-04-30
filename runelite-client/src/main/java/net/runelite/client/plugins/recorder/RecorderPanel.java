@@ -142,12 +142,15 @@ public final class RecorderPanel extends PluginPanel
     private String selectedUsername = null;
     private final JButton addCornerBtn = new JButton("+");
     private final JButton loginBtn = new JButton("Log in");
-    private final JButton dumpBtn = new JButton("Debug: dump open widgets");
+    private final JButton loginV2Btn = new JButton("Log in V2");
+    private final JTextField worldField = new JTextField(4);
     private final JLabel loginStatus = new JLabel(" ");
     private final java.util.concurrent.atomic.AtomicBoolean loginInFlight = new java.util.concurrent.atomic.AtomicBoolean(false);
     private volatile Thread loginThread = null;
     private final JButton stopBtn = new JButton("Stop");
     private LoginAssistant loginAssistant;
+    private net.runelite.client.sequence.login.LoginAssistantV2 loginAssistantV2;
+    private net.runelite.client.sequence.login.AccountPrefs accountPrefs;
     private CredentialStore credentialStore;
     private DebugOverlay debugOverlay;
     private TileMarker tileMarker;
