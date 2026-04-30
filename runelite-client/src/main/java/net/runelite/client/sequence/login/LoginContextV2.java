@@ -24,6 +24,7 @@ public final class LoginContextV2
     private final Random rng;
     private final Consumer<String> statusSink;
     @Nullable private final Integer targetWorldId;
+    private final boolean jagexAccount;
 
     public LoginContextV2(LoginCredentials credentials,
                           HumanizedInputDispatcher dispatcher,
@@ -33,6 +34,18 @@ public final class LoginContextV2
                           Consumer<String> statusSink,
                           @Nullable Integer targetWorldId)
     {
+        this(credentials, dispatcher, client, clientThread, rng, statusSink, targetWorldId, false);
+    }
+
+    public LoginContextV2(LoginCredentials credentials,
+                          HumanizedInputDispatcher dispatcher,
+                          Client client,
+                          @Nullable ClientThread clientThread,
+                          Random rng,
+                          Consumer<String> statusSink,
+                          @Nullable Integer targetWorldId,
+                          boolean jagexAccount)
+    {
         this.credentials = credentials;
         this.dispatcher = dispatcher;
         this.client = client;
@@ -40,6 +53,7 @@ public final class LoginContextV2
         this.rng = rng;
         this.statusSink = statusSink;
         this.targetWorldId = targetWorldId;
+        this.jagexAccount = jagexAccount;
     }
 
     public LoginCredentials getCredentials() { return credentials; }
@@ -48,5 +62,6 @@ public final class LoginContextV2
     @Nullable public ClientThread getClientThread() { return clientThread; }
     public Random getRng() { return rng; }
     @Nullable public Integer getTargetWorldId() { return targetWorldId; }
+    public boolean isJagexAccount() { return jagexAccount; }
     public void status(String msg) { if (statusSink != null) statusSink.accept(msg); }
 }

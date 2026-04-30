@@ -70,6 +70,7 @@ import javax.swing.BoxLayout;
 import javax.swing.DefaultListModel;
 import javax.swing.Icon;
 import javax.swing.JButton;
+import javax.swing.JCheckBox;
 import javax.swing.JComboBox;
 import javax.swing.JComponent;
 import javax.swing.JLabel;
@@ -858,6 +859,10 @@ public final class RecorderPanel extends PluginPanel
 
     private static final int CRED_ROW_HEIGHT = 26;
     private static final int CRED_ICON_SIZE = 14;
+    // Stored in the credential slot for Jagex accounts — never typed into OSRS
+    // (Jagex login bypasses the password form entirely). Non-empty so the
+    // macOS Keychain security command accepts the write without error.
+    static final String JAGEX_PW_SENTINEL = "jagex";
 
     /** Rebuild the credential rows from {@link #currentUsernames}. Each row is
      *  a clickable JPanel that selects the username; per-row buttons handle
@@ -903,7 +908,8 @@ public final class RecorderPanel extends PluginPanel
             ? javax.swing.UIManager.getColor("List.selectionBackground")
             : credListPanel.getBackground());
 
-        JLabel nameLabel = new JLabel(username);
+        boolean isJagex = accountPrefs != null && accountPrefs.isJagex(username);
+        JLabel nameLabel = new JLabel(isJagex ? "[J] " + username : username);
         nameLabel.setForeground(selected
             ? javax.swing.UIManager.getColor("List.selectionForeground")
             : credListPanel.getForeground());
@@ -1864,12 +1870,13 @@ public final class RecorderPanel extends PluginPanel
             }
         }
 
+        boolean jagex = accountPrefs != null && accountPrefs.isJagex(user);
         LoginCredentials creds = new LoginCredentials(user, credentialStore);
         final Integer fTargetWorld = targetWorld;
         Thread t = new Thread(() -> {
             try
             {
-                boolean ok = loginAssistantV2.login(creds, fTargetWorld, this::setStatus);
+                boolean ok = loginAssistantV2.login(creds, fTargetWorld, this::setStatus, jagex);
                 if (ok && fTargetWorld != null && accountPrefs != null)
                 {
                     accountPrefs.setLastWorld(user, fTargetWorld);
@@ -1906,19 +1913,22 @@ public final class RecorderPanel extends PluginPanel
     {
         JTextField userField = new JTextField(20);
         JPasswordField pwField = new JPasswordField(20);
-        Object[] form = { "Username:", userField, "Password:", pwField };
+        JCheckBox jagexBox = new JCheckBox("Jagex account");
+        jagexBox.addItemListener(e -> pwField.setEnabled(!jagexBox.isSelected()));
+        Object[] form = { "Username:", userField, "Password:", pwField, jagexBox };
         int result = JOptionPane.showConfirmDialog(this, form,
             "Add credential", JOptionPane.OK_CANCEL_OPTION, JOptionPane.PLAIN_MESSAGE);
         if (result != JOptionPane.OK_OPTION) return;
 
         String user = userField.getText() == null ? "" : userField.getText().trim();
         char[] pw = pwField.getPassword();
+        boolean jagex = jagexBox.isSelected();
         if (user.isEmpty())
         {
             JOptionPane.showMessageDialog(this, "Username cannot be empty.", "Add credential", JOptionPane.WARNING_MESSAGE);
             return;
         }
-        if (pw.length == 0)
+        if (!jagex && pw.length == 0)
         {
             int conf = JOptionPane.showConfirmDialog(this, "Save with empty password?",
                 "Add credential", JOptionPane.YES_NO_OPTION);
@@ -1927,6 +1937,7 @@ public final class RecorderPanel extends PluginPanel
 
         final String fUser = user;
         final char[] fPw = pw;
+        final boolean fJagex = jagex;
         Thread t = new Thread(() -> {
             try
             {
@@ -1942,7 +1953,8 @@ public final class RecorderPanel extends PluginPanel
                     catch (Exception ex) { return; }
                     if (over[0] != JOptionPane.YES_OPTION) return;
                 }
-                credentialStore.write(fUser, new String(fPw));
+                credentialStore.write(fUser, fJagex ? JAGEX_PW_SENTINEL : new String(fPw));
+                if (accountPrefs != null) accountPrefs.setJagex(fUser, fJagex);
                 SwingUtilities.invokeLater(() -> loginStatus.setText("saved " + fUser));
                 persistLastSelected(fUser);
                 SwingUtilities.invokeLater(() -> selectedUsername = fUser);
@@ -1973,6 +1985,7 @@ public final class RecorderPanel extends PluginPanel
             try
             {
                 credentialStore.delete(username);
+                if (accountPrefs != null) accountPrefs.setJagex(username, false);
                 SwingUtilities.invokeLater(() -> {
                     loginStatus.setText("deleted " + username);
                     if (username.equals(selectedUsername))
@@ -2000,11 +2013,17 @@ public final class RecorderPanel extends PluginPanel
     private void onEditCredential(final String oldUsername)
     {
         if (oldUsername == null) return;
+        boolean oldJagex = accountPrefs != null && accountPrefs.isJagex(oldUsername);
+
         JTextField userField = new JTextField(oldUsername, 20);
         JPasswordField pwField = new JPasswordField(20);
+        pwField.setEnabled(!oldJagex);
+        JCheckBox jagexBox = new JCheckBox("Jagex account", oldJagex);
+        jagexBox.addItemListener(e -> pwField.setEnabled(!jagexBox.isSelected()));
         Object[] form = {
             "Username:", userField,
-            "Password (leave empty to keep current):", pwField
+            "Password (leave empty to keep current):", pwField,
+            jagexBox
         };
         int result = JOptionPane.showConfirmDialog(this, form,
             "Edit credential", JOptionPane.OK_CANCEL_OPTION, JOptionPane.PLAIN_MESSAGE);
@@ -2012,6 +2031,7 @@ public final class RecorderPanel extends PluginPanel
 
         final String newUser = userField.getText() == null ? "" : userField.getText().trim();
         final char[] pw = pwField.getPassword();
+        final boolean newJagex = jagexBox.isSelected();
         if (newUser.isEmpty())
         {
             JOptionPane.showMessageDialog(this, "Username cannot be empty.",
@@ -2022,7 +2042,19 @@ public final class RecorderPanel extends PluginPanel
 
         final boolean usernameChanged = !newUser.equals(oldUsername);
         final boolean passwordChanged = pw.length > 0;
-        if (!usernameChanged && !passwordChanged)
+        final boolean jagexChanged = (newJagex != oldJagex);
+
+        // Switching from Jagex → normal requires a new password (we never stored one).
+        if (oldJagex && !newJagex && !passwordChanged)
+        {
+            JOptionPane.showMessageDialog(this,
+                "Enter a password when removing the Jagex account flag.",
+                "Edit credential", JOptionPane.WARNING_MESSAGE);
+            java.util.Arrays.fill(pw, '\0');
+            return;
+        }
+
+        if (!usernameChanged && !passwordChanged && !jagexChanged)
         {
             setStatus("no changes");
             java.util.Arrays.fill(pw, '\0');
@@ -2050,6 +2082,10 @@ public final class RecorderPanel extends PluginPanel
                 {
                     pwToWrite = new String(pw);
                 }
+                else if (newJagex)
+                {
+                    pwToWrite = JAGEX_PW_SENTINEL;
+                }
                 else
                 {
                     // Keep existing password — read it from the store.
@@ -2064,6 +2100,11 @@ public final class RecorderPanel extends PluginPanel
 
                 credentialStore.write(newUser, pwToWrite);
                 if (usernameChanged) credentialStore.delete(oldUsername);
+                if (accountPrefs != null)
+                {
+                    accountPrefs.setJagex(newUser, newJagex);
+                    if (usernameChanged) accountPrefs.setJagex(oldUsername, false);
+                }
 
                 SwingUtilities.invokeLater(() -> {
                     loginStatus.setText("updated " + newUser);

@@ -1,3 +1,37 @@
+## Build & run
+
+```bash
+JBIN=/opt/homebrew/Cellar/openjdk@17/17.0.19/libexec/openjdk.jdk/Contents/Home/bin/java
+
+# Compile only (fast, ~1 s when incremental)
+JAVA_HOME=$(dirname $JBIN)/.. ./gradlew :client:compileJava
+
+# Full build (shadow jar, ~4 s incremental)
+JAVA_HOME=$(dirname $JBIN)/.. ./gradlew :client:shadowJar
+
+# Run RuneLite directly (classic accounts / no Jagex)
+$JBIN -ea \
+  --add-opens java.desktop/com.apple.eawt=ALL-UNNAMED \
+  --add-opens java.desktop/com.apple.eawt.event=ALL-UNNAMED \
+  --add-opens java.base/java.lang=ALL-UNNAMED \
+  -jar runelite-client/build/libs/client-*.jar \
+  --developer-mode &
+
+# Run the pre-launcher (Jagex account selector + console)
+# No -ea or --add-opens needed here — only the RuneLite child needs them.
+$JBIN -cp runelite-client/build/libs/client-*.jar \
+  net.runelite.client.launcher.AccountLauncher
+```
+
+**Why each flag is required:**
+- `:client:` — the gradle subproject is `client`, not `runelite-client`
+- `-ea` — RuneLite asserts on developer mode and exits with "enable assertions" without it
+- `--add-opens java.desktop/com.apple.eawt=ALL-UNNAMED` — `OSXFullScreenAdapter` extends a non-exported Apple class; Java 17 blocks it without this
+- `--developer-mode` — skips the launcher's update gate and enables plugin hot-reload
+- Run via shadow jar, not via classpath; RuneLite's classloader uses `ClientLoader.class.getClassLoader()` which breaks on split-classpath setups
+
+---
+
 ## Threading model — read FIRST. Most silent freezes come from getting this wrong.
 
 The OSRS client has **one shared thread** that decodes packets, runs cs2

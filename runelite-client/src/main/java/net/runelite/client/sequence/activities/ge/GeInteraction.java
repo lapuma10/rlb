@@ -740,6 +740,20 @@ public final class GeInteraction implements GeActions {
             SequenceSleep.sleep(client,
                 180L + ThreadLocalRandom.current().nextInt(380));
         }
+        // The GE CS2 can render the item child before the coins child on the
+        // same tick. Re-scan once after the first pass so a coins button that
+        // was hidden during the initial findCollectButtons() call isn't left
+        // behind. Skip any item id already clicked to avoid double-clicking.
+        List<CollectButton> second = dispatcher.runOnClient(this::findCollectButtons);
+        if (second == null) return;
+        for (CollectButton b : second) {
+            if (hits.stream().anyMatch(h -> h.itemId() == b.itemId())) continue;
+            log.info("collect({}): late-render click '{}' at {} (item={})",
+                slot, b.verb, b.bounds, b.itemId);
+            dispatcher.boundsClickOnWorker(b.bounds, b.verb);
+            SequenceSleep.sleep(client,
+                180L + ThreadLocalRandom.current().nextInt(380));
+        }
     }
 
     private record CollectButton(Rectangle bounds, String verb, int itemId) {}

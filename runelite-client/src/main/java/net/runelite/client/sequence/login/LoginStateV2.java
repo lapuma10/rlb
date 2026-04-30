@@ -5,6 +5,7 @@ public enum LoginStateV2
 {
     PRECHECK,
     WAIT_FOR_LOGIN_SCREEN,
+    AWAIT_JAGEX_LOGIN,
     SWITCH_WORLD,
     NUDGE_INTRO,
     RESOLVE_USERNAME,

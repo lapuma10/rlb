@@ -50,6 +50,7 @@ public enum LoginError
     FIELD_NOT_CLEARED      (false, "field state diverged from expected (input dispatch issue)"),
     WELCOME_STUCK          (false, "welcome screen click ignored after 3 attempts"),
     WORLD_SWITCH_FAILED    (false, "world switch failed; aborting"),
+    JAGEX_NOT_CONFIGURED   (false, "Jagex: no credentials.properties — launch via Jagex Launcher with --insecure-write-credentials first"),
     INTERRUPTED            (false, "login cancelled");
 
     private final boolean recoverable;

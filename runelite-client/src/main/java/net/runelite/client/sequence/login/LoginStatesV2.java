@@ -28,6 +28,7 @@ public final class LoginStatesV2
     static final long AWAIT_LOGGED_IN_TIMEOUT_MS = 30_000L;
     static final long AWAIT_WELCOME_TIMEOUT_MS = 5_000L;
     static final long WELCOME_DISMISS_POLL_MS = 3_000L;
+    static final long AWAIT_JAGEX_LOGIN_TIMEOUT_MS = 30_000L;
     static final long WELCOME_CLICK_DELAY_MIN_MS = 4_000L;
     static final long WELCOME_CLICK_DELAY_MAX_MS = 45_000L;
 
@@ -37,6 +38,7 @@ public final class LoginStatesV2
         {
             GameState gs = ctx.getDispatcher().runOnClient(ctx.getClient()::getGameState);
             if (gs == null) return StateResultV2.fail(LoginError.UNEXPECTED_GAMESTATE);
+            boolean jagex = ctx.isJagexAccount();
             switch (gs)
             {
                 case LOGGED_IN:
@@ -49,10 +51,17 @@ public final class LoginStatesV2
                 }
                 case LOGGING_IN:
                 case LOADING:
+                    if (jagex) return StateResultV2.cont(LoginStateV2.AWAIT_JAGEX_LOGIN);
                     return StateResultV2.cont(LoginStateV2.WAIT_FOR_LOGIN_SCREEN);
                 case LOGIN_SCREEN:
+                    if (jagex)
+                    {
+                        log.warn("[login-v2] Jagex account at LOGIN_SCREEN — credentials.properties missing or expired");
+                        return StateResultV2.fail(LoginError.JAGEX_NOT_CONFIGURED);
+                    }
                     return StateResultV2.cont(LoginStateV2.SWITCH_WORLD);
                 default:
+                    if (jagex) return StateResultV2.cont(LoginStateV2.AWAIT_JAGEX_LOGIN);
                     return StateResultV2.fail(LoginError.UNEXPECTED_GAMESTATE);
             }
         }
@@ -61,6 +70,31 @@ public final class LoginStatesV2
             log.warn("[login-v2] precheck failed", ex);
             return StateResultV2.fail(LoginError.CLIENT_THREAD_STUCK);
         }
+    }
+
+    public static StateResultV2 awaitJagexLogin(LoginContextV2 ctx)
+    {
+        ctx.status("waiting for Jagex auto-login…");
+        long deadline = System.currentTimeMillis() + AWAIT_JAGEX_LOGIN_TIMEOUT_MS;
+        while (System.currentTimeMillis() < deadline)
+        {
+            if (Thread.interrupted()) return StateResultV2.fail(LoginError.INTERRUPTED);
+            try
+            {
+                GameState gs = ctx.getDispatcher().runOnClient(ctx.getClient()::getGameState);
+                if (gs == GameState.LOGGED_IN) return StateResultV2.cont(LoginStateV2.AWAIT_WELCOME);
+                if (gs == GameState.LOGIN_SCREEN)
+                {
+                    log.warn("[login-v2] Jagex auto-login failed — fell back to LOGIN_SCREEN");
+                    return StateResultV2.fail(LoginError.JAGEX_NOT_CONFIGURED);
+                }
+                if (gs == GameState.CONNECTION_LOST) return StateResultV2.fail(LoginError.CONNECTION_TIMEOUT);
+            }
+            catch (Exception ex) { return StateResultV2.fail(LoginError.CLIENT_THREAD_STUCK); }
+            try { SequenceSleep.sleep(ctx.getClient(), POLL_INNER_SLEEP_MS); }
+            catch (InterruptedException ie) { return StateResultV2.fail(LoginError.INTERRUPTED); }
+        }
+        return StateResultV2.fail(LoginError.TIMEOUT_NO_RESPONSE);
     }
 
     public static StateResultV2 waitForLoginScreen(LoginContextV2 ctx)
@@ -341,7 +375,7 @@ public final class LoginStatesV2
             try { previous = cb.getContents(null); } catch (Exception ignored) {}
 
             String pw = ctx.getCredentials().getPassword();
-            if (pw == null) return StateResultV2.fail(LoginError.BAD_CREDS);
+            if (pw == null || pw.isEmpty()) return StateResultV2.fail(LoginError.BAD_CREDS);
             cb.setContents(new java.awt.datatransfer.StringSelection(pw), null);
             clipboardSet = true;
 

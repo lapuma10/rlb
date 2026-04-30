@@ -18,6 +18,7 @@ public final class LoginRunnerV2
         EnumMap<LoginStateV2, Function<LoginContextV2, StateResultV2>> handlers = new EnumMap<>(LoginStateV2.class);
         handlers.put(LoginStateV2.PRECHECK,              LoginStatesV2::precheck);
         handlers.put(LoginStateV2.WAIT_FOR_LOGIN_SCREEN, LoginStatesV2::waitForLoginScreen);
+        handlers.put(LoginStateV2.AWAIT_JAGEX_LOGIN,     LoginStatesV2::awaitJagexLogin);
         handlers.put(LoginStateV2.SWITCH_WORLD,          LoginStatesV2::switchWorld);
         handlers.put(LoginStateV2.NUDGE_INTRO,           LoginStatesV2::nudgeIntro);
         handlers.put(LoginStateV2.RESOLVE_USERNAME,      LoginStatesV2::resolveUsername);

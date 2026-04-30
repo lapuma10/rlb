@@ -45,28 +45,39 @@ public final class WorldSwitcherV2
         Client client = ctx.getClient();
         HumanizedInputDispatcher dispatcher = ctx.getDispatcher();
 
-        // Resolve the World object first — bail early if the id isn't in the list.
-        World target = dispatcher.runOnClient(() -> findWorld(client, targetWorldId));
-        if (target == null)
-        {
-            log.warn("[login-v2] world {} not in world list", targetWorldId);
-            return false;
-        }
-
-        // Humanized step: click the "Worlds" button on the title screen so
-        // the user sees that the bot intentionally selected a world.
+        // Click the "Worlds" button first — this is what causes the OSRS client
+        // to fetch and populate client.getWorldList(). Looking up the world
+        // before this click returns null because the list hasn't loaded yet.
         TitleFrame.Frame frame = dispatcher.runOnClient(() -> TitleFrame.current(client));
         java.awt.Point btn = TitleFrame.button(frame, TitleFrame.ButtonId.WORLDS_BUTTON);
         log.info("[login-v2] click WORLDS_BUTTON canvas=({},{}) frame=({},{}) target=({},{})",
             client.getCanvasWidth(), client.getCanvasHeight(), frame.x(), frame.y(), btn.x, btn.y);
         dispatcher.clickCanvas(btn.x, btn.y);
 
-        SequenceSleep.sleep(client, 600 + ctx.getRng().nextInt(900));
+        // Poll until the world list is populated, then resolve our target world.
+        World target = null;
+        long listDeadline = System.currentTimeMillis() + WORLD_CHANGE_TIMEOUT_MS;
+        while (System.currentTimeMillis() < listDeadline)
+        {
+            if (Thread.interrupted()) throw new InterruptedException();
+            target = dispatcher.runOnClient(() -> findWorld(client, targetWorldId));
+            if (target != null) break;
+            SequenceSleep.sleep(client, POLL_SLEEP_MS);
+        }
+        if (target == null)
+        {
+            log.warn("[login-v2] world {} not in world list after {}ms wait",
+                targetWorldId, WORLD_CHANGE_TIMEOUT_MS);
+            return false;
+        }
+
+        SequenceSleep.sleep(client, 600 + ctx.getRng().nextInt(300));
 
         // Apply the world change via the engine setter. See class javadoc.
+        final World finalTarget = target;
         try
         {
-            dispatcher.runOnClient(() -> { client.changeWorld(target); return null; });
+            dispatcher.runOnClient(() -> { client.changeWorld(finalTarget); return null; });
         }
         catch (Exception ex)
         {

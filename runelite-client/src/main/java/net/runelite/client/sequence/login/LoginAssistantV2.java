@@ -49,9 +49,16 @@ public final class LoginAssistantV2
      */
     public boolean login(LoginCredentials creds, @Nullable Integer targetWorldId, Consumer<String> status)
     {
+        return login(creds, targetWorldId, status, false);
+    }
+
+    public boolean login(LoginCredentials creds, @Nullable Integer targetWorldId,
+                         Consumer<String> status, boolean jagexAccount)
+    {
         if (creds == null) throw new IllegalArgumentException("credentials required");
         Consumer<String> sink = status != null ? status : s -> {};
-        LoginContextV2 ctx = new LoginContextV2(creds, dispatcher, client, clientThread, rng, sink, targetWorldId);
+        LoginContextV2 ctx = new LoginContextV2(creds, dispatcher, client, clientThread, rng, sink,
+            targetWorldId, jagexAccount);
         return LoginRunnerV2.run(ctx);
     }
 }

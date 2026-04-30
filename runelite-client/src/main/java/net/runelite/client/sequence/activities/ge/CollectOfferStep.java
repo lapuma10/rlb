@@ -193,7 +193,13 @@ public final class CollectOfferStep implements Step {
     /** Pick COLLECT_ALL vs PER_SLOT and dispatch the first click. */
     private void dispatchStrategy(StepContext ctx, WorldSnapshot s, int slot) {
         Blackboard step = ctx.bb().scope(BlackboardScope.STEP);
-        Strategy strategy = useCollectAll.getAsBoolean() ? Strategy.COLLECT_ALL : Strategy.PER_SLOT;
+        // COLLECT_ALL clicks the toolbar button on the main GE grid — it is
+        // hidden while the per-slot detail view is open. If we're already in
+        // the detail view (collectOpen), force PER_SLOT so we stay in the
+        // right context; re-rolling to COLLECT_ALL here would always no-op.
+        boolean detailOpen = s.grandExchange().collectOpen();
+        Strategy strategy = (!detailOpen && useCollectAll.getAsBoolean())
+            ? Strategy.COLLECT_ALL : Strategy.PER_SLOT;
         step.put(K_STRATEGY, strategy);
 
         if (strategy == Strategy.COLLECT_ALL) {
