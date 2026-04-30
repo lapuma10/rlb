@@ -11,6 +11,7 @@ import net.runelite.client.sequence.affordance.GeBlockReason;
 import net.runelite.client.sequence.blackboard.Blackboard;
 import net.runelite.client.sequence.blackboard.BlackboardKey;
 import net.runelite.client.sequence.blackboard.BlackboardScope;
+import net.runelite.client.sequence.dispatch.InputDispatcher;
 
 /**
  * Sets the price-each in the offer-setup widget. Mirror of
@@ -23,13 +24,17 @@ public final class SetPriceStep implements Step {
     /** Set to true after {@code GeActions.setPrice} returns true. */
     private static final BlackboardKey<Boolean> K_PROMPT_SEEN =
         BlackboardKey.of("setPrice.promptSeen", Boolean.class);
-    private static final BlackboardKey<Integer> K_START_TICK =
-        BlackboardKey.of("setPrice.startTick", Integer.class);
-    /** Same fallback as SetQuantityStep — see comment there. */
-    private static final int DISPATCH_FALLBACK_TICKS = 5;
+    /** Same as SetQuantityStep — defer dispatch until dispatcher is idle. */
+    private static final BlackboardKey<Boolean> K_NEEDS_DISPATCH =
+        BlackboardKey.of("setPrice.needsDispatch", Boolean.class);
+    /** Tick the worker first went idle (see SetQuantityStep). */
+    private static final BlackboardKey<Integer> K_FIRST_IDLE_TICK =
+        BlackboardKey.of("setPrice.firstIdleTick", Integer.class);
+    private static final int POST_IDLE_FALLBACK_TICKS = 5;
 
     private final int priceEach;
     private final GeActions ge;
+    private InputDispatcher dispatcher;
 
     public SetPriceStep(int priceEach, GeActions ge) {
         if (priceEach <= 0) throw new IllegalArgumentException("priceEach must be > 0");
@@ -49,20 +54,29 @@ public final class SetPriceStep implements Step {
     public void onStart(StepContext ctx) {
         WorldSnapshot s = ctx.snapshot();
         Blackboard step = ctx.bb().scope(BlackboardScope.STEP);
+        this.dispatcher = ctx.dispatcher();
         if (!s.grandExchange().offerSetupOpen()) {
             step.put(K_PRECONDITION, new GeBlockReason.GeOfferSetupNotOpen());
             return;
         }
-        step.put(K_START_TICK, s.tick());
+        // Defer dispatch — same rationale as SetQuantityStep.onStart.
+        step.put(K_NEEDS_DISPATCH, true);
+    }
+
+    @Override public void onEvent(Object event, StepContext ctx) {}
+
+    @Override
+    public void tick(StepContext ctx) {
+        Blackboard step = ctx.bb().scope(BlackboardScope.STEP);
+        if (!Boolean.TRUE.equals(step.get(K_NEEDS_DISPATCH).orElse(false))) return;
+        if (dispatcher == null || dispatcher.isBusy()) return;
+        step.put(K_NEEDS_DISPATCH, false);
         boolean queued = ge.setPrice(priceEach);
         if (!queued) {
             step.put(K_PRECONDITION,
                 new GeBlockReason.GeChatboxPromptTimeout("setPrice"));
         }
     }
-
-    @Override public void onEvent(Object event, StepContext ctx) {}
-    @Override public void tick(StepContext ctx) {}
 
     @Override
     public Completion check(WorldSnapshot s, Blackboard bb) {
@@ -72,14 +86,24 @@ public final class SetPriceStep implements Step {
         if (!s.grandExchange().offerSetupOpen()) {
             return Completion.failed(new GeBlockReason.GeOfferSetupNotOpen());
         }
-        // Async typing — see SetQuantityStep.check for the same logic.
+        if (Boolean.TRUE.equals(step.get(K_NEEDS_DISPATCH).orElse(false))) {
+            return Completion.RUNNING;
+        }
+        if (dispatcher != null && dispatcher.isBusy()) {
+            return Completion.RUNNING;
+        }
+        if (step.get(K_FIRST_IDLE_TICK).isEmpty()) {
+            step.put(K_FIRST_IDLE_TICK, s.tick());
+        }
         boolean promptOpen = s.grandExchange().chatboxPromptOpen();
         if (promptOpen) step.put(K_PROMPT_SEEN, true);
         boolean promptSeen = Boolean.TRUE.equals(step.get(K_PROMPT_SEEN).orElse(null));
-        int startTick = step.get(K_START_TICK).orElse(s.tick());
-        int elapsed = s.tick() - startTick;
-        if (!promptOpen && (promptSeen || elapsed >= DISPATCH_FALLBACK_TICKS)) {
+        if (!promptOpen && promptSeen) {
             return new Completion.Succeeded("price submitted");
+        }
+        int firstIdle = step.get(K_FIRST_IDLE_TICK).orElse(s.tick());
+        if (s.tick() - firstIdle >= POST_IDLE_FALLBACK_TICKS) {
+            return new Completion.Succeeded("price submitted (post-idle fallback)");
         }
         return Completion.RUNNING;
     }

@@ -68,16 +68,20 @@ public class GrandExchangeBankPrepFactoryTest {
         assertTrue("Bank sub-flow (CloseBank) must precede GE Core (OpenGrandExchange)",
             closeIdx < openGEIdx);
 
-        // The buy-side WithdrawItemStep must target the COINS item id (995),
-        // and the quantity must equal totalCost = quantity * priceEach (1 * 1_500_000 = 1_500_000).
+        // The buy-side WithdrawItemStep must target the COINS item id (995).
+        // The quantity is rounded UP to the next "nice" buffered amount per
+        // GrandExchangeSequenceFactory.roundUpToNiceCoinAmount — never the
+        // exact total. For 1 * 1_500_000 = 1_500_000, the next nice amount
+        // is 10_000_000 (the {1,5}×10^n sequence skips 5M).
         WithdrawItemStep w = (WithdrawItemStep) children.stream()
             .filter(s -> s instanceof WithdrawItemStep).findFirst().orElseThrow();
         assertEquals("buy-side withdraw must target COINS (item id 995)", 995, readField(w, "itemId"));
         Object desired = readFieldObj(w, "desired");
-        assertTrue("buy-side withdraw must use AtLeast(totalCost)",
+        assertTrue("buy-side withdraw must use AtLeast(roundedTotalCost)",
             desired instanceof WithdrawQuantity.AtLeast);
         assertEquals(
-            1_500_000,
+            "1.5M cost should round UP to 10M (nice-buffer sequence skips 5M)",
+            10_000_000,
             ((WithdrawQuantity.AtLeast) desired).qty());
 
         // Reactive allow-list must contain BOTH bank root and GE roots so the

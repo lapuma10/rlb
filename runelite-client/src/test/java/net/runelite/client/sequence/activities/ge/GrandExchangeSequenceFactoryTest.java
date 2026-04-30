@@ -45,26 +45,28 @@ public class GrandExchangeSequenceFactoryTest {
         snaps.add(snapAtGe().tick(3).geOpen(true).build());
         snaps.add(snapAtGe().tick(4).geOpen(true).build());
         // Async typing means each step polls snapshot for transitions and
-        // falls back to elapsed-tick success after ~5 ticks (covers tests
-        // where RecordingGeActions doesn't actually move state). Keep
-        // setupOpen=true for a wide window so all sub-steps have time.
-        for (int t = 5; t < 35; t++) {
+        // falls back to elapsed-tick success after ~5 ticks. SelectItem +
+        // PickSearchResult + deferred-dispatch SetQuantity + SetPrice each
+        // need a multi-tick fallback window, so total setup before
+        // ConfirmOffer is ~25-35 engine ticks. Keep setupOpen=true wide.
+        for (int t = 5; t < 50; t++) {
             snaps.add(snapAtGe().tick(t).geOpen(true).geSetupOpen(true).build());
         }
-        // Offer appears in slot 0 after Confirm click — give the offer a
-        // long visibility window since SetQuantityStep + SetPriceStep each
-        // wait 5 ticks for fallback success.
-        for (int t = 35; t < 45; t++) {
+        // Offer appears in slot 0 after Confirm click — wide ACTIVE window.
+        for (int t = 50; t < 65; t++) {
             snaps.add(snapAtGe().tick(t).geOpen(true).geSetupOpen(true)
                 .offer(0, OfferSide.BUY, OfferStatus.ACTIVE, 4151, 1, 0, 1_500_000)
                 .build());
         }
-        // Offer fills
-        snaps.add(snapAtGe().tick(45).geOpen(true).geSetupOpen(true)
-            .offer(0, OfferSide.BUY, OfferStatus.COMPLETE, 4151, 1, 1, 1_500_000)
-            .build());
-        // After collect: slot empty, inventory has the bought item
-        for (int t = 46; t < 80; t++) {
+        // Offer fills — wide COMPLETE window so WaitForOfferStep observes
+        // it through its first few check() calls.
+        for (int t = 65; t < 75; t++) {
+            snaps.add(snapAtGe().tick(t).geOpen(true).geSetupOpen(true)
+                .offer(0, OfferSide.BUY, OfferStatus.COMPLETE, 4151, 1, 1, 1_500_000)
+                .build());
+        }
+        // After collect: slot empty, inventory has the bought item.
+        for (int t = 75; t < 130; t++) {
             snaps.add(new GeSnapBuilder()
                 .tick(t).player(3160, 3490, 0)
                 .invCoins(1_000_000).invItem(4151, 1)
@@ -73,13 +75,13 @@ public class GrandExchangeSequenceFactoryTest {
         }
 
         BuyItemIntent intent = new BuyItemIntent(
-            4151, "Abyssal whip", 1, new PricePolicy.Exact(1_500_000), OfferWaitPolicy.until(20));
+            4151, "Abyssal whip", 1, new PricePolicy.Exact(1_500_000), OfferWaitPolicy.until(50));
         RecordingGeActions ge = new RecordingGeActions();
         GrandExchangeSequencePlan plan = GrandExchangeSequenceFactory.buyCore(intent, GE_AREA, ge);
 
         GeEngineHarness h = new GeEngineHarness().queue(snaps);
         h.run(plan.root());
-        h.advance(70);
+        h.advance(120);
 
         assertEquals("buy-core happy path should complete", SequenceState.IDLE, h.state());
 

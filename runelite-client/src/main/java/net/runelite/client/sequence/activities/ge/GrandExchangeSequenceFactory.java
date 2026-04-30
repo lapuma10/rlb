@@ -144,6 +144,34 @@ public final class GrandExchangeSequenceFactory {
     /** OSRS coin item id (used for the buy-side bank withdraw). */
     private static final int COINS_ITEM_ID = 995;
 
+    /** "Nice" buffered coin amounts the bank-prep flow rounds the
+     *  required total UP to. We never withdraw the exact total because
+     *  small price drift / partial-fill gaps shouldn't bust the buy.
+     *  Per user spec: 2k → 10k, 15k → 50k, 99k → 100k, 300k → 500k.
+     *  The {1, 5} × 10^n sequence skips 5×10^n at every k → 10k,
+     *  M → 10M boundary so a {@code 5k} withdraw (a more conspicuous
+     *  bot-tell at the bank stand) never appears. */
+    private static final long[] NICE_COIN_BUFFERS = {
+        10L,             50L,             100L,             500L,
+        1_000L,          10_000L,         50_000L,          100_000L,         500_000L,
+        1_000_000L,      10_000_000L,     50_000_000L,      100_000_000L,     500_000_000L,
+        1_000_000_000L,  10_000_000_000L
+    };
+
+    /** Round {@code total} UP to the next entry in {@link #NICE_COIN_BUFFERS}.
+     *  Examples: {@code 2k → 10k, 15k → 50k, 99k → 100k, 300k → 500k}.
+     *  Caps at {@link Integer#MAX_VALUE} because {@code BankActions.withdrawX}
+     *  takes an int. */
+    static int roundUpToNiceCoinAmount(long total) {
+        if (total <= 0) return 0;
+        for (long n : NICE_COIN_BUFFERS) {
+            if (n > total) {
+                return n > Integer.MAX_VALUE ? Integer.MAX_VALUE : (int) n;
+            }
+        }
+        return Integer.MAX_VALUE;
+    }
+
     /**
      * Buy with bank prep: withdraw coins from a bank booth at the GE first,
      * then run the GE Core buy sequence. Player must already be in
@@ -165,7 +193,9 @@ public final class GrandExchangeSequenceFactory {
             throw new IllegalArgumentException(
                 "totalCost overflows int: " + intent.quantity() + " * " + priceEach);
         }
-        int totalCostInt = (int) totalCost;
+        // Round up to a buffered amount so we never withdraw the exact
+        // cost — see roundUpToNiceCoinAmount.
+        int withdrawCoinAmount = roundUpToNiceCoinAmount(totalCost);
 
         Step createOffer = new LinearSequence("CreateBuyOffer")
             .then(new StartOfferStep(OfferSide.BUY, ge))
@@ -180,7 +210,7 @@ public final class GrandExchangeSequenceFactory {
             // Bank sub-flow
             .then(new OpenBankStep(Set.of(), bank))
             .then(new WaitForBankReadyStep())
-            .then(new WithdrawItemStep(COINS_ITEM_ID, new WithdrawQuantity.AtLeast(totalCostInt), bank))
+            .then(new WithdrawItemStep(COINS_ITEM_ID, new WithdrawQuantity.AtLeast(withdrawCoinAmount), bank))
             .then(new CloseBankStep(bank))
             // GE Core sub-flow
             .then(new OpenGrandExchangeStep(ge))

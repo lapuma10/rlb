@@ -11,6 +11,7 @@ import net.runelite.client.sequence.affordance.GeBlockReason;
 import net.runelite.client.sequence.blackboard.Blackboard;
 import net.runelite.client.sequence.blackboard.BlackboardKey;
 import net.runelite.client.sequence.blackboard.BlackboardScope;
+import net.runelite.client.sequence.dispatch.InputDispatcher;
 
 /**
  * Sets the quantity in the offer-setup widget. Dispatches via
@@ -25,19 +26,31 @@ public final class SetQuantityStep implements Step {
     /** Set true the first tick we observe MESLAYERMODE != 0 after dispatch. */
     private static final BlackboardKey<Boolean> K_PROMPT_SEEN =
         BlackboardKey.of("setQty.promptSeen", Boolean.class);
-    /** Tick onStart fired — used for the elapsed-tick fallback when the
-     *  prompt-open pulse is missed (snapshot polling cadence vs cs2 tick
-     *  timing). */
-    private static final BlackboardKey<Integer> K_START_TICK =
-        BlackboardKey.of("setQty.startTick", Integer.class);
-    /** Ticks to wait for the async dispatcher worker to complete the
-     *  typing if we never observed the MESLAYERMODE pulse (the snapshot
-     *  observer polls between cs2 transitions and can miss a fast prompt
-     *  open/close cycle). 5 ticks ~= 3 seconds of game time. */
-    private static final int DISPATCH_FALLBACK_TICKS = 5;
+    /** True while we still need to dispatch the click+type RUN_TASK. We
+     *  defer dispatch until the dispatcher worker is idle so the prior
+     *  step's chain (e.g. PickSearchResult clicking the result row) has
+     *  fully landed before we click the Set Quantity widget. Without
+     *  this gate the dispatch was silently dropped by the busy guard
+     *  and the bot fell through to ConfirmOffer with default qty=1. */
+    private static final BlackboardKey<Boolean> K_NEEDS_DISPATCH =
+        BlackboardKey.of("setQty.needsDispatch", Boolean.class);
+    /** Tick the worker first went idle after our dispatch — used for an
+     *  idle-only snapshot-cadence fallback if the brief MESLAYERMODE!=0
+     *  pulse was missed by the observer. */
+    private static final BlackboardKey<Integer> K_FIRST_IDLE_TICK =
+        BlackboardKey.of("setQty.firstIdleTick", Integer.class);
+    /** Idle-tick fallback window after the worker has finished. Only
+     *  meaningful AFTER {@code dispatcher.isBusy() == false}. 5 ticks
+     *  (~3s) is generous for the snapshot observer to catch any post-
+     *  dispatch state. */
+    private static final int POST_IDLE_FALLBACK_TICKS = 5;
 
     private final int qty;
     private final GeActions ge;
+    /** Engine-supplied dispatcher; captured in onStart from
+     *  {@link StepContext#dispatcher()} and used by {@link #tick} /
+     *  {@link #check} to gate dispatch + success on worker idleness. */
+    private InputDispatcher dispatcher;
 
     public SetQuantityStep(int qty, GeActions ge) {
         if (qty <= 0)   throw new IllegalArgumentException("qty must be > 0");
@@ -57,20 +70,32 @@ public final class SetQuantityStep implements Step {
     public void onStart(StepContext ctx) {
         WorldSnapshot s = ctx.snapshot();
         Blackboard step = ctx.bb().scope(BlackboardScope.STEP);
+        this.dispatcher = ctx.dispatcher();
         if (!s.grandExchange().offerSetupOpen()) {
             step.put(K_PRECONDITION, new GeBlockReason.GeOfferSetupNotOpen());
             return;
         }
-        step.put(K_START_TICK, s.tick());
+        // Defer dispatch — tick() will fire it the first tick the
+        // dispatcher worker is idle. If we dispatched here while the
+        // prior step's chain (PickSearchResult clicking the result row)
+        // is still in flight, the busy guard would silently drop us.
+        step.put(K_NEEDS_DISPATCH, true);
+    }
+
+    @Override public void onEvent(Object event, StepContext ctx) {}
+
+    @Override
+    public void tick(StepContext ctx) {
+        Blackboard step = ctx.bb().scope(BlackboardScope.STEP);
+        if (!Boolean.TRUE.equals(step.get(K_NEEDS_DISPATCH).orElse(false))) return;
+        if (dispatcher == null || dispatcher.isBusy()) return;
+        step.put(K_NEEDS_DISPATCH, false);
         boolean queued = ge.setQuantity(qty);
         if (!queued) {
             step.put(K_PRECONDITION,
                 new GeBlockReason.GeChatboxPromptTimeout("setQuantity"));
         }
     }
-
-    @Override public void onEvent(Object event, StepContext ctx) {}
-    @Override public void tick(StepContext ctx) {}
 
     @Override
     public Completion check(WorldSnapshot s, Blackboard bb) {
@@ -80,21 +105,35 @@ public final class SetQuantityStep implements Step {
         if (!s.grandExchange().offerSetupOpen()) {
             return Completion.failed(new GeBlockReason.GeOfferSetupNotOpen());
         }
-        // Async typing path. Two ways to declare success:
-        //   1. Live signal: numeric prompt opened (MESLAYERMODE != 0) THEN
-        //      closed (back to 0) — the engine clears the mode on Enter.
-        //   2. Fallback: enough ticks elapsed for the dispatcher worker to
-        //      have finished the type+Enter chain AND the prompt isn't
-        //      currently open. Covers fast cs2 cycles where the snapshot
-        //      observer's poll misses the brief MODE=7 window, and tests
-        //      where RecordingGeActions doesn't actually transition state.
+        // Still deferred (waiting for prior chain) → keep running.
+        if (Boolean.TRUE.equals(step.get(K_NEEDS_DISPATCH).orElse(false))) {
+            return Completion.RUNNING;
+        }
+        // Worker still typing/clicking → keep running. Engine's lastBusyTick
+        // logic also keeps timeoutTicks at bay while we wait.
+        if (dispatcher != null && dispatcher.isBusy()) {
+            return Completion.RUNNING;
+        }
+        // Worker has gone idle. Stamp the first idle tick so the fallback
+        // window below counts only POST-dispatch idle ticks.
+        if (step.get(K_FIRST_IDLE_TICK).isEmpty()) {
+            step.put(K_FIRST_IDLE_TICK, s.tick());
+        }
+        // Live signal: prompt opened then closed (Enter pressed).
         boolean promptOpen = s.grandExchange().chatboxPromptOpen();
         if (promptOpen) step.put(K_PROMPT_SEEN, true);
         boolean promptSeen = Boolean.TRUE.equals(step.get(K_PROMPT_SEEN).orElse(null));
-        int startTick = step.get(K_START_TICK).orElse(s.tick());
-        int elapsed = s.tick() - startTick;
-        if (!promptOpen && (promptSeen || elapsed >= DISPATCH_FALLBACK_TICKS)) {
+        if (!promptOpen && promptSeen) {
             return new Completion.Succeeded("quantity submitted");
+        }
+        // Snapshot-cadence fallback — ONLY after the worker has been idle
+        // for a short window. This means the RUN_TASK genuinely finished
+        // (no longer lying about a click that's still in flight). The
+        // observer occasionally polls between cs2 transitions and misses
+        // the brief MESLAYERMODE != 0 pulse.
+        int firstIdle = step.get(K_FIRST_IDLE_TICK).orElse(s.tick());
+        if (s.tick() - firstIdle >= POST_IDLE_FALLBACK_TICKS) {
+            return new Completion.Succeeded("quantity submitted (post-idle fallback)");
         }
         return Completion.RUNNING;
     }

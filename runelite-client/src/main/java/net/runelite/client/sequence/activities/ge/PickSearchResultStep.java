@@ -11,6 +11,7 @@ import net.runelite.client.sequence.affordance.GeBlockReason;
 import net.runelite.client.sequence.blackboard.Blackboard;
 import net.runelite.client.sequence.blackboard.BlackboardKey;
 import net.runelite.client.sequence.blackboard.BlackboardScope;
+import net.runelite.client.sequence.dispatch.InputDispatcher;
 
 /**
  * Validate-then-click step for the GE search result list. Runs immediately
@@ -55,6 +56,10 @@ public final class PickSearchResultStep implements Step {
     private final int itemId;
     private final String displayName;
     private final GeActions ge;
+    /** Captured from {@link StepContext#dispatcher()} in onStart so check()
+     *  can wait for the prior step's bundled type+pick RUN_TASK to finish
+     *  before declaring success. */
+    private InputDispatcher dispatcher;
 
     public PickSearchResultStep(int itemId, String displayName, GeActions ge) {
         if (itemId <= 0) throw new IllegalArgumentException("itemId must be > 0");
@@ -75,6 +80,7 @@ public final class PickSearchResultStep implements Step {
     public void onStart(StepContext ctx) {
         WorldSnapshot s = ctx.snapshot();
         Blackboard step = ctx.bb().scope(BlackboardScope.STEP);
+        this.dispatcher = ctx.dispatcher();
         if (!s.grandExchange().offerSetupOpen()) {
             step.put(K_PRECONDITION, new GeBlockReason.GeOfferSetupNotOpen());
             return;
@@ -112,12 +118,18 @@ public final class PickSearchResultStep implements Step {
         if (!s.grandExchange().offerSetupOpen()) {
             return Completion.failed(new GeBlockReason.GeOfferSetupNotOpen());
         }
+        // The prior SelectItemStep bundled type + pick into one RUN_TASK
+        // that's still running on the worker. Wait for it to finish
+        // before declaring success — otherwise SetQuantity dispatches
+        // into a busy worker and gets dropped.
+        if (dispatcher != null && dispatcher.isBusy()) {
+            return Completion.RUNNING;
+        }
         boolean stillPopulated = s.grandExchange().searchResultsPopulated();
         int clickTick = step.get(K_CLICK_TICK).orElse(s.tick());
         int elapsed = s.tick() - clickTick;
-        // Success when results closed (live signal) OR enough ticks
-        // elapsed (best-effort fallback when the snapshot observer
-        // missed the brief results-rendered window).
+        // Success when results closed (live signal) OR enough idle ticks
+        // elapsed (fallback only after worker is idle, see above).
         if (!stillPopulated || elapsed >= POST_CLICK_VERIFY_TICKS) {
             return new Completion.Succeeded("results closed; offer-setup advanced");
         }

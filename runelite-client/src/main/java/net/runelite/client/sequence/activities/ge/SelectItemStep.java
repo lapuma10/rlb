@@ -11,6 +11,7 @@ import net.runelite.client.sequence.affordance.GeBlockReason;
 import net.runelite.client.sequence.blackboard.Blackboard;
 import net.runelite.client.sequence.blackboard.BlackboardKey;
 import net.runelite.client.sequence.blackboard.BlackboardScope;
+import net.runelite.client.sequence.dispatch.InputDispatcher;
 
 /**
  * Selects the item being traded in the offer-setup interface. Dispatches
@@ -38,6 +39,12 @@ public final class SelectItemStep implements Step {
     private final int itemId;
     private final String displayName;
     private final GeActions ge;
+    /** Captured from {@link StepContext#dispatcher()} in onStart so check()
+     *  can gate {@code Succeeded} on the dispatcher worker being idle —
+     *  the bundled type+pick RUN_TASK can take 10+s, and we must not let
+     *  the next step (PickSearchResult / SetQuantity) start dispatching
+     *  while that's still running. */
+    private InputDispatcher dispatcher;
 
     public SelectItemStep(int itemId, String displayName, GeActions ge) {
         if (itemId <= 0) throw new IllegalArgumentException("itemId must be > 0");
@@ -58,6 +65,7 @@ public final class SelectItemStep implements Step {
     public void onStart(StepContext ctx) {
         WorldSnapshot s = ctx.snapshot();
         Blackboard step = ctx.bb().scope(BlackboardScope.STEP);
+        this.dispatcher = ctx.dispatcher();
         if (!s.grandExchange().offerSetupOpen()) {
             step.put(K_PRECONDITION, new GeBlockReason.GeOfferSetupNotOpen());
             return;
@@ -81,16 +89,26 @@ public final class SelectItemStep implements Step {
         if (!s.grandExchange().offerSetupOpen()) {
             return Completion.failed(new GeBlockReason.GeOfferSetupNotOpen());
         }
-        // The typing runs async on the dispatcher worker. Succeed when
-        // the search results widget has rendered (live signal) OR enough
-        // ticks elapsed for the dispatch to land (best-effort fallback —
-        // covers a missed snapshot of the results-rendered window).
+        // The bundled type+pick PICK_GE_SEARCH_RESULT RUN_TASK runs
+        // type → poll-for-results → click-row on the worker thread —
+        // typically 8-12s end to end. We MUST NOT declare success while
+        // it's still running, otherwise the next step (PickSearchResult /
+        // SetQuantity) dispatches into a busy worker and gets dropped.
+        if (dispatcher != null && dispatcher.isBusy()) {
+            return Completion.RUNNING;
+        }
+        // Worker idle. Succeed when the search results widget has
+        // rendered (live signal). We KEEP the elapsed-based fallback
+        // here because the row-click that closes the search may have
+        // already cleared {@code searchResultsPopulated} by the time we
+        // first observe it — but we only fall back to it AFTER the
+        // worker is idle, which means the RUN_TASK is genuinely done.
         if (s.grandExchange().searchResultsPopulated()) {
             return new Completion.Succeeded("search list rendered");
         }
         int startTick = step.get(K_START_TICK).orElse(s.tick());
         if (s.tick() - startTick >= DISPATCH_FALLBACK_TICKS) {
-            return new Completion.Succeeded("type dispatched (fallback)");
+            return new Completion.Succeeded("type dispatched (fallback, worker idle)");
         }
         return Completion.RUNNING;
     }
