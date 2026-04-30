@@ -180,6 +180,16 @@ public final class StateDrivenEngine implements SequenceEngine {
                         : Failure.fromCheck(f.reason(), elapsed);
                 handleLeafFailure(leaf, failure, snap);
             } else if (c instanceof Completion.Running) {
+                // If the dispatcher worker is actively running a chain on
+                // this leaf's behalf (RUN_TASK, walk, multi-click), bump
+                // the leaf's lastBusyTick so timeoutTicks counts only
+                // idle ticks AFTER the chain finishes — RuneScape is
+                // laggy and a humanized typing chain alone can run 5-10s.
+                // See StepFrame.lastBusyTick javadoc and CLAUDE.md
+                // "Threading model".
+                if (dispatcher.isBusy()) {
+                    leaf.setLastBusyTick(currentTick);
+                }
                 if (leaf.timedOut(currentTick)) {
                     int elapsed = currentTick - leaf.getStartedTick();
                     handleLeafFailure(leaf, Failure.timeout(elapsed), snap);

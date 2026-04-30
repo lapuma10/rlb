@@ -38,20 +38,16 @@ public final class WithdrawItemStep implements Step {
     @Override public String name()                                  { return "WithdrawItem(" + displayName + ", " + desired + ")"; }
     @Override public int priority()                                 { return 100; }
     /**
-     * 30 ticks ≈ 18s — generous because the dispatcher worker may need to:
-     *   right-click the slot (~1s)
-     *   pick "Withdraw-X" (~0.5s)
-     *   wait for chatbox numeric prompt (~0.5s)
-     *   type up to ~10 digits with humanized inter-key dwell (~6-8s for
-     *     1.5M coins; longer for 100M+ stacks)
-     *   press Enter and wait for inventory to update (~0.5s)
-     * Earlier value (6 ticks ≈ 3.6s) caused the engine to externally time
-     * out the step mid-type for any quantity >999 — see CLAUDE.md
-     * "Threading model" / 2026-04-30 1.5M coins withdraw regression.
-     * The typed WithdrawNoOp guard (suppressed via K_DISPATCH_DONE while
-     * the RUN_TASK is in flight) still catches genuine no-ops faster.
+     * 6 ticks of <i>idle waiting</i> after the dispatcher worker finishes.
+     * Busy-time during the right-click → menu pick → chatbox prompt →
+     * humanized typing chain is held off the timer by
+     * {@code StepFrame.lastBusyTick} (see CLAUDE.md "Threading model"),
+     * so this only bounds the post-dispatch propagation window — i.e.
+     * "how long do we wait for the server to apply the withdraw after
+     * we pressed Enter?". 6 ticks ≈ 3.6s, plenty for server-tick
+     * propagation while still failing fast on a genuine no-op.
      */
-    @Override public int timeoutTicks()                             { return 30; }
+    @Override public int timeoutTicks()                             { return 6; }
     @Override public PreemptionPolicy preemptionPolicy()            { return PreemptionPolicy.WHEN_SAFE; }
     @Override public boolean isSafeToPause(WorldSnapshot s, Blackboard bb) { return true; }
 
