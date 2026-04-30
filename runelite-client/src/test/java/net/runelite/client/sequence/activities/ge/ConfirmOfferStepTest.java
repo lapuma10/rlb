@@ -144,6 +144,97 @@ public class ConfirmOfferStepTest {
     }
 
     @Test
+    public void priceWarningRejectedByDefaultFailsWithPriceTooHigh() {
+        // Default (acceptHighPriceWarning=false): popup arrives, step
+        // dismisses with No, fails GeOfferPriceTooHigh.
+        WorldSnapshot before = new GeSnapBuilder().tick(0).geOpen(true).build();
+        WorldSnapshot withPopup = new GeSnapBuilder()
+            .tick(1).geOpen(true).priceWarningOpen(true).build();
+        // Subsequent snapshots: popup gone, no offer surfaced — confirms
+        // the step short-circuits via the K_WARNING_DISMISSED gate.
+        java.util.List<WorldSnapshot> snaps = new java.util.ArrayList<>();
+        snaps.add(before);
+        snaps.add(withPopup);
+        for (int t = 2; t < 6; t++) {
+            snaps.add(new GeSnapBuilder().tick(t).geOpen(true).build());
+        }
+        RecordingGeActions a = new RecordingGeActions();
+        GeEngineHarness h = new GeEngineHarness().queue(snaps);
+        h.run(new ConfirmOfferStep(4151, OfferSide.BUY, 5, 1_500_000, a));
+        h.advance(6);
+
+        assertEquals(SequenceState.FAILED, h.state());
+        assertTrue("dispatched dismiss-No",
+            a.calls().contains("dismissPriceWarning(No)"));
+        boolean foundReason = false;
+        for (TelemetryRecord r : h.recentTelemetry()) {
+            if (r.payload() != null && r.payload().contains("GeOfferPriceTooHigh")) {
+                foundReason = true; break;
+            }
+        }
+        assertTrue("expected GeOfferPriceTooHigh", foundReason);
+    }
+
+    /** Regression: `tick()` must NOT dispatch `dismissPriceWarning` while
+     *  the prior `confirmOffer` click chain is still busy. Without the
+     *  gate, the dismiss is silently dropped by the busy guard,
+     *  K_WARNING_DISMISSED gets set anyway, and check() falsely surfaces
+     *  GeOfferPriceTooHigh on the next tick — the popup hangs. */
+    @Test
+    public void priceWarningWaitsForDispatcherIdleBeforeDismissing() {
+        WorldSnapshot before = new GeSnapBuilder().tick(0).geOpen(true).build();
+        WorldSnapshot withPopup = new GeSnapBuilder()
+            .tick(1).geOpen(true).priceWarningOpen(true).build();
+        // Popup persists for a few ticks while busy, then clears once
+        // busy releases and the No click lands.
+        java.util.List<WorldSnapshot> snaps = new java.util.ArrayList<>();
+        snaps.add(before);
+        for (int t = 1; t < 6; t++) {
+            snaps.add(new GeSnapBuilder().tick(t).geOpen(true).priceWarningOpen(true).build());
+        }
+        // After busy clears + dismiss lands: popup gone, no offer.
+        for (int t = 6; t < 12; t++) {
+            snaps.add(new GeSnapBuilder().tick(t).geOpen(true).build());
+        }
+        RecordingGeActions a = new RecordingGeActions();
+        GeEngineHarness h = new GeEngineHarness().queue(snaps);
+        h.run(new ConfirmOfferStep(4151, OfferSide.BUY, 5, 1_500_000, a));
+        // Busy=true across the popup-arrival ticks. tick() must NOT dispatch.
+        h.dispatcher().setBusy(true);
+        h.advance(4);
+        assertTrue("dismiss held while worker busy: " + a.calls(),
+            !a.calls().contains("dismissPriceWarning(No)"));
+        // Worker idle — tick fires the dismiss; check fails PriceTooHigh.
+        h.dispatcher().setBusy(false);
+        h.advance(8);
+        assertTrue("dismiss dispatched after busy cleared: " + a.calls(),
+            a.calls().contains("dismissPriceWarning(No)"));
+        assertEquals(SequenceState.FAILED, h.state());
+    }
+
+    @Test
+    public void priceWarningAcceptedContinuesToOffer() {
+        // acceptHighPriceWarning=true: popup arrives, click Yes, then offer
+        // surfaces and step succeeds.
+        WorldSnapshot before = new GeSnapBuilder().tick(0).geOpen(true).build();
+        WorldSnapshot withPopup = new GeSnapBuilder()
+            .tick(1).geOpen(true).priceWarningOpen(true).build();
+        WorldSnapshot popupGone = new GeSnapBuilder().tick(2).geOpen(true).build();
+        WorldSnapshot offerLanded = new GeSnapBuilder().tick(3).geOpen(true)
+            .offer(2, OfferSide.BUY, OfferStatus.ACTIVE, 4151, 5, 0, 1_500_000)
+            .build();
+        RecordingGeActions a = new RecordingGeActions();
+        GeEngineHarness h = new GeEngineHarness()
+            .queue(before, withPopup, popupGone, offerLanded);
+        h.run(new ConfirmOfferStep(4151, OfferSide.BUY, 5, 1_500_000, a, true));
+        h.advance(4);
+
+        assertEquals(SequenceState.IDLE, h.state());
+        assertTrue("dispatched dismiss-Yes",
+            a.calls().contains("dismissPriceWarning(Yes)"));
+    }
+
+    @Test
     public void notSurfacedAfterTimeoutFailsWithRejected() {
         // Offer never surfaces — confirm dispatched but ge.offers stays empty.
         WorldSnapshot s = new GeSnapBuilder().tick(0).geOpen(true).build();

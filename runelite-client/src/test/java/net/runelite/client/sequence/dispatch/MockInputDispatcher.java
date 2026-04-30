@@ -32,6 +32,11 @@ import java.util.List;
 
 public final class MockInputDispatcher implements InputDispatcher {
     @Getter private final List<ActionRequest> requests = new ArrayList<>();
+    /** Tests that exercise the busy-guard race (e.g. StartOfferStep
+     *  must wait for the slot-click chain to release the worker before
+     *  the next step's onStart fires) flip this true mid-run. Default
+     *  false matches the production happy path. */
+    private volatile boolean busy = false;
 
     @Override
     public void dispatch(ActionRequest req)
@@ -51,8 +56,13 @@ public final class MockInputDispatcher implements InputDispatcher {
         }
     }
     @Override public void cancel(ActionRequest req) { requests.remove(req); }
-    @Override public boolean isBusy() { return false; }
+    @Override public boolean isBusy() { return busy; }
     @Override public InputMode mode() { return InputMode.MOCK; }
+
+    /** Test-only: simulate the dispatcher worker holding busy across step
+     *  transitions. Used to verify steps that dispatch input gate their
+     *  Succeeded on the worker being idle. */
+    public void setBusy(boolean busy) { this.busy = busy; }
 
     public void clear() { requests.clear(); }
 }

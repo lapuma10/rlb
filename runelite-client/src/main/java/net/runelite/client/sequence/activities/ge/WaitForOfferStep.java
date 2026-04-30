@@ -29,6 +29,14 @@ public final class WaitForOfferStep implements Step {
 
     private static final BlackboardKey<Integer> K_START_TICK =
         BlackboardKey.of("waitOffer.startTick", Integer.class);
+    /** Last observed completedQuantity. Reset every time it changes; used
+     *  to detect a partial-fill stall caused by the OSRS buy-limit cap. */
+    private static final BlackboardKey<Integer> K_LAST_COMPLETED =
+        BlackboardKey.of("waitOffer.lastCompleted", Integer.class);
+    /** Tick at which K_LAST_COMPLETED was last updated. Used to measure
+     *  consecutive-no-progress duration for stall detection. */
+    private static final BlackboardKey<Integer> K_LAST_PROGRESS_TICK =
+        BlackboardKey.of("waitOffer.lastProgressTick", Integer.class);
 
     private final OfferWaitPolicy waitPolicy;
 
@@ -70,11 +78,33 @@ public final class WaitForOfferStep implements Step {
 
         if (o.isComplete()) return new Completion.Succeeded("offer complete in slot " + slot);
 
+        // Track progress per tick so we can detect a buy-limit cap stall:
+        // the offer moves ACTIVE with completedQuantity > 0 then stops
+        // progressing because the rolling 4-hour buy limit was hit.
+        int completed = o.completedQuantity();
+        int requested = o.requestedQuantity();
+        Integer lastCompleted = bb.scope(BlackboardScope.STEP).get(K_LAST_COMPLETED).orElse(null);
+        if (lastCompleted == null || completed != lastCompleted) {
+            bb.scope(BlackboardScope.STEP).put(K_LAST_COMPLETED, completed);
+            bb.scope(BlackboardScope.STEP).put(K_LAST_PROGRESS_TICK, s.tick());
+        }
+
+        // Stall short-circuit: partial fill that hasn't progressed for
+        // partialStallTicks consecutive snapshots → accept what we got and
+        // move on. Real players don't sit at the GE waiting for a 4h limit
+        // window to reset.
+        if (completed > 0 && waitPolicy.partialStallTicks() > 0) {
+            int lastProgress = bb.scope(BlackboardScope.STEP)
+                .get(K_LAST_PROGRESS_TICK).orElse(s.tick());
+            if (s.tick() - lastProgress >= waitPolicy.partialStallTicks()) {
+                return new Completion.Succeeded("partial fill (stalled): "
+                    + completed + "/" + requested);
+            }
+        }
+
         int startTick = bb.scope(BlackboardScope.STEP).get(K_START_TICK).orElse(s.tick());
         int elapsed = s.tick() - startTick;
         if (elapsed >= waitPolicy.timeoutTicks()) {
-            int completed = o.completedQuantity();
-            int requested = o.requestedQuantity();
             if (waitPolicy.acceptPartialOnTimeout() && completed > 0) {
                 return new Completion.Succeeded("partial fill accepted: " + completed + "/" + requested);
             }

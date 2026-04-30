@@ -249,6 +249,11 @@ public final class WithdrawItemStep implements Step {
         if (desired instanceof WithdrawQuantity.AtLeast a) {
             return currentCount >= a.qty();
         }
+        if (desired instanceof WithdrawQuantity.WithdrawAmount) {
+            // Never short-circuit — the caller wants a fresh withdraw of
+            // qty on top of whatever is already in inventory.
+            return false;
+        }
         // FillRemainingInventory: never "already satisfied" just because count >= 1 — only when no room remains.
         return freeSlots == 0;
     }
@@ -257,12 +262,22 @@ public final class WithdrawItemStep implements Step {
         if (desired instanceof WithdrawQuantity.AtLeast a) {
             return a.qty();
         }
+        if (desired instanceof WithdrawQuantity.WithdrawAmount w) {
+            return w.qty();
+        }
         return 1;   // FillRemainingInventory — for telemetry / BankMissingItem.requiredQty only
     }
 
     private int resolveTargetCount(int currentCount, int freeSlots, int knownBankCount) {
         if (desired instanceof WithdrawQuantity.AtLeast a) {
             return Math.max(a.qty(), currentCount);
+        }
+        if (desired instanceof WithdrawQuantity.WithdrawAmount w) {
+            // Withdraw qty MORE — target = current + qty, delta = qty.
+            // Don't cap by knownBankCount here; the BankMissingItem
+            // precondition check will fail-fast if the bank doesn't have
+            // enough.
+            return currentCount + w.qty();
         }
         // FillRemainingInventory: allow partial final trip — cap by knownBankCount (§8.2).
         return currentCount + Math.min(freeSlots, knownBankCount);

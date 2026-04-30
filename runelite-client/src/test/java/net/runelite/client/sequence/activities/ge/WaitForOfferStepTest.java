@@ -129,6 +129,60 @@ public class WaitForOfferStepTest {
     }
 
     @Test
+    public void buyLimitCapStallShortCircuitsLongTimeout() {
+        // Buy limit cap: offer goes ACTIVE/PARTIAL with completedQuantity
+        // > 0 but never progresses because the rolling 4-hour limit was
+        // hit. With a stall window of 3 ticks, the wait should
+        // short-circuit BEFORE the long timeout (50 ticks) elapses.
+        List<WorldSnapshot> snaps = new ArrayList<>();
+        // Tick 0..1: progressing — completedQty rises 0→3.
+        snaps.add(snap(0, 0, OfferSide.BUY, OfferStatus.ACTIVE, 4151, 200, 0, 100));
+        snaps.add(snap(1, 0, OfferSide.BUY, OfferStatus.PARTIALLY_COMPLETE, 4151, 200, 3, 100));
+        // Tick 2..10: stuck at 160 — buy limit hit. Stall begins at tick 2;
+        // by tick 5 (3 ticks of no progress) the stall short-circuits.
+        for (int t = 2; t < 12; t++) {
+            snaps.add(snap(t, 0, OfferSide.BUY, OfferStatus.PARTIALLY_COMPLETE, 4151, 200, 160, 100));
+        }
+        GeEngineHarness h = new GeEngineHarness().queue(snaps);
+        h.run(new LinearSequence("waitWrap")
+            .then(new SlotWriter(0))
+            // Long timeout (50 ticks) but short stall (3 ticks).
+            .then(new WaitForOfferStep(OfferWaitPolicy.untilOrPartialStall(50, 3))));
+        h.advance(12);
+
+        assertEquals("stall should short-circuit before 50-tick timeout",
+            SequenceState.IDLE, h.state());
+    }
+
+    @Test
+    public void noProgressZeroQtyDoesNotStallEarly() {
+        // Stall detection should only fire when completedQuantity > 0.
+        // A genuine "offer never moved off zero" should fall through to
+        // the normal timeout path.
+        List<WorldSnapshot> snaps = new ArrayList<>();
+        for (int t = 0; t < 8; t++) {
+            snaps.add(snap(t, 0, OfferSide.BUY, OfferStatus.ACTIVE, 4151, 5, 0, 100));
+        }
+        GeEngineHarness h = new GeEngineHarness().queue(snaps);
+        h.run(new LinearSequence("waitWrap")
+            .then(new SlotWriter(0))
+            // 5-tick timeout, 2-tick stall (would fire at tick 2 if it
+            // applied to qty=0). It must not fire — fall through to
+            // GeOfferTimeout at tick 5.
+            .then(new WaitForOfferStep(OfferWaitPolicy.untilOrPartialStall(5, 2))));
+        h.advance(8);
+
+        assertEquals(SequenceState.FAILED, h.state());
+        boolean found = false;
+        for (TelemetryRecord r : h.recentTelemetry()) {
+            if (r.payload() != null && r.payload().contains("GeOfferTimeout")) {
+                found = true; break;
+            }
+        }
+        assertTrue("expected GeOfferTimeout (stall must not fire on qty=0)", found);
+    }
+
+    @Test
     public void sellZeroProgressTimeoutFailsWithGeOfferTimeout() {
         // Spec 16: SELL no progress + !acceptPartial + timeout.
         List<WorldSnapshot> snaps = new ArrayList<>();

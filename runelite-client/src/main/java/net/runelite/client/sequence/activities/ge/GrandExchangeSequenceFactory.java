@@ -9,11 +9,13 @@ import net.runelite.client.sequence.Step;
 import net.runelite.client.sequence.activities.EnsureNoBlockingInterfaceStep;
 import net.runelite.client.sequence.activities.banking.BankActions;
 import net.runelite.client.sequence.activities.banking.CloseBankStep;
+import net.runelite.client.sequence.activities.banking.HaveAtLeastInInventoryStep;
 import net.runelite.client.sequence.activities.banking.OpenBankStep;
 import net.runelite.client.sequence.activities.banking.WaitForBankReadyStep;
 import net.runelite.client.sequence.activities.banking.WithdrawItemStep;
 import net.runelite.client.sequence.activities.banking.WithdrawQuantity;
 import net.runelite.client.sequence.composite.LinearSequence;
+import net.runelite.client.sequence.composite.Selector;
 import net.runelite.client.sequence.views.OfferSide;
 
 /**
@@ -32,7 +34,12 @@ public final class GrandExchangeSequenceFactory {
      *  (not blockers). */
     public static final Set<Integer> GE_ROOTS = Set.of(
         InterfaceID.GeOffers.UNIVERSE,
-        InterfaceID.GeCollect.UNIVERSE
+        InterfaceID.GeCollect.UNIVERSE,
+        // Popupoverlay surfaces the "Your offer is much higher than the
+        // guide price" warning during ConfirmOffer. ConfirmOfferStep
+        // dismisses it itself (Yes for price-checks, No otherwise) — the
+        // reactive must NOT Escape it out from under us.
+        InterfaceID.Popupoverlay.UNIVERSE
     );
 
     /** Bank-Phase-B reactive allow-list adds the bank widget so the reactive
@@ -193,6 +200,7 @@ public final class GrandExchangeSequenceFactory {
             throw new IllegalArgumentException(
                 "totalCost overflows int: " + intent.quantity() + " * " + priceEach);
         }
+        int totalCostInt = (int) totalCost;
         // Round up to a buffered amount so we never withdraw the exact
         // cost — see roundUpToNiceCoinAmount.
         int withdrawCoinAmount = roundUpToNiceCoinAmount(totalCost);
@@ -205,13 +213,25 @@ public final class GrandExchangeSequenceFactory {
             .then(new SetPriceStep(priceEach, ge))
             .then(new ConfirmOfferStep(intent.itemId(), OfferSide.BUY, intent.quantity(), priceEach, ge));
 
-        Step root = new LinearSequence("BuyItemAtGEWithBankPrep")
-            .then(new EnsureAtGrandExchangeStep(geArea))
-            // Bank sub-flow
+        // Bank sub-flow is conditional: if the player already has enough
+        // coins to fund the trade (inventory.count(coins) >= totalCost),
+        // skip opening the bank entirely. Otherwise withdraw the rounded
+        // buffered amount FLAT (not "top-up to the buffer") so a starting
+        // balance of 4_999 doesn't produce a 45_001-coin withdraw — we
+        // pull the full 50_000 either way.
+        Step bankWithdraw = new LinearSequence("BankWithdrawCoins")
             .then(new OpenBankStep(Set.of(), bank))
             .then(new WaitForBankReadyStep())
-            .then(new WithdrawItemStep(COINS_ITEM_ID, new WithdrawQuantity.AtLeast(withdrawCoinAmount), bank))
-            .then(new CloseBankStep(bank))
+            .then(new WithdrawItemStep(COINS_ITEM_ID,
+                new WithdrawQuantity.WithdrawAmount(withdrawCoinAmount), bank))
+            .then(new CloseBankStep(bank));
+        Step ensureCoins = new Selector("EnsureCoinsForBuy")
+            .option(new HaveAtLeastInInventoryStep(COINS_ITEM_ID, totalCostInt, "Coins"))
+            .option(bankWithdraw);
+
+        Step root = new LinearSequence("BuyItemAtGEWithBankPrep")
+            .then(new EnsureAtGrandExchangeStep(geArea))
+            .then(ensureCoins)
             // GE Core sub-flow
             .then(new OpenGrandExchangeStep(ge))
             .then(new CollectAllCompletedOffersStep(ge))

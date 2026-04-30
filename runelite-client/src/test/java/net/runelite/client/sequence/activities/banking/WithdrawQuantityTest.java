@@ -74,21 +74,24 @@ public class WithdrawQuantityTest {
         );
     }
 
-    // -- Only two permitted subtypes (no Exact) ----------------------------
+    // -- Three permitted subtypes (AtLeast, WithdrawAmount, FillRemainingInventory) -
 
     @Test
-    public void onlyTwoPermittedSubtypes() {
+    public void threePermittedSubtypes() {
         Class<?>[] permitted = WithdrawQuantity.class.getPermittedSubclasses();
         assertNotNull("WithdrawQuantity must be sealed", permitted);
-        assertEquals("exactly two permitted subtypes", 2, permitted.length);
+        assertEquals("exactly three permitted subtypes", 3, permitted.length);
 
         boolean hasAtLeast = false;
+        boolean hasWithdrawAmount = false;
         boolean hasFill    = false;
         for (Class<?> c : permitted) {
-            if (c == WithdrawQuantity.AtLeast.class)              hasAtLeast = true;
-            if (c == WithdrawQuantity.FillRemainingInventory.class) hasFill  = true;
+            if (c == WithdrawQuantity.AtLeast.class)               hasAtLeast = true;
+            if (c == WithdrawQuantity.WithdrawAmount.class)        hasWithdrawAmount = true;
+            if (c == WithdrawQuantity.FillRemainingInventory.class) hasFill = true;
         }
         assertTrue("AtLeast must be permitted",              hasAtLeast);
+        assertTrue("WithdrawAmount must be permitted",       hasWithdrawAmount);
         assertTrue("FillRemainingInventory must be permitted", hasFill);
     }
 

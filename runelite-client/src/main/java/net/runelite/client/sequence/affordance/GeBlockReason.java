@@ -30,6 +30,7 @@ public sealed interface GeBlockReason extends DiagnosticReason
             GeBlockReason.GeOfferQuantityMismatch,
             GeBlockReason.GeOfferItemMismatch,
             GeBlockReason.GeOfferPriceMismatch,
+            GeBlockReason.GeOfferPriceTooHigh,
             GeBlockReason.GeCollectFailed,
             GeBlockReason.InsufficientCoins,
             GeBlockReason.InsufficientSellItems {
@@ -56,6 +57,13 @@ public sealed interface GeBlockReason extends DiagnosticReason
     record GeOfferQuantityMismatch(int slot, int expected, int actual) implements GeBlockReason {}
     record GeOfferItemMismatch(int slot, int expectedItemId, int actualItemId) implements GeBlockReason {}
     record GeOfferPriceMismatch(int slot, int expectedPriceEach, int actualPriceEach) implements GeBlockReason {}
+    /** Confirm-offer triggered the OSRS "Your offer is much higher than the
+     *  guide price" warning popup and the trade was NOT a price-check, so
+     *  we declined ("No"). The caller should retry with a lower
+     *  {@code priceEach}. {@code submittedPriceEach} is what we tried to
+     *  submit — caller's anti-loop guard should make sure the retry is
+     *  actually lower. */
+    record GeOfferPriceTooHigh(int submittedPriceEach) implements GeBlockReason {}
     record GeCollectFailed(int slot, int expectedDeltaItemId, int observedDelta) implements GeBlockReason {}
     record InsufficientCoins(int needed, int have) implements GeBlockReason {}
     record InsufficientSellItems(int itemId, int needed, int have) implements GeBlockReason {}

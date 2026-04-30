@@ -1,5 +1,7 @@
 package net.runelite.client.sequence.activities.ge;
 
+import java.util.concurrent.ThreadLocalRandom;
+import java.util.function.BooleanSupplier;
 import net.runelite.client.sequence.Completion;
 import net.runelite.client.sequence.Failure;
 import net.runelite.client.sequence.PreemptionPolicy;
@@ -11,6 +13,7 @@ import net.runelite.client.sequence.affordance.GeBlockReason;
 import net.runelite.client.sequence.blackboard.Blackboard;
 import net.runelite.client.sequence.blackboard.BlackboardKey;
 import net.runelite.client.sequence.blackboard.BlackboardScope;
+import net.runelite.client.sequence.dispatch.InputDispatcher;
 import net.runelite.client.sequence.views.GrandExchangeOfferView;
 import net.runelite.client.sequence.views.OfferSide;
 
@@ -23,6 +26,16 @@ import net.runelite.client.sequence.views.OfferSide;
  * increase). Persists the pre-collect inventory count to STEP scope and
  * waits for the slot to become EMPTY AND the inventory count to rise above
  * that baseline.
+ *
+ * <p>Two collect strategies, picked randomly per onStart for humanization
+ * (real players don't always tap the toolbar shortcut):
+ * <ul>
+ *   <li>{@code COLLECT_ALL} (~63%): one click on
+ *       {@code GeOffers.COLLECTALL} drains every completed offer (items
+ *       AND leftover coins from partial fills) into the inventory.</li>
+ *   <li>{@code PER_SLOT} (~37%): click the slot's container to open the
+ *       offer-detail / collect view, then click {@code COLLECT_INV}.</li>
+ * </ul>
  *
  * <p>Already-satisfied: slot already EMPTY (collect happened externally).
  *
@@ -44,6 +57,10 @@ public final class CollectOfferStep implements Step {
         BlackboardKey.of("collectOffer.startTick", Integer.class);
     private static final BlackboardKey<Boolean> K_ALREADY_EMPTY =
         BlackboardKey.of("collectOffer.alreadyEmpty", Boolean.class);
+    private static final BlackboardKey<Strategy> K_STRATEGY =
+        BlackboardKey.of("collectOffer.strategy", Strategy.class);
+    private static final BlackboardKey<Phase> K_PHASE =
+        BlackboardKey.of("collectOffer.phase", Phase.class);
     /** SEQUENCE-scope so it survives Retry(N) STEP-scope clears: the expected
      *  item id from the FIRST attempt. Used when a retry encounters an
      *  already-empty slot — we still need to verify delta from the original
@@ -52,17 +69,48 @@ public final class CollectOfferStep implements Step {
         BlackboardKey.of("collectOffer.deltaItemIdPersisted", Integer.class);
     private static final BlackboardKey<Integer> K_DELTA_START_PERSISTED =
         BlackboardKey.of("collectOffer.deltaStartPersisted", Integer.class);
+    /** Set true in onStart when the offer is PARTIALLY_COMPLETE (e.g.
+     *  WaitForOfferStep accepted a buy-limit-stalled fill). The slot
+     *  WILL NOT empty — collecting from a partial offer extracts the
+     *  filled portion to inventory but the offer continues running for
+     *  the unfilled remainder. Success criterion in this mode is "click
+     *  dispatched + worker idle + a couple of grace ticks", not slot
+     *  empty. The remaining active portion is left for the next session
+     *  to revisit (per user spec). */
+    private static final BlackboardKey<Boolean> K_PARTIAL_MODE =
+        BlackboardKey.of("collectOffer.partialMode", Boolean.class);
+    private static final BlackboardKey<Integer> K_PARTIAL_DISPATCH_TICK =
+        BlackboardKey.of("collectOffer.partialDispatchTick", Integer.class);
+    /** Engine ticks of "worker idle, post-dispatch" we wait before declaring
+     *  the partial collect done. Generous — the in-grid detail collect can
+     *  take 2–3 ticks for both DETAILS_COLLECT children to land. */
+    private static final int PARTIAL_GRACE_TICKS = 5;
+
+    /** 63% COLLECT_ALL / 37% PER_SLOT — see CollectAllCompletedOffersStep
+     *  for the humanization rationale. */
+    private static final BooleanSupplier DEFAULT_USE_COLLECT_ALL =
+        () -> ThreadLocalRandom.current().nextInt(100) < 63;
 
     private final GeActions ge;
+    private final BooleanSupplier useCollectAll;
+    private InputDispatcher dispatcher;
 
     public CollectOfferStep(GeActions ge) {
+        this(ge, DEFAULT_USE_COLLECT_ALL);
+    }
+
+    /** Test/override constructor: pin the strategy via a deterministic
+     *  {@link BooleanSupplier}. */
+    public CollectOfferStep(GeActions ge, BooleanSupplier useCollectAll) {
         if (ge == null) throw new IllegalArgumentException("GeActions must not be null");
+        if (useCollectAll == null) throw new IllegalArgumentException("useCollectAll must not be null");
         this.ge = ge;
+        this.useCollectAll = useCollectAll;
     }
 
     @Override public String name()                              { return "CollectOffer"; }
     @Override public int priority()                             { return 100; }
-    @Override public int timeoutTicks()                         { return 8; }
+    @Override public int timeoutTicks()                         { return 12; }
     @Override public PreemptionPolicy preemptionPolicy()        { return PreemptionPolicy.WHEN_SAFE; }
     @Override public boolean isSafeToPause(WorldSnapshot s, Blackboard b) { return true; }
     @Override public boolean canStart(WorldSnapshot s, Blackboard b) { return true; }
@@ -71,6 +119,7 @@ public final class CollectOfferStep implements Step {
     public void onStart(StepContext ctx) {
         WorldSnapshot s = ctx.snapshot();
         Blackboard step = ctx.bb().scope(BlackboardScope.STEP);
+        this.dispatcher = ctx.dispatcher();
 
         if (!s.grandExchange().open()) {
             step.put(K_PRECONDITION, new GeBlockReason.GeNotOpen());
@@ -92,11 +141,7 @@ public final class CollectOfferStep implements Step {
         GrandExchangeOfferView o = offers.get(slot);
 
         // If a previous attempt persisted expected item / baseline (Retry path),
-        // reuse them instead of re-deriving from the now-empty slot. This
-        // prevents the "already-empty + lost-context" bug where a retry would
-        // see slot=EMPTY, derive expectedItemId=0, and short-circuit to
-        // Succeeded — bypassing the delta verification that the FIRST attempt
-        // failed on.
+        // reuse them instead of re-deriving from the now-empty slot.
         Integer persistedItemId = ctx.bb().scope(BlackboardScope.SEQUENCE)
             .get(K_DELTA_ITEM_ID_PERSISTED).orElse(null);
         Integer persistedStart = ctx.bb().scope(BlackboardScope.SEQUENCE)
@@ -105,11 +150,11 @@ public final class CollectOfferStep implements Step {
             step.put(K_EXPECTED_DELTA_ITEM_ID, persistedItemId);
             step.put(K_EXPECTED_DELTA_START, persistedStart);
             step.put(K_START_TICK, s.tick());
-            // On retry, only re-dispatch if the slot still has an offer to
-            // collect; an already-EMPTY slot means the original click landed
-            // — we just need to keep watching for the inventory delta.
+            // Retry: re-fire if the slot still holds an offer. Re-roll the
+            // strategy — if the prior PER_SLOT attempt got stuck on a hidden
+            // INDEX_N, the retry might land on COLLECT_ALL and recover.
             if (!o.isEmpty()) {
-                ge.collect(slot);
+                dispatchStrategy(ctx, s, slot);
             }
             return;
         }
@@ -117,9 +162,6 @@ public final class CollectOfferStep implements Step {
         // First attempt: compute expected delta target from the live slot.
         int expectedItemId = (o.side() == OfferSide.SELL) ? COINS_ITEM_ID : o.itemId();
         if (expectedItemId == 0 && o.isEmpty()) {
-            // Slot is already EMPTY at onStart with no prior context — treat
-            // as already-satisfied (collect happened externally before we
-            // started).
             step.put(K_ALREADY_EMPTY, true);
             return;
         }
@@ -127,22 +169,65 @@ public final class CollectOfferStep implements Step {
         step.put(K_EXPECTED_DELTA_ITEM_ID, expectedItemId);
         step.put(K_EXPECTED_DELTA_START, startCount);
         step.put(K_START_TICK, s.tick());
-        // Persist into SEQUENCE so retries reuse the same expected target.
         ctx.bb().scope(BlackboardScope.SEQUENCE).put(K_DELTA_ITEM_ID_PERSISTED, expectedItemId);
         ctx.bb().scope(BlackboardScope.SEQUENCE).put(K_DELTA_START_PERSISTED, startCount);
 
-        // Already-satisfied: slot is empty AND we already know what to look
-        // for. (e.g., collect happened externally between Wait and Collect.)
         if (o.isEmpty()) {
             step.put(K_ALREADY_EMPTY, true);
             return;
         }
 
-        ge.collect(slot);
+        // Partial-fill mode: the offer is still ACTIVE with a partial fill
+        // (typical cause: WaitForOfferStep saw the buy-limit-cap stall and
+        // accepted the partial). The slot will NOT empty — collecting from
+        // a partial offer extracts the filled portion to inventory but
+        // leaves the remainder running. Different success criterion in
+        // check() — see K_PARTIAL_MODE handling.
+        if (o.status() == net.runelite.client.sequence.views.OfferStatus.PARTIALLY_COMPLETE) {
+            step.put(K_PARTIAL_MODE, true);
+        }
+
+        dispatchStrategy(ctx, s, slot);
+    }
+
+    /** Pick COLLECT_ALL vs PER_SLOT and dispatch the first click. */
+    private void dispatchStrategy(StepContext ctx, WorldSnapshot s, int slot) {
+        Blackboard step = ctx.bb().scope(BlackboardScope.STEP);
+        Strategy strategy = useCollectAll.getAsBoolean() ? Strategy.COLLECT_ALL : Strategy.PER_SLOT;
+        step.put(K_STRATEGY, strategy);
+
+        if (strategy == Strategy.COLLECT_ALL) {
+            ge.collectAll();
+            step.put(K_PHASE, Phase.AWAIT_DRAIN);
+            return;
+        }
+
+        // PER_SLOT: open the slot's detail view if not already there.
+        if (s.grandExchange().collectOpen()) {
+            step.put(K_PHASE, Phase.CLICK_COLLECT_INV);
+            ge.collect(slot);
+        } else {
+            step.put(K_PHASE, Phase.OPEN_COLLECT);
+            ge.openOfferDetail(slot);
+        }
     }
 
     @Override public void onEvent(Object event, StepContext ctx) {}
-    @Override public void tick(StepContext ctx) {}
+
+    @Override public void tick(StepContext ctx) {
+        // PER_SLOT phase machine only.
+        Blackboard step = ctx.bb().scope(BlackboardScope.STEP);
+        if (step.get(K_STRATEGY).orElse(null) != Strategy.PER_SLOT) return;
+        if (step.get(K_PHASE).orElse(null) == Phase.AWAIT_COLLECT_VIEW
+            && ctx.snapshot().grandExchange().collectOpen()) {
+            Integer slotBox = ctx.bb().scope(BlackboardScope.SEQUENCE)
+                .get(GeBlackboardKeys.K_GE_OFFER_SLOT).orElse(null);
+            if (slotBox != null) {
+                step.put(K_PHASE, Phase.CLICK_COLLECT_INV);
+                ge.collect(slotBox);
+            }
+        }
+    }
 
     @Override
     public Completion check(WorldSnapshot s, Blackboard bb) {
@@ -151,6 +236,10 @@ public final class CollectOfferStep implements Step {
         if (pre != null) return Completion.failed(pre);
 
         if (Boolean.TRUE.equals(step.get(K_ALREADY_EMPTY).orElse(null))) {
+            // Clear SEQUENCE-scope retry-baseline keys so a follow-up
+            // CollectOfferStep in a longer sequence doesn't mis-read them
+            // as "this is a retry, reuse the prior baseline" (P2 MINOR).
+            clearPersistedBaseline(bb);
             return new Completion.Succeeded("slot already empty");
         }
 
@@ -162,23 +251,88 @@ public final class CollectOfferStep implements Step {
         int slot = slotBox;
         GrandExchangeOfferView o = s.grandExchange().offers().get(slot);
 
-        int expectedItemId = step.get(K_EXPECTED_DELTA_ITEM_ID).orElse(-1);
-        int startCount = step.get(K_EXPECTED_DELTA_START).orElse(0);
-        int now = (expectedItemId > 0) ? s.inventory().count(expectedItemId) : 0;
-        int delta = now - startCount;
-
+        // Slot draining is the success signal. We deliberately do NOT
+        // gate on `inventory.count(unnotedItemId) > startCount` because
+        // the bot collects items as NOTES (left-click default action
+        // "Collect-notes") — the noted item id differs from the unnoted
+        // form, so the unnoted count never rises and a delta-gated
+        // success would always time out into GeCollectFailed. The slot
+        // can only empty if the items left the GE (collected by us, by
+        // the player externally, or by abort), and in all of those
+        // cases the player's wealth is conserved. Telemetry-only delta
+        // included in the success message for diagnostic value.
         boolean slotEmpty = o.isEmpty();
-        boolean deltaObserved = expectedItemId > 0 && delta > 0;
+        if (slotEmpty) {
+            int expectedItemId = step.get(K_EXPECTED_DELTA_ITEM_ID).orElse(-1);
+            int startCount = step.get(K_EXPECTED_DELTA_START).orElse(0);
+            int now = (expectedItemId > 0) ? s.inventory().count(expectedItemId) : 0;
+            int delta = now - startCount;
+            clearPersistedBaseline(bb);
+            return new Completion.Succeeded("collected (slot empty, unnoted-delta=" + delta + ")");
+        }
 
-        if (slotEmpty && deltaObserved) {
-            return new Completion.Succeeded("collected (delta=" + delta + ")");
+        // Partial-fill mode: slot will NOT empty (offer is still active for
+        // the unfilled remainder). Success when the dispatcher worker has
+        // gone idle post-dispatch and a brief grace window has passed —
+        // the click landed, items extracted to inventory, the offer keeps
+        // running for the rest. Per user spec: "collect what we can, leave
+        // the rest for later".
+        if (Boolean.TRUE.equals(step.get(K_PARTIAL_MODE).orElse(null))) {
+            // Stamp the first-idle tick once the click chain releases. Use
+            // a separate key so the normal full-collect path (which expects
+            // slot-empty) isn't affected.
+            if (dispatcher == null || !dispatcher.isBusy()) {
+                Integer firstIdle = step.get(K_PARTIAL_DISPATCH_TICK).orElse(null);
+                if (firstIdle == null) {
+                    step.put(K_PARTIAL_DISPATCH_TICK, s.tick());
+                    return Completion.RUNNING;
+                }
+                if (s.tick() - firstIdle >= PARTIAL_GRACE_TICKS) {
+                    clearPersistedBaseline(bb);
+                    return new Completion.Succeeded(
+                        "partial collected (slot still ACTIVE: "
+                            + o.completedQuantity() + "/" + o.requestedQuantity() + ")");
+                }
+            }
+            return Completion.RUNNING;
+        }
+
+        // PER_SLOT phase progression must NOT advance while the prior
+        // dispatch (openOfferDetail click chain) is still parking the
+        // cursor — tick() would dispatch the second click into the busy
+        // guard and the request would be silently dropped (mirror the
+        // 2026-04-30 StartOfferStep race fix). Mirrors
+        // CollectAllCompletedOffersStep.check() at the same gate site.
+        if (dispatcher != null && dispatcher.isBusy()) {
+            return Completion.RUNNING;
+        }
+        if (step.get(K_STRATEGY).orElse(null) == Strategy.PER_SLOT) {
+            Phase ph = step.get(K_PHASE).orElse(Phase.OPEN_COLLECT);
+            if (ph == Phase.OPEN_COLLECT && s.grandExchange().collectOpen()) {
+                step.put(K_PHASE, Phase.AWAIT_COLLECT_VIEW);
+            }
         }
 
         int startTick = step.get(K_START_TICK).orElse(s.tick());
         if (s.tick() - startTick >= timeoutTicks()) {
-            return Completion.failed(new GeBlockReason.GeCollectFailed(slot, expectedItemId, delta));
+            // Click-missed timeout: slot still occupied. Reason fields are
+            // best-effort — observed delta is meaningless when collecting
+            // notes since `count(unnotedItemId)` won't move regardless.
+            int expectedItemId = step.get(K_EXPECTED_DELTA_ITEM_ID).orElse(-1);
+            int startCount = step.get(K_EXPECTED_DELTA_START).orElse(0);
+            int now = (expectedItemId > 0) ? s.inventory().count(expectedItemId) : 0;
+            return Completion.failed(new GeBlockReason.GeCollectFailed(
+                slot, expectedItemId, now - startCount));
         }
         return Completion.RUNNING;
+    }
+
+    /** Clear the SEQUENCE-scope persistence keys this step uses to survive
+     *  Recovery.Retry. Called on success / already-satisfied so a downstream
+     *  CollectOfferStep in the same sequence re-derives its baseline. */
+    private static void clearPersistedBaseline(Blackboard bb) {
+        bb.scope(BlackboardScope.SEQUENCE).remove(K_DELTA_ITEM_ID_PERSISTED);
+        bb.scope(BlackboardScope.SEQUENCE).remove(K_DELTA_START_PERSISTED);
     }
 
     @Override
@@ -188,4 +342,7 @@ public final class CollectOfferStep implements Step {
         if (f.diagnostic() instanceof GeBlockReason.GeCollectFailed)  return new Recovery.Retry(2);
         return new Recovery.Retry(2);
     }
+
+    private enum Strategy { COLLECT_ALL, PER_SLOT }
+    private enum Phase { OPEN_COLLECT, AWAIT_COLLECT_VIEW, CLICK_COLLECT_INV, AWAIT_DRAIN }
 }

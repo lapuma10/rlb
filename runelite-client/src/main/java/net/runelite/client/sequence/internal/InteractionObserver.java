@@ -89,6 +89,20 @@ final class InteractionObserver {
                 /* blocksWorld */ true,
                 /* canBeClosed */ true));
         }
+        // Generic OSRS modal popup overlay — used by the GE high-price
+        // warning ("Your offer is much higher than the guide price...")
+        // and other "are you sure?" confirm dialogs. Surfacing it as a
+        // BlockingInterface lets sequences allow-list it (see GE_ROOTS in
+        // GrandExchangeSequenceFactory) so the EnsureNoBlockingInterface
+        // reactive doesn't Escape it out from under ConfirmOfferStep,
+        // which has its own typed Yes/No handling.
+        if (widgets.isVisible(InterfaceID.Popupoverlay.UNIVERSE)) {
+            return Optional.of(new BlockingInterface(
+                "PopupOverlay",
+                InterfaceID.Popupoverlay.UNIVERSE,
+                /* blocksWorld */ true,
+                /* canBeClosed */ true));
+        }
         // Bank widget: report it (even though it's allow-listed by banking
         // sequences) so non-banking code paths can react.
         if (bank.open()) {

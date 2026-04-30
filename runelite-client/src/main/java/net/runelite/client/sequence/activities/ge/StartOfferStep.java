@@ -12,6 +12,7 @@ import net.runelite.client.sequence.affordance.GeBlockReason;
 import net.runelite.client.sequence.blackboard.Blackboard;
 import net.runelite.client.sequence.blackboard.BlackboardKey;
 import net.runelite.client.sequence.blackboard.BlackboardScope;
+import net.runelite.client.sequence.dispatch.InputDispatcher;
 import net.runelite.client.sequence.views.GrandExchangeView;
 import net.runelite.client.sequence.views.OfferSide;
 
@@ -33,6 +34,13 @@ public final class StartOfferStep implements Step {
 
     private final OfferSide side;
     private final GeActions ge;
+    /** Captured from {@link StepContext#dispatcher()} in onStart so check()
+     *  can gate Succeeded on the slot-click chain having released the
+     *  dispatcher worker. The post-click humanization (cursor parking,
+     *  ~50–2000ms tail) outlives the SETUP-screen open by an unbounded
+     *  margin; declaring success while busy lets the next step onStart
+     *  dispatch into the busy guard and silently drop. */
+    private InputDispatcher dispatcher;
 
     public StartOfferStep(OfferSide side, GeActions ge) {
         if (side == null || side == OfferSide.NONE) {
@@ -54,6 +62,7 @@ public final class StartOfferStep implements Step {
     public void onStart(StepContext ctx) {
         WorldSnapshot s = ctx.snapshot();
         Blackboard step = ctx.bb().scope(BlackboardScope.STEP);
+        this.dispatcher = ctx.dispatcher();
         GrandExchangeView gx = s.grandExchange();
         if (!gx.open()) {
             step.put(K_PRECONDITION, new GeBlockReason.GeNotOpen());
@@ -80,10 +89,20 @@ public final class StartOfferStep implements Step {
         Blackboard step = bb.scope(BlackboardScope.STEP);
         GeBlockReason pre = step.get(K_PRECONDITION).orElse(null);
         if (pre != null) return Completion.failed(pre);
-        if (s.grandExchange().offerSetupOpen()) {
-            return new Completion.Succeeded("offer-setup open");
+        if (!s.grandExchange().offerSetupOpen()) {
+            return Completion.RUNNING;
         }
-        return Completion.RUNNING;
+        // SETUP is up — but the slot-click chain may still be running its
+        // post-click humanization (cursor park) and holding the dispatcher
+        // busy. Declaring Succeeded here would let SelectItemStep.onStart
+        // dispatch PICK_GE_SEARCH_RESULT, the busy guard would silently
+        // drop it, the search would never run, and the bot would later
+        // click "Enter quantity" on an item-less SETUP — observed as the
+        // 17:47 / 17:48 GE_SET_QUANTITY chatbox-prompt timeouts.
+        if (dispatcher != null && dispatcher.isBusy()) {
+            return Completion.RUNNING;
+        }
+        return new Completion.Succeeded("offer-setup open");
     }
 
     @Override

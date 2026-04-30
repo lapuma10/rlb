@@ -23,6 +23,14 @@ public interface GeActions {
      *  surfacing the offer-setup interface for that slot. */
     void clickOfferSlotButton(int slot, OfferSide side);
 
+    /** Click the indicated offer slot's container widget directly (no verb
+     *  match), surfacing the offer-detail / collect view for slots holding an
+     *  active or completed offer. Use this instead of
+     *  {@link #clickOfferSlotButton} when the slot is NOT empty — the verb
+     *  match in the latter looks for "Create Buy/Sell offer" which only
+     *  exists on empty slots. */
+    void openOfferDetail(int slot);
+
     /** Type the item name into the GE search chatbox WITHOUT submitting.
      *  Returns true if the chatbox-search prompt opened, the name was
      *  typed, and the result list rendered with at least one group of 3
@@ -53,8 +61,30 @@ public interface GeActions {
     /** Click the "Confirm Offer" button on the offer-setup interface. */
     void confirmOffer();
 
+    /** Dismiss the OSRS "Your offer is much higher than the guide price"
+     *  warning popup. {@code accept=true} → click "Yes" (proceed at the
+     *  overpriced bid; used by price-check probes). {@code accept=false}
+     *  → click "No" (cancel the offer; default for normal trades, caller
+     *  is expected to retry with a lower price).
+     *
+     *  <p>Targets {@code Popupoverlay.BUTTON_1} (Yes, 0x01210008) /
+     *  {@code BUTTON_0} (No, 0x01210007). */
+    void dismissPriceWarning(boolean accept);
+
     /** Collect proceeds from the indicated slot (left-click → inventory). */
     void collect(int slot);
+
+    /** Click the {@code GeOffers.COLLECTALL} toolbar button on the main GE
+     *  view — drains every completed offer (items AND leftover coins from
+     *  partial fills) into the player's inventory in one click. Visible
+     *  whenever the GE main 8-slot grid is showing and at least one slot
+     *  has a completed or partially-completed offer to collect.
+     *
+     *  <p>Preferred over {@link #collect(int)} when there's no need to be
+     *  surgical about a specific slot — bypasses the detail-view dance and
+     *  the per-slot widget visibility issues (e.g. {@code INDEX_N} self-
+     *  hidden when the slot has a stuck offer). */
+    void collectAll();
 
     /** Close the GE main interface (Escape / X). */
     void closeGrandExchange();

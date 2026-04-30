@@ -245,14 +245,25 @@ public final class GrandExchangeTab extends JPanel {
         setStatus(script.status(), null);
     }
 
+    /** Default buy-limit-cap stall detection window. ~18s (30 ticks * 600ms)
+     *  of no completedQuantity progress is conservative enough that we
+     *  won't false-positive on bursty fills, but short enough that we
+     *  don't wait forever on a 4-hour buy-limit cap. */
+    private static final int DEFAULT_STALL_TICKS = 30;
+
     private BuyItemIntent buildBuyIntent() {
         Resolved r = resolveItem(itemField.getText());
         int qty = (Integer) quantitySpinner.getValue();
         int price = (Integer) priceSpinner.getValue();
         int waitTicks = (Integer) waitTicksSpinner.getValue();
+        // Stall detection is ALWAYS on — when the OSRS buy-limit caps a
+        // fill mid-offer (e.g. asked for 200 of an item, got 160, no
+        // more for 4h), we collect what we have and move on instead of
+        // hanging until the limit window resets. The acceptPartial
+        // checkbox additionally controls timeout-based partial accept.
         OfferWaitPolicy waitPolicy = acceptPartial.isSelected()
-            ? OfferWaitPolicy.untilOrPartial(waitTicks)
-            : OfferWaitPolicy.until(waitTicks);
+            ? OfferWaitPolicy.untilOrPartialStall(waitTicks, DEFAULT_STALL_TICKS)
+            : new OfferWaitPolicy(waitTicks, false, DEFAULT_STALL_TICKS);
         return new BuyItemIntent(r.id, r.name, qty, new PricePolicy.Exact(price), waitPolicy);
     }
 
@@ -262,8 +273,8 @@ public final class GrandExchangeTab extends JPanel {
         int price = (Integer) priceSpinner.getValue();
         int waitTicks = (Integer) waitTicksSpinner.getValue();
         OfferWaitPolicy waitPolicy = acceptPartial.isSelected()
-            ? OfferWaitPolicy.untilOrPartial(waitTicks)
-            : OfferWaitPolicy.until(waitTicks);
+            ? OfferWaitPolicy.untilOrPartialStall(waitTicks, DEFAULT_STALL_TICKS)
+            : new OfferWaitPolicy(waitTicks, false, DEFAULT_STALL_TICKS);
         return new SellItemIntent(r.id, r.name, qty, new PricePolicy.Exact(price), waitPolicy);
     }
 

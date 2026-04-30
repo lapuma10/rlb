@@ -58,19 +58,29 @@ public class GrandExchangeSequenceFactoryTest {
                 .offer(0, OfferSide.BUY, OfferStatus.ACTIVE, 4151, 1, 0, 1_500_000)
                 .build());
         }
-        // Offer fills — wide COMPLETE window so WaitForOfferStep observes
-        // it through its first few check() calls.
-        for (int t = 65; t < 75; t++) {
+        // Offer fills (setup view still open from the confirm click) — short
+        // window for WaitForOfferStep to observe COMPLETE.
+        for (int t = 65; t < 68; t++) {
             snaps.add(snapAtGe().tick(t).geOpen(true).geSetupOpen(true)
                 .offer(0, OfferSide.BUY, OfferStatus.COMPLETE, 4151, 1, 1, 1_500_000)
                 .build());
         }
+        // CollectOfferStep picks 63/37 between COLLECT_ALL (single
+        // collectAll click) and PER_SLOT (openOfferDetail → collect dance).
+        // Both paths advance through these snapshots: keep collectOpen=true
+        // so the PER_SLOT phase machine can advance, but slot 0 EMPTY +
+        // inventory delta after t=68 also satisfies COLLECT_ALL.
+        for (int t = 68; t < 73; t++) {
+            snaps.add(snapAtGe().tick(t).geOpen(true).geCollectOpen(true)
+                .offer(0, OfferSide.BUY, OfferStatus.COMPLETE, 4151, 1, 1, 1_500_000)
+                .build());
+        }
         // After collect: slot empty, inventory has the bought item.
-        for (int t = 75; t < 130; t++) {
+        for (int t = 73; t < 130; t++) {
             snaps.add(new GeSnapBuilder()
                 .tick(t).player(3160, 3490, 0)
                 .invCoins(1_000_000).invItem(4151, 1)
-                .geOpen(true)
+                .geOpen(true).geCollectOpen(true)
                 .build());
         }
 
@@ -94,7 +104,13 @@ public class GrandExchangeSequenceFactoryTest {
         assertTrue("setQuantity dispatched", calls.contains("setQuantity(1)"));
         assertTrue("setPrice dispatched", calls.contains("setPrice(1500000)"));
         assertTrue("confirmOffer dispatched", calls.contains("confirmOffer()"));
-        assertTrue("collect dispatched", calls.contains("collect(slot=0)"));
+        // CollectOfferStep / CollectAllCompletedOffersStep alternate
+        // 63%/37% between COLLECT_ALL and PER_SLOT — accept either path.
+        boolean collectAllPath = calls.contains("collectAll()");
+        boolean perSlotPath = calls.contains("openOfferDetail(slot=0)")
+            && calls.contains("collect(slot=0)");
+        assertTrue("expected collect dispatch (calls=" + calls + ")",
+            collectAllPath || perSlotPath);
     }
 
     @Test

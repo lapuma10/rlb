@@ -49,6 +49,15 @@ public interface GrandExchangeView {
      *  no prompt is open. */
     int chatboxPromptMode();
 
+    /** True when the OSRS "Your offer is much higher / lower than the guide
+     *  price. Are you sure you wish to place this offer?" warning popup is
+     *  on screen. Detected via {@code Popupoverlay.UNIVERSE} visibility +
+     *  the body text containing "guide price". {@code ConfirmOfferStep}
+     *  dispatches the appropriate Yes/No dismiss based on whether the
+     *  trade is a price-check (accept) or a normal trade (reject and
+     *  abort with {@code GeOfferPriceTooHigh}). */
+    boolean priceWarningOpen();
+
     /** All eight slots, in index order 0..7. */
     List<GrandExchangeOfferView> offers();
 
@@ -81,6 +90,7 @@ public interface GrandExchangeView {
         public boolean searchResultsPopulated() { return false; }
         public boolean chatboxPromptOpen()    { return false; }
         public int chatboxPromptMode()        { return 0; }
+        public boolean priceWarningOpen()     { return false; }
         public List<GrandExchangeOfferView> offers()              { return emptyOffers; }
         public OptionalInt firstEmptySlot()                       { return OptionalInt.of(0); }
         public int emptySlotCount()                               { return 8; }

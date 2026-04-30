@@ -3,8 +3,11 @@ package net.runelite.client.sequence.activities.ge;
 import java.awt.Rectangle;
 import java.awt.event.KeyEvent;
 import java.util.ArrayDeque;
+import java.util.ArrayList;
 import java.util.Deque;
+import java.util.List;
 import java.util.Set;
+import java.util.concurrent.ThreadLocalRandom;
 import lombok.extern.slf4j.Slf4j;
 import net.runelite.api.Client;
 import net.runelite.api.NPC;
@@ -190,6 +193,20 @@ public final class GeInteraction implements GeActions {
     private static void pushAll(Deque<Widget> stack, Widget[] arr) {
         if (arr == null) return;
         for (Widget c : arr) if (c != null) stack.push(c);
+    }
+
+    @Override
+    public void openOfferDetail(int slot) {
+        // Click the slot CONTAINER widget directly (no verb match). Slots with
+        // an existing offer don't carry "Create Buy/Sell offer" buttons —
+        // their default click handler opens the offer-detail / collect view,
+        // which is what we need to expose COLLECT_INV.
+        int containerId = slotIndexWidget(slot);
+        if (containerId == 0) {
+            log.warn("openOfferDetail: slot {} out of range 0..7", slot);
+            return;
+        }
+        clickWidget(containerId, "openOfferDetail(" + slot + ")");
     }
 
     private static int slotIndexWidget(int slot) {
@@ -661,11 +678,114 @@ public final class GeInteraction implements GeActions {
     }
 
     @Override
+    public void dismissPriceWarning(boolean accept) {
+        // Captured live (2026-04-30 click-inspector tick=227): "Yes" lives at
+        // Popupoverlay.BUTTON_1 (0x01210008), so "No" is BUTTON_0 (0x01210007).
+        // Both are dynamic children of Popupoverlay.UNIVERSE; CLICK_WIDGET
+        // resolves their bounds afresh, so this works in fixed and resizable
+        // layouts alike.
+        int widgetId = accept
+            ? InterfaceID.Popupoverlay.BUTTON_1
+            : InterfaceID.Popupoverlay.BUTTON_0;
+        clickWidget(widgetId, "dismissPriceWarning(" + (accept ? "Yes" : "No") + ")");
+    }
+
+    @Override
     public void collect(int slot) {
-        // GeCollect.COLLECT_INV is the "Collect to inventory" button. Phase A
-        // just clicks it once; if multiple slots are ready, COLLECTALL handles
-        // them.
-        clickWidget(InterfaceID.GeCollect.COLLECT_INV, "collect(" + slot + ")");
+        // Per-slot collect via the in-grid offer-detail view's
+        // GeOffers.DETAILS_COLLECT widget (0x01d10018). Captured live
+        // from the click-inspector (2026-04-30 tick=979/981):
+        //   idx=2 — bought item / refund. actions=[Collect-notes,
+        //           Collect-items, Bank, Examine]. We pick "Collect-items"
+        //           so inv.count(itemId) tracks (Collect-notes goes to
+        //           the noted item id, which inventory.count ignores).
+        //   idx=3 — leftover coins. actions=[Collect, Bank, Examine].
+        // Both children share the parent's packed widget id (dynamic
+        // children of DETAILS_COLLECT), so we walk the children and
+        // dispatch CLICK_BOUNDS by verb — same pattern as
+        // clickOfferSlotButton's findSideButton.
+        //
+        // Two clicks need to be sequenced — bundle into a RUN_TASK so the
+        // dispatcher's busy flag stays held across both, mirroring the
+        // setQuantity / setPrice click+type pattern.
+        ActionRequest req = ActionRequest.builder()
+            .kind(ActionRequest.Kind.RUN_TASK)
+            .channel(ActionRequest.Channel.MOUSE)
+            .task(() -> runCollectFromDetail(slot))
+            .taskName("GE_COLLECT(" + slot + ")")
+            .build();
+        log.info("collect(slot={}): queueing GE_COLLECT", slot);
+        dispatcher.dispatch(req);
+    }
+
+    /** Worker-thread implementation of the per-slot collect dance.
+     *  Resolves the DETAILS_COLLECT children on the client thread, then
+     *  clicks each by bounds+verb on the worker — no re-entry into the
+     *  dispatcher's single-flight gate.
+     *
+     *  <p>Public so the dispatcher can call back via the {@code RUN_TASK}
+     *  payload; not meant for step code to invoke directly. */
+    public void runCollectFromDetail(int slot) throws InterruptedException {
+        List<CollectButton> hits = dispatcher.runOnClient(this::findCollectButtons);
+        if (hits == null || hits.isEmpty()) {
+            log.warn("collect({}): no DETAILS_COLLECT children visible — detail view not open?", slot);
+            return;
+        }
+        for (CollectButton b : hits) {
+            log.info("collect({}): click '{}' at {} (item={})",
+                slot, b.verb, b.bounds, b.itemId);
+            dispatcher.boundsClickOnWorker(b.bounds, b.verb);
+            // Brief humanizing gap between the two clicks. Real players
+            // never machine-gun item-then-coins in adjacent ticks.
+            SequenceSleep.sleep(client,
+                180L + ThreadLocalRandom.current().nextInt(380));
+        }
+    }
+
+    private record CollectButton(Rectangle bounds, String verb, int itemId) {}
+
+    /** Walk the dynamic children of {@code GeOffers.DETAILS_COLLECT} on
+     *  the client thread and pick the DEFAULT left-click action for each
+     *  visible child. Real player muscle-memory is "click the item icon →
+     *  click the coins icon" — straight left-clicks, no right-click menu
+     *  routing. The default action is {@code Collect-notes} for
+     *  unstackable items (delivers the noted form), {@code Collect} for
+     *  stackable items (potions, runes — already stack so noting is
+     *  meaningless), and {@code Collect} for the coins child. Skips
+     *  children whose default action isn't a Collect-* verb (defensive
+     *  against future widget-tree changes). Must run on the client thread. */
+    private List<CollectButton> findCollectButtons() {
+        Widget container = client.getWidget(InterfaceID.GeOffers.DETAILS_COLLECT);
+        if (container == null || container.isHidden()) return List.of();
+        Widget[] kids = container.getDynamicChildren();
+        if (kids == null) return List.of();
+        List<CollectButton> out = new ArrayList<>(2);
+        for (Widget k : kids) {
+            if (k == null || k.isHidden()) continue;
+            Rectangle b = k.getBounds();
+            if (b == null || b.isEmpty()) continue;
+            String[] actions = k.getActions();
+            if (actions == null || actions.length == 0) continue;
+            String defaultVerb = actions[0];
+            if (defaultVerb == null || defaultVerb.isEmpty()) continue;
+            // Defensive — DETAILS_COLLECT children should always have a
+            // Collect-* default action, but skip non-collect children just
+            // in case the widget tree changes shape.
+            String n = VerbMatcher.normalise(defaultVerb);
+            if (!n.startsWith("collect")) continue;
+            out.add(new CollectButton(b, defaultVerb, k.getItemId()));
+        }
+        return out;
+    }
+
+    @Override
+    public void collectAll() {
+        // GeOffers.COLLECTALL is the "Collect" toolbar button at the top of
+        // the main GE view. One click drains every completed offer (items +
+        // leftover coins from partial fills) into the inventory — no per-slot
+        // detail-view dance needed. Visible whenever the GE main grid is
+        // showing and at least one slot has something to collect.
+        clickWidget(InterfaceID.GeOffers.COLLECTALL, "collectAll");
     }
 
     @Override

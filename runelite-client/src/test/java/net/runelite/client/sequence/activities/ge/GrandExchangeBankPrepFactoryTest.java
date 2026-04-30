@@ -14,6 +14,7 @@ import net.runelite.client.sequence.activities.banking.WaitForBankReadyStep;
 import net.runelite.client.sequence.activities.banking.WithdrawItemStep;
 import net.runelite.client.sequence.activities.banking.WithdrawQuantity;
 import net.runelite.client.sequence.composite.LinearSequence;
+import net.runelite.client.sequence.composite.Selector;
 import org.junit.Test;
 
 import static org.junit.Assert.assertEquals;
@@ -68,21 +69,30 @@ public class GrandExchangeBankPrepFactoryTest {
         assertTrue("Bank sub-flow (CloseBank) must precede GE Core (OpenGrandExchange)",
             closeIdx < openGEIdx);
 
+        // Bank flow is now wrapped in a Selector — option 1 is a
+        // HaveAtLeastInInventoryStep guard that succeeds when we already
+        // have enough coins (skipping the bank entirely); option 2 is
+        // the bank LinearSequence. Verify both are present.
+        assertTrue("root tree must contain a Selector wrapping the bank flow",
+            children.stream().anyMatch(s -> s instanceof Selector));
+        assertTrue("Selector option 1: HaveAtLeastInInventoryStep guard",
+            children.stream().anyMatch(s -> s instanceof
+                net.runelite.client.sequence.activities.banking.HaveAtLeastInInventoryStep));
+
         // The buy-side WithdrawItemStep must target the COINS item id (995).
-        // The quantity is rounded UP to the next "nice" buffered amount per
-        // GrandExchangeSequenceFactory.roundUpToNiceCoinAmount — never the
-        // exact total. For 1 * 1_500_000 = 1_500_000, the next nice amount
-        // is 10_000_000 (the {1,5}×10^n sequence skips 5M).
+        // The quantity is the FLAT round-up amount (NOT a top-up to it) —
+        // see WithdrawQuantity.WithdrawAmount.  For 1 * 1_500_000 = 1_500_000,
+        // the next nice amount is 10_000_000 (the {1,5}×10^n sequence skips 5M).
         WithdrawItemStep w = (WithdrawItemStep) children.stream()
             .filter(s -> s instanceof WithdrawItemStep).findFirst().orElseThrow();
         assertEquals("buy-side withdraw must target COINS (item id 995)", 995, readField(w, "itemId"));
         Object desired = readFieldObj(w, "desired");
-        assertTrue("buy-side withdraw must use AtLeast(roundedTotalCost)",
-            desired instanceof WithdrawQuantity.AtLeast);
+        assertTrue("buy-side withdraw must use WithdrawAmount (flat withdraw of buffer)",
+            desired instanceof WithdrawQuantity.WithdrawAmount);
         assertEquals(
             "1.5M cost should round UP to 10M (nice-buffer sequence skips 5M)",
             10_000_000,
-            ((WithdrawQuantity.AtLeast) desired).qty());
+            ((WithdrawQuantity.WithdrawAmount) desired).qty());
 
         // Reactive allow-list must contain BOTH bank root and GE roots so the
         // reactive does not try to dismiss either while the active sub-flow
@@ -179,20 +189,30 @@ public class GrandExchangeBankPrepFactoryTest {
         }
     }
 
+    /** Flatten the step tree (LinearSequence + Selector + leaves) into a
+     *  pre-order list. The buy-with-prep root now wraps the bank sub-flow
+     *  in a Selector (option 1 = HaveAtLeastInInventoryStep guard, option
+     *  2 = LinearSequence("BankWithdrawCoins")), so the previous direct
+     *  LinearSequence walk no longer surfaces the bank steps. */
     private static List<Step> collectLinearChildren(Step root) {
-        if (!(root instanceof LinearSequence ls)) {
-            throw new AssertionError("root not a LinearSequence: " + root.getClass());
+        List<Step> out = new ArrayList<>();
+        flatten(root, out);
+        return out;
+    }
+
+    private static void flatten(Step s, List<Step> out) {
+        out.add(s);
+        if (s instanceof LinearSequence ls) {
+            for (Step c : ls.getChildren()) flatten(c, out);
+        } else if (s instanceof Selector sel) {
+            for (Step c : sel.children()) flatten(c, out);
         }
-        return new ArrayList<>(ls.getChildren());
     }
 
     /** True iff {@code targetClass} appears anywhere in the children tree. */
     private static boolean anyDeepChild(List<Step> children, Class<?> targetClass) {
         for (Step c : children) {
             if (targetClass.isInstance(c)) return true;
-            if (c instanceof LinearSequence inner) {
-                if (anyDeepChild(new ArrayList<>(inner.getChildren()), targetClass)) return true;
-            }
         }
         return false;
     }
