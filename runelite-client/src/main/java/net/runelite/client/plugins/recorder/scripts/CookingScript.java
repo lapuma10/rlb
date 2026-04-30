@@ -27,6 +27,7 @@ import net.runelite.client.sequence.Step;
 import net.runelite.client.sequence.activities.banking.BankingSequenceFactory;
 import net.runelite.client.sequence.activities.banking.BankingSequencePlan;
 import net.runelite.client.sequence.dispatch.HumanizedInputDispatcher;
+import net.runelite.client.sequence.dispatch.SequenceSleep;
 import net.runelite.client.sequence.dispatch.InputOwnership;
 import net.runelite.client.sequence.internal.ClientObserver;
 import net.runelite.client.sequence.telemetry.TelemetryRecord;
@@ -368,7 +369,7 @@ public final class CookingScript
                 if (here == null)
                 {
                     status.set("waiting for player (loading / disconnect?)");
-                    Thread.sleep(TICK_MS);
+                    SequenceSleep.sleep(client, TICK_MS);
                     continue;
                 }
 
@@ -376,7 +377,7 @@ public final class CookingScript
                 // first, then run state-specific logic on the next tick.
                 if (safeDismissLevelUp())
                 {
-                    Thread.sleep(TICK_MS);
+                    SequenceSleep.sleep(client, TICK_MS);
                     continue;
                 }
                 switch (state.get())
@@ -391,7 +392,7 @@ public final class CookingScript
                     case IDLE:
                     default:                 running.set(false);      break;
                 }
-                Thread.sleep(TICK_MS);
+                SequenceSleep.sleep(client, TICK_MS);
             }
         }
         catch (InterruptedException ie)
@@ -1058,7 +1059,7 @@ public final class CookingScript
         }
 
         // Use-mode is engaged. Brief settle, re-resolve logs, click.
-        Thread.sleep(400);
+        SequenceSleep.sleep(client, 400);
         CookingInteraction.Match logs2 = cook.findGroundLogs(logsId);
         if (logs2 == null)
         {
@@ -1277,7 +1278,7 @@ public final class CookingScript
             status.set("cook: raw food slot vanished — re-checking");
             return;
         }
-        Thread.sleep(400);
+        SequenceSleep.sleep(client, 400);
         // Re-resolve heat source after brief wait. FIRE_FROM_LOGS must
         // target the tile we lit — generic by-name returns whatever
         // fire is closest (incl. another player's), which is bot-tell

@@ -16,6 +16,7 @@ import net.runelite.client.plugins.recorder.transport.TransportResolver;
 import net.runelite.client.plugins.recorder.walker.PathSpec;
 import net.runelite.client.plugins.recorder.walker.UniversalWalker;
 import net.runelite.client.sequence.dispatch.HumanizedInputDispatcher;
+import net.runelite.client.sequence.dispatch.SequenceSleep;
 
 /**
  * Walk-to-bank-and-deposit strategy. Replaces the previous stub.
@@ -176,7 +177,7 @@ public final class BankDepositStrategy implements BankingStrategy
                     log.warn("BankDepositStrategy: walker {} during {}", st, stepName);
                     return false;
                 default:
-                    Thread.sleep(WALK_TICK_MS);
+                    SequenceSleep.sleep(client, WALK_TICK_MS);
             }
         }
     }
@@ -203,7 +204,7 @@ public final class BankDepositStrategy implements BankingStrategy
             }
             long now = System.currentTimeMillis();
             long since = lastDispatch == 0 ? Long.MAX_VALUE : now - lastDispatch;
-            if (since < BANK_PACE_MS) { Thread.sleep(WALK_TICK_MS); continue; }
+            if (since < BANK_PACE_MS) { SequenceSleep.sleep(client, WALK_TICK_MS); continue; }
 
             Boolean openBoxed = onClient(bank::isBankOpen);
             boolean open = Boolean.TRUE.equals(openBoxed);
@@ -278,7 +279,7 @@ public final class BankDepositStrategy implements BankingStrategy
                 {
                     if (now - openedAtMs < BANK_LOAD_GRACE_MS)
                     {
-                        Thread.sleep(WALK_TICK_MS);
+                        SequenceSleep.sleep(client, WALK_TICK_MS);
                         continue;
                     }
                     log.warn("BankDepositStrategy: bank container did not populate");
@@ -308,7 +309,7 @@ public final class BankDepositStrategy implements BankingStrategy
             // 5) Close bank.
             if (bank.tryCloseBank()) lastDispatch = now;
             // Wait one cycle for the close to flush.
-            Thread.sleep(WALK_TICK_MS);
+            SequenceSleep.sleep(client, WALK_TICK_MS);
             Boolean stillOpenBoxed = onClient(bank::isBankOpen);
             boolean stillOpen = Boolean.TRUE.equals(stillOpenBoxed);
             if (!stillOpen) return true;

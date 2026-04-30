@@ -33,7 +33,23 @@ import java.util.List;
 public final class MockInputDispatcher implements InputDispatcher {
     @Getter private final List<ActionRequest> requests = new ArrayList<>();
 
-    @Override public void dispatch(ActionRequest req) { requests.add(req); }
+    @Override
+    public void dispatch(ActionRequest req)
+    {
+        requests.add(req);
+        // RUN_TASK carries a worker-thread lambda; in production the
+        // dispatcher worker runs it asynchronously. Tests assert post-
+        // conditions on the recorded BankActions/GeActions invocations
+        // that the lambda makes, so run it synchronously here. Failures
+        // surface as RuntimeException — tests wrap their fakes to record
+        // calls without throwing.
+        if (req != null && req.getKind() == ActionRequest.Kind.RUN_TASK
+            && req.getTask() != null)
+        {
+            try { req.getTask().run(); }
+            catch (InterruptedException ie) { Thread.currentThread().interrupt(); }
+        }
+    }
     @Override public void cancel(ActionRequest req) { requests.remove(req); }
     @Override public boolean isBusy() { return false; }
     @Override public InputMode mode() { return InputMode.MOCK; }

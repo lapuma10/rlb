@@ -34,6 +34,7 @@ import net.runelite.client.plugins.recorder.farm.BankInteraction;
 import net.runelite.client.plugins.recorder.farm.InventoryUtil;
 import net.runelite.client.plugins.recorder.transport.TransportResolver;
 import net.runelite.client.sequence.dispatch.HumanizedInputDispatcher;
+import net.runelite.client.sequence.dispatch.SequenceSleep;
 import net.runelite.client.sequence.internal.ActionRequest;
 
 /**
@@ -301,7 +302,7 @@ public final class LumbridgeBankPenScript
                     case IDLE:
                     default:       running.set(false); break;
                 }
-                Thread.sleep(humanCadence());
+                SequenceSleep.sleep(client, humanCadence());
             }
         }
         catch (InterruptedException ie)

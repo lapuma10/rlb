@@ -27,6 +27,7 @@ package net.runelite.client.plugins.recorder.flush;
 
 import lombok.extern.slf4j.Slf4j;
 import net.runelite.client.plugins.recorder.buffer.JsonlGzipWriter;
+import net.runelite.client.sequence.dispatch.SequenceSleep;
 import net.runelite.client.plugins.recorder.buffer.RecordingBuffer;
 import net.runelite.client.plugins.recorder.events.EventCodec;
 import net.runelite.client.plugins.recorder.events.RecordedEvent;
@@ -74,7 +75,7 @@ public final class FlushDaemon
 		{
 			try
 			{
-				Thread.sleep(flushIntervalMs);
+				SequenceSleep.sleep(null, flushIntervalMs);
 			}
 			catch (InterruptedException ie)
 			{

@@ -19,6 +19,7 @@ import net.runelite.client.plugins.recorder.transport.TransportResolver;
 import net.runelite.client.plugins.recorder.walker.PathSpec;
 import net.runelite.client.plugins.recorder.walker.UniversalWalker;
 import net.runelite.client.sequence.dispatch.HumanizedInputDispatcher;
+import net.runelite.client.sequence.dispatch.SequenceSleep;
 
 /**
  * Chicken farm bot, V2 — uses the {@link UniversalWalker walker framework}
@@ -241,7 +242,7 @@ public final class ChickenFarmV2Script
                     case IDLE:
                     default:       running.set(false); break;
                 }
-                Thread.sleep(TICK_MS);
+                SequenceSleep.sleep(client, TICK_MS);
             }
         }
         catch (InterruptedException ie)

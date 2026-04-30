@@ -11,6 +11,7 @@ import net.runelite.client.sequence.blackboard.Blackboard;
 import net.runelite.client.sequence.blackboard.BlackboardKey;
 import net.runelite.client.sequence.blackboard.BlackboardScope;
 import net.runelite.client.sequence.blackboard.SequenceBlackboardKeys;
+import net.runelite.client.sequence.internal.ActionRequest;
 
 /**
  * Clicks a bank booth to open the bank.
@@ -82,14 +83,21 @@ public final class OpenBankStep implements Step {
             }
         }
 
-        // Fresh work
+        // Fresh work — dispatch the booth click as a worker-thread task.
+        // We must NOT call bank.clickBankBoothRandom() directly here:
+        // onStart runs on the OSRS client thread, and the booth click
+        // flow internally sleeps the calling thread between input events
+        // (camera pan, cursor move, click press, post-click settle). See
+        // CLAUDE.md "Threading model" — the BankActions guard would throw
+        // and the step would abort before the booth click ever lands.
         step.put(K_START_TICK, s.tick());
-        try {
-            bank.clickBankBoothRandom();
-        } catch (InterruptedException ie) {
-            Thread.currentThread().interrupt();
-            step.put(K_PRECONDITION_FAILURE, new DiagnosticReason.Unknown("interrupted"));
-        }
+        ActionRequest req = ActionRequest.builder()
+            .kind(ActionRequest.Kind.RUN_TASK)
+            .channel(ActionRequest.Channel.MOUSE)
+            .task(bank::clickBankBoothRandom)
+            .taskName("BANK_OPEN")
+            .build();
+        ctx.dispatcher().dispatch(req);
     }
 
     @Override public void onEvent(Object e, StepContext ctx) {}

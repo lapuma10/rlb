@@ -25,6 +25,7 @@
 package net.runelite.client.sequence.login;
 
 import lombok.extern.slf4j.Slf4j;
+import net.runelite.client.sequence.dispatch.SequenceSleep;
 
 /**
  * Applies the recovery action for a recoverable LoginError. Caller invokes
@@ -95,6 +96,6 @@ public final class LoginErrorRecovery
     {
         long ms = minMs + ctx.getRng().nextInt(maxMs - minMs);
         log.info("[login] recovery sleep {}ms", ms);
-        Thread.sleep(ms);
+        SequenceSleep.sleep(ctx.getClient(), ms);
     }
 }

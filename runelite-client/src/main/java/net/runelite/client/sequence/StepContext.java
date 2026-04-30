@@ -25,6 +25,7 @@
 package net.runelite.client.sequence;
 
 import net.runelite.client.sequence.blackboard.Blackboard;
+import net.runelite.client.sequence.dispatch.InputDispatcher;
 import net.runelite.client.sequence.internal.Actions;
 
 public interface StepContext {
@@ -34,4 +35,11 @@ public interface StepContext {
     int currentTick();
     InputMode inputMode();
     void log(String msg);
+
+    /** Direct handle on the engine's input dispatcher. Steps that need to
+     *  enqueue an {@link net.runelite.client.sequence.internal.ActionRequest}
+     *  (typically {@code RUN_TASK} for multi-step blocking flows like banking
+     *  or GE order setup) call this. Reads still go through the snapshot;
+     *  only the dispatcher should be used to schedule input. */
+    InputDispatcher dispatcher();
 }

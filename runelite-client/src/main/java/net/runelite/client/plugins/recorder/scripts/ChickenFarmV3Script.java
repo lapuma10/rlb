@@ -20,6 +20,7 @@ import net.runelite.client.plugins.recorder.trail.TrailPath;
 import net.runelite.client.plugins.recorder.trail.TrailRegistry;
 import net.runelite.client.plugins.recorder.trail.TrailWalker;
 import net.runelite.client.sequence.dispatch.HumanizedInputDispatcher;
+import net.runelite.client.sequence.dispatch.SequenceSleep;
 import net.runelite.client.sequence.internal.ActionRequest;
 
 /**
@@ -260,7 +261,7 @@ public final class ChickenFarmV3Script
                     status.set("tick error: " + re.getClass().getSimpleName()
                         + " — see log");
                 }
-                Thread.sleep(TICK_MS);
+                SequenceSleep.sleep(client, TICK_MS);
             }
         }
         catch (InterruptedException ie) { Thread.currentThread().interrupt(); }
@@ -452,7 +453,7 @@ public final class ChickenFarmV3Script
         while (combat.state() != ChickenCombatLoop.State.IDLE
             && System.currentTimeMillis() < until)
         {
-            Thread.sleep(60);
+            SequenceSleep.sleep(client, 60);
         }
         try { dispatcher.awaitIdle(2000L); }
         catch (InterruptedException ie) { Thread.currentThread().interrupt(); throw ie; }

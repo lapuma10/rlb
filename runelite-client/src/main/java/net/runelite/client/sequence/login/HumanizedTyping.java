@@ -28,6 +28,7 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.Random;
 import javax.annotation.Nullable;
+import net.runelite.client.sequence.dispatch.SequenceSleep;
 
 /**
  * Generates inter-keystroke delays that look like a human typing in chunks.
@@ -154,7 +155,7 @@ public final class HumanizedTyping
             onBackspace.run();
             events++;
             long delay = nextBackspaceDelayMs(rng);
-            Thread.sleep(delay);
+            SequenceSleep.sleep(null, delay);
             tickCallback.run();
         }
         return events;
@@ -190,7 +191,7 @@ public final class HumanizedTyping
                 nextGuardCheck = System.currentTimeMillis() + 200;
             }
             onBackspace.run();
-            Thread.sleep(nextBackspaceDelayMs(rng));
+            SequenceSleep.sleep(null, nextBackspaceDelayMs(rng));
         }
     }
 

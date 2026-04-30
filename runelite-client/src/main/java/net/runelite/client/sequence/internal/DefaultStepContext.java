@@ -30,6 +30,7 @@ import net.runelite.client.sequence.InputMode;
 import net.runelite.client.sequence.StepContext;
 import net.runelite.client.sequence.WorldSnapshot;
 import net.runelite.client.sequence.blackboard.Blackboard;
+import net.runelite.client.sequence.dispatch.InputDispatcher;
 
 @Slf4j
 @RequiredArgsConstructor
@@ -39,6 +40,7 @@ public final class DefaultStepContext implements StepContext {
     private final WorldSnapshot snapshot;
     private final int currentTick;
     private final InputMode mode;
+    private final InputDispatcher dispatcher;
 
     @Override public Actions actions() { return actions; }
     @Override public Blackboard bb() { return bb; }
@@ -46,4 +48,5 @@ public final class DefaultStepContext implements StepContext {
     @Override public int currentTick() { return currentTick; }
     @Override public InputMode inputMode() { return mode; }
     @Override public void log(String msg) { log.info(msg); }
+    @Override public InputDispatcher dispatcher() { return dispatcher; }
 }

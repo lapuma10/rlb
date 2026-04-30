@@ -31,6 +31,7 @@ import net.runelite.api.widgets.Widget;
 import net.runelite.client.callback.ClientThread;
 import net.runelite.client.sequence.activities.banking.BankActions;
 import net.runelite.client.sequence.dispatch.HumanizedInputDispatcher;
+import net.runelite.client.sequence.dispatch.SequenceSleep;
 import net.runelite.client.sequence.internal.ActionRequest;
 
 /**
@@ -71,6 +72,30 @@ public final class BankInteraction implements BankActions
         this.client = client;
         this.clientThread = clientThread;
         this.dispatcher = dispatcher;
+    }
+
+    /** Fail loud if a {@link BankActions} entry point is invoked on the OSRS
+     *  client thread. The downstream flows in this class call
+     *  {@link SequenceSleep#sleep} / {@link HumanizedInputDispatcher#typeChatboxAndEnter}
+     *  / {@link HumanizedInputDispatcher#rightClickAndPickMenu}, every one of
+     *  which sleeps the calling thread between input events. Sleeping the
+     *  client thread freezes the render loop / cs2 / NPCs and the chatbox
+     *  prompt this code is trying to type into never opens. See the
+     *  "Threading model" section at the top of {@code CLAUDE.md} — engine
+     *  steps must enqueue {@link ActionRequest.Kind#RUN_TASK} so the
+     *  dispatcher worker runs the flow off-thread. */
+    private void assertWorkerThread(String op)
+    {
+        if (client != null && client.isClientThread())
+        {
+            throw new IllegalStateException(
+                "BankActions." + op + " called on the OSRS client thread — "
+                    + "this would freeze the game (cs2 / chatbox prompt / "
+                    + "NPCs) for the duration of the multi-step flow. Wrap "
+                    + "the call in an ActionRequest.Kind.RUN_TASK and "
+                    + "dispatcher.dispatch(...) it from your Step.onStart, "
+                    + "then poll the WorldSnapshot in Step.check.");
+        }
     }
 
     /** True if the bank-main widget is loaded and visible. */
@@ -139,9 +164,12 @@ public final class BankInteraction implements BankActions
         // and npcClick do, so without this we'd send a click at hull
         // bounds that may not currently project onto the camera, and
         // the booth would appear "snapped to" rather than approached.
-        WorldPoint boothTile = pick.npc != null
+        //
+        // NPC.getWorldLocation() / GameObject.getWorldLocation() assert
+        // on the client thread under -ea — read inside onClient.
+        WorldPoint boothTile = onClient(() -> pick.npc != null
             ? pick.npc.getWorldLocation()
-            : pick.go.getWorldLocation();
+            : pick.go.getWorldLocation());
         if (boothTile != null) dispatcher.rotateCameraToward(boothTile);
         if (pick.npc != null)
         {
@@ -164,14 +192,16 @@ public final class BankInteraction implements BankActions
         });
         if (b == null)
         {
-            log.warn("bank: booth at {} has no convex hull",
-                pick.go.getWorldLocation());
+            // Read fields inside onClient — getWorldLocation asserts client
+            // thread; we're on the dispatcher worker here.
+            log.warn("bank: booth has no convex hull (tile={})", boothTile);
             return false;
         }
         int cx = b.x + b.width / 2;
         int cy = b.y + b.height / 2;
+        Integer goId = onClient(() -> pick.go.getId());
         log.info("bank: clicking bank booth (id={}) hull center ({},{})",
-            pick.go.getId(), cx, cy);
+            goId, cx, cy);
         dispatcher.clickCanvas(cx, cy);
         return true;
     }
@@ -182,6 +212,7 @@ public final class BankInteraction implements BankActions
     @Override
     public void clickBankBoothRandom() throws InterruptedException
     {
+        assertWorkerThread("clickBankBoothRandom");
         tryClickBankBoothRandom();
     }
 
@@ -445,6 +476,7 @@ public final class BankInteraction implements BankActions
     @Override
     public void closeBank() throws InterruptedException
     {
+        assertWorkerThread("closeBank");
         tryCloseBank();
     }
 
@@ -505,6 +537,7 @@ public final class BankInteraction implements BankActions
     @Override
     public void withdrawAll(int itemId) throws InterruptedException
     {
+        assertWorkerThread("withdrawAll");
         tryWithdrawAll(itemId);
     }
 
@@ -519,6 +552,7 @@ public final class BankInteraction implements BankActions
     @Override
     public void withdrawOne(int itemId) throws InterruptedException
     {
+        assertWorkerThread("withdrawOne");
         tryWithdrawOne(itemId);
     }
 
@@ -557,6 +591,7 @@ public final class BankInteraction implements BankActions
     @Override
     public void withdrawX(int itemId, int qty) throws InterruptedException
     {
+        assertWorkerThread("withdrawX");
         tryWithdrawX(itemId, qty);
     }
 
@@ -575,34 +610,34 @@ public final class BankInteraction implements BankActions
     @Override
     public void withdrawAsNoteX(int itemId, int qty) throws InterruptedException
     {
+        assertWorkerThread("withdrawAsNoteX");
         tryWithdrawAsNoteX(itemId, qty);
     }
 
     /** If the bank's withdraw-mode varbit is not in "note" state, click the
      *  Bankmain.NOTE toggle and wait for the varbit to flip. Returns true
-     *  iff note mode is on (or successfully turned on) when this returns. */
+     *  iff note mode is on (or successfully turned on) when this returns.
+     *
+     *  <p>Called from inside the dispatcher worker (we run as part of
+     *  {@code tryWithdrawAsNoteX} which is itself wrapped in a {@code
+     *  RUN_TASK}), so we already hold the dispatcher's busy flag. Use
+     *  {@link HumanizedInputDispatcher#widgetClickOnWorker} for the
+     *  toggle click — calling {@code dispatcher.dispatch(...)} from here
+     *  would self-drop on the busy flag, and {@code awaitIdle} would
+     *  deadlock waiting for ourselves to finish. */
     private boolean ensureNoteModeOn() throws InterruptedException
     {
         Integer state = onClient(() -> client.getVarbitValue(VarbitID.BANK_WITHDRAWNOTES));
         if (state != null && state == 1) return true;
 
-        // Wait for any in-flight click chain to land — otherwise dispatch
-        // is silently dropped by the busy guard and our varbit poll just
-        // times out.
-        dispatcher.awaitIdle(2000);
-        ActionRequest req = ActionRequest.builder()
-            .kind(ActionRequest.Kind.CLICK_WIDGET)
-            .channel(ActionRequest.Channel.MOUSE)
-            .widgetId(InterfaceID.Bankmain.NOTE)
-            .build();
-        dispatcher.dispatch(req);
+        dispatcher.widgetClickOnWorker(InterfaceID.Bankmain.NOTE);
 
         // Poll the varbit briefly — clicking the toggle bumps it within a
         // tick or two; if it doesn't, bail rather than withdraw in item mode.
         long deadline = System.currentTimeMillis() + 1500L;
         while (System.currentTimeMillis() < deadline)
         {
-            Thread.sleep(80L);
+            SequenceSleep.sleep(client, 80L);
             Integer cur = onClient(() -> client.getVarbitValue(VarbitID.BANK_WITHDRAWNOTES));
             if (cur != null && cur == 1) return true;
         }
@@ -652,6 +687,7 @@ public final class BankInteraction implements BankActions
     @Override
     public void depositAll(int itemId) throws InterruptedException
     {
+        assertWorkerThread("depositAll");
         tryDepositAll(itemId);
     }
 
@@ -773,7 +809,7 @@ public final class BankInteraction implements BankActions
             // Brief glance-pause before the next burst — the inter-burst
             // beat is what makes wheel-scrolling look like a person
             // searching, not an automated scrollbar drag.
-            Thread.sleep(150L + (long) (Math.random() * 250L));
+            SequenceSleep.sleep(client, 150L + (long) (Math.random() * 250L));
         }
         log.warn("bank: scroll-to-find timed out for itemId={}", itemId);
         return false;

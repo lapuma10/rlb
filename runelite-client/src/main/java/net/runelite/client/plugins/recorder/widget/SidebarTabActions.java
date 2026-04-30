@@ -6,6 +6,7 @@ import net.runelite.api.Varbits;
 import net.runelite.api.widgets.Widget;
 import net.runelite.client.callback.ClientThread;
 import net.runelite.client.sequence.dispatch.HumanizedInputDispatcher;
+import net.runelite.client.sequence.dispatch.SequenceSleep;
 
 /** Switches the active OSRS sidebar tab by clicking its actual icon
  *  widget — never via F-keys (the user can rebind), never via
@@ -118,7 +119,7 @@ public final class SidebarTabActions
         while (System.currentTimeMillis() < until)
         {
             if (isOpen(tab)) return true;
-            Thread.sleep(60);
+            SequenceSleep.sleep(client, 60);
         }
         return false;
     }

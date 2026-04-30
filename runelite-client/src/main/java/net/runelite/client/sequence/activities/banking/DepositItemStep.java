@@ -8,6 +8,7 @@ import net.runelite.client.sequence.affordance.DiagnosticReason;
 import net.runelite.client.sequence.blackboard.Blackboard;
 import net.runelite.client.sequence.blackboard.BlackboardKey;
 import net.runelite.client.sequence.blackboard.BlackboardScope;
+import net.runelite.client.sequence.internal.ActionRequest;
 
 /**
  * Deposits all of a given item into the bank.
@@ -49,14 +50,18 @@ public final class DepositItemStep implements Step {
             return;
         }
 
-        // Fresh work
+        // Fresh work — dispatched as a RUN_TASK so the right-click → menu
+        // pick → settle flow runs on the dispatcher worker, never on the
+        // OSRS client thread. See CLAUDE.md "Threading model".
         step.put(K_START_TICK, s.tick());
-        try {
-            bank.depositAll(itemId);
-        } catch (InterruptedException ie) {
-            Thread.currentThread().interrupt();
-            step.put(K_PRECONDITION_FAILURE, new DiagnosticReason.Unknown("interrupted"));
-        }
+        final int id = itemId;
+        ActionRequest req = ActionRequest.builder()
+            .kind(ActionRequest.Kind.RUN_TASK)
+            .channel(ActionRequest.Channel.MOUSE)
+            .task(() -> bank.depositAll(id))
+            .taskName("BANK_DEPOSIT_ALL(" + id + ")")
+            .build();
+        ctx.dispatcher().dispatch(req);
     }
 
     @Override public void onEvent(Object e, StepContext ctx) {}

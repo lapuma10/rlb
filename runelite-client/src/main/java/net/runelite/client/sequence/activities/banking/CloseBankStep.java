@@ -7,6 +7,7 @@ import net.runelite.client.sequence.affordance.DiagnosticReason;
 import net.runelite.client.sequence.blackboard.Blackboard;
 import net.runelite.client.sequence.blackboard.BlackboardKey;
 import net.runelite.client.sequence.blackboard.BlackboardScope;
+import net.runelite.client.sequence.internal.ActionRequest;
 
 /**
  * Closes the bank widget.
@@ -39,13 +40,19 @@ public final class CloseBankStep implements Step {
             return;
         }
 
+        // Close-bank uses the X button (or Escape fallback); both run
+        // through the dispatcher with internal sleeps for cursor settle,
+        // so the work belongs on the dispatcher worker, not on the
+        // engine's client-thread tick path. See CLAUDE.md "Threading
+        // model".
         step.put(K_START_TICK, s.tick());
-        try {
-            bank.closeBank();
-        } catch (InterruptedException ie) {
-            Thread.currentThread().interrupt();
-            step.put(K_PRECONDITION_FAILURE, new DiagnosticReason.Unknown("interrupted"));
-        }
+        ActionRequest req = ActionRequest.builder()
+            .kind(ActionRequest.Kind.RUN_TASK)
+            .channel(ActionRequest.Channel.MOUSE)
+            .task(bank::closeBank)
+            .taskName("BANK_CLOSE")
+            .build();
+        ctx.dispatcher().dispatch(req);
     }
 
     @Override public void onEvent(Object e, StepContext ctx) {}

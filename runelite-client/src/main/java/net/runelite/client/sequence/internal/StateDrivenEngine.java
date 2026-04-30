@@ -564,7 +564,7 @@ public final class StateDrivenEngine implements SequenceEngine {
 
     private DefaultStepContext makeCtx(WorldSnapshot snap, StepFrame frame) {
         DirectActions actions = new DirectActions(sink, frame.getId(), frame.getDepth(), frame.getStep().priority());
-        return new DefaultStepContext(actions, blackboard, snap, currentTick, dispatcher.mode());
+        return new DefaultStepContext(actions, blackboard, snap, currentTick, dispatcher.mode(), dispatcher);
     }
 
     private TelemetryRecord rec(StepFrame frame, TelemetryRecord.Event ev, String payload) {

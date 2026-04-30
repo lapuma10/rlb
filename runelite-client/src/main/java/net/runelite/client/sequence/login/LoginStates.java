@@ -26,6 +26,7 @@ package net.runelite.client.sequence.login;
 
 import net.runelite.api.GameState;
 import lombok.extern.slf4j.Slf4j;
+import net.runelite.client.sequence.dispatch.SequenceSleep;
 import net.runelite.client.sequence.login.CredentialStoreException;
 
 /**
@@ -95,7 +96,7 @@ public final class LoginStates
             {
                 return new StateResult.Failure(LoginError.CLIENT_THREAD_STUCK);
             }
-            try { Thread.sleep(POLL_INNER_SLEEP_MS); }
+            try { SequenceSleep.sleep(ctx.getClient(), POLL_INNER_SLEEP_MS); }
             catch (InterruptedException ie) { return new StateResult.Failure(LoginError.INTERRUPTED); }
         }
         return new StateResult.Failure(LoginError.UNEXPECTED_GAMESTATE);
@@ -191,7 +192,7 @@ public final class LoginStates
             if (idx == null || idx != LOGIN_FORM_INDEX) return new StateResult.Failure(LoginError.FIELD_NOT_CLEARED);
 
             ctx.getDispatcher().clickCanvas(USERNAME_FIELD_X, USERNAME_FIELD_Y);
-            Thread.sleep(120 + ctx.getRng().nextInt(220));
+            SequenceSleep.sleep(ctx.getClient(), 120 + ctx.getRng().nextInt(220));
 
             HumanizedTyping.holdBackspaceUntilEmpty(
                 () -> {
@@ -275,7 +276,7 @@ public final class LoginStates
             for (int attempt = 0; attempt < 2; attempt++)
             {
                 ctx.getDispatcher().clickCanvas(PASSWORD_FIELD_X, PASSWORD_FIELD_Y);
-                Thread.sleep(120 + ctx.getRng().nextInt(220));
+                SequenceSleep.sleep(ctx.getClient(), 120 + ctx.getRng().nextInt(220));
                 Integer focused = ctx.getDispatcher().runOnClient(ctx.getClient()::getCurrentLoginField);
                 if (focused != null && focused == LOGIN_FIELD_PASSWORD)
                 {
@@ -381,7 +382,7 @@ public final class LoginStates
             int modifierKey = isMac() ? java.awt.event.KeyEvent.VK_META : java.awt.event.KeyEvent.VK_CONTROL;
             ctx.getDispatcher().tapKeyWithModifier(modifierKey, modifierMask, java.awt.event.KeyEvent.VK_V);
 
-            Thread.sleep(80 + ctx.getRng().nextInt(120));
+            SequenceSleep.sleep(ctx.getClient(), 80 + ctx.getRng().nextInt(120));
             return new StateResult.Continue(LoginState.CLICK_LOGIN);
         }
         catch (InterruptedException ie)
@@ -428,7 +429,7 @@ public final class LoginStates
             Integer idx = ctx.getDispatcher().runOnClient(ctx.getClient()::getLoginIndex);
             if (idx == null || idx != LOGIN_FORM_INDEX) return new StateResult.Failure(LoginError.FIELD_NOT_CLEARED);
 
-            Thread.sleep(200 + ctx.getRng().nextInt(500));
+            SequenceSleep.sleep(ctx.getClient(), 200 + ctx.getRng().nextInt(500));
 
             // Submit via ENTER instead of clicking the Login widget. The widget
             // detector returned null on this layout (LoginButtonDetector
@@ -504,7 +505,7 @@ public final class LoginStates
             {
                 return new StateResult.Failure(LoginError.CLIENT_THREAD_STUCK);
             }
-            try { Thread.sleep(POLL_INNER_SLEEP_MS); }
+            try { SequenceSleep.sleep(ctx.getClient(), POLL_INNER_SLEEP_MS); }
             catch (InterruptedException ie) { return new StateResult.Failure(LoginError.INTERRUPTED); }
         }
         return new StateResult.Failure(LoginError.TIMEOUT_NO_RESPONSE);
@@ -591,7 +592,7 @@ public final class LoginStates
             {
                 return new StateResult.Failure(LoginError.CLIENT_THREAD_STUCK);
             }
-            try { Thread.sleep(POLL_INNER_SLEEP_MS); }
+            try { SequenceSleep.sleep(ctx.getClient(), POLL_INNER_SLEEP_MS); }
             catch (InterruptedException ie) { return new StateResult.Failure(LoginError.INTERRUPTED); }
         }
         return new StateResult.Continue(LoginState.DONE);
@@ -603,7 +604,7 @@ public final class LoginStates
         {
             long delay = WELCOME_CLICK_DELAY_MIN_MS + (long)(ctx.getRng().nextDouble() * (WELCOME_CLICK_DELAY_MAX_MS - WELCOME_CLICK_DELAY_MIN_MS));
             log.info("[login] welcome screen visible — waiting {}ms before click", delay);
-            Thread.sleep(delay);
+            SequenceSleep.sleep(ctx.getClient(), delay);
 
             for (int attempt = 0; attempt < 3; attempt++)
             {
@@ -617,10 +618,10 @@ public final class LoginStates
                     if (Thread.interrupted()) return new StateResult.Failure(LoginError.INTERRUPTED);
                     boolean stillVisible = ctx.getDispatcher().runOnClient(() -> WelcomeScreenDetector.isVisible(ctx.getClient()));
                     if (!stillVisible) return new StateResult.Continue(LoginState.DONE);
-                    Thread.sleep(POLL_INNER_SLEEP_MS);
+                    SequenceSleep.sleep(ctx.getClient(), POLL_INNER_SLEEP_MS);
                 }
                 log.info("[login] welcome dismiss attempt {} did not register; retrying", attempt + 1);
-                Thread.sleep(1000);
+                SequenceSleep.sleep(ctx.getClient(), 1000);
             }
             return new StateResult.Failure(LoginError.WELCOME_STUCK);
         }
@@ -656,7 +657,7 @@ public final class LoginStates
                 if (idx != null && idx != LOGIN_FORM_INDEX) return true;
             }
             catch (Exception ignored) {}
-            try { Thread.sleep(POLL_INNER_SLEEP_MS); }
+            try { SequenceSleep.sleep(ctx.getClient(), POLL_INNER_SLEEP_MS); }
             catch (InterruptedException ie) { return false; }
         }
         return false;
@@ -679,7 +680,7 @@ public final class LoginStates
                 if (idx != null && idx == targetIdx) return true;
             }
             catch (Exception ignored) {}
-            try { Thread.sleep(POLL_INNER_SLEEP_MS); }
+            try { SequenceSleep.sleep(ctx.getClient(), POLL_INNER_SLEEP_MS); }
             catch (InterruptedException ie) { return false; }
         }
         return false;

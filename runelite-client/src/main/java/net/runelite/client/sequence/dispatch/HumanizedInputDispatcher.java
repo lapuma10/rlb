@@ -75,6 +75,20 @@ public class HumanizedInputDispatcher implements InputDispatcher
     private final Random rng = new Random();
     private final AtomicBoolean busy = new AtomicBoolean(false);
     private final AtomicReference<String> lastError = new AtomicReference<>(null);
+    /** Callback to handle {@link ActionRequest.Kind#PICK_GE_SEARCH_RESULT}
+     *  on the worker thread. Set by GE-script wiring at startup; null
+     *  outside GE flows. Worker thread is safe to sleep on (per
+     *  SequenceSleep contract) — this is the place that long-poll
+     *  search-result widget lookups must run. */
+    private volatile java.util.function.BiConsumer<Integer, String> geSearchResultPicker;
+
+    /** Register the worker-thread handler for {@link ActionRequest.Kind#PICK_GE_SEARCH_RESULT}.
+     *  Wired by {@code GrandExchangeScript} after constructing
+     *  {@code GeInteraction}; calling without this set is a no-op + warn. */
+    public void setGeSearchResultPicker(java.util.function.BiConsumer<Integer, String> picker)
+    {
+        this.geSearchResultPicker = picker;
+    }
 
     public HumanizedInputDispatcher(Client client) { this(client, null); }
 
@@ -354,6 +368,29 @@ public class HumanizedInputDispatcher implements InputDispatcher
                 req.getTypeDwellMinMs(),
                 req.getTypeDwellMaxMs(),
                 req.isTypePressEnter());
+            case PICK_GE_SEARCH_RESULT -> {
+                java.util.function.BiConsumer<Integer, String> picker = geSearchResultPicker;
+                if (picker == null) {
+                    log.warn("PICK_GE_SEARCH_RESULT dispatched but no picker registered");
+                } else {
+                    picker.accept(req.getItemId(), req.getPickName());
+                }
+            }
+            case RUN_TASK -> {
+                BlockingTask task = req.getTask();
+                String taskName = req.getTaskName() == null ? "<unnamed>" : req.getTaskName();
+                if (task == null) {
+                    log.warn("RUN_TASK dispatched without a task ({})", taskName);
+                } else {
+                    log.info("RUN_TASK begin: {}", taskName);
+                    long t0 = System.currentTimeMillis();
+                    try { task.run(); }
+                    finally {
+                        log.info("RUN_TASK end:   {} ({}ms)", taskName,
+                            System.currentTimeMillis() - t0);
+                    }
+                }
+            }
             case KEY -> keyTap(req.getKeyCode());
             default -> log.debug("unhandled kind {}", req.getKind());
         }
@@ -1051,6 +1088,47 @@ public class HumanizedInputDispatcher implements InputDispatcher
         if (pixel == null) { lastError.set("widget " + widgetId + " not found"); return; }
         moveCursorTo(pixel.getX(), pixel.getY());
         clickPress(MouseEvent.BUTTON1);
+    }
+
+    /** Worker-callable wrapper around {@link #boundsClick} — exposed for
+     *  multi-step worker tasks (e.g. {@code GeInteraction.runPickSearchResult})
+     *  that already hold the busy flag and need to issue another bounds
+     *  click without re-acquiring it. */
+    public void boundsClickOnWorker(java.awt.Rectangle bounds, String verb) throws InterruptedException
+    {
+        boundsClick(bounds, verb);
+    }
+
+    /** Worker-callable wrapper around {@link #typeChatboxInternal} — same
+     *  rationale as {@link #boundsClickOnWorker}. */
+    public boolean typeChatboxOnWorker(String text, long awaitMs,
+                                        long minDwellMs, long maxDwellMs,
+                                        boolean pressEnter)
+        throws InterruptedException
+    {
+        return typeChatboxInternal(text, awaitMs, minDwellMs, maxDwellMs, pressEnter);
+    }
+
+    /** Worker-callable wrapper around {@link #widgetClick} — same rationale
+     *  as {@link #boundsClickOnWorker}. Use from inside a {@code RUN_TASK}
+     *  that needs to click a widget mid-flow without re-acquiring busy. */
+    public void widgetClickOnWorker(int widgetId) throws InterruptedException
+    {
+        widgetClick(widgetId);
+    }
+
+    /** Worker-callable wrapper around {@link #widgetVerbClick} — same
+     *  rationale as {@link #boundsClickOnWorker}. */
+    public void widgetVerbClickOnWorker(int widgetId, String verb) throws InterruptedException
+    {
+        widgetVerbClick(widgetId, verb);
+    }
+
+    /** Worker-callable wrapper around {@link #invSlotClick} — same
+     *  rationale as {@link #boundsClickOnWorker}. */
+    public void invSlotClickOnWorker(int slot, String verb) throws InterruptedException
+    {
+        invSlotClick(slot, verb);
     }
 
     /** Click inside a pre-resolved canvas rectangle with optional verb match.

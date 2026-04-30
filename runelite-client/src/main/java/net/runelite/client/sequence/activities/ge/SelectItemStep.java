@@ -28,11 +28,12 @@ public final class SelectItemStep implements Step {
         BlackboardKey.of("selectItem.precondition", GeBlockReason.class);
     private static final BlackboardKey<Integer> K_START_TICK =
         BlackboardKey.of("selectItem.startTick", Integer.class);
-    /** Best-effort fallback ticks — same shape as SetQuantityStep. The
-     *  async TYPE_CHATBOX dispatch finishes in 2-4 game ticks under
-     *  normal lag; 8 gives margin without blocking forever on a missed
-     *  varc pulse. */
-    private static final int DISPATCH_FALLBACK_TICKS = 8;
+    /** Best-effort fallback ticks. The combined PICK_GE_SEARCH_RESULT
+     *  worker dispatch types the name (~3-5s), polls for the matching row
+     *  (variable, can take 5-10s on slow cs2 redraw), then clicks — so
+     *  we need a generous fallback. 25 ticks ~= 15s, covers worst case
+     *  while still failing fast on a stuck flow. */
+    private static final int DISPATCH_FALLBACK_TICKS = 25;
 
     private final int itemId;
     private final String displayName;
@@ -48,7 +49,7 @@ public final class SelectItemStep implements Step {
 
     @Override public String name()                              { return "SelectItem(" + displayName + ")"; }
     @Override public int priority()                             { return 100; }
-    @Override public int timeoutTicks()                         { return 30; }
+    @Override public int timeoutTicks()                         { return 40; }
     @Override public PreemptionPolicy preemptionPolicy()        { return PreemptionPolicy.WHEN_SAFE; }
     @Override public boolean isSafeToPause(WorldSnapshot s, Blackboard b) { return true; }
     @Override public boolean canStart(WorldSnapshot s, Blackboard b) { return true; }

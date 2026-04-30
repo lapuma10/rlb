@@ -15,6 +15,7 @@ import net.runelite.api.widgets.Widget;
 import net.runelite.client.callback.ClientThread;
 import net.runelite.client.plugins.recorder.transport.VerbMatcher;
 import net.runelite.client.sequence.dispatch.HumanizedInputDispatcher;
+import net.runelite.client.sequence.dispatch.SequenceSleep;
 import net.runelite.client.sequence.internal.ActionRequest;
 import net.runelite.client.sequence.views.OfferSide;
 
@@ -221,12 +222,14 @@ public final class GeInteraction implements GeActions {
 
     @Override
     public boolean selectItem(int itemId, String displayName) {
-        // Dispatches an async TYPE_CHATBOX request. Returns true if the
-        // dispatch was queued; the actual typing runs on the dispatcher's
-        // worker thread (NEVER on the client thread — see SequenceSleep).
-        // The calling step polls snapshot for completion (MESLAYERINPUT
-        // shows the typed text and search results render) instead of
-        // blocking on the typing path.
+        // Dispatches a SINGLE worker-thread operation that BOTH types the
+        // search name AND clicks the matching result row when it appears.
+        // Combining the two sub-steps into one dispatch avoids the gap
+        // where the dispatcher's single-flight busy flag could drop the
+        // follow-up pick request — and makes the entire select operation
+        // atomic from the engine's view (one dispatch, success-or-fail).
+        // The actual typing + polling + clicking runs on the dispatcher
+        // worker so the engine/client thread is never blocked.
         String name = displayName;
         if (name == null || name.isEmpty() || name.startsWith("item#")) {
             try {
@@ -248,18 +251,23 @@ public final class GeInteraction implements GeActions {
             log.warn("selectItem: no usable name for item {} (displayName='{}')", itemId, displayName);
             return false;
         }
-        // Lowercase — real players don't shift-type into a search box.
+        // Stash the resolved canonical name for pickSearchResult to read —
+        // it's how the worker knows what name to match against rendered rows.
+        // Lowercase what we type (real players don't shift-type a search box)
+        // but match the row by the canonical (non-lowercased) name.
         String typed = name.toLowerCase(java.util.Locale.ROOT);
         ActionRequest req = ActionRequest.builder()
-            .kind(ActionRequest.Kind.TYPE_CHATBOX)
+            .kind(ActionRequest.Kind.PICK_GE_SEARCH_RESULT)
             .channel(ActionRequest.Channel.KEYBOARD)
+            .itemId(itemId)
+            .pickName(name)
             .typeText(typed)
-            .typePressEnter(false)
             .typeAwaitMs(CHATBOX_AWAIT_MS)
             .typeDwellMinMs(CHATBOX_DWELL_MIN_MS)
             .typeDwellMaxMs(CHATBOX_DWELL_MAX_MS)
             .build();
-        log.info("selectItem: queueing TYPE_CHATBOX itemId={} text=\"{}\"", itemId, typed);
+        log.info("selectItem: queueing PICK_GE_SEARCH_RESULT itemId={} typed=\"{}\" matchName=\"{}\"",
+            itemId, typed, name);
         dispatcher.dispatch(req);
         return true;
     }
@@ -330,74 +338,76 @@ public final class GeInteraction implements GeActions {
 
     @Override
     public boolean pickSearchResult(int itemId) {
-        // Search-result rows live as dynamic children of
-        // Chatbox.MES_LAYER_SCROLLCONTENTS. They share the parent's packed
-        // widget id (so getId() is useless for addressing them) — but each
-        // row carries an action like "Select <col=ff9040>Bread</col>" with
-        // the canonical item name baked in. We resolve the canonical name
-        // from the item id, then poll for a row whose action matches via
-        // VerbMatcher (case-insensitive, color-tag tolerant). Polling
-        // because the row list flickers between "placeholder" and "results"
-        // as the cs2 search runs — a single snapshot misses the window.
-        String wantedName;
-        try {
-            wantedName = dispatcher.runOnClient(() -> {
-                var def = client.getItemDefinition(itemId);
-                return def == null ? null : def.getName();
-            });
-        } catch (InterruptedException ie) {
-            Thread.currentThread().interrupt();
-            return false;
-        } catch (Exception ex) {
-            log.warn("pickSearchResult: failed to resolve name for item {}: {}", itemId, ex.toString());
-            return false;
+        // No-op now — the type-and-pick flow is bundled into selectItem's
+        // single PICK_GE_SEARCH_RESULT dispatch (see selectItem above).
+        // PickSearchResultStep's onStart still calls this for
+        // back-compatibility; it returns true so the step's check() can
+        // poll snapshot for the actual completion signal.
+        return true;
+    }
+
+    /** Worker-thread implementation of PICK_GE_SEARCH_RESULT. Called from
+     *  {@link HumanizedInputDispatcher#handle} on its worker thread — safe
+     *  to {@code SequenceSleep.sleep(client, ...)} here.
+     *
+     *  <p>Single-shot select-and-pick:
+     *  <ol>
+     *    <li>Type the search name (no Enter — let the search results
+     *        widget render incrementally).</li>
+     *    <li>Poll {@code MES_LAYER_SCROLLCONTENTS} for a row whose
+     *        Widget.getName() / actions match {@code wantedName}.</li>
+     *    <li>Click that row's bounds (verb "Select").</li>
+     *  </ol>
+     *  Bundling steps 1-3 into one worker call means the dispatcher's
+     *  single-flight busy flag stays held throughout — no risk of a
+     *  gap where another dispatch could be dropped.
+     *
+     *  <p>This is a public entry point for the dispatcher to call back
+     *  into; it's NOT meant to be called from step code. */
+    public void runPickSearchResult(int itemId, String wantedName) throws InterruptedException {
+        // Step 1: type the search text. typeText was passed via the
+        // ActionRequest; we pull it from the request via this method's
+        // caller path. We type lowercase (no shift) to avoid bot tells.
+        String typed = wantedName.toLowerCase(java.util.Locale.ROOT);
+        log.info("runPickSearchResult: typing \"{}\" for itemId={}", typed, itemId);
+        // Use the dispatcher's typeChatboxInternal directly — we're
+        // already on the worker thread holding the busy flag, so this is
+        // safe and doesn't try to acquire the flag again.
+        boolean typedOk = dispatcher.typeChatboxOnWorker(typed, CHATBOX_AWAIT_MS,
+            CHATBOX_DWELL_MIN_MS, CHATBOX_DWELL_MAX_MS, false);
+        if (!typedOk) {
+            log.warn("runPickSearchResult: typing \"{}\" failed (chatbox prompt timeout)", typed);
+            return;
         }
-        if (wantedName == null || wantedName.isEmpty() || "null".equals(wantedName)) {
-            log.warn("pickSearchResult: no canonical name for item {}", itemId);
-            return false;
+
+        // Step 2: poll for the matching row.
+        long deadline = System.currentTimeMillis() + CHATBOX_AWAIT_MS;
+        ResultRow row = null;
+        while (System.currentTimeMillis() < deadline) {
+            row = dispatcher.runOnClient(() -> findResultRowFor(wantedName));
+            if (row != null) break;
+            SequenceSleep.sleep(client, 120L);
         }
-        try {
-            // Poll for the matching row up to CHATBOX_AWAIT_MS — same
-            // safety-net cap as the chatbox prompt await. The widget's
-            // stored action is the bare verb "Select"; the item-name
-            // suffix only exists in the rendered menu. So we match on
-            // "Select" and disambiguate by Widget.getName(), which cs2
-            // sets to the item name on each result row.
-            long deadline = System.currentTimeMillis() + CHATBOX_AWAIT_MS;
-            ResultRow row = null;
-            while (System.currentTimeMillis() < deadline) {
-                row = dispatcher.runOnClient(() -> findResultRowFor(wantedName));
-                if (row != null) break;
-                Thread.sleep(120L);
-            }
-            if (row == null) {
-                dumpResultRowsForDiagnostic(itemId);
-                log.warn("pickSearchResult: no row matching item \"{}\" within {}ms",
-                    wantedName, CHATBOX_AWAIT_MS);
-                return false;
-            }
-            log.info("pickSearchResult: itemId={} matched name=\"{}\" action=\"{}\" bounds={}",
-                itemId, wantedName, row.matchedAction, row.bounds);
-            // Pre-click human dwell — reading the row list takes a beat.
-            long dwell = CHATBOX_DWELL_MIN_MS
-                + java.util.concurrent.ThreadLocalRandom.current()
-                    .nextLong(CHATBOX_DWELL_MAX_MS - CHATBOX_DWELL_MIN_MS + 1);
-            Thread.sleep(dwell);
-            ActionRequest req = ActionRequest.builder()
-                .kind(ActionRequest.Kind.CLICK_BOUNDS)
-                .channel(ActionRequest.Channel.MOUSE)
-                .bounds(row.bounds)
-                .verb(row.matchedAction)
-                .build();
-            dispatcher.dispatch(req);
-            // Post-click probe — 1s after dispatch, snapshot live state.
-            Thread.sleep(1000L);
-            logPostClickState(itemId);
-            return true;
-        } catch (InterruptedException ie) {
-            Thread.currentThread().interrupt();
-            return false;
+        if (row == null) {
+            dumpResultRowsForDiagnostic(itemId);
+            log.warn("runPickSearchResult: no row matching \"{}\" within {}ms",
+                wantedName, CHATBOX_AWAIT_MS);
+            return;
         }
+        log.info("runPickSearchResult: itemId={} matched name=\"{}\" action=\"{}\" bounds={}",
+            itemId, wantedName, row.matchedAction, row.bounds);
+
+        // Step 3: pre-click human dwell, then click the row.
+        long dwell = CHATBOX_DWELL_MIN_MS
+            + java.util.concurrent.ThreadLocalRandom.current()
+                .nextLong(CHATBOX_DWELL_MAX_MS - CHATBOX_DWELL_MIN_MS + 1);
+        SequenceSleep.sleep(client, dwell);
+        // Click directly on the worker thread — call the dispatcher's
+        // boundsClick helper (we're already inside a worker dispatch chain,
+        // already holding the busy flag).
+        dispatcher.boundsClickOnWorker(row.bounds, row.matchedAction);
+        SequenceSleep.sleep(client, 500L);
+        logPostClickState(itemId);
     }
 
     private record ResultRow(String matchedAction, Rectangle bounds) {}
@@ -570,27 +580,21 @@ public final class GeInteraction implements GeActions {
         // Per buy-flow-recipe.json step 8-9: click GeOffers.SETUP[7]
         // ("Enter quantity"), MESLAYERMODE flips 0->7, type the digits,
         // press Enter, GE_NEWOFFER_QUANTITY commits to the typed value.
-        // Both clicks are async via the dispatcher worker — never block
-        // the engine/client thread.
-        try {
-            if (!clickSetupChild(SETUP_CHILD_ENTER_QUANTITY, "Enter quantity")) {
-                log.warn("ge: SETUP[7] (Enter quantity) not visible — aborting setQuantity({})", qty);
-                return false;
-            }
-        } catch (InterruptedException ie) {
-            Thread.currentThread().interrupt();
-            return false;
-        }
+        //
+        // The click and the type used to be two separate dispatches. The
+        // second was dropped by the busy guard (the click hadn't finished
+        // when the type queued), and the chatbox prompt was left stuck
+        // waiting for input. Bundle both into one RUN_TASK so the worker
+        // runs them in sequence while holding busy throughout.
         ActionRequest req = ActionRequest.builder()
-            .kind(ActionRequest.Kind.TYPE_CHATBOX)
+            .kind(ActionRequest.Kind.RUN_TASK)
             .channel(ActionRequest.Channel.KEYBOARD)
-            .typeText(Integer.toString(qty))
-            .typePressEnter(true)
-            .typeAwaitMs(CHATBOX_AWAIT_MS)
-            .typeDwellMinMs(CHATBOX_DWELL_MIN_MS)
-            .typeDwellMaxMs(CHATBOX_DWELL_MAX_MS)
+            .task(() -> runClickSetupChildThenType(
+                SETUP_CHILD_ENTER_QUANTITY, "Enter quantity",
+                Integer.toString(qty)))
+            .taskName("GE_SET_QUANTITY(" + qty + ")")
             .build();
-        log.info("setQuantity: queueing TYPE_CHATBOX qty={}", qty);
+        log.info("setQuantity: queueing GE_SET_QUANTITY qty={}", qty);
         dispatcher.dispatch(req);
         return true;
     }
@@ -598,38 +602,35 @@ public final class GeInteraction implements GeActions {
     @Override
     public boolean setPrice(int priceEach) {
         // Per buy-flow-recipe.json step 5-6: click GeOffers.SETUP[12]
-        // ("Enter price"), then type digits and Enter. Async via worker.
-        try {
-            if (!clickSetupChild(SETUP_CHILD_ENTER_PRICE, "Enter price")) {
-                log.warn("ge: SETUP[12] (Enter price) not visible — aborting setPrice({})", priceEach);
-                return false;
-            }
-        } catch (InterruptedException ie) {
-            Thread.currentThread().interrupt();
-            return false;
-        }
+        // ("Enter price"), then type digits and Enter. Click and type are
+        // bundled into one RUN_TASK to prevent the busy guard from
+        // dropping the type half — see setQuantity above.
         ActionRequest req = ActionRequest.builder()
-            .kind(ActionRequest.Kind.TYPE_CHATBOX)
+            .kind(ActionRequest.Kind.RUN_TASK)
             .channel(ActionRequest.Channel.KEYBOARD)
-            .typeText(Integer.toString(priceEach))
-            .typePressEnter(true)
-            .typeAwaitMs(CHATBOX_AWAIT_MS)
-            .typeDwellMinMs(CHATBOX_DWELL_MIN_MS)
-            .typeDwellMaxMs(CHATBOX_DWELL_MAX_MS)
+            .task(() -> runClickSetupChildThenType(
+                SETUP_CHILD_ENTER_PRICE, "Enter price",
+                Integer.toString(priceEach)))
+            .taskName("GE_SET_PRICE(" + priceEach + ")")
             .build();
-        log.info("setPrice: queueing TYPE_CHATBOX price={}", priceEach);
+        log.info("setPrice: queueing GE_SET_PRICE price={}", priceEach);
         dispatcher.dispatch(req);
         return true;
     }
 
-    /** Click a specific child of {@code GeOffers.SETUP} by index — the
-     *  setup widget's buttons (Enter quantity, Enter price, +1, +10, ...)
-     *  share the SETUP packed widget id but are addressable as dynamic
-     *  children via {@code parent.getChild(idx)}. Same pattern the
-     *  dispatcher uses for inventory slots ({@code invSlotClick}).
-     *  Returns true on a successful dispatch; false if the child isn't
-     *  visible (offer-setup not open, slot-overview showing instead). */
-    private boolean clickSetupChild(int childIndex, String verb) throws InterruptedException {
+    /** Worker-thread implementation of the setQuantity / setPrice flow.
+     *  Resolves the SETUP child bounds on the client thread, clicks them
+     *  on the worker, then types the digits + Enter — all without going
+     *  back through {@link HumanizedInputDispatcher#dispatch} (which would
+     *  self-drop on the busy flag we hold). Mirrors
+     *  {@link #runPickSearchResult}'s combined typing + clicking.
+     *
+     *  <p>Public so the dispatcher can call back into it via the
+     *  {@code RUN_TASK} payload, but not intended for step code to invoke
+     *  directly — go through {@link #setQuantity} / {@link #setPrice}. */
+    public void runClickSetupChildThenType(int childIndex, String verb, String digits)
+        throws InterruptedException
+    {
         Rectangle bounds = dispatcher.runOnClient(() -> {
             Widget setup = client.getWidget(InterfaceID.GeOffers.SETUP);
             if (setup == null || setup.isHidden()) return null;
@@ -638,16 +639,20 @@ public final class GeInteraction implements GeActions {
             Rectangle b = child.getBounds();
             return b == null || b.isEmpty() ? null : b;
         });
-        if (bounds == null) return false;
-        log.info("clickSetupChild({}, verb=\"{}\"): bounds={}", childIndex, verb, bounds);
-        ActionRequest req = ActionRequest.builder()
-            .kind(ActionRequest.Kind.CLICK_BOUNDS)
-            .channel(ActionRequest.Channel.MOUSE)
-            .bounds(bounds)
-            .verb(verb)
-            .build();
-        dispatcher.dispatch(req);
-        return true;
+        if (bounds == null) {
+            log.warn("ge: SETUP[{}] ({}) not visible — aborting type=\"{}\"",
+                childIndex, verb, digits);
+            return;
+        }
+        log.info("runClickSetupChildThenType({}, verb=\"{}\", type=\"{}\"): bounds={}",
+            childIndex, verb, digits, bounds);
+        dispatcher.boundsClickOnWorker(bounds, verb);
+        boolean typed = dispatcher.typeChatboxOnWorker(
+            digits, CHATBOX_AWAIT_MS, CHATBOX_DWELL_MIN_MS, CHATBOX_DWELL_MAX_MS, true);
+        if (!typed) {
+            log.warn("runClickSetupChildThenType: chatbox prompt did not open for SETUP[{}] ({})",
+                childIndex, verb);
+        }
     }
 
     @Override

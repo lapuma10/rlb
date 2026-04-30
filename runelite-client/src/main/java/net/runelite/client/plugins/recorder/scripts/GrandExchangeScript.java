@@ -80,8 +80,17 @@ public final class GrandExchangeScript {
         this.dispatcher = dispatcher;
         this.inputOwnership = inputOwnership;
         this.geArea = geArea;
-        this.geActions = new GeInteraction(client, clientThread, dispatcher);
+        GeInteraction ge = new GeInteraction(client, clientThread, dispatcher);
+        this.geActions = ge;
         this.bankActions = bankActions;
+        // Register the worker-thread picker so PICK_GE_SEARCH_RESULT
+        // dispatches route back into GeInteraction's runPickSearchResult.
+        // Without this the dispatcher logs "no picker registered" and the
+        // entire GE select flow no-ops.
+        dispatcher.setGeSearchResultPicker((itemId, name) -> {
+            try { ge.runPickSearchResult(itemId, name); }
+            catch (InterruptedException ie) { Thread.currentThread().interrupt(); }
+        });
     }
 
     /** True iff this script was constructed with a {@link BankActions} impl,

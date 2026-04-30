@@ -57,6 +57,7 @@ import net.runelite.client.plugins.recorder.transport.RouteOverlay;
 import net.runelite.client.plugins.recorder.transport.TransportResolver;
 import net.runelite.client.plugins.recorder.transport.Waypoint;
 import net.runelite.client.sequence.dispatch.HumanizedInputDispatcher;
+import net.runelite.client.sequence.dispatch.SequenceSleep;
 import net.runelite.client.sequence.login.CredentialStore;
 import net.runelite.client.sequence.login.CredentialStoreException;
 import net.runelite.client.sequence.login.LoginAssistant;
@@ -682,7 +683,7 @@ public final class RecorderPanel extends PluginPanel
                         }
 
                         // Poll cadence (NOT click cadence). 800-1200ms.
-                        Thread.sleep(800 + (int)(Math.random() * 400));
+                        SequenceSleep.sleep(client, 800 + (int)(Math.random() * 400));
                     }
 
                     if (!arrivedHere)
@@ -1508,7 +1509,7 @@ public final class RecorderPanel extends PluginPanel
                     SwingUtilities.invokeLater(() -> trailStatusLabel.setText(done));
                     return;
                 }
-                Thread.sleep(600);
+                SequenceSleep.sleep(client, 600);
             }
         }
         catch (InterruptedException ie) { Thread.currentThread().interrupt(); }

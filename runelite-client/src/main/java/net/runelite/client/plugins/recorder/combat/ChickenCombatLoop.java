@@ -40,6 +40,7 @@ import net.runelite.api.coords.WorldPoint;
 import net.runelite.api.gameval.InventoryID;
 import net.runelite.client.callback.ClientThread;
 import net.runelite.client.sequence.dispatch.HumanizedInputDispatcher;
+import net.runelite.client.sequence.dispatch.SequenceSleep;
 import net.runelite.client.sequence.internal.ActionRequest;
 import javax.annotation.Nullable;
 import java.util.Random;
@@ -859,9 +860,9 @@ public final class ChickenCombatLoop
         catch (Throwable th) { log.debug("status sink threw", th); }
     }
 
-    private static void sleepQuiet(long ms)
+    private void sleepQuiet(long ms)
     {
-        try { Thread.sleep(ms); }
+        try { SequenceSleep.sleep(client, ms); }
         catch (InterruptedException ie) { Thread.currentThread().interrupt(); }
     }
 

@@ -29,6 +29,7 @@ import net.runelite.api.Item;
 import net.runelite.api.ItemContainer;
 import net.runelite.api.gameval.InventoryID;
 import net.runelite.client.sequence.dispatch.HumanizedInputDispatcher;
+import net.runelite.client.sequence.dispatch.SequenceSleep;
 import net.runelite.client.sequence.internal.ActionRequest;
 import java.util.HashSet;
 import java.util.Set;
@@ -109,7 +110,7 @@ public final class PowerMineStrategy implements BankingStrategy
                     log.warn("PowerMine: drop on slot {} timed out", slot);
                     break;
                 }
-                Thread.sleep(DISPATCH_POLL_MS);
+                SequenceSleep.sleep(ctx.client(), DISPATCH_POLL_MS);
             }
             String err = dispatcher.lastErrorMessage();
             if (err != null)
@@ -123,7 +124,7 @@ public final class PowerMineStrategy implements BankingStrategy
             // Brief inter-drop pause — humans don't fire menu selects at
             // a constant cadence. The dispatcher's settle/post-click
             // already adds humanization but a small additional gap helps.
-            Thread.sleep(80);
+            SequenceSleep.sleep(ctx.client(), 80);
         }
     }
 

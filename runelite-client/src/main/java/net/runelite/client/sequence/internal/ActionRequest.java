@@ -27,12 +27,21 @@ package net.runelite.client.sequence.internal;
 import java.awt.Rectangle;
 import lombok.Value;
 import net.runelite.api.coords.WorldPoint;
+import net.runelite.client.sequence.dispatch.BlockingTask;
 import javax.annotation.Nullable;
 
 @Value
 @lombok.Builder(toBuilder = true)
 public class ActionRequest {
-    public enum Kind { WALK, CLICK_TILE, CLICK_NPC, CLICK_GAME_OBJECT, CLICK_GROUND_ITEM, CLICK_WIDGET, CLICK_INV_ITEM, CLICK_BOUNDS, TYPE_CHATBOX, KEY }
+    public enum Kind { WALK, CLICK_TILE, CLICK_NPC, CLICK_GAME_OBJECT, CLICK_GROUND_ITEM, CLICK_WIDGET, CLICK_INV_ITEM, CLICK_BOUNDS, TYPE_CHATBOX, PICK_GE_SEARCH_RESULT, KEY,
+        /** Run a {@link BlockingTask} on the dispatcher worker thread.
+         *  Bridges multi-step blocking flows (banking, GE order setup) into
+         *  the engine without freezing the client thread. The dispatcher
+         *  holds its busy flag for the entire task so the task is the sole
+         *  in-flight chain — inside the task, use the {@code *OnWorker}
+         *  helpers and other caller-thread primitives, never call
+         *  {@code dispatcher.dispatch(...)} recursively. */
+        RUN_TASK }
     public enum Channel { CLIENT, MOUSE, KEYBOARD }
 
     Kind kind;
@@ -80,4 +89,19 @@ public class ActionRequest {
      *  BEFORE the first keystroke. */
     long typeDwellMinMs;
     long typeDwellMaxMs;
+    /** Canonical item name for {@link Kind#PICK_GE_SEARCH_RESULT} — the
+     *  worker thread polls the GE search result list for a row whose
+     *  Widget.getName() / getText() matches and clicks it. {@link #itemId}
+     *  is also set so the worker can fall back to icon-id matching. */
+    @Nullable String pickName;
+    /** Payload for {@link Kind#RUN_TASK}: the blocking work the dispatcher
+     *  worker thread runs. Captured at the call site (typically by an
+     *  engine step's {@code onStart}) so the multi-step flow runs off the
+     *  client thread. Must not be {@code null} when {@code kind ==
+     *  RUN_TASK}. */
+    @Nullable BlockingTask task;
+    /** Human-readable label for {@link Kind#RUN_TASK} — used in dispatcher
+     *  logs to identify which task is running, since the {@link #task}
+     *  itself is opaque. e.g. {@code "BANK_WITHDRAW_X(995,2684)"}. */
+    @Nullable String taskName;
 }

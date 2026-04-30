@@ -26,6 +26,7 @@ package net.runelite.client.sequence.dispatch;
 
 import lombok.RequiredArgsConstructor;
 import net.runelite.api.Client;
+import net.runelite.client.sequence.dispatch.SequenceSleep;
 import java.awt.Canvas;
 import java.awt.event.KeyEvent;
 import java.awt.event.MouseEvent;
@@ -107,7 +108,7 @@ public final class CanvasInput
         long t = System.currentTimeMillis();
         c.dispatchEvent(new KeyEvent(c, KeyEvent.KEY_PRESSED,
             t, 0, keyCode, KeyEvent.CHAR_UNDEFINED));
-        Thread.sleep(Math.max(0, holdMs));
+        SequenceSleep.sleep(client, Math.max(0, holdMs));
         c.dispatchEvent(new KeyEvent(c, KeyEvent.KEY_RELEASED,
             t, 0, keyCode, KeyEvent.CHAR_UNDEFINED));
     }
@@ -131,7 +132,7 @@ public final class CanvasInput
         // KEY_TYPED is what the title-screen text input actually reads.
         c.dispatchEvent(new KeyEvent(c, KeyEvent.KEY_TYPED,
             t, mods, KeyEvent.VK_UNDEFINED, ch));
-        Thread.sleep(Math.max(0, holdMs));
+        SequenceSleep.sleep(client, Math.max(0, holdMs));
         c.dispatchEvent(new KeyEvent(c, KeyEvent.KEY_RELEASED,
             t, mods, vk, KeyEvent.CHAR_UNDEFINED));
     }
@@ -146,7 +147,7 @@ public final class CanvasInput
         long t = System.currentTimeMillis();
         c.dispatchEvent(new KeyEvent(c, KeyEvent.KEY_PRESSED,
             t, modifierMask, keyCode, KeyEvent.CHAR_UNDEFINED));
-        Thread.sleep(Math.max(0, holdMs));
+        SequenceSleep.sleep(client, Math.max(0, holdMs));
         c.dispatchEvent(new KeyEvent(c, KeyEvent.KEY_RELEASED,
             t, modifierMask, keyCode, KeyEvent.CHAR_UNDEFINED));
     }

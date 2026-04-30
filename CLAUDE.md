@@ -1,3 +1,83 @@
+## Threading model — read FIRST. Most silent freezes come from getting this wrong.
+
+The OSRS client has **one shared thread** that decodes packets, runs cs2
+scripts (chatbox prompts, dialogues, bank rebuilds), ticks NPCs, renders
+frames, and drains the click queue. Sleeping it for 7ms freezes the
+whole game world for 7ms — including the cs2 that would open the
+chatbox you're trying to type into. Symptom: "client looks throttled,
+state never advances, my polling loop times out" — that's never OSRS
+lagging, it's us holding its only thread.
+
+**Three threading questions, in order. Answer all three before writing
+the code, not after the runtime guard catches it.**
+
+### 1. Am I reading game state? → client thread.
+
+`Widget`, `Scene`, `Tile`, `NPC`, `Menu`, varbits, varplayers — all
+require the client thread (RuneLite asserts under `-ea`). Marshal with
+`clientThread.invoke(...)`, `BankInteraction.onClient(supplier)`,
+`HumanizedInputDispatcher.onClient(...)`. Reads are microseconds — get
+in, get out.
+
+### 2. Am I just building data / making a decision? → either thread.
+
+Constructing an `ActionRequest`, comparing snapshot fields, picking an
+NPC from a list, computing a target qty — pure compute, runs anywhere.
+
+### 3. Am I doing a multi-step input flow with internal waits? → dispatcher worker, NEVER the client thread.
+
+Right-click → wait for menu → pick verb → wait for chatbox prompt →
+type digits → press Enter → wait for varbit. Every one of those waits
+is a `SequenceSleep.sleep(...)` on the calling thread. If the calling
+thread is the client thread, you've frozen the game.
+
+This is the question that's most often missed. The trap: an engine
+`Step.onStart` / `check` / `tick` runs on the client thread, so calling
+`bank.withdrawX(...)` (or any blocking method on `BankInteraction` /
+`GeInteraction` / `HumanizedInputDispatcher`) **directly from a step is
+a bug** even though it compiles and looks fine.
+
+The fix shape is always the same — enqueue an `ActionRequest` to the
+dispatcher worker, return; let `Step.check()` poll the snapshot:
+
+```
+Step.onStart (client thread)               Dispatcher worker
+─────────────────────────────              ──────────────────────────
+read state via onClient(...)               run the multi-step flow:
+build ActionRequest    ─── enqueue ──►       click → SequenceSleep
+return immediately                           → type → SequenceSleep
+                                             → press Enter
+Step.check (every tick)                      → done
+read snapshot.inventory().count(itemId)
+"did target reach?" → Succeeded / RUNNING
+```
+
+`SequenceSleep.sleep(client, ms)` already throws on the client thread
+to make this fail loud — but that's *detection*, not *prevention*.
+Don't ship work that depends on the runtime guard catching it. Walk
+through the three questions before writing the step.
+
+**Worked example — the bank-withdraw-X regression of 2026-04-30:**
+`WithdrawItemStep.onStart` (client thread) called
+`bank.withdrawX(itemId, delta)`. Inside, `tryWithdrawX` does
+right-click → "Withdraw-X" → chatbox prompt → typed number → Enter,
+with `SequenceSleep.sleep(...)` between each. First sleep threw,
+the step aborted before any verb was selected, the bot just sat at
+the bank doing nothing. Fix: a `BANK_WITHDRAW_X` `ActionRequest.Kind`
+that the dispatcher worker runs; `WithdrawItemStep.onStart` enqueues
+and returns; `check()` polls inventory until target reached.
+
+### Worker threads
+
+Worker threads (dispatcher, login-assistant, anything you spawn) are
+safe for `SequenceSleep`. They are NOT safe for direct widget/scene
+reads — marshal back to the client thread for the read, then continue.
+The Swing EDT is also a worker, but treat it as off-limits for blocking
+work — panel button click handlers must `Thread.start()` for anything
+that calls `awaitIdle` or `dispatcher.dispatch`.
+
+---
+
 ## Sequence engine — read FIRST for any NEW gameplay scripting
 
 The repo has a state-driven sequence engine under
@@ -366,17 +446,11 @@ treating them as walks because the target widget was hidden).
 
 ## 9. Threading
 
-> **Am I reading widget / scene state on the client thread?**
-
-- All `Widget`, `Scene`, `Tile`, `NPC.getInteracting()`, etc. reads
-  must happen on the client thread (RuneLite asserts this under -ea).
-- Use `clientThread.invoke(...)` or our `onClient(supplier)` helpers.
-
-> **Am I dispatching from a worker thread that could block the EDT?**
-
-- Worker threads are safe for sleeping. The EDT (Swing) is not. Don't
-  call long-running operations (`awaitIdle`, dispatcher actions) from
-  panel button click handlers without a `Thread.start()`.
+See the **"Threading model"** section at the top of this file. The
+three-question framework (read on client thread, build/decide
+anywhere, multi-step blocking flows on dispatcher worker) is
+load-bearing — re-read it before any sequence-engine step or
+dispatcher work.
 
 ---
 

@@ -33,6 +33,7 @@ import net.runelite.api.gameval.InventoryID;
 import net.runelite.client.callback.ClientThread;
 import net.runelite.client.plugins.recorder.transport.TransportResolver;
 import net.runelite.client.sequence.dispatch.HumanizedInputDispatcher;
+import net.runelite.client.sequence.dispatch.SequenceSleep;
 import net.runelite.client.sequence.internal.ActionRequest;
 import javax.annotation.Nullable;
 import java.util.ArrayDeque;
@@ -234,7 +235,7 @@ public final class MiningLoop
             return;
         }
         WorldPoint here = playerPosition();
-        if (here == null) { Thread.sleep(POLL_MS); return; }
+        if (here == null) { SequenceSleep.sleep(client, POLL_MS); return; }
         Set<WorldPoint> depletedSet = new HashSet<>(recentDepleted);
         RockSelector.Candidate candidate;
         synchronized (this) { candidate = selector.pick(candidates, here, depletedSet); }
@@ -252,7 +253,7 @@ public final class MiningLoop
             // No "Mine" verb on this tile right now — treat as depleted from
             // selecting's POV and move on.
             recordDepleted(recentDepleted, candidate.tile());
-            Thread.sleep(POLL_MS);
+            SequenceSleep.sleep(client, POLL_MS);
             return;
         }
         int objectId = match.matchedObjectId();
@@ -275,7 +276,7 @@ public final class MiningLoop
         while (dispatcher.isBusy())
         {
             if (Thread.currentThread().isInterrupted()) throw new InterruptedException("stop");
-            Thread.sleep(POLL_MS / 2);
+            SequenceSleep.sleep(client, POLL_MS / 2);
         }
         String err = dispatcher.lastErrorMessage();
         if (err != null)
@@ -317,7 +318,7 @@ public final class MiningLoop
                 boolean full = inv != null && inv.count() >= 28;
                 return new SwingSnapshot(anim, liveId, verbOk, full);
             });
-            if (snap == null) { Thread.sleep(POLL_MS); continue; }
+            if (snap == null) { SequenceSleep.sleep(client, POLL_MS); continue; }
             tracker.observe(snap.anim(), snap.liveObjectId(), snap.verbOk(), snap.invFull());
 
             // Inventory progress — bump kill counter if a new ore landed.
@@ -338,7 +339,7 @@ public final class MiningLoop
                 state.set(next);
                 return;
             }
-            Thread.sleep(POLL_MS);
+            SequenceSleep.sleep(client, POLL_MS);
         }
     }
 

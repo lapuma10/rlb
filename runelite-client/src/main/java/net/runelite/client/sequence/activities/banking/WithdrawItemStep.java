@@ -8,6 +8,8 @@ import net.runelite.client.sequence.affordance.DiagnosticReason;
 import net.runelite.client.sequence.blackboard.Blackboard;
 import net.runelite.client.sequence.blackboard.BlackboardKey;
 import net.runelite.client.sequence.blackboard.BlackboardScope;
+import net.runelite.client.sequence.dispatch.BlockingTask;
+import net.runelite.client.sequence.internal.ActionRequest;
 import net.runelite.client.sequence.views.BankItemAvailability;
 import net.runelite.client.sequence.views.BankView;
 import net.runelite.client.sequence.views.InventoryView;
@@ -123,20 +125,37 @@ public final class WithdrawItemStep implements Step {
 
         if (delta == 0) return;   // defensive belt-and-braces; alreadySatisfied should have caught this
 
-        try {
-            if (useNote) {
-                bank.withdrawAsNoteX(itemId, delta);
-            } else if (delta == 1) {
-                bank.withdrawOne(itemId);
-            } else if (delta == knownBankCount) {
-                bank.withdrawAll(itemId);
-            } else {
-                bank.withdrawX(itemId, delta);
-            }
-        } catch (InterruptedException ie) {
-            Thread.currentThread().interrupt();
-            step.put(K_PRECONDITION_FAILURE, new DiagnosticReason.Unknown("interrupted"));
+        // Dispatch the multi-step withdraw flow (right-click → "Withdraw-X"
+        // → chatbox numeric prompt → typed digits → Enter) onto the
+        // dispatcher worker. onStart runs on the OSRS client thread, where
+        // the BankActions guard would throw to prevent freezing the game.
+        // See CLAUDE.md "Threading model" for the full explanation.
+        final int id = itemId;
+        final int qty = delta;
+        final int knownBank = knownBankCount;
+        final boolean note = useNote;
+        final BlockingTask task;
+        final String taskName;
+        if (note) {
+            task = () -> bank.withdrawAsNoteX(id, qty);
+            taskName = "BANK_WITHDRAW_NOTE_X(" + id + "," + qty + ")";
+        } else if (qty == 1) {
+            task = () -> bank.withdrawOne(id);
+            taskName = "BANK_WITHDRAW_ONE(" + id + ")";
+        } else if (qty == knownBank) {
+            task = () -> bank.withdrawAll(id);
+            taskName = "BANK_WITHDRAW_ALL(" + id + ")";
+        } else {
+            task = () -> bank.withdrawX(id, qty);
+            taskName = "BANK_WITHDRAW_X(" + id + "," + qty + ")";
         }
+        ActionRequest req = ActionRequest.builder()
+            .kind(ActionRequest.Kind.RUN_TASK)
+            .channel(ActionRequest.Channel.MOUSE)
+            .task(task)
+            .taskName(taskName)
+            .build();
+        ctx.dispatcher().dispatch(req);
     }
 
     @Override public void onEvent(Object e, StepContext ctx) { /* no-op — proof relies on snapshot verification */ }
