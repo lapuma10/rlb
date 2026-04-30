@@ -192,8 +192,10 @@ public final class CookingInteraction
      *  WHICH near-pile we light each trip. */
     public Match findGroundLogs(int itemId) throws InterruptedException
     {
+        // Find the closest log spawn; if multiple are equidistant, pick one
+        // at random so the bot doesn't always light the same tile.
         return onClient(() -> Match.wrap(
-            scanner.findTileItemByIdRandomNear(itemId, SEARCH_RADIUS, 2)));
+            scanner.findTileItemById(itemId, SEARCH_RADIUS)));
     }
 
     /** Find a Fire game object whose composition name matches
@@ -331,7 +333,18 @@ public final class CookingInteraction
         int cy = b.y + b.height / 2;
         log.info("cook: clicking ground-logs tile {} at ({},{}) [light fire]",
             logsMatch.tile, cx, cy);
-        dispatcher.clickCanvas(cx, cy);
+        // boundsClickOnWorker settles 60ms then checks isTopMenuVerb("Use") before
+        // left-clicking. If use-mode dropped between useTinderbox() and here, the
+        // left-click default on the tile is "Take" — we'd silently pick up our own
+        // fuel. The pre-check catches that: verb mismatch → right-click attempted
+        // → "Use" absent from menu → lastError set, menu escaped, no Take fired.
+        dispatcher.boundsClickOnWorker(b, "Use");
+        String err = dispatcher.lastErrorMessage();
+        if (err != null)
+        {
+            log.info("cook: logs click aborted (use-mode guard) — {}", err);
+            return false;
+        }
         return true;
     }
 

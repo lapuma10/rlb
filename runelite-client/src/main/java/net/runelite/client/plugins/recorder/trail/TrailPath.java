@@ -93,6 +93,10 @@ public final class TrailPath
             }
             else if (ev instanceof TrailEvent.Transport tr)
             {
+                // Widget-button clicks (CC_OP) were incorrectly captured in
+                // older recordings — param0/param1 are component IDs, not scene
+                // coords, producing garbage world tiles. Skip them.
+                if ("CC_OP".equals(tr.targetKind()) || "CC_OP_LOW_PRIORITY".equals(tr.targetKind())) continue;
                 if (isStairTransport(tr.option()))
                 {
                     pendingStairs = tr;

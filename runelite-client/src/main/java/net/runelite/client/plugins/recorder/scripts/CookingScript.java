@@ -114,6 +114,17 @@ public final class CookingScript
     private static final long COOK_STUCK_MS = 30_000;
     /** Throttle between cooking-action dispatches (use raw + click fire). */
     private static final long COOK_PACE_MS = 1500;
+    /** Min/max random delay before dismissing the level-up popup. A real
+     *  player glances at the screen, reads the level, then clicks away —
+     *  dismissing instantly every time is a visible bot tell. */
+    private static final long LEVEL_UP_DISMISS_MIN_MS = 3_000;
+    private static final long LEVEL_UP_DISMISS_MAX_MS = 34_000;
+    /** How long after a light dispatch with NO firemaking animation seen we
+     *  treat the click as swallowed and retry. Covers the common case where
+     *  logs respawn on an already-burning tile (click does nothing, player
+     *  never starts the firemaking anim). Much shorter than LIGHT_TIMEOUT_MS
+     *  which is reserved for slow low-level attempts where the anim did fire. */
+    private static final long LIGHT_NO_ANIM_TIMEOUT_MS = 4_000;
 
     public enum State
     {
@@ -219,6 +230,17 @@ public final class CookingScript
      *  attempt — avoids hammering the same flow if the engine swallows
      *  our use-mode click. */
     private long lightingBackoffUntilMs;
+    /** True once we observe the firemaking animation after a light dispatch.
+     *  Lets us distinguish "click worked, just waiting for fire" (anim seen)
+     *  from "click was swallowed entirely" (no anim within LIGHT_NO_ANIM_TIMEOUT_MS),
+     *  e.g. because logs respawned on a tile that already has a fire burning. */
+    private boolean seenFiremakingAnimSinceDispatch;
+    /** Wall-clock time when the level-up popup was first seen this occurrence.
+     *  0 when no popup is visible. We wait a random 2–6 s before dismissing. */
+    private long levelUpFirstSeenAtMs;
+    /** The randomised wall-clock time at which we will actually press Space
+     *  to dismiss the currently-visible level-up popup. */
+    private long levelUpDismissAfterMs;
 
     /** Max retries on a banking sub-step (booth click / deposit /
      *  withdraw / close) before aborting. 3 tries covers transient
@@ -373,13 +395,10 @@ public final class CookingScript
                     continue;
                 }
 
-                // The level-up popup interrupts everything else — dismiss
-                // first, then run state-specific logic on the next tick.
-                if (safeDismissLevelUp())
-                {
-                    SequenceSleep.sleep(client, TICK_MS);
-                    continue;
-                }
+                // Check level-up popup — dismiss with Space after a random
+                // delay, but don't block the FSM. Cooking and walking will
+                // clear the notification too, so it's fine to keep going.
+                safeDismissLevelUp();
                 switch (state.get())
                 {
                     case BANKING_LEGACY:     tickBankingLegacy();     break;
@@ -989,11 +1008,27 @@ public final class CookingScript
             }
             if (cook.isFiremaking())
             {
+                seenFiremakingAnimSinceDispatch = true;
                 status.set("light: firemaking animation, waiting for fire");
                 return;
             }
-            // No fire yet, no animation — engine may still be queueing
-            // the action. Hold up to LIGHT_TIMEOUT_MS, then back off.
+            // No fire, no animation currently. Two cases:
+            //  (a) We never saw the anim at all — the click was swallowed
+            //      (logs on a fire tile, or dispatcher missed the target).
+            //      Retry quickly after LIGHT_NO_ANIM_TIMEOUT_MS.
+            //  (b) We did see the anim (low-level FM retrying) — wait the
+            //      full LIGHT_TIMEOUT_MS for the fire to actually spawn.
+            if (!seenFiremakingAnimSinceDispatch
+                    && (now - lightDispatchedAtMs) > LIGHT_NO_ANIM_TIMEOUT_MS)
+            {
+                log.info("cook: no firemaking anim seen after {}ms — click swallowed, retrying",
+                    now - lightDispatchedAtMs);
+                litFireTile = null;
+                lightDispatchedAtMs = 0L;
+                seenFiremakingAnimSinceDispatch = false;
+                lightingBackoffUntilMs = now + 1000L;
+                return;
+            }
             if (now - lightDispatchedAtMs > LIGHT_TIMEOUT_MS)
             {
                 String e = dispatcher.lastErrorMessage();
@@ -1001,6 +1036,7 @@ public final class CookingScript
                     litFireTile, LIGHT_TIMEOUT_MS, e);
                 litFireTile = null;
                 lightDispatchedAtMs = 0L;
+                seenFiremakingAnimSinceDispatch = false;
                 lightingBackoffUntilMs = now + 2000L;
                 return;
             }
@@ -1028,6 +1064,18 @@ public final class CookingScript
         if (logs == null)
         {
             status.set("light: waiting for log spawn");
+            return;
+        }
+
+        // Logs can respawn on a tile that already has a burning fire.
+        // Trying to light them does nothing — the fire blocks the action.
+        // If the fire is already there, claim it and skip straight to cooking.
+        CookingInteraction.Match existingFire = cook.findFireAt(l.heatSourceName(), logs.tile);
+        if (existingFire != null)
+        {
+            log.info("cook: fire already at log tile {} — using it directly", logs.tile);
+            litFireTile = existingFire.tile;
+            setState(State.COOKING);
             return;
         }
 
@@ -1084,6 +1132,7 @@ public final class CookingScript
         // tell us; we just don't see a Fire on the tile, time out,
         // and retry.
         litFireTile = logs2.tile;
+        seenFiremakingAnimSinceDispatch = false;
         lightDispatchedAtMs = System.currentTimeMillis();
         status.set("light: clicked logs at " + litFireTile + " — waiting for fire");
     }
@@ -1300,15 +1349,39 @@ public final class CookingScript
     // Helpers
     // ────────────────────────────────────────────────────────────────
 
-    /** Try to dismiss the level-up popup. Returns true iff a tap was
-     *  dispatched (caller skips the rest of the tick to give the dialog
-     *  one tick to vanish). Wrapped in try/catch so any exotic widget
-     *  state error doesn't kill the loop. */
-    private boolean safeDismissLevelUp()
+    /** Check the level-up popup. If visible and the random delay has expired,
+     *  press Space to dismiss — but never pauses the FSM. The script keeps
+     *  cooking/walking; those actions will also clear the notification. */
+    private void safeDismissLevelUp()
     {
-        try { return cook.dismissLevelUp(); }
-        catch (InterruptedException ie) { Thread.currentThread().interrupt(); return false; }
-        catch (Throwable th) { log.warn("cook: dismissLevelUp threw", th); return false; }
+        try
+        {
+            if (!cook.isLevelUpVisible())
+            {
+                levelUpFirstSeenAtMs = 0L;
+                return;
+            }
+            long now = System.currentTimeMillis();
+            if (levelUpFirstSeenAtMs == 0L)
+            {
+                long delay = LEVEL_UP_DISMISS_MIN_MS
+                    + ThreadLocalRandom.current().nextLong(
+                        LEVEL_UP_DISMISS_MAX_MS - LEVEL_UP_DISMISS_MIN_MS);
+                levelUpFirstSeenAtMs = now;
+                levelUpDismissAfterMs = now + delay;
+                log.info("cook: level-up — will dismiss in {}ms", delay);
+                return;
+            }
+            if (now >= levelUpDismissAfterMs)
+            {
+                log.info("cook: level-up — pressing Space ({}ms after popup appeared)",
+                    now - levelUpFirstSeenAtMs);
+                cook.dismissLevelUp();
+                levelUpFirstSeenAtMs = 0L;
+            }
+        }
+        catch (InterruptedException ie) { Thread.currentThread().interrupt(); }
+        catch (Throwable th) { log.warn("cook: dismissLevelUp threw", th); }
     }
 
     /** First item id in the inventory that is a cooked or burnt food
@@ -1419,6 +1492,7 @@ public final class CookingScript
         {
             litFireTile = null;
             lightDispatchedAtMs = 0L;
+            seenFiremakingAnimSinceDispatch = false;
         }
     }
 

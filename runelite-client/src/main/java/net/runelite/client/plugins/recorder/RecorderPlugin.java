@@ -39,6 +39,7 @@ import net.runelite.client.plugins.PluginDescriptor;
 import net.runelite.client.plugins.recorder.annotator.AnnotatorHudOverlay;
 import net.runelite.client.plugins.recorder.annotator.AreaSelector;
 import net.runelite.client.plugins.recorder.scripts.ChickenFarmV2Script;
+import net.runelite.client.plugins.recorder.scripts.CooksAssistantScript;
 import net.runelite.client.plugins.recorder.scripts.CookingScript;
 import net.runelite.client.plugins.recorder.scripts.GrandExchangeScript;
 import net.runelite.client.sequence.dispatch.InputOwnership;
@@ -124,6 +125,7 @@ public class RecorderPlugin extends Plugin
     private TrailRecorder trailRecorder;
     private TrailRegistry trailRegistry;
     private AnnotatorHudOverlay hudOverlay;
+    private CooksAssistantScript cooksAssistantScript;
     private AreaSelector areaSelector;
     private net.runelite.client.plugins.recorder.inspector.ClickInspector clickInspector;
 
@@ -293,6 +295,14 @@ public class RecorderPlugin extends Plugin
         eventBus.register(grandExchangeScript);
         panel.setGrandExchangeScript(grandExchangeScript, itemManager);
 
+        // Cook's Assistant quest script — constructed after GE Core so we can
+        // pass grandExchangeScript + trailRegistry as dependencies.
+        HumanizedInputDispatcher questDispatcher = new HumanizedInputDispatcher(client, clientThread);
+        TransportResolver questResolver = new TransportResolver(client);
+        cooksAssistantScript = new CooksAssistantScript(
+            client, clientThread, questDispatcher, questResolver, trailRegistry, grandExchangeScript);
+        panel.setCooksAssistantScript(cooksAssistantScript);
+
         // Click inspector — toggleable diagnostic. Subscribes itself to the
         // EventBus only when enabled; safe to leave off by default.
         clickInspector = new net.runelite.client.plugins.recorder.inspector.ClickInspector(
@@ -354,6 +364,7 @@ public class RecorderPlugin extends Plugin
         }
         if (chickenLoop != null) chickenLoop.stop();
         if (miningLoop != null) miningLoop.stop();
+        if (cooksAssistantScript != null) { cooksAssistantScript.stop(); cooksAssistantScript = null; }
         if (hudOverlay != null) overlayManager.remove(hudOverlay);
         if (areaSelector != null && areaSelector.isActive()) areaSelector.cancel();
         if (debugOverlay != null) overlayManager.remove(debugOverlay);

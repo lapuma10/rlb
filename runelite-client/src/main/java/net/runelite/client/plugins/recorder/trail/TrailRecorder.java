@@ -197,6 +197,11 @@ public final class TrailRecorder
         if (entry == null) return;
         String option = entry.getOption();
         if (!isTransportVerb(option)) return;
+        // CC_OP / CC_OP_LOW_PRIORITY are widget-button clicks (e.g. closing
+        // the GE interface). param0/param1 are component IDs, not scene coords,
+        // so resolveClickTile produces garbage world points for them. Widget
+        // interactions are never region transitions — skip entirely.
+        if (entry.getType() != null && entry.getType().toString().startsWith("CC_OP")) return;
         // Resolve the click's world tile from param0/param1 (scene coords)
         // → world via the player's current scene base. Falls back to the
         // player's tile if the scene math fails (rare; means the click

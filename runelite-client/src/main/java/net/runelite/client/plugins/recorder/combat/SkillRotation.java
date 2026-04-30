@@ -113,6 +113,14 @@ public class SkillRotation
 
         if (skill == activeSkill)
         {
+            // If the active skill just reached its target, switch now —
+            // no point waiting for the cycle threshold.
+            if (hasMetTarget(activeSkill))
+            {
+                log.info("{} reached target — switching immediately", activeSkill);
+                switchToNextSkill();
+                return;
+            }
             levelsGainedThisCycle++;
             log.info("cycle progress: {}/{} levels toward switch", levelsGainedThisCycle, switchThreshold);
             if (levelsGainedThisCycle >= switchThreshold)
@@ -169,6 +177,16 @@ public class SkillRotation
         int min = plan.minLevelsBeforeSwitch();
         int max = plan.maxLevelsBeforeSwitch();
         return min + rng.nextInt(max - min + 1);
+    }
+
+    private boolean hasMetTarget(Skill skill)
+    {
+        int current = currentLevels.getOrDefault(skill, 1);
+        for (SkillTarget st : plan.targets())
+        {
+            if (st.skill() == skill) return current >= st.targetLevel();
+        }
+        return false;
     }
 
     /**

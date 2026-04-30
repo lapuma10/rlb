@@ -81,7 +81,7 @@ public record TrainingPlan(
      */
     public static TrainingPlan basic(List<SkillTarget> targets, boolean autoRetaliate)
     {
-        return new TrainingPlan(targets, autoRetaliate, false, 2, 5,
+        return new TrainingPlan(targets, autoRetaliate, false, 1, 2,
             DEFAULT_XP_HOVER_MIN_MS, DEFAULT_XP_HOVER_MAX_MS);
     }
 }

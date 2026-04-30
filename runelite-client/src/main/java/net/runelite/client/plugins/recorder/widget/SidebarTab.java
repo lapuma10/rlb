@@ -17,31 +17,31 @@ public enum SidebarTab
     COMBAT(
         InterfaceID.Toplevel.STONE0,
         InterfaceID.ToplevelOsrsStretch.STONE0,
-        InterfaceID.ToplevelPreEoc.ICON0),
+        InterfaceID.ToplevelPreEoc.STONE0),
     STATS(
         InterfaceID.Toplevel.STONE1,
         InterfaceID.ToplevelOsrsStretch.STONE1,
-        InterfaceID.ToplevelPreEoc.ICON1),
+        InterfaceID.ToplevelPreEoc.STONE1),
     QUESTS(
         InterfaceID.Toplevel.STONE2,
         InterfaceID.ToplevelOsrsStretch.STONE2,
-        InterfaceID.ToplevelPreEoc.ICON2),
+        InterfaceID.ToplevelPreEoc.STONE2),
     INVENTORY(
         InterfaceID.Toplevel.STONE3,
         InterfaceID.ToplevelOsrsStretch.STONE3,
-        InterfaceID.ToplevelPreEoc.ICON3),
+        InterfaceID.ToplevelPreEoc.STONE3),
     EQUIPMENT(
         InterfaceID.Toplevel.STONE4,
         InterfaceID.ToplevelOsrsStretch.STONE4,
-        InterfaceID.ToplevelPreEoc.ICON4),
+        InterfaceID.ToplevelPreEoc.STONE4),
     PRAYER(
         InterfaceID.Toplevel.STONE5,
         InterfaceID.ToplevelOsrsStretch.STONE5,
-        InterfaceID.ToplevelPreEoc.ICON5),
+        InterfaceID.ToplevelPreEoc.STONE5),
     MAGIC(
         InterfaceID.Toplevel.STONE6,
         InterfaceID.ToplevelOsrsStretch.STONE6,
-        InterfaceID.ToplevelPreEoc.ICON6);
+        InterfaceID.ToplevelPreEoc.STONE6);
 
     /** Icon widget ids in layout-priority order: Fixed, Resizable
      *  Classic (Stretch), Resizable Modern (PreEoc). The first one

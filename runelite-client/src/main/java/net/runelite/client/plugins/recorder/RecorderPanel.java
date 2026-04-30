@@ -40,6 +40,7 @@ import net.runelite.client.plugins.recorder.debug.DebugOverlay;
 import net.runelite.client.plugins.recorder.farm.RouteWalker;
 import net.runelite.client.plugins.recorder.mining.MiningLoop;
 import net.runelite.client.plugins.recorder.scripts.ChickenFarmV2Script;
+import net.runelite.client.plugins.recorder.scripts.CooksAssistantScript;
 import net.runelite.client.plugins.recorder.scripts.CookingScript;
 import net.runelite.client.plugins.recorder.scripts.GrandExchangeScript;
 import net.runelite.client.plugins.recorder.scripts.GrandExchangeTab;
@@ -220,6 +221,11 @@ public final class RecorderPanel extends PluginPanel
     private final JComboBox<CookingFood.Entry> cookFoodBox = new JComboBox<>();
     private final JLabel cookStatusLabel = new JLabel("Cooking: idle");
     private final JLabel cookCountsLabel = new JLabel("Cooked: 0  Burnt: 0");
+    // Cook's Assistant quest script.
+    private CooksAssistantScript cooksAssistantScript;
+    private final JButton questStartBtn  = new JButton("Start quest");
+    private final JButton questStopBtn   = new JButton("Stop");
+    private final JLabel  questStatusLabel = new JLabel("Quest: idle");
     // GE Core (Phase A): wired by RecorderPlugin via setGrandExchangeScript.
     private GrandExchangeTab grandExchangeTab;
     private final JTabbedPane tabs = new JTabbedPane();
@@ -264,6 +270,7 @@ public final class RecorderPanel extends PluginPanel
         tabs.addTab("Record", new JScrollPane(buildRecordTab()));
         tabs.addTab("Mining", new JScrollPane(buildMiningTab()));
         tabs.addTab("Cooking", new JScrollPane(buildCookingTab()));
+        tabs.addTab("Cook's Quest", new JScrollPane(buildCooksQuestTab()));
         tabs.addTab("Login",  new JScrollPane(buildLoginTab()));
         add(tabs, BorderLayout.CENTER);
 
@@ -280,6 +287,8 @@ public final class RecorderPanel extends PluginPanel
         miningClearRocksBtn.addActionListener(e -> onMiningClearRocks());
         cookStartBtn.addActionListener(e -> onCookStart());
         cookStopBtn.addActionListener(e -> onCookStop());
+        questStartBtn.addActionListener(e -> onQuestStart());
+        questStopBtn.addActionListener(e -> onQuestStop());
         markerBtn.addActionListener(e -> onMarker());
         markTileBtn.addActionListener(e -> onMarkTile());
         walkToMarkBtn.addActionListener(e -> onWalkToMark());
@@ -1291,7 +1300,7 @@ public final class RecorderPanel extends PluginPanel
         net.runelite.client.plugins.recorder.combat.TrainingPlan plan =
             retLeave
             ? new net.runelite.client.plugins.recorder.combat.TrainingPlan(
-                targets, false, true, 2, 5,
+                targets, false, true, 1, 2,
                 net.runelite.client.plugins.recorder.combat.TrainingPlan.DEFAULT_XP_HOVER_MIN_MS,
                 net.runelite.client.plugins.recorder.combat.TrainingPlan.DEFAULT_XP_HOVER_MAX_MS)
             : net.runelite.client.plugins.recorder.combat.TrainingPlan.basic(targets, retOn);
@@ -1707,6 +1716,60 @@ public final class RecorderPanel extends PluginPanel
     {
         Dimension pref = c.getPreferredSize();
         c.setMaximumSize(new Dimension(Integer.MAX_VALUE, pref.height));
+    }
+
+    private JPanel buildCooksQuestTab()
+    {
+        JPanel p = new JPanel();
+        p.setLayout(new BoxLayout(p, BoxLayout.Y_AXIS));
+        p.setBorder(BorderFactory.createTitledBorder("Cook's Assistant Quest"));
+
+        JPanel buttons = new JPanel(new BorderLayout(4, 4));
+        buttons.add(questStartBtn, BorderLayout.CENTER);
+        buttons.add(questStopBtn, BorderLayout.EAST);
+        capHeight(buttons);
+
+        p.add(new JLabel("<html><small>Pre-conditions: pot of flour in inv;<br>"
+            + "bucket of milk OR empty bucket in inv.</small></html>"));
+        p.add(Box.createVerticalStrut(4));
+        p.add(buttons);
+        p.add(questStatusLabel);
+        p.add(Box.createVerticalGlue());
+        return p;
+    }
+
+    public void setCooksAssistantScript(CooksAssistantScript script)
+    {
+        this.cooksAssistantScript = script;
+    }
+
+    private void onQuestStart()
+    {
+        if (cooksAssistantScript == null)
+        {
+            questStatusLabel.setText("Quest: unavailable");
+            return;
+        }
+        cooksAssistantScript.start();
+        questStatusLabel.setText("Quest: starting");
+    }
+
+    private void onQuestStop()
+    {
+        if (cooksAssistantScript == null) return;
+        cooksAssistantScript.stop();
+        questStatusLabel.setText("Quest: stopping");
+    }
+
+    private void refreshCooksQuest()
+    {
+        if (cooksAssistantScript == null)
+        {
+            questStatusLabel.setText("Quest: unavailable");
+            return;
+        }
+        questStatusLabel.setText(cooksAssistantScript.state()
+            + " — " + cooksAssistantScript.status());
     }
 
     /** Wire the cooking script. The plugin constructs the script in
@@ -2254,6 +2317,7 @@ public final class RecorderPanel extends PluginPanel
         refreshMining();
         refreshLumby();
         refreshCooking();
+        refreshCooksQuest();
     }
 
     /** Mirror the bare chicken combat loop's state into the panel labels.

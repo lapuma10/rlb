@@ -42,6 +42,10 @@ public final class TrailWalker
     public static final long INTERACT_THROTTLE_MS = 3_000;
     public static final long STUCK_AFTER_MS = 15_000;
     public static final int TRANSPORT_ADJACENCY = 1;
+    /** Chebyshev distance within which a visible transport object is clicked
+     *  directly (OSRS pathfinds and queues the verb). Beyond this the walker
+     *  walks closer first to ensure the engine can route the player. */
+    public static final int TRANSPORT_DIRECT_CLICK_TILES = 13;
 
     private final Client client;
     private final ClientThread clientThread;
@@ -410,41 +414,19 @@ public final class TrailWalker
         boolean adjacent = pos.getPlane() == t.getPlane()
             && Math.abs(pos.getX() - t.getX()) <= TRANSPORT_ADJACENCY
             && Math.abs(pos.getY() - t.getY()) <= TRANSPORT_ADJACENCY;
-        if (!adjacent)
-        {
-            // Walk toward the transport tile.
-            if (shouldClick(now, t))
-            {
-                log.info("trail-walker: walk-to-transport {} (verb {})", t, leg.verb());
-                ActionRequest req = ActionRequest.builder()
-                    .kind(ActionRequest.Kind.WALK)
-                    .channel(ActionRequest.Channel.MOUSE)
-                    .tile(t)
-                    .build();
-                dispatcher.dispatch(req);
-                lastClickMs = now;
-                lastClickLegIdx = legIdx;
-                lastWalkPick = t;
-            }
-            return Status.IN_PROGRESS;
-        }
-        if (now - lastInteractMs < INTERACT_THROTTLE_MS) return Status.IN_PROGRESS;
-        // Wait until the player's pose is idle before clicking the verb —
-        // mirrors UniversalWalker's "don't open menu mid-walk" rule.
-        Boolean settled = onClient(() -> {
-            Player self = client.getLocalPlayer();
-            return self != null && self.getPoseAnimation() == self.getIdlePoseAnimation();
-        });
-        if (settled == null || !settled) return Status.IN_PROGRESS;
-        // Pre-flight: is the verb actually present on any object at this
-        // tile? When a gate is already open, the recorded "Open" verb
-        // disappears (the impostor advertises "Close" instead). Without
-        // this check the dispatcher's findTransport silently fails and we
-        // burn the 3s INTERACT_THROTTLE_MS retrying forever. If the verb
-        // is missing for several consecutive ticks, treat the transport as
-        // already done and advance — the next leg's WALK will route the
-        // player through the now-open gate.
+
+        // Check verb presence BEFORE deciding whether to walk or click.
+        // When the object is PRESENT in the scene, dispatch CLICK_GAME_OBJECT
+        // directly — OSRS pathfinds the player to it and executes the verb,
+        // exactly like a human clicking stairs from 5 tiles away. The old
+        // "walk adjacent first, then click" path always fell back to minimap
+        // because hovering the transport tile shows the verb (e.g.
+        // "Climb-down"), never "Walk here", causing oscillation near the
+        // object as minimap routing overshot or undershot the 1-tile adjacency
+        // threshold. UNKNOWN (tile not yet in scene) keeps the walk-adjacent
+        // fallback so we don't spin dispatching a verb the resolver can't find.
         TransportVerbState verbState = checkVerbPresence(t, leg.verb());
+
         if (verbState == TransportVerbState.MISSING)
         {
             transportVerbMissingTicks++;
@@ -462,8 +444,48 @@ public final class TrailWalker
             return Status.IN_PROGRESS;
         }
         transportVerbMissingTicks = 0;
-        log.info("trail-walker: CLICK_GAME_OBJECT verb '{}' tile {} id {}",
-            leg.verb(), t, leg.objectId());
+
+        int distToTransport = Math.max(
+            Math.abs(pos.getX() - t.getX()), Math.abs(pos.getY() - t.getY()));
+        boolean withinDirectClickRange = distToTransport <= TRANSPORT_DIRECT_CLICK_TILES;
+
+        if (!adjacent && (verbState == TransportVerbState.UNKNOWN || !withinDirectClickRange))
+        {
+            // Walk closer first: either the object isn't loaded in scene yet,
+            // or we're beyond the direct-click range.
+            if (shouldClick(now, t))
+            {
+                log.info("trail-walker: walk-to-transport {} (verb {}, dist={}, verbState={})",
+                    t, leg.verb(), distToTransport, verbState);
+                ActionRequest req = ActionRequest.builder()
+                    .kind(ActionRequest.Kind.WALK)
+                    .channel(ActionRequest.Channel.MOUSE)
+                    .tile(t)
+                    .build();
+                dispatcher.dispatch(req);
+                lastClickMs = now;
+                lastClickLegIdx = legIdx;
+                lastWalkPick = t;
+            }
+            return Status.IN_PROGRESS;
+        }
+
+        // Object is PRESENT (or UNKNOWN but adjacent) — click it.
+        if (now - lastInteractMs < INTERACT_THROTTLE_MS) return Status.IN_PROGRESS;
+        // When already adjacent, wait for idle pose so we don't interrupt a
+        // walk animation with a second click mid-step. When not adjacent but
+        // PRESENT, skip idle — the game queues the verb and executes it on
+        // arrival, so clicking while walking is correct and expected.
+        if (adjacent)
+        {
+            Boolean settled = onClient(() -> {
+                Player self = client.getLocalPlayer();
+                return self != null && self.getPoseAnimation() == self.getIdlePoseAnimation();
+            });
+            if (settled == null || !settled) return Status.IN_PROGRESS;
+        }
+        log.info("trail-walker: CLICK_GAME_OBJECT verb '{}' tile {} id {} (adjacent={})",
+            leg.verb(), t, leg.objectId(), adjacent);
         ActionRequest req = ActionRequest.builder()
             .kind(ActionRequest.Kind.CLICK_GAME_OBJECT)
             .channel(ActionRequest.Channel.MOUSE)

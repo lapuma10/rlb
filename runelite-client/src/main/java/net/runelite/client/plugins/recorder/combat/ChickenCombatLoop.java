@@ -135,6 +135,11 @@ public final class ChickenCombatLoop
     private final AtomicReference<CombatTarget> target = new AtomicReference<>(null);
     private final AtomicReference<String> latestStatus = new AtomicReference<>("idle");
     private final AtomicBoolean stopRequested = new AtomicBoolean(false);
+    /** Set by {@link #stopAfterCurrentKill()} — prevents the next
+     *  {@link #doSelect()} from starting a new fight. Unlike
+     *  {@link #stopRequested}, this does NOT interrupt the current
+     *  kill or loot; the loop drains naturally. */
+    private final AtomicBoolean stopAfterKill = new AtomicBoolean(false);
     private final AtomicInteger killCount = new AtomicInteger(0);
     /** World tile of the most recent confirmed kill, captured during the
      *  combat tick that flips KILLED. Read by {@link #doKilled} to seed
@@ -205,6 +210,7 @@ public final class ChickenCombatLoop
             return;
         }
         stopRequested.set(false);
+        stopAfterKill.set(false);
         target.set(null);
         killCount.set(0);
         setState(State.SELECTING);
@@ -224,6 +230,15 @@ public final class ChickenCombatLoop
         Thread t = worker;
         if (t != null) t.interrupt();
         setStatus("stopping");
+    }
+
+    /** Finish the current kill + loot, then stop — do not start the next fight.
+     *  Unlike {@link #stop()}, this does not interrupt an in-progress loot
+     *  cycle; the loop drains naturally and transitions to IDLE after the
+     *  current chicken is dead and its drops are collected. */
+    public void stopAfterCurrentKill()
+    {
+        stopAfterKill.set(true);
     }
 
     public State state() { return state.get(); }
@@ -293,6 +308,13 @@ public final class ChickenCombatLoop
     /** Visible for testing: pick a target and transition to ENGAGING. */
     boolean doSelect()
     {
+        // If we were asked to stop after the previous kill, honour that now
+        // by telling the outer loop to exit before picking the next chicken.
+        if (stopAfterKill.get())
+        {
+            stopRequested.set(true);
+            return false;
+        }
         // Locking invariant: don't enter SELECTING while a target is held.
         if (target.get() != null)
         {

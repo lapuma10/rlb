@@ -179,12 +179,16 @@ public final class SceneScanner
         if (matches.isEmpty()) return null;
         if (jitter <= 0 || matches.size() == 1)
         {
-            // Strict-closest behaviour: find the one with bestDist.
+            // Collect all matches at exactly bestDist and pick one randomly
+            // so that ties (multiple spawns equidistant from the player) don't
+            // always resolve to the same scan-order winner.
+            java.util.List<Match> atBest = new java.util.ArrayList<>();
             for (int i = 0; i < matches.size(); i++)
             {
-                if (dists.get(i) == bestDist) return matches.get(i);
+                if (dists.get(i) == bestDist) atBest.add(matches.get(i));
             }
-            return matches.get(0);
+            if (atBest.isEmpty()) return matches.get(0);
+            return atBest.get((int) (Math.random() * atBest.size()));
         }
         // Gather all matches within bestDist + jitter tiles, then pick
         // uniformly. Same closest band → no surprise picks far away.

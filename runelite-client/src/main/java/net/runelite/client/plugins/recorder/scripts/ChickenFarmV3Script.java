@@ -411,9 +411,25 @@ public final class ChickenFarmV3Script
             onClient(() -> { trainingSession.tick(); return null; });
             if (trainingSession.isComplete())
             {
-                status.set("training complete — returning to bank");
-                handoffFromCombatToWalk();
-                setState(State.RETURN);
+                ChickenCombatLoop.State cs = combat.state();
+                boolean midKill = cs == ChickenCombatLoop.State.ENGAGING
+                    || cs == ChickenCombatLoop.State.IN_COMBAT
+                    || cs == ChickenCombatLoop.State.KILLED
+                    || cs == ChickenCombatLoop.State.LOOTING;
+                if (midKill)
+                {
+                    // Let the current kill and loot finish, then the loop
+                    // will idle before picking the next chicken.
+                    combat.stopAfterCurrentKill();
+                    status.set("training done — finishing kill");
+                }
+                else
+                {
+                    // Between kills or never started — go to bank now.
+                    status.set("training complete — returning to bank");
+                    handoffFromCombatToWalk();
+                    setState(State.RETURN);
+                }
                 return;
             }
             status.set("training: " + trainingSession.status());

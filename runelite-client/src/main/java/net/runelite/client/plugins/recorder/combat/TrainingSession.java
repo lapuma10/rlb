@@ -299,7 +299,7 @@ public class TrainingSession
                 else retaliateToggle.ensureOff();
             }
             Skill active = rotation.activeSkill();
-            CombatStyleIndex.forSkill(active).ifPresent(styleSwitcher::ensureStyle);
+            styleSwitcher.ensureStyleForSkill(active);
             return;
         }
 
@@ -319,10 +319,10 @@ public class TrainingSession
         if (styleNeedsCheck && combatTab != null)
         {
             Skill active = rotation.activeSkill();
-            var desired = CombatStyleIndex.forSkill(active);
-            if (desired.isPresent())
+            int desiredSlot = styleSwitcher.resolveSlotForSkill(active);
+            if (desiredSlot >= 0)
             {
-                styleMismatched = combatTab.currentStyleIndex() != desired.get().widgetIndex();
+                styleMismatched = combatTab.currentStyleIndex() != desiredSlot;
             }
             if (!styleMismatched)
             {
@@ -342,7 +342,7 @@ public class TrainingSession
             // change, restore the prior tab now and clear the snapshot.
             if (sidebarTabs != null
                 && tabToRestoreAfter != null
-                && sidebarTabs.currentTab() == SidebarTab.COMBAT)
+                && combatTab.isCombatTabOpen())
             {
                 log.info("training: restoring previous tab {}", tabToRestoreAfter);
                 sidebarTabs.openTab(tabToRestoreAfter);
@@ -359,10 +359,9 @@ public class TrainingSession
         // saturates the dispatcher and the second click gets dropped.
         if (sidebarTabs != null)
         {
-            SidebarTab now = sidebarTabs.currentTab();
-            if (now != SidebarTab.COMBAT)
+            if (!combatTab.isCombatTabOpen())
             {
-                if (tabToRestoreAfter == null) tabToRestoreAfter = now;
+                if (tabToRestoreAfter == null) tabToRestoreAfter = sidebarTabs.currentTab();
                 if (!sidebarTabs.openTab(SidebarTab.COMBAT))
                 {
                     log.debug("training: openTab(COMBAT) couldn't dispatch this tick");
@@ -384,7 +383,7 @@ public class TrainingSession
         if (styleMismatched)
         {
             Skill active = rotation.activeSkill();
-            CombatStyleIndex.forSkill(active).ifPresent(styleSwitcher::ensureStyle);
+            styleSwitcher.ensureStyleForSkill(active);
         }
     }
 
