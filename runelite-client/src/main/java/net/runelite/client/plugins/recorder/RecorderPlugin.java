@@ -124,6 +124,7 @@ public class RecorderPlugin extends Plugin
     private TrailRegistry trailRegistry;
     private AnnotatorHudOverlay hudOverlay;
     private AreaSelector areaSelector;
+    private net.runelite.client.plugins.recorder.inspector.ClickInspector clickInspector;
 
     @Provides
     RecorderConfig provideConfig(ConfigManager cm)
@@ -280,6 +281,12 @@ public class RecorderPlugin extends Plugin
         eventBus.register(grandExchangeScript);
         panel.setGrandExchangeScript(grandExchangeScript, itemManager);
 
+        // Click inspector — toggleable diagnostic. Subscribes itself to the
+        // EventBus only when enabled; safe to leave off by default.
+        clickInspector = new net.runelite.client.plugins.recorder.inspector.ClickInspector(
+            client, eventBus);
+        panel.setClickInspector(clickInspector);
+
         BufferedImage icon = ImageUtil.loadImageResource(getClass(), "/util/reset.png");
         navButton = NavigationButton.builder()
             .tooltip("Recorder")
@@ -362,6 +369,10 @@ public class RecorderPlugin extends Plugin
             grandExchangeScript = null;
         }
         if (eventCapture != null) eventBus.unregister(eventCapture);
+        if (clickInspector != null) {
+            clickInspector.setEnabled(false);
+            clickInspector = null;
+        }
         panel = null; navButton = null; debugOverlay = null; chickenOverlay = null; routeOverlay = null; tileMarker = null;
         hudOverlay = null; areaSelector = null;
         markerListener = null; toggleListener = null;

@@ -213,22 +213,20 @@ public final class GeInteraction implements GeActions {
     private static final long CHATBOX_AWAIT_MS = 15_000L;
     /** Randomized dwell range applied AFTER the prompt is detected and
      *  BEFORE the first keystroke. Models a player reading the prompt and
-     *  reaching for the keyboard. 3–8s is intentionally on the long side —
-     *  instant-typing immediately after the prompt opens is the most
-     *  obvious bot tell on GE search / quantity / price flows. */
-    private static final long CHATBOX_DWELL_MIN_MS = 3_000L;
-    private static final long CHATBOX_DWELL_MAX_MS = 8_000L;
+     *  reaching for the keyboard. Tightened from 3–8s after live testing
+     *  felt "forever" — 800–2200ms is still humanly visible (most players
+     *  don't react in <500ms) without making the bot feel comatose. */
+    private static final long CHATBOX_DWELL_MIN_MS = 800L;
+    private static final long CHATBOX_DWELL_MAX_MS = 2_200L;
 
     @Override
     public boolean selectItem(int itemId, String displayName) {
-        // Step 1 of the two-step item flow: type the search name into the
-        // chatbox prompt WITHOUT submitting Enter. We don't trust the
-        // engine's auto-pick — pickSearchResult is responsible for finding
-        // the row whose icon's getItemId() matches our intent and clicking
-        // exactly that row. If the caller passed a placeholder ("item#NNN")
-        // because the UI received a numeric id, resolve the canonical name
-        // from the item definition first so the search returns sensible
-        // matches.
+        // Dispatches an async TYPE_CHATBOX request. Returns true if the
+        // dispatch was queued; the actual typing runs on the dispatcher's
+        // worker thread (NEVER on the client thread — see SequenceSleep).
+        // The calling step polls snapshot for completion (MESLAYERINPUT
+        // shows the typed text and search results render) instead of
+        // blocking on the typing path.
         String name = displayName;
         if (name == null || name.isEmpty() || name.startsWith("item#")) {
             try {
@@ -250,57 +248,151 @@ public final class GeInteraction implements GeActions {
             log.warn("selectItem: no usable name for item {} (displayName='{}')", itemId, displayName);
             return false;
         }
+        // Lowercase — real players don't shift-type into a search box.
+        String typed = name.toLowerCase(java.util.Locale.ROOT);
+        ActionRequest req = ActionRequest.builder()
+            .kind(ActionRequest.Kind.TYPE_CHATBOX)
+            .channel(ActionRequest.Channel.KEYBOARD)
+            .typeText(typed)
+            .typePressEnter(false)
+            .typeAwaitMs(CHATBOX_AWAIT_MS)
+            .typeDwellMinMs(CHATBOX_DWELL_MIN_MS)
+            .typeDwellMaxMs(CHATBOX_DWELL_MAX_MS)
+            .build();
+        log.info("selectItem: queueing TYPE_CHATBOX itemId={} text=\"{}\"", itemId, typed);
+        dispatcher.dispatch(req);
+        return true;
+    }
+
+    /** Dump the entire chatbox sub-tree (MES_LAYER + MES_LAYER_SCROLLCONTENTS)
+     *  including static, dynamic, and nested children. Called when
+     *  {@code awaitSearchResultsPopulated} times out — tells us where the
+     *  GE search results actually live in the live widget tree. */
+    private void dumpChatboxWidgetTreeForDiagnostic() {
         try {
-            if (!dispatcher.typeChatbox(name, CHATBOX_AWAIT_MS,
-                CHATBOX_DWELL_MIN_MS, CHATBOX_DWELL_MAX_MS)) {
-                log.warn("ge: search chatbox prompt did not appear within {}ms — aborting type for item {}",
-                    CHATBOX_AWAIT_MS, itemId);
-                return false;
-            }
-            // Wait for the result list to render before declaring success —
-            // pickSearchResult needs the dynamic children populated.
-            if (!dispatcher.awaitSearchResultsPopulated(CHATBOX_AWAIT_MS)) {
-                log.warn("ge: search results widget did not populate within {}ms for item {} (\"{}\")",
-                    CHATBOX_AWAIT_MS, itemId, name);
-                return false;
-            }
-            return true;
+            dispatcher.runOnClient(() -> {
+                int[] widgetIds = {
+                    InterfaceID.Chatbox.MES_LAYER,
+                    InterfaceID.Chatbox.MES_LAYER_SCROLLCONTENTS,
+                    InterfaceID.Chatbox.MES_LAYER_SCROLLAREA,
+                    InterfaceID.Chatbox.CHATAREA,
+                };
+                String[] names = {
+                    "MES_LAYER", "MES_LAYER_SCROLLCONTENTS",
+                    "MES_LAYER_SCROLLAREA", "CHATAREA",
+                };
+                for (int i = 0; i < widgetIds.length; i++) {
+                    Widget w = client.getWidget(widgetIds[i]);
+                    if (w == null) {
+                        log.warn("chatbox-diag: {} (0x{}) is null",
+                            names[i], Integer.toHexString(widgetIds[i]));
+                        continue;
+                    }
+                    int staticN = w.getStaticChildren() == null ? 0 : w.getStaticChildren().length;
+                    int dynN    = w.getDynamicChildren() == null ? 0 : w.getDynamicChildren().length;
+                    int nestN   = w.getNestedChildren() == null ? 0 : w.getNestedChildren().length;
+                    log.warn("chatbox-diag: {} (0x{}) hidden={} bounds={} static={} dynamic={} nested={}",
+                        names[i], Integer.toHexString(widgetIds[i]), w.isHidden(),
+                        w.getBounds(), staticN, dynN, nestN);
+                    dumpKids(names[i] + ".dynamic", w.getDynamicChildren());
+                    dumpKids(names[i] + ".static",  w.getStaticChildren());
+                    dumpKids(names[i] + ".nested",  w.getNestedChildren());
+                }
+                int mode = client.getVarcIntValue(
+                    net.runelite.api.gameval.VarClientID.MESLAYERMODE);
+                String typed = client.getVarcStrValue(
+                    net.runelite.api.gameval.VarClientID.MESLAYERINPUT);
+                log.warn("chatbox-diag: MESLAYERMODE={} MESLAYERINPUT=\"{}\"", mode, typed);
+                return null;
+            });
         } catch (InterruptedException ie) {
             Thread.currentThread().interrupt();
-            return false;
+        }
+    }
+
+    private static void dumpKids(String label, Widget[] kids) {
+        if (kids == null || kids.length == 0) return;
+        for (int i = 0; i < Math.min(kids.length, 20); i++) {
+            Widget c = kids[i];
+            if (c == null) continue;
+            String text = c.getText();
+            String textShort = text == null ? "null" :
+                (text.length() > 40 ? text.substring(0, 40) + "…" : text)
+                    .replaceAll("<[^>]+>", "");
+            log.warn("  {}[{}] id=0x{} itemId={} text=\"{}\" hidden={} bounds={}",
+                label, i, Integer.toHexString(c.getId()), c.getItemId(),
+                textShort, c.isHidden(), c.getBounds());
+        }
+        if (kids.length > 20) {
+            log.warn("  {}: ... and {} more", label, kids.length - 20);
         }
     }
 
     @Override
     public boolean pickSearchResult(int itemId) {
-        // Search results live at Chatbox.MES_LAYER_SCROLLCONTENTS as
-        // dynamic children in groups of 3 per row — pattern lifted from
-        // RuneLite's GrandExchangePlugin#highlightSearchMatches. Layout
-        // observed in the wild: index 0 = item icon (carries getItemId),
-        // index 1 = item-name text, index 2 = price text. We match by id
-        // (unique) and click the icon child's bounds — its rectangle is
-        // tight to the row's left edge but the engine accepts a click
-        // anywhere on the row.
+        // Search-result rows live as dynamic children of
+        // Chatbox.MES_LAYER_SCROLLCONTENTS. They share the parent's packed
+        // widget id (so getId() is useless for addressing them) — but each
+        // row carries an action like "Select <col=ff9040>Bread</col>" with
+        // the canonical item name baked in. We resolve the canonical name
+        // from the item id, then poll for a row whose action matches via
+        // VerbMatcher (case-insensitive, color-tag tolerant). Polling
+        // because the row list flickers between "placeholder" and "results"
+        // as the cs2 search runs — a single snapshot misses the window.
+        String wantedName;
         try {
-            ResultRow row = dispatcher.runOnClient(() -> findResultRowFor(itemId));
+            wantedName = dispatcher.runOnClient(() -> {
+                var def = client.getItemDefinition(itemId);
+                return def == null ? null : def.getName();
+            });
+        } catch (InterruptedException ie) {
+            Thread.currentThread().interrupt();
+            return false;
+        } catch (Exception ex) {
+            log.warn("pickSearchResult: failed to resolve name for item {}: {}", itemId, ex.toString());
+            return false;
+        }
+        if (wantedName == null || wantedName.isEmpty() || "null".equals(wantedName)) {
+            log.warn("pickSearchResult: no canonical name for item {}", itemId);
+            return false;
+        }
+        try {
+            // Poll for the matching row up to CHATBOX_AWAIT_MS — same
+            // safety-net cap as the chatbox prompt await. The widget's
+            // stored action is the bare verb "Select"; the item-name
+            // suffix only exists in the rendered menu. So we match on
+            // "Select" and disambiguate by Widget.getName(), which cs2
+            // sets to the item name on each result row.
+            long deadline = System.currentTimeMillis() + CHATBOX_AWAIT_MS;
+            ResultRow row = null;
+            while (System.currentTimeMillis() < deadline) {
+                row = dispatcher.runOnClient(() -> findResultRowFor(wantedName));
+                if (row != null) break;
+                Thread.sleep(120L);
+            }
             if (row == null) {
-                log.warn("pickSearchResult: no row with itemId={} in search results", itemId);
+                dumpResultRowsForDiagnostic(itemId);
+                log.warn("pickSearchResult: no row matching item \"{}\" within {}ms",
+                    wantedName, CHATBOX_AWAIT_MS);
                 return false;
             }
-            log.info("pickSearchResult: itemId={} → bounds={}", itemId, row.bounds);
+            log.info("pickSearchResult: itemId={} matched name=\"{}\" action=\"{}\" bounds={}",
+                itemId, wantedName, row.matchedAction, row.bounds);
+            // Pre-click human dwell — reading the row list takes a beat.
+            long dwell = CHATBOX_DWELL_MIN_MS
+                + java.util.concurrent.ThreadLocalRandom.current()
+                    .nextLong(CHATBOX_DWELL_MAX_MS - CHATBOX_DWELL_MIN_MS + 1);
+            Thread.sleep(dwell);
             ActionRequest req = ActionRequest.builder()
                 .kind(ActionRequest.Kind.CLICK_BOUNDS)
                 .channel(ActionRequest.Channel.MOUSE)
                 .bounds(row.bounds)
+                .verb(row.matchedAction)
                 .build();
-            // Pre-click human dwell to look like the player scanned the
-            // list before clicking — the typing dwell already covered the
-            // post-prompt pause, but reading 5–20 result rows takes its
-            // own visual beat.
-            long dwell = CHATBOX_DWELL_MIN_MS
-                + (long) (Math.random() * (CHATBOX_DWELL_MAX_MS - CHATBOX_DWELL_MIN_MS + 1));
-            Thread.sleep(dwell);
             dispatcher.dispatch(req);
+            // Post-click probe — 1s after dispatch, snapshot live state.
+            Thread.sleep(1000L);
+            logPostClickState(itemId);
             return true;
         } catch (InterruptedException ie) {
             Thread.currentThread().interrupt();
@@ -308,72 +400,254 @@ public final class GeInteraction implements GeActions {
         }
     }
 
-    private record ResultRow(Rectangle bounds) {}
+    private record ResultRow(String matchedAction, Rectangle bounds) {}
 
-    /** Walk dynamic children of {@code MES_LAYER_SCROLLCONTENTS} in groups
-     *  of 3, searching for an icon child whose {@code getItemId()} equals
-     *  {@code itemId}. Returns the union of bounds across the row's three
-     *  children so the click lands somewhere humanly-plausible (icon, name,
-     *  or price text — not a tiny pixel inside one of them). Must run on
-     *  the client thread. */
-    private ResultRow findResultRowFor(int itemId) {
+    /** Walk dynamic children of {@code MES_LAYER_SCROLLCONTENTS} and
+     *  return the row matching {@code wantedName}. Per the click-inspector
+     *  capture (buy-flow-recipe.json step 4), each row stores action
+     *  "Select" — the menu's "Select &lt;name&gt;" string is built at
+     *  render time by appending the row's identifying name to the verb,
+     *  so {@link Widget#getActions()} alone can't disambiguate.
+     *
+     *  <p>Disambiguation tries each of these in order against the
+     *  normalised item name:
+     *  <ol>
+     *    <li>{@link Widget#getName()} — primary signal cs2 sets per row.</li>
+     *    <li>{@link Widget#getText()} — fallback (some revisions populate
+     *        text instead of name).</li>
+     *    <li>Any {@code getActions()} entry that, when stripped of color
+     *        tags, ends with the item name (e.g. "Select Bread").</li>
+     *  </ol>
+     *  Color tags are stripped via {@link VerbMatcher#normalise}.
+     *  Must run on the client thread. */
+    private ResultRow findResultRowFor(String wantedName) {
         Widget container = client.getWidget(InterfaceID.Chatbox.MES_LAYER_SCROLLCONTENTS);
         if (container == null || container.isHidden()) return null;
         Widget[] kids = container.getDynamicChildren();
-        if (kids == null || kids.length < 3) return null;
-        int rowCount = kids.length / 3;
-        for (int i = 0; i < rowCount; i++) {
-            Widget icon = kids[i * 3];
-            if (icon == null) continue;
-            if (icon.getItemId() != itemId) continue;
-            Rectangle merged = null;
-            for (int j = 0; j < 3; j++) {
-                Widget part = kids[i * 3 + j];
-                if (part == null) continue;
-                Rectangle b = part.getBounds();
-                if (b == null || b.isEmpty()) continue;
-                merged = merged == null ? new Rectangle(b) : merged.union(b);
-            }
-            if (merged == null || merged.isEmpty()) continue;
-            return new ResultRow(merged);
+        if (kids == null) return null;
+        String wantedNorm = VerbMatcher.normalise(wantedName);
+        for (Widget k : kids) {
+            if (k == null || k.isHidden()) continue;
+            if (!rowMatches(k, wantedNorm)) continue;
+            Rectangle b = k.getBounds();
+            if (b == null || b.isEmpty()) continue;
+            return new ResultRow("Select", b);
         }
         return null;
     }
 
+    /** Three-way name match for a search result row: getName(), getText(),
+     *  or any action ending with the wanted name (e.g. "Select Bread"). */
+    private static boolean rowMatches(Widget row, String wantedNorm) {
+        String name = row.getName();
+        if (name != null && !name.isEmpty()
+            && VerbMatcher.normalise(name).equals(wantedNorm)) return true;
+        String text = row.getText();
+        if (text != null && !text.isEmpty()
+            && VerbMatcher.normalise(text).equals(wantedNorm)) return true;
+        String[] actions = row.getActions();
+        if (actions != null) {
+            for (String a : actions) {
+                if (a == null || a.isEmpty()) continue;
+                String an = VerbMatcher.normalise(a);
+                if (an.equals(wantedNorm)) return true;
+                if (an.endsWith("-" + wantedNorm)) return true;
+                if (an.endsWith(wantedNorm) && an.length() > wantedNorm.length()) return true;
+            }
+        }
+        return false;
+    }
+
+    /** When findResultRowFor returns null, dump every row's full child
+     *  layout so we can see what the live widget tree actually looks like
+     *  — the failure mode is silent otherwise. Each line: row index, child
+     *  index, packed widget id, getItemId, getText (truncated), getActions
+     *  (first 3), bounds. */
+    private void dumpResultRowsForDiagnostic(int wantedItemId) {
+        try {
+            dispatcher.runOnClient(() -> {
+                Widget container = client.getWidget(
+                    InterfaceID.Chatbox.MES_LAYER_SCROLLCONTENTS);
+                if (container == null) {
+                    log.warn("pickSearchResult diag: MES_LAYER_SCROLLCONTENTS is null");
+                    return null;
+                }
+                if (container.isHidden()) {
+                    log.warn("pickSearchResult diag: MES_LAYER_SCROLLCONTENTS hidden");
+                    return null;
+                }
+                Widget[] kids = container.getDynamicChildren();
+                if (kids == null || kids.length == 0) {
+                    log.warn("pickSearchResult diag: MES_LAYER_SCROLLCONTENTS has 0 dynamic children");
+                    return null;
+                }
+                log.warn("pickSearchResult diag: wantedItemId={}, total dynamic children={}",
+                    wantedItemId, kids.length);
+                int rows = kids.length / 3;
+                int extra = kids.length % 3;
+                log.warn("pickSearchResult diag: rowCount(/3)={} extraChildren={}", rows, extra);
+                for (int i = 0; i < kids.length; i++) {
+                    Widget w = kids[i];
+                    int rowIdx = i / 3;
+                    int childIdx = i % 3;
+                    if (w == null) {
+                        log.warn("  row={} child={} (null)", rowIdx, childIdx);
+                        continue;
+                    }
+                    String text = w.getText();
+                    String textShort = text == null ? "null" :
+                        (text.length() > 40 ? text.substring(0, 40) + "…" : text)
+                            .replaceAll("<[^>]+>", "");
+                    String[] actions = w.getActions();
+                    StringBuilder ab = new StringBuilder();
+                    if (actions != null) {
+                        int shown = 0;
+                        for (String a : actions) {
+                            if (a == null || a.isEmpty()) continue;
+                            if (shown > 0) ab.append('|');
+                            ab.append(a.replaceAll("<[^>]+>", ""));
+                            if (++shown >= 3) break;
+                        }
+                    }
+                    Rectangle b = null;
+                    try { b = w.getBounds(); } catch (Exception ignored) {}
+                    String wname = null;
+                    try { wname = w.getName(); } catch (Exception ignored) {}
+                    log.warn("  row={} child={} id=0x{} itemId={} name=\"{}\" text=\"{}\" actions=[{}] bounds={}",
+                        rowIdx, childIdx, Integer.toHexString(w.getId()),
+                        w.getItemId(),
+                        wname == null ? "" : wname.replaceAll("<[^>]+>", ""),
+                        textShort, ab,
+                        b == null ? "?" : b.x + "," + b.y + " " + b.width + "x" + b.height);
+                }
+                return null;
+            });
+        } catch (InterruptedException ie) {
+            Thread.currentThread().interrupt();
+        }
+    }
+
+    /** Log post-click chatbox / search / offer-setup state so we can tell
+     *  whether the row click triggered the expected transition. Called ~1s
+     *  after dispatch so the engine has had a tick to respond. */
+    private void logPostClickState(int itemId) {
+        try {
+            dispatcher.runOnClient(() -> {
+                int mode = client.getVarcIntValue(
+                    net.runelite.api.gameval.VarClientID.MESLAYERMODE);
+                Widget results = client.getWidget(
+                    InterfaceID.Chatbox.MES_LAYER_SCROLLCONTENTS);
+                int resultRows = 0;
+                boolean resultsHidden = true;
+                if (results != null) {
+                    resultsHidden = results.isHidden();
+                    Widget[] kids = results.getDynamicChildren();
+                    if (kids != null) resultRows = kids.length / 3;
+                }
+                Widget setup = client.getWidget(InterfaceID.GeOffers.SETUP);
+                boolean setupOpen = setup != null && !setup.isHidden();
+                log.info("pickSearchResult post-click(itemId={}): MESLAYERMODE={} resultsHidden={} resultRows={} setupOpen={}",
+                    itemId, mode, resultsHidden, resultRows, setupOpen);
+                return null;
+            });
+        } catch (InterruptedException ie) {
+            Thread.currentThread().interrupt();
+        }
+    }
+
+    /** Child indices on {@code GeOffers.SETUP} captured from the
+     *  click-inspector recipe (buy-flow-recipe.json). The setup widget's
+     *  buttons are dynamic children at fixed offsets — no chatbox prompt
+     *  auto-opens after picking the search result, so the bot must click
+     *  the right button to OPEN the numeric prompt before typing. */
+    private static final int SETUP_CHILD_QTY_PLUS_ONE     = 2;
+    private static final int SETUP_CHILD_QTY_PLUS_TEN     = 4;
+    private static final int SETUP_CHILD_ENTER_QUANTITY   = 7;
+    private static final int SETUP_CHILD_ENTER_PRICE      = 12;
+
     @Override
     public boolean setQuantity(int qty) {
-        // After a successful selectItem (item-name search → Enter), the cs2
-        // script transitions the chatbox directly to the "Set quantity"
-        // numeric prompt — no separate *X click needed. The same conservative
-        // timeout applies because cs2 transitions still cost a tick or two.
+        // Per buy-flow-recipe.json step 8-9: click GeOffers.SETUP[7]
+        // ("Enter quantity"), MESLAYERMODE flips 0->7, type the digits,
+        // press Enter, GE_NEWOFFER_QUANTITY commits to the typed value.
+        // Both clicks are async via the dispatcher worker — never block
+        // the engine/client thread.
         try {
-            if (!dispatcher.typeChatboxAndEnter(Integer.toString(qty), CHATBOX_AWAIT_MS,
-                CHATBOX_DWELL_MIN_MS, CHATBOX_DWELL_MAX_MS)) {
-                log.warn("ge: quantity chatbox prompt did not appear within {}ms — aborting type qty={}",
-                    CHATBOX_AWAIT_MS, qty);
+            if (!clickSetupChild(SETUP_CHILD_ENTER_QUANTITY, "Enter quantity")) {
+                log.warn("ge: SETUP[7] (Enter quantity) not visible — aborting setQuantity({})", qty);
                 return false;
             }
-            return true;
         } catch (InterruptedException ie) {
             Thread.currentThread().interrupt();
             return false;
         }
+        ActionRequest req = ActionRequest.builder()
+            .kind(ActionRequest.Kind.TYPE_CHATBOX)
+            .channel(ActionRequest.Channel.KEYBOARD)
+            .typeText(Integer.toString(qty))
+            .typePressEnter(true)
+            .typeAwaitMs(CHATBOX_AWAIT_MS)
+            .typeDwellMinMs(CHATBOX_DWELL_MIN_MS)
+            .typeDwellMaxMs(CHATBOX_DWELL_MAX_MS)
+            .build();
+        log.info("setQuantity: queueing TYPE_CHATBOX qty={}", qty);
+        dispatcher.dispatch(req);
+        return true;
     }
 
     @Override
     public boolean setPrice(int priceEach) {
+        // Per buy-flow-recipe.json step 5-6: click GeOffers.SETUP[12]
+        // ("Enter price"), then type digits and Enter. Async via worker.
         try {
-            if (!dispatcher.typeChatboxAndEnter(Integer.toString(priceEach), CHATBOX_AWAIT_MS,
-                CHATBOX_DWELL_MIN_MS, CHATBOX_DWELL_MAX_MS)) {
-                log.warn("ge: price chatbox prompt did not appear within {}ms — aborting type price={}",
-                    CHATBOX_AWAIT_MS, priceEach);
+            if (!clickSetupChild(SETUP_CHILD_ENTER_PRICE, "Enter price")) {
+                log.warn("ge: SETUP[12] (Enter price) not visible — aborting setPrice({})", priceEach);
                 return false;
             }
-            return true;
         } catch (InterruptedException ie) {
             Thread.currentThread().interrupt();
             return false;
         }
+        ActionRequest req = ActionRequest.builder()
+            .kind(ActionRequest.Kind.TYPE_CHATBOX)
+            .channel(ActionRequest.Channel.KEYBOARD)
+            .typeText(Integer.toString(priceEach))
+            .typePressEnter(true)
+            .typeAwaitMs(CHATBOX_AWAIT_MS)
+            .typeDwellMinMs(CHATBOX_DWELL_MIN_MS)
+            .typeDwellMaxMs(CHATBOX_DWELL_MAX_MS)
+            .build();
+        log.info("setPrice: queueing TYPE_CHATBOX price={}", priceEach);
+        dispatcher.dispatch(req);
+        return true;
+    }
+
+    /** Click a specific child of {@code GeOffers.SETUP} by index — the
+     *  setup widget's buttons (Enter quantity, Enter price, +1, +10, ...)
+     *  share the SETUP packed widget id but are addressable as dynamic
+     *  children via {@code parent.getChild(idx)}. Same pattern the
+     *  dispatcher uses for inventory slots ({@code invSlotClick}).
+     *  Returns true on a successful dispatch; false if the child isn't
+     *  visible (offer-setup not open, slot-overview showing instead). */
+    private boolean clickSetupChild(int childIndex, String verb) throws InterruptedException {
+        Rectangle bounds = dispatcher.runOnClient(() -> {
+            Widget setup = client.getWidget(InterfaceID.GeOffers.SETUP);
+            if (setup == null || setup.isHidden()) return null;
+            Widget child = setup.getChild(childIndex);
+            if (child == null || child.isSelfHidden()) return null;
+            Rectangle b = child.getBounds();
+            return b == null || b.isEmpty() ? null : b;
+        });
+        if (bounds == null) return false;
+        log.info("clickSetupChild({}, verb=\"{}\"): bounds={}", childIndex, verb, bounds);
+        ActionRequest req = ActionRequest.builder()
+            .kind(ActionRequest.Kind.CLICK_BOUNDS)
+            .channel(ActionRequest.Channel.MOUSE)
+            .bounds(bounds)
+            .verb(verb)
+            .build();
+        dispatcher.dispatch(req);
+        return true;
     }
 
     @Override

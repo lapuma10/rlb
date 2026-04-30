@@ -151,6 +151,9 @@ public final class RecorderPanel extends PluginPanel
     private DebugOverlay debugOverlay;
     private TileMarker tileMarker;
     private RouteOverlay routeOverlay;
+    private net.runelite.client.plugins.recorder.inspector.ClickInspector clickInspector;
+    private final javax.swing.JCheckBox clickInspectorCb =
+        new javax.swing.JCheckBox("Click Inspector");
     private Timer refreshTimer;
     private final JButton chickenStartBtn = new JButton("Start chicken loop");
     private final JButton chickenStopBtn = new JButton("Stop");
@@ -295,7 +298,23 @@ public final class RecorderPanel extends PluginPanel
         p.add(elapsedLabel);
         p.add(totalLabel);
         p.add(breakdownLabel);
+        // Diagnostic toggle: routes every menu click + the varbit/varc
+        // changes it triggers to client.log under the [click-inspector]
+        // tag. Off by default; toggle when cataloguing a new UI flow.
+        p.add(clickInspectorCb);
+        clickInspectorCb.addActionListener(e -> {
+            if (clickInspector != null) {
+                clickInspector.setEnabled(clickInspectorCb.isSelected());
+            }
+        });
         return p;
+    }
+
+    /** Wired by RecorderPlugin at startUp. */
+    public void setClickInspector(
+        net.runelite.client.plugins.recorder.inspector.ClickInspector ci)
+    {
+        this.clickInspector = ci;
     }
 
     // ------------------------------------------------------------------

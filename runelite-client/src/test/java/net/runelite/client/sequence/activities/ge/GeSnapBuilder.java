@@ -35,6 +35,8 @@ public final class GeSnapBuilder {
     private boolean movementAvailable = true;
     private BlockingInterface blocker;
     private boolean geOpen, geSetupOpen, geCollectOpen;
+    private boolean searchResultsPopulated;
+    private int chatboxPromptMode;
     private final GrandExchangeOfferView[] offers = new GrandExchangeOfferView[8];
 
     public GeSnapBuilder() {
@@ -78,6 +80,8 @@ public final class GeSnapBuilder {
     }
 
     public GeSnapBuilder geSetupOpen(boolean v) { this.geSetupOpen = v; return this; }
+    public GeSnapBuilder searchResultsPopulated(boolean v) { this.searchResultsPopulated = v; return this; }
+    public GeSnapBuilder chatboxPromptMode(int v) { this.chatboxPromptMode = v; return this; }
 
     public GeSnapBuilder geCollectOpen(boolean v) { this.geCollectOpen = v; return this; }
 
@@ -97,7 +101,8 @@ public final class GeSnapBuilder {
             mode, worldInteractionAvailable, movementAvailable,
             Optional.ofNullable(blocker));
         GrandExchangeView ge = new BuiltGrandExchangeView(
-            geOpen, geSetupOpen, geCollectOpen, List.of(offers.clone()));
+            geOpen, geSetupOpen, geCollectOpen, searchResultsPopulated,
+            chatboxPromptMode, List.of(offers.clone()));
         PlayerView pv = playerLocation == null ? null : new BuiltPlayerView(playerLocation);
         return new BuiltSnapshot(tick, pv, inv, interaction, ge);
     }
@@ -148,8 +153,10 @@ public final class GeSnapBuilder {
 
     private record BuiltGrandExchangeView(
         boolean open, boolean offerSetupOpen, boolean collectOpen,
+        boolean searchResultsPopulated, int chatboxPromptMode,
         List<GrandExchangeOfferView> offers
     ) implements GrandExchangeView {
+        @Override public boolean chatboxPromptOpen()      { return chatboxPromptMode != 0; }
         @Override public OptionalInt firstEmptySlot() {
             for (GrandExchangeOfferView o : offers) {
                 if (o.isEmpty()) return OptionalInt.of(o.slot());

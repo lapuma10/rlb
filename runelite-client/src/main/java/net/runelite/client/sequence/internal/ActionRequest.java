@@ -32,7 +32,7 @@ import javax.annotation.Nullable;
 @Value
 @lombok.Builder(toBuilder = true)
 public class ActionRequest {
-    public enum Kind { WALK, CLICK_TILE, CLICK_NPC, CLICK_GAME_OBJECT, CLICK_GROUND_ITEM, CLICK_WIDGET, CLICK_INV_ITEM, CLICK_BOUNDS, KEY }
+    public enum Kind { WALK, CLICK_TILE, CLICK_NPC, CLICK_GAME_OBJECT, CLICK_GROUND_ITEM, CLICK_WIDGET, CLICK_INV_ITEM, CLICK_BOUNDS, TYPE_CHATBOX, KEY }
     public enum Channel { CLIENT, MOUSE, KEYBOARD }
 
     Kind kind;
@@ -63,4 +63,21 @@ public class ActionRequest {
      *  click target uniquely — e.g. dynamic children of a parent that all
      *  return the parent's packed id from {@code Widget.getId()}. */
     @Nullable Rectangle bounds;
+    /** Text payload for {@link Kind#TYPE_CHATBOX}. The dispatcher's worker
+     *  thread waits for the chatbox prompt to open, dwells, types char by
+     *  char, then optionally submits with Enter. NEVER call the dispatcher's
+     *  blocking type helpers from the client thread — use this kind so the
+     *  work runs off-thread. */
+    @Nullable String typeText;
+    /** {@code true} = press Enter after typing (numeric prompts: bank
+     *  Withdraw-X, GE Set quantity / Set price). {@code false} = leave the
+     *  search prompt open (GE search: caller follows up by clicking a
+     *  result row). */
+    boolean typePressEnter;
+    /** Safety-net cap on chatbox-prompt detection polling. */
+    long typeAwaitMs;
+    /** Randomized human-dwell range applied AFTER prompt detection and
+     *  BEFORE the first keystroke. */
+    long typeDwellMinMs;
+    long typeDwellMaxMs;
 }

@@ -45,6 +45,19 @@ public final class GrandExchangeObserver {
         boolean setupOpen = offersOpen && isVisible(InterfaceID.GeOffers.SETUP);
         boolean collectOpen = isVisible(InterfaceID.GeCollect.UNIVERSE);
 
+        // Search-result detection: chatbox MES_LAYER_SCROLLCONTENTS carries
+        // the result rows as dynamic children in groups of 3 — at least one
+        // full group means at least one row rendered. (Pattern lifted from
+        // RuneLite's GrandExchangePlugin#highlightSearchMatches.)
+        boolean searchPopulated = false;
+        Widget searchResults = client.getWidget(InterfaceID.Chatbox.MES_LAYER_SCROLLCONTENTS);
+        if (searchResults != null && !searchResults.isHidden()) {
+            Widget[] kids = searchResults.getDynamicChildren();
+            searchPopulated = kids != null && kids.length >= 3;
+        }
+        int promptMode = client.getVarcIntValue(
+            net.runelite.api.gameval.VarClientID.MESLAYERMODE);
+
         // Members detection: cap usable slots to 3 for F2P. Worlds without
         // the MEMBERS flag are F2P; the locked slot widgets aren't clickable
         // there, so picking firstEmptySlot()=3 would silently no-op.
@@ -62,7 +75,7 @@ public final class GrandExchangeObserver {
             }
         }
         return new SnapshotGrandExchangeView(offersOpen, setupOpen, collectOpen,
-            List.copyOf(slots), usableSlots);
+            searchPopulated, promptMode, List.copyOf(slots), usableSlots);
     }
 
     private static GrandExchangeOfferView map(int slot, GrandExchangeOffer o) {
@@ -110,9 +123,13 @@ public final class GrandExchangeObserver {
         boolean open,
         boolean offerSetupOpen,
         boolean collectOpen,
+        boolean searchResultsPopulated,
+        int chatboxPromptMode,
         List<GrandExchangeOfferView> offers,
         int usableSlots
     ) implements GrandExchangeView {
+
+        @Override public boolean chatboxPromptOpen() { return chatboxPromptMode != 0; }
 
         @Override public OptionalInt firstEmptySlot() {
             for (int i = 0; i < usableSlots && i < offers.size(); i++) {

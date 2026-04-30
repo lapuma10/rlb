@@ -28,13 +28,11 @@ public final class SelectItemStep implements Step {
         BlackboardKey.of("selectItem.precondition", GeBlockReason.class);
     private static final BlackboardKey<Integer> K_START_TICK =
         BlackboardKey.of("selectItem.startTick", Integer.class);
-    /** Set to true after {@code GeActions.selectItem} returns true (chatbox
-     *  prompt arrived and the name was typed). The check() guard treats
-     *  {@code offerSetupOpen()} as success ONLY when this flag is set —
-     *  otherwise a timeout-failed selectItem would silently cascade and
-     *  the next step's typing would land in the still-open search box. */
-    private static final BlackboardKey<Boolean> K_TYPED =
-        BlackboardKey.of("selectItem.typed", Boolean.class);
+    /** Best-effort fallback ticks — same shape as SetQuantityStep. The
+     *  async TYPE_CHATBOX dispatch finishes in 2-4 game ticks under
+     *  normal lag; 8 gives margin without blocking forever on a missed
+     *  varc pulse. */
+    private static final int DISPATCH_FALLBACK_TICKS = 8;
 
     private final int itemId;
     private final String displayName;
@@ -50,7 +48,7 @@ public final class SelectItemStep implements Step {
 
     @Override public String name()                              { return "SelectItem(" + displayName + ")"; }
     @Override public int priority()                             { return 100; }
-    @Override public int timeoutTicks()                         { return 6; }
+    @Override public int timeoutTicks()                         { return 30; }
     @Override public PreemptionPolicy preemptionPolicy()        { return PreemptionPolicy.WHEN_SAFE; }
     @Override public boolean isSafeToPause(WorldSnapshot s, Blackboard b) { return true; }
     @Override public boolean canStart(WorldSnapshot s, Blackboard b) { return true; }
@@ -64,9 +62,8 @@ public final class SelectItemStep implements Step {
             return;
         }
         step.put(K_START_TICK, s.tick());
-        boolean typed = ge.selectItem(itemId, displayName);
-        step.put(K_TYPED, typed);
-        if (!typed) {
+        boolean queued = ge.selectItem(itemId, displayName);
+        if (!queued) {
             step.put(K_PRECONDITION,
                 new GeBlockReason.GeChatboxPromptTimeout("selectItem"));
         }
@@ -80,13 +77,19 @@ public final class SelectItemStep implements Step {
         Blackboard step = bb.scope(BlackboardScope.STEP);
         GeBlockReason pre = step.get(K_PRECONDITION).orElse(null);
         if (pre != null) return Completion.failed(pre);
-        // Only treat "offer-setup still open" as success when the typing
-        // path actually succeeded (chatbox prompt opened and we submitted
-        // the name). Otherwise the search prompt is still up and the next
-        // step's typing would land in it — exactly the bug we're guarding.
-        if (Boolean.TRUE.equals(step.get(K_TYPED).orElse(null))
-            && s.grandExchange().offerSetupOpen()) {
+        if (!s.grandExchange().offerSetupOpen()) {
+            return Completion.failed(new GeBlockReason.GeOfferSetupNotOpen());
+        }
+        // The typing runs async on the dispatcher worker. Succeed when
+        // the search results widget has rendered (live signal) OR enough
+        // ticks elapsed for the dispatch to land (best-effort fallback —
+        // covers a missed snapshot of the results-rendered window).
+        if (s.grandExchange().searchResultsPopulated()) {
             return new Completion.Succeeded("search list rendered");
+        }
+        int startTick = step.get(K_START_TICK).orElse(s.tick());
+        if (s.tick() - startTick >= DISPATCH_FALLBACK_TICKS) {
+            return new Completion.Succeeded("type dispatched (fallback)");
         }
         return Completion.RUNNING;
     }

@@ -1,0 +1,416 @@
+{
+  "_comment": [
+    "Ground-truth recipe for the OSRS Grand Exchange buy / sell / collect flow.",
+    "Captured 2026-04-30 from a real human click sequence using the recorder",
+    "click-inspector plugin (toggle via the recorder side panel). Every click,",
+    "varbit transition, and varc transition was logged tick-by-tick to",
+    "~/.runelite/logs/client.log filtered to the [click-inspector] tag.",
+    "",
+    "This is the SOURCE OF TRUTH for what the bot's GE step library must",
+    "dispatch. If a future OSRS update changes any widget id, child index,",
+    "verb string, or varbit signal, re-run the click-inspector capture and",
+    "regenerate this file — do NOT guess.",
+    "",
+    "How to recapture: enable click-inspector in the recorder panel,",
+    "click through the full buy + collect flow once, copy out the click /",
+    "varbit / varcStr / varcInt lines from the log, update the steps array",
+    "below preserving structure."
+  ],
+
+  "captured": {
+    "iso8601": "2026-04-30T15:40:48+02:00",
+    "world_type": "F2P",
+    "client_version": "1.12.25-SNAPSHOT",
+    "item_traded": { "id": 2309, "name": "Bread" },
+    "intent": { "side": "BUY", "quantity": 25, "price_each_gp": 199 },
+    "_recapture_note": "Re-verified 2026-04-30T15:40 with the click-inspector's WidgetInspector-format output (id grp chld idx named). All packed ids, child indices and verbs in the steps[] array were confirmed unchanged. New data added: the History side-flow (NPC_FOURTH_OPTION on the GE Clerk) and the GeHistory close button — see history_side_flow at the end of this file."
+  },
+
+  "constants": {
+    "_comment": "Stable identifiers — these are referenced by step rows below.",
+    "ge_clerk_npc_id": 2464,
+    "ge_clerk_npc_action_exchange": "NPC_THIRD_OPTION",
+    "ge_clerk_npc_action_history": "NPC_FOURTH_OPTION",
+    "coins_item_id": 995,
+    "search_chatbox_mode": 14,
+    "numeric_chatbox_mode": 7,
+    "default_chatbox_mode_closed": 0,
+    "geoffers_group_id": 465,
+    "gehistory_group_id": 383,
+    "chatbox_group_id": 162,
+    "ge_offer_default_price_varbit_seed": "GE_NEWOFFER_PRICE picks up the engine's market price (e.g. 97 for Bread) when a result row is selected; the bot should treat this as advisory only and overwrite via 'Enter price'."
+  },
+
+  "widget_chains": {
+    "_comment": "Captured widget chains as printed by the click-inspector. The leaf is what the engine reports as the actual click target. [N] suffix is the dynamic-child index within the parent.",
+    "buy_slot_button": "Toplevel.UNIVERSE > Toplevel.GAMEFRAME > Toplevel.MAIN > Toplevel.MAINMODAL > GeOffers.UNIVERSE > GeOffers.CONTENTS > GeOffers.INDEX > GeOffers.INDEX_<N> > GeOffers.INDEX_<N>[3]",
+    "sell_slot_button_inferred": "Toplevel.UNIVERSE > ... > GeOffers.INDEX_<N>[?] (inferred sibling of [3]; recapture for SELL flow to confirm)",
+    "search_result_row": "Toplevel.UNIVERSE > Toplevel.GAMEFRAME > Toplevel.CHAT_CONTAINER > Chatbox.UNIVERSE > Chatbox.CHATAREA > Chatbox.MES_LAYER > Chatbox.MES_LAYER_SCROLLAREA > Chatbox.MES_LAYER_SCROLLCONTENTS > Chatbox.MES_LAYER_SCROLLCONTENTS[<row>]",
+    "enter_price_button": "Toplevel.UNIVERSE > ... > GeOffers.SETUP > GeOffers.SETUP[12]",
+    "enter_quantity_button": "Toplevel.UNIVERSE > ... > GeOffers.SETUP > GeOffers.SETUP[7]",
+    "qty_plus_one_button": "Toplevel.UNIVERSE > ... > GeOffers.SETUP > GeOffers.SETUP[2]",
+    "qty_plus_ten_button": "Toplevel.UNIVERSE > ... > GeOffers.SETUP > GeOffers.SETUP[4]",
+    "qty_plus_hundred_button_inferred": "Toplevel.UNIVERSE > ... > GeOffers.SETUP > GeOffers.SETUP[?] (recapture to confirm)",
+    "confirm_button": "Toplevel.UNIVERSE > ... > GeOffers.SETUP > GeOffers.SETUP_CONFIRM",
+    "view_filled_offer": "Toplevel.UNIVERSE > ... > GeOffers.INDEX > GeOffers.INDEX_<N> > GeOffers.INDEX_<N>[2]",
+    "gehistory_close_button": "Toplevel.UNIVERSE > Toplevel.GAMEFRAME > Toplevel.MAIN > Toplevel.MAINMODAL > GeHistory.UNIVERSE > GeHistory.CONTENTS > GeHistory.FRAME > GeHistory.FRAME[11]",
+    "collect_items_button": "Toplevel.UNIVERSE > ... > GeOffers.DETAILS > GeOffers.DETAILS_COLLECT > GeOffers.DETAILS_COLLECT[2]",
+    "collect_coins_button": "Toplevel.UNIVERSE > ... > GeOffers.DETAILS > GeOffers.DETAILS_COLLECT > GeOffers.DETAILS_COLLECT[3]",
+    "close_ge_button": "Toplevel.UNIVERSE > ... > GeOffers.FRAME > GeOffers.FRAME[11]"
+  },
+
+  "_comment_signals": [
+    "Signal vocabulary used in the steps[] array's confirming_signals[]:",
+    "  - varbit:NAME old->new   — Varbits.NAME transitioned",
+    "  - varcInt:NAME old->new  — VarClientID.NAME (int) transitioned",
+    "  - varcStr:NAME old->new  — VarClientID.NAME (str) transitioned",
+    "  - widget:CONDITION       — widget visibility / text predicate",
+    "Initial values shown as '?' mean the inspector couldn't read pre-click",
+    "state because the varbit / varc was newly initialised that tick."
+  ],
+
+  "steps": [
+    {
+      "step": 1,
+      "name": "Open Grand Exchange",
+      "tick_observed": 215,
+      "click": {
+        "kind": "NPC",
+        "verb": "Exchange",
+        "target": "<col=ffff00>Grand Exchange Clerk",
+        "npc_id_constant_ref": "ge_clerk_npc_id",
+        "menu_action": "NPC_THIRD_OPTION"
+      },
+      "confirming_signals": [
+        "widget:GeOffers.UNIVERSE becomes visible (main GE interface)"
+      ],
+      "notes": "GE clerks are id 2464 (others 2461..2464 exist in the API; the captured run hit 2464). Right-click+menu-pick if 'Exchange' is not the hover-default."
+    },
+    {
+      "step": 2,
+      "name": "Click 'Create Buy offer' on first empty slot",
+      "tick_observed": 217,
+      "click": {
+        "kind": "WIDGET",
+        "widget_chain_ref": "buy_slot_button",
+        "leaf_packed_id_for_slot_0": "0x01D1_0007",
+        "leaf_packed_id_format_per_slot": "InterfaceID.GeOffers.INDEX_<N>",
+        "child_index_buy": 3,
+        "bounds_observed": [33, 128, 46, 45],
+        "verb": "Create <col=ff9040>Buy</col> offer",
+        "verb_normalised": "create-buy-offer",
+        "menu_action": "CC_OP",
+        "menu_op_id": 1
+      },
+      "confirming_signals": [
+        "varbit:GE_SELECTEDSLOT ?->1   (slot index + 1; here slot 0 -> 1)",
+        "varcInt:MESLAYERMODE 0->14   (chatbox-search prompt opens)",
+        "varcStr:MESLAYERINPUT ?->''  (input string reset)"
+      ],
+      "notes": "Sell-side button is a sibling within the same INDEX_<N> container (likely child index 4 — recapture a SELL flow to confirm). The search prompt opens automatically on the same tick as the click."
+    },
+    {
+      "step": 3,
+      "name": "Type item name into chatbox search",
+      "tick_observed": 219,
+      "click": {
+        "kind": "KEYBOARD",
+        "input": "bread",
+        "input_lowercase_required": true,
+        "input_normalisation_notes": "OSRS GE search is case-insensitive but real players don't shift-type — lowercase reduces bot fingerprints."
+      },
+      "confirming_signals": [
+        "varcStr:MESLAYERINPUT '' -> 'b' -> 'br' -> 'bre' -> 'brea' -> 'bread'   (one transition per char; intermediate duplicates are normal — engine echoes char twice on some keystrokes)"
+      ],
+      "notes": "Each character produces a varcStr transition AS THE CHAR ARRIVES. Bot can verify keystroke delivery by polling MESLAYERINPUT after each typeChar."
+    },
+    {
+      "step": 4,
+      "name": "Click matching result row in search dropdown",
+      "tick_observed": 223,
+      "click": {
+        "kind": "WIDGET",
+        "widget_chain_ref": "search_result_row",
+        "leaf_packed_id": "0x00A2_0034",
+        "leaf_packed_id_constant": "InterfaceID.Chatbox.MES_LAYER_SCROLLCONTENTS",
+        "child_index_first_row": 0,
+        "child_index_per_row": "[i] for i = 0,1,2,...",
+        "bounds_observed_first_row": [11, 367, 161, 32],
+        "verb": "Select",
+        "target_with_color_tags": "<col=ff9040>Bread</col>",
+        "menu_action": "CC_OP",
+        "menu_op_id": 1
+      },
+      "confirming_signals": [
+        "varcInt:MESLAYERMODE 14->0   (search prompt closes)",
+        "varcStr:MESLAYERINPUT 'bread' -> ''",
+        "varbit:GE_NEWOFFER_PRICE ?->97   (engine seeds with default market price)",
+        "varbit:GE_NEWOFFER_QUANTITY ?->1"
+      ],
+      "notes": "The widget's getActions() returns [\"Select\"] (no item suffix). The 'Select Bread' menu string is built dynamically by the engine appending the row's identifying name. Disambiguate rows by Widget.getName() OR by matching the 'target' text against the canonical item name."
+    },
+    {
+      "step": 5,
+      "name": "Click 'Enter price' (custom price prompt)",
+      "tick_observed": 228,
+      "optional": true,
+      "click": {
+        "kind": "WIDGET",
+        "widget_chain_ref": "enter_price_button",
+        "child_index": 12,
+        "bounds_observed": [369, 195, 35, 35],
+        "verb": "Enter price",
+        "menu_action": "CC_OP",
+        "menu_op_id": 1
+      },
+      "confirming_signals": [
+        "varcInt:MESLAYERMODE 0->7   (numeric input prompt opens)"
+      ],
+      "notes": "Skip if you want the seeded market price. Numeric mode (7) is distinct from search mode (14) — the dispatcher's awaitChatboxInputPrompt must accept BOTH (any non-zero MESLAYERMODE)."
+    },
+    {
+      "step": 6,
+      "name": "Type price",
+      "tick_observed": 231,
+      "optional": true,
+      "click": {
+        "kind": "KEYBOARD",
+        "input": "199",
+        "input_terminator": "Enter (VK_ENTER)"
+      },
+      "confirming_signals": [
+        "varcStr:MESLAYERINPUT '' -> '1' -> '19' -> '199'",
+        "varcInt:MESLAYERMODE 7->0   (Enter dismisses the prompt)",
+        "varcStr:MESLAYERINPUT '199' -> ''",
+        "varbit:GE_NEWOFFER_PRICE 97->199   (engine commits the new value 1-2 ticks after Enter)"
+      ],
+      "notes": "Verify the typing landed by polling GE_NEWOFFER_PRICE — if it doesn't update within ~5 ticks, the keystrokes did not register and the step should fail."
+    },
+    {
+      "step": 7,
+      "name": "Click '+10' quantity preset (alternative to typing custom qty)",
+      "tick_observed": 236,
+      "optional": true,
+      "click": {
+        "kind": "WIDGET",
+        "widget_chain_ref": "qty_plus_ten_button",
+        "child_index": 4,
+        "bounds_observed": [75, 195, 35, 35],
+        "verb": "+10",
+        "menu_action": "CC_OP",
+        "menu_op_id": 1
+      },
+      "confirming_signals": [
+        "varbit:GE_NEWOFFER_QUANTITY 1->10"
+      ],
+      "notes": "Preset buttons (+1, +10, +100, ...) are CC_OP clicks that increment GE_NEWOFFER_QUANTITY without opening a chatbox prompt. Faster + more humanlike than typing for round numbers."
+    },
+    {
+      "step": 8,
+      "name": "Click 'Enter quantity' (custom quantity prompt)",
+      "tick_observed": 238,
+      "click": {
+        "kind": "WIDGET",
+        "widget_chain_ref": "enter_quantity_button",
+        "child_index": 7,
+        "bounds_observed": [198, 195, 35, 35],
+        "verb": "Enter quantity",
+        "menu_action": "CC_OP",
+        "menu_op_id": 1
+      },
+      "confirming_signals": [
+        "varcInt:MESLAYERMODE 0->7"
+      ]
+    },
+    {
+      "step": 9,
+      "name": "Type quantity",
+      "tick_observed": 245,
+      "click": {
+        "kind": "KEYBOARD",
+        "input": "25",
+        "input_terminator": "Enter"
+      },
+      "confirming_signals": [
+        "varcStr:MESLAYERINPUT '' -> '2' -> '25'",
+        "varcInt:MESLAYERMODE 7->0",
+        "varcStr:MESLAYERINPUT '25' -> ''",
+        "varbit:GE_NEWOFFER_QUANTITY 10->25"
+      ]
+    },
+    {
+      "step": 10,
+      "name": "Confirm offer",
+      "tick_observed": 249,
+      "click": {
+        "kind": "WIDGET",
+        "widget_chain_ref": "confirm_button",
+        "leaf_packed_id_constant": "InterfaceID.GeOffers.SETUP_CONFIRM",
+        "bounds_observed": [184, 268, 152, 40],
+        "verb": "Confirm",
+        "menu_action": "CC_OP",
+        "menu_op_id": 1
+      },
+      "confirming_signals": [
+        "varbit:GE_NEWOFFER_PRICE 199->0   (newoffer state cleared on commit)",
+        "varbit:GE_NEWOFFER_QUANTITY 25->0",
+        "varbit:GE_SELECTEDSLOT 1->0   (returns to slot overview)"
+      ]
+    },
+    {
+      "step": 11,
+      "name": "View filled offer",
+      "tick_observed": 253,
+      "click": {
+        "kind": "WIDGET",
+        "widget_chain_ref": "view_filled_offer",
+        "child_index": 2,
+        "bounds_observed": [27, 85, 115, 110],
+        "verb": "View offer",
+        "menu_action": "CC_OP",
+        "menu_op_id": 1
+      },
+      "confirming_signals": [
+        "varbit:GE_SELECTEDSLOT 0->1"
+      ],
+      "notes": "Required prelude to collect — the DETAILS_COLLECT widgets only render after the slot is expanded. Skip if status is already COMPLETE in the slot's offer state and the slot is already selected."
+    },
+    {
+      "step": 12,
+      "name": "Collect items (notes or unnoted depending on op)",
+      "tick_observed": 255,
+      "click": {
+        "kind": "WIDGET",
+        "widget_chain_ref": "collect_items_button",
+        "child_index": 2,
+        "bounds_observed": [396, 271, 36, 32],
+        "verb": "Collect-notes",
+        "verb_alternatives": ["Collect-items / Collect to inventory (op id varies)"],
+        "target_with_color_tags": "<col=ff9040>Bread</col>",
+        "item_id_for_buy": 2309,
+        "menu_action": "CC_OP",
+        "menu_op_id": 1
+      },
+      "confirming_signals": [
+        "inventory:count(<itemId>) increases   (BUY) — primary post-condition",
+        "widget:GeOffers.DETAILS_COLLECT[2] becomes hidden after collect"
+      ]
+    },
+    {
+      "step": 13,
+      "name": "Collect coins (only if SELL completed; for BUY this is the change/refund)",
+      "tick_observed": 258,
+      "optional": true,
+      "click": {
+        "kind": "WIDGET",
+        "widget_chain_ref": "collect_coins_button",
+        "child_index": 3,
+        "bounds_observed": [447, 271, 36, 32],
+        "verb": "Collect",
+        "target_with_color_tags": "<col=ff9040>Coins</col>",
+        "item_id": 995,
+        "menu_action": "CC_OP",
+        "menu_op_id": 2
+      },
+      "confirming_signals": [
+        "inventory:count(995) increases",
+        "varbit:GE_SELECTEDSLOT 1->0   (slot empties, returns to overview)"
+      ]
+    },
+    {
+      "step": 14,
+      "name": "Close GE",
+      "tick_observed": 261,
+      "click": {
+        "kind": "WIDGET",
+        "widget_chain_ref": "close_ge_button",
+        "child_index": 11,
+        "bounds_observed": [473, 25, 26, 23],
+        "verb": "Close",
+        "menu_action": "CC_OP",
+        "menu_op_id": 1
+      },
+      "confirming_signals": [
+        "widget:GeOffers.UNIVERSE becomes hidden"
+      ],
+      "notes": "Equivalent to pressing Escape. Both the X widget and Escape close the modal."
+    }
+  ],
+
+  "key_invariants": [
+    "MESLAYERMODE = 14 → search prompt open. The dispatcher's awaitChatboxInputPrompt must treat any non-zero value as 'open'.",
+    "MESLAYERMODE = 7 → numeric prompt open (Enter price / Enter quantity / bank Withdraw-X all use 7).",
+    "MESLAYERINPUT IS the input buffer for both modes — it transitions char-by-char during typing and is cleared (->'') on submit/cancel.",
+    "GE_NEWOFFER_PRICE and GE_NEWOFFER_QUANTITY are the read-back varbits for verifying that custom typing actually committed.",
+    "GE_SELECTEDSLOT is 0 in the overview, slot+1 (1..8) when viewing a specific slot. The single most reliable progress signal across the whole flow.",
+    "Result-row Widget.getActions() = ['Select']. The full menu string 'Select Bread' is built by appending the row's identifying text to the verb at render time. Match by Widget.getName() or row text, NOT by getActions() containing the full menu string."
+  ],
+
+  "raw_capture_excerpt": [
+    "tick=215 click verb='Exchange' target='<col=ffff00>Grand Exchange Clerk' id=2464 action=NPC_THIRD_OPTION",
+    "tick=217 click verb='Create <col=ff9040>Buy</col> offer' widget=...GeOffers.INDEX_0[3] bounds=[x=33,y=128,w=46,h=45] id=1 action=CC_OP",
+    "tick=217 varbit GE_SELECTEDSLOT ?->1",
+    "tick=217 varcInt MESLAYERMODE 0->14",
+    "tick=219 varcStr MESLAYERINPUT ''->'b' / 'b'->'br' / 'br'->'bre' / 'bre'->'brea' / 'brea'->'bread'",
+    "tick=223 click verb='Select' target='<col=ff9040>Bread</col>' widget=...Chatbox.MES_LAYER_SCROLLCONTENTS[0] bounds=[x=11,y=367,w=161,h=32] id=1 action=CC_OP",
+    "tick=223 varcInt MESLAYERMODE 14->0",
+    "tick=223 varbit GE_NEWOFFER_PRICE ?->97 / GE_NEWOFFER_QUANTITY ?->1",
+    "tick=228 click verb='Enter price' widget=...GeOffers.SETUP[12] bounds=[x=369,y=195,w=35,h=35] id=1 action=CC_OP",
+    "tick=228 varcInt MESLAYERMODE 0->7",
+    "tick=231-233 varcStr MESLAYERINPUT ''->'1'->'19'->'199' / MODE 7->0 / GE_NEWOFFER_PRICE 97->199",
+    "tick=236 click verb='+10' widget=...GeOffers.SETUP[4] bounds=[x=75,y=195,w=35,h=35] id=1 action=CC_OP",
+    "tick=236 varbit GE_NEWOFFER_QUANTITY 1->10",
+    "tick=238 click verb='Enter quantity' widget=...GeOffers.SETUP[7] bounds=[x=198,y=195,w=35,h=35] id=1 action=CC_OP",
+    "tick=239-247 MODE 0->7 / MESLAYERINPUT ''->'2'->'25' / MODE 7->0 / GE_NEWOFFER_QUANTITY 10->25",
+    "tick=249 click verb='Confirm' widget=...GeOffers.SETUP_CONFIRM bounds=[x=184,y=268,w=152,h=40] id=1 action=CC_OP",
+    "tick=249 GE_NEWOFFER_PRICE 199->0 / GE_NEWOFFER_QUANTITY 25->0 / GE_SELECTEDSLOT 1->0",
+    "tick=253 click verb='View offer' widget=...GeOffers.INDEX_0[2] bounds=[x=27,y=85,w=115,h=110] id=1 action=CC_OP",
+    "tick=253 GE_SELECTEDSLOT 0->1",
+    "tick=255 click verb='Collect-notes' target='<col=ff9040>Bread</col>' widget=...GeOffers.DETAILS_COLLECT[2] item=2309 bounds=[x=396,y=271,w=36,h=32] id=1 action=CC_OP",
+    "tick=258 click verb='Collect' target='<col=ff9040>Coins</col>' widget=...GeOffers.DETAILS_COLLECT[3] item=995 bounds=[x=447,y=271,w=36,h=32] id=2 action=CC_OP",
+    "tick=258 GE_SELECTEDSLOT 1->0",
+    "tick=261 click verb='Close' widget=...GeOffers.FRAME[11] bounds=[x=473,y=25,w=26,h=23] id=1 action=CC_OP"
+  ],
+
+  "history_side_flow": {
+    "_comment": "Side-flow captured 2026-04-30T15:40 — viewing previous trade history via the GE Clerk's 'History' menu option. Uses the separate GeHistory interface (group 383), distinct from the buy/sell GeOffers interface (group 465). Useful as a pre-trade reconnaissance step: read prior offer outcomes before re-listing.",
+    "steps": [
+      {
+        "step": "h1",
+        "name": "Right-click GE Clerk → History",
+        "click": {
+          "kind": "NPC",
+          "verb": "History",
+          "target": "<col=ffff00>Grand Exchange Clerk",
+          "npc_id_constant_ref": "ge_clerk_npc_id",
+          "menu_action": "NPC_FOURTH_OPTION",
+          "menu_action_constant_ref": "ge_clerk_npc_action_history"
+        },
+        "confirming_signals": [
+          "widget:GeHistory.UNIVERSE becomes visible (separate from GeOffers.UNIVERSE)"
+        ],
+        "notes": "Right-click required — 'History' is not the hover-default. The Clerk's left-click default is 'Talk-to'; 'Exchange' (NPC_THIRD_OPTION) is what opens the buy/sell interface; 'History' (NPC_FOURTH_OPTION) opens this read-only interface."
+      },
+      {
+        "step": "h2",
+        "name": "Close history",
+        "click": {
+          "kind": "WIDGET",
+          "widget_chain_ref": "gehistory_close_button",
+          "leaf_packed_id": "0x017F_0001",
+          "leaf_grp": 383,
+          "leaf_chld": 1,
+          "leaf_idx": 11,
+          "bounds_observed": [473, 25, 26, 23],
+          "verb": "Close",
+          "menu_action": "CC_OP",
+          "menu_op_id": 1
+        },
+        "confirming_signals": [
+          "widget:GeHistory.UNIVERSE becomes hidden"
+        ],
+        "notes": "GeHistory.FRAME[11] mirrors GeOffers.FRAME[11] — same idx, different parent group. The close-button child index (11) appears stable across modals in the GeOffers / GeHistory family."
+      }
+    ]
+  }
+}

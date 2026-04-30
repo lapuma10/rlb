@@ -346,6 +346,24 @@ treating them as walks because the target widget was hidden).
   If your next action computes a pixel and moves the cursor, fine. If
   it tries to read a hover state, the cursor isn't on canvas anymore.
 
+> **The whole client looks frozen — NPCs aren't moving, cs2 isn't
+> running, my UI prompt isn't opening. Is OSRS lagging?**
+
+- No. **OSRS is never frozen on its own.** When game state stops
+  advancing, the cause is almost always a right-click context menu
+  the bot opened and never dismissed. OSRS blocks every game thread
+  while a menu is up.
+- Where this happens: any `selectMenuVerb(verb)` call that returns
+  `false` (verb not in the menu) leaves the menu open. Five sites
+  in `HumanizedInputDispatcher`: `boundsClick`, `widgetVerbClick`,
+  `npcClick`, `gameObjectClick`, `invSlotClick`. All of them now
+  `tapKey(VK_ESCAPE)` on failure — keep that pattern in any new
+  verb-click helper.
+- Symptom-to-cause: chatbox prompt that "doesn't open until our
+  script gives up" = stuck menu blocking the cs2 that would open
+  it. Once we abort, the menu eventually dismisses and the queued
+  click effect finally renders.
+
 ## 9. Threading
 
 > **Am I reading widget / scene state on the client thread?**

@@ -173,7 +173,7 @@ public class HumanizedInputDispatcher implements InputDispatcher
         if (w < 200 || h < 200) return;   // tiny canvas — skip
         // Brief pause before the drift starts. Real cursor moves don't
         // chain back-to-back at zero delay.
-        Thread.sleep(80 + rng.nextInt(220));
+        SequenceSleep.sleep(client, 80 + rng.nextInt(220));
         int edge = rng.nextInt(4);
         int over = 6 + rng.nextInt(50);   // 6..55 px past the canvas edge
         int targetX, targetY;
@@ -269,7 +269,7 @@ public class HumanizedInputDispatcher implements InputDispatcher
                 onClient(() -> { client.setCameraYawTarget(interim); return null; });
             }
             catch (Throwable ignored) { /* best-effort */ }
-            Thread.sleep(stepMs);
+            SequenceSleep.sleep(client, stepMs);
         }
     }
 
@@ -348,6 +348,12 @@ public class HumanizedInputDispatcher implements InputDispatcher
             }
             case CLICK_INV_ITEM -> invSlotClick(Math.max(0, req.getSlot()), req.getVerb());
             case CLICK_BOUNDS -> boundsClick(req.getBounds(), req.getVerb());
+            case TYPE_CHATBOX -> typeChatboxInternal(
+                req.getTypeText(),
+                req.getTypeAwaitMs(),
+                req.getTypeDwellMinMs(),
+                req.getTypeDwellMaxMs(),
+                req.isTypePressEnter());
             case KEY -> keyTap(req.getKeyCode());
             default -> log.debug("unhandled kind {}", req.getKind());
         }
@@ -389,7 +395,7 @@ public class HumanizedInputDispatcher implements InputDispatcher
         log.info("walk → world {} via screen ({},{})", target, pixel.getX(), pixel.getY());
         moveCursorTo(pixel.getX(), pixel.getY());
         // Give the engine ~2 render frames to compute hover-state menu entries.
-        Thread.sleep(50);
+        SequenceSleep.sleep(client, 50);
 
         // Minimap hover never produces 'Walk here' menu entries — the engine
         // routes minimap left-clicks via widget hit-test on press, not via
@@ -421,7 +427,7 @@ public class HumanizedInputDispatcher implements InputDispatcher
             }
             log.info("minimap fallback → ({},{}) [no menu pre-check]", mm.getX(), mm.getY());
             moveCursorTo(mm.getX(), mm.getY());
-            Thread.sleep(30);
+            SequenceSleep.sleep(client, 30);
             // Don't re-check the menu — minimap clicks never populate it.
         }
         clickPress(MouseEvent.BUTTON1);
@@ -434,7 +440,7 @@ public class HumanizedInputDispatcher implements InputDispatcher
         for (var s : wind.path(startX, startY, x, y))
         {
             input.mouseMove(s.x(), s.y());
-            Thread.sleep(s.dtMs());
+            SequenceSleep.sleep(client, s.dtMs());
         }
     }
 
@@ -448,11 +454,11 @@ public class HumanizedInputDispatcher implements InputDispatcher
         // Settle on target before pressing. Wider pre-click window than
         // post-click — humans aim then commit; the post-click "did I get
         // it?" beat is shorter.
-        Thread.sleep(180 + rng.nextInt(320));   // 180..500ms
+        SequenceSleep.sleep(client, 180 + rng.nextInt(320));   // 180..500ms
         input.mousePress(button);
-        Thread.sleep(40 + rng.nextInt(40));     // 40..80ms button-down
+        SequenceSleep.sleep(client, 40 + rng.nextInt(40));     // 40..80ms button-down
         input.mouseRelease(button);
-        Thread.sleep(100 + rng.nextInt(250));   // 100..350ms post-click hold
+        SequenceSleep.sleep(client, 100 + rng.nextInt(250));   // 100..350ms post-click hold
     }
 
     /** True if the engine's would-be left-click action at the current cursor
@@ -565,7 +571,7 @@ public class HumanizedInputDispatcher implements InputDispatcher
 
         // Phase 4 — pre-click settle (the human "did I get the right one"
         // beat). This is the LAST big delay before the press.
-        Thread.sleep(180 + rng.nextInt(220));   // 180..400ms
+        SequenceSleep.sleep(client, 180 + rng.nextInt(220));   // 180..400ms
 
         // Phase 5 — re-resolve the click pixel using the model convex hull.
         // This is the freshest possible measurement; the press lands within
@@ -589,7 +595,7 @@ public class HumanizedInputDispatcher implements InputDispatcher
         {
             moveCursorTo(clickPixel.getX(), clickPixel.getY());
         }
-        Thread.sleep(40 + rng.nextInt(40));     // 40..80ms final settle
+        SequenceSleep.sleep(client, 40 + rng.nextInt(40));     // 40..80ms final settle
 
         // Phase 7 — verify hover is `verb` on OUR npc, just before press.
         Boolean topMatches = onClient(() -> isTopVerbOnNpc(verb, npcIndex));
@@ -599,9 +605,9 @@ public class HumanizedInputDispatcher implements InputDispatcher
             // "commit" beat; another long pre-click sleep would just give
             // the chicken time to step out from under us.
             input.mousePress(MouseEvent.BUTTON1);
-            Thread.sleep(40 + rng.nextInt(40));
+            SequenceSleep.sleep(client, 40 + rng.nextInt(40));
             input.mouseRelease(MouseEvent.BUTTON1);
-            Thread.sleep(100 + rng.nextInt(250));
+            SequenceSleep.sleep(client, 100 + rng.nextInt(250));
             return;
         }
 
@@ -610,7 +616,7 @@ public class HumanizedInputDispatcher implements InputDispatcher
         // Open the context menu and click the matching entry.
         log.info("npc {} not hover-default for '{}' — right-click flow", npcIndex, verb);
         clickPress(MouseEvent.BUTTON3);
-        Thread.sleep(120);
+        SequenceSleep.sleep(client, 120);
         MenuRow row = onClient(() -> findMenuRow(
             e -> VerbMatcher.matches(verb, e.getOption()) && e.getIdentifier() == npcIndex));
         if (row == null)
@@ -620,11 +626,11 @@ public class HumanizedInputDispatcher implements InputDispatcher
             return;
         }
         moveCursorTo(row.x, row.y);
-        Thread.sleep(40 + rng.nextInt(60));
+        SequenceSleep.sleep(client, 40 + rng.nextInt(60));
         input.mousePress(MouseEvent.BUTTON1);
-        Thread.sleep(40 + rng.nextInt(40));
+        SequenceSleep.sleep(client, 40 + rng.nextInt(40));
         input.mouseRelease(MouseEvent.BUTTON1);
-        Thread.sleep(80 + rng.nextInt(180));
+        SequenceSleep.sleep(client, 80 + rng.nextInt(180));
     }
 
     /** Click target capture for {@link #npcClick}. {@code world} feeds the
@@ -684,7 +690,7 @@ public class HumanizedInputDispatcher implements InputDispatcher
         }
         moveCursorTo(preAim.getX(), preAim.getY());
         // Phase 4 — pre-click settle.
-        Thread.sleep(180 + rng.nextInt(220));   // 180..400ms
+        SequenceSleep.sleep(client, 180 + rng.nextInt(220));   // 180..400ms
         // Phase 5 — verify hover top is "Take" with our item id. Item tiles
         // don't have a separate "model hull" worth re-resolving; the tile
         // is the interactable area, so no Phase-5-style re-aim.
@@ -692,9 +698,9 @@ public class HumanizedInputDispatcher implements InputDispatcher
         if (Boolean.TRUE.equals(topMatches))
         {
             input.mousePress(MouseEvent.BUTTON1);
-            Thread.sleep(40 + rng.nextInt(40));
+            SequenceSleep.sleep(client, 40 + rng.nextInt(40));
             input.mouseRelease(MouseEvent.BUTTON1);
-            Thread.sleep(100 + rng.nextInt(250));
+            SequenceSleep.sleep(client, 100 + rng.nextInt(250));
             return;
         }
         // Phase 6 — top of menu is a different action (Walk here, or
@@ -706,7 +712,7 @@ public class HumanizedInputDispatcher implements InputDispatcher
         // a menu on empty grass.
         log.info("ground item {} not at top of menu at {} — right-click flow", itemId, tile);
         clickPress(MouseEvent.BUTTON3);
-        Thread.sleep(120);
+        SequenceSleep.sleep(client, 120);
         MenuRow row = onClient(() -> findMenuRow(
             e -> VerbMatcher.matches("Take", e.getOption()) && e.getIdentifier() == itemId));
         if (row == null)
@@ -716,11 +722,11 @@ public class HumanizedInputDispatcher implements InputDispatcher
             return;
         }
         moveCursorTo(row.x, row.y);
-        Thread.sleep(40 + rng.nextInt(60));
+        SequenceSleep.sleep(client, 40 + rng.nextInt(60));
         input.mousePress(MouseEvent.BUTTON1);
-        Thread.sleep(40 + rng.nextInt(40));
+        SequenceSleep.sleep(client, 40 + rng.nextInt(40));
         input.mouseRelease(MouseEvent.BUTTON1);
-        Thread.sleep(80 + rng.nextInt(180));
+        SequenceSleep.sleep(client, 80 + rng.nextInt(180));
     }
 
     /** Client-thread check: does {@code tile} have a TileItem with id
@@ -826,7 +832,7 @@ public class HumanizedInputDispatcher implements InputDispatcher
             tile, pixel.getX(), pixel.getY(), verb, match.matchedVerb(), match.matchedObjectId());
         moveCursorTo(pixel.getX(), pixel.getY());
         // Give the engine ~2 render frames to compute hover-state menu entries.
-        Thread.sleep(60);
+        SequenceSleep.sleep(client, 60);
 
         // If the engine's top-of-menu (left-click action) already matches the
         // verb, a single left-click is enough — the same path a real player
@@ -844,12 +850,15 @@ public class HumanizedInputDispatcher implements InputDispatcher
         clickPress(MouseEvent.BUTTON3);
         // Wait one render frame so the engine actually populates / opens the
         // mini-menu. Engine ticks are ~50ms; one or two should be plenty.
-        Thread.sleep(120);
+        SequenceSleep.sleep(client, 120);
         boolean ok = selectMenuVerb(verb);
         if (!ok)
         {
             lastError.set("menu open but verb '" + verb + "' not present");
             log.info("right-click menu did not contain verb '{}'", verb);
+            // Dismiss stuck menu (see boundsClick comment).
+            try { tapKey(java.awt.event.KeyEvent.VK_ESCAPE); }
+            catch (InterruptedException ie) { Thread.currentThread().interrupt(); }
         }
     }
 
@@ -891,11 +900,11 @@ public class HumanizedInputDispatcher implements InputDispatcher
         // here than for a fresh aim — the cursor is already over the menu and
         // the user's eye has already locked onto the option.
         moveCursorTo(row.x, row.y);
-        Thread.sleep(40 + rng.nextInt(60));
+        SequenceSleep.sleep(client, 40 + rng.nextInt(60));
         input.mousePress(MouseEvent.BUTTON1);
-        Thread.sleep(40 + rng.nextInt(40));
+        SequenceSleep.sleep(client, 40 + rng.nextInt(40));
         input.mouseRelease(MouseEvent.BUTTON1);
-        Thread.sleep(80 + rng.nextInt(180));
+        SequenceSleep.sleep(client, 80 + rng.nextInt(180));
         return true;
     }
 
@@ -1018,7 +1027,7 @@ public class HumanizedInputDispatcher implements InputDispatcher
         }
         // Verb-aware: hover, check L-click default, fall back to right-click.
         moveCursorTo(x, y);
-        Thread.sleep(60);
+        SequenceSleep.sleep(client, 60);
         boolean isTop = onClient(() -> isTopMenuVerb(verb));
         if (isTop)
         {
@@ -1026,11 +1035,13 @@ public class HumanizedInputDispatcher implements InputDispatcher
             return;
         }
         clickPress(MouseEvent.BUTTON3);
-        Thread.sleep(120);
+        SequenceSleep.sleep(client, 120);
         boolean ok = selectMenuVerb(verb);
         if (!ok)
         {
             lastError.set("inv slot " + slot + " menu open but verb '" + verb + "' not present");
+            try { tapKey(java.awt.event.KeyEvent.VK_ESCAPE); }
+            catch (InterruptedException ie) { Thread.currentThread().interrupt(); }
         }
     }
 
@@ -1072,19 +1083,30 @@ public class HumanizedInputDispatcher implements InputDispatcher
             clickPress(MouseEvent.BUTTON1);
             return;
         }
-        Thread.sleep(60);
+        SequenceSleep.sleep(client, 60);
         boolean isTop = onClient(() -> isTopMenuVerb(verb));
         if (isTop)
         {
             clickPress(MouseEvent.BUTTON1);
             return;
         }
+        log.info("boundsClick: top-verb mismatch for \"{}\" — opening right-click menu", verb);
         clickPress(MouseEvent.BUTTON3);
-        Thread.sleep(120);
+        SequenceSleep.sleep(client, 120);
         boolean ok = selectMenuVerb(verb);
         if (!ok)
         {
             lastError.set("boundsClick: menu open but verb '" + verb + "' not present");
+            // CRITICAL: a stuck right-click menu blocks ALL OSRS gameplay
+            // (cs2 scripts, NPC movement, the queued click's effects) until
+            // the user dismisses it. We dismiss with Escape so the engine
+            // can continue processing — without this the entire client
+            // appears "throttled" until the dispatcher gives up and stops
+            // querying. Symptomatic failure: chatbox prompt never opens
+            // after a BUY click, then opens after our timeout fires.
+            log.warn("boundsClick: dismissing stuck right-click menu (verb '{}' not in entries)", verb);
+            try { tapKey(java.awt.event.KeyEvent.VK_ESCAPE); }
+            catch (InterruptedException ie) { Thread.currentThread().interrupt(); }
         }
     }
 
@@ -1104,7 +1126,7 @@ public class HumanizedInputDispatcher implements InputDispatcher
         if (pixel == null) { lastError.set("widget " + widgetId + " not found"); return; }
         moveCursorTo(pixel.getX(), pixel.getY());
         // Give the engine ~2 render frames to populate hover-state menu entries.
-        Thread.sleep(60);
+        SequenceSleep.sleep(client, 60);
         boolean isTop = onClient(() -> isTopMenuVerb(verb));
         if (isTop)
         {
@@ -1112,11 +1134,13 @@ public class HumanizedInputDispatcher implements InputDispatcher
             return;
         }
         clickPress(MouseEvent.BUTTON3);
-        Thread.sleep(120);
+        SequenceSleep.sleep(client, 120);
         boolean ok = selectMenuVerb(verb);
         if (!ok)
         {
             lastError.set("widget " + widgetId + " menu open but verb '" + verb + "' not present");
+            try { tapKey(java.awt.event.KeyEvent.VK_ESCAPE); }
+            catch (InterruptedException ie) { Thread.currentThread().interrupt(); }
         }
     }
 
@@ -1188,7 +1212,7 @@ public class HumanizedInputDispatcher implements InputDispatcher
         long dwell = minDwellMs == maxDwellMs
             ? minDwellMs
             : minDwellMs + rng.nextInt((int) Math.min(Integer.MAX_VALUE, maxDwellMs - minDwellMs + 1));
-        Thread.sleep(dwell);
+        SequenceSleep.sleep(client, dwell);
         return true;
     }
 
@@ -1208,12 +1232,12 @@ public class HumanizedInputDispatcher implements InputDispatcher
         if (Math.abs(input.cursorX() - x) > 4 || Math.abs(input.cursorY() - y) > 4)
         {
             moveCursorTo(x, y);
-            Thread.sleep(60 + rng.nextInt(80));
+            SequenceSleep.sleep(client, 60 + rng.nextInt(80));
         }
         for (int i = 0; i < notches; i++)
         {
             input.mouseWheel(x, y, sgn);
-            Thread.sleep(80 + rng.nextInt(140));
+            SequenceSleep.sleep(client, 80 + rng.nextInt(140));
         }
     }
 
@@ -1233,7 +1257,7 @@ public class HumanizedInputDispatcher implements InputDispatcher
             if (Thread.currentThread().isInterrupted())
                 throw new InterruptedException("awaitIdle interrupted");
             if (System.currentTimeMillis() > deadline) return false;
-            Thread.sleep(50);
+            SequenceSleep.sleep(client, 50);
         }
         return true;
     }
@@ -1291,7 +1315,7 @@ public class HumanizedInputDispatcher implements InputDispatcher
             return;
         }
         moveCursorTo(x, y);
-        Thread.sleep(60);
+        SequenceSleep.sleep(client, 60);
         boolean isTop = onClient(() -> isTopMenuVerb(verb));
         if (isTop)
         {
@@ -1299,11 +1323,13 @@ public class HumanizedInputDispatcher implements InputDispatcher
             return;
         }
         clickPress(MouseEvent.BUTTON3);
-        Thread.sleep(120);
+        SequenceSleep.sleep(client, 120);
         boolean ok = selectMenuVerb(verb);
         if (!ok)
         {
             lastError.set("right-click menu did not contain verb '" + verb + "'");
+            try { tapKey(java.awt.event.KeyEvent.VK_ESCAPE); }
+            catch (InterruptedException ie) { Thread.currentThread().interrupt(); }
         }
     }
 
@@ -1322,26 +1348,91 @@ public class HumanizedInputDispatcher implements InputDispatcher
         keyTap(keyCode);
     }
 
-    /** Wait until any chatbox text/numeric input prompt is open
-     *  ({@code VarClientID.MESLAYERMODE != 0}). The OSRS client toggles
-     *  this varc when "Enter amount:" / "Set price:" / item-search /
-     *  any chatbox input dialog opens — we use it instead of walking
-     *  widget {@code isHidden()} up the parent chain because that
-     *  signal is unreliable for these prompts (the layer's hidden
-     *  flag flickers across script-driven sub-states). Returns true
-     *  if a prompt was visible before the deadline; false on timeout. */
+    /** Wait until any chatbox text/numeric input prompt is open. Two
+     *  distinct signals — both required because each on its own misses
+     *  half the prompts:
+     *
+     *  <ol>
+     *    <li>{@code VarClientID.MESLAYERMODE != 0} catches RuneLite-
+     *        injected input modes ({@code SEARCH=11} for bank-search /
+     *        GE-search, {@code PRIVATE_MESSAGE=6} for /tell, plus the
+     *        client's own panels). See {@link net.runelite.api.vars.InputType}
+     *        for the full enumeration — the named constants there are
+     *        every value the OSRS client ever writes to this varc.</li>
+     *
+     *    <li>{@code VarClientID.MESLAYERINPUT} (the typed-text varc-str)
+     *        changing from baseline catches the CS2 numeric prompts
+     *        ("Enter amount:" for bank Withdraw-X, "Set quantity:" /
+     *        "Set price:" for GE offers). Those prompts are NOT in
+     *        {@link net.runelite.api.vars.InputType}, so MESLAYERMODE
+     *        stays 0 even when the dialog is plainly on screen — the
+     *        only authoritative signal is that the OSRS client backs
+     *        the input field with this varc-str (initialised fresh on
+     *        dialog open). We snapshot at entry and watch for any
+     *        transition; null → "" is the typical edge.</li>
+     *  </ol>
+     *
+     *  <p>Walking widget {@code isHidden()} up the parent chain is
+     *  unreliable for these prompts (the layer's hidden flag flickers
+     *  across script-driven sub-states) so we don't use it.
+     *
+     *  <p>Returns true if a prompt was visible before the deadline;
+     *  false on timeout. */
     public boolean awaitChatboxInputPrompt(long timeoutMs) throws InterruptedException
     {
         // Let any in-flight click chain land before we poll, otherwise
         // we race the right-click → menu pick that opened the dialog.
         awaitIdle(Math.min(timeoutMs, 2000L));
+        // Snapshot AFTER awaitIdle so any pending typing has settled.
+        // Subsequent polls compare against this — a transition (incl.
+        // null → "" on fresh dialog open) is the open-signal for the
+        // CS2 numeric prompts.
+        String baseline = onClient(() -> client.getVarcStrValue(
+            net.runelite.api.gameval.VarClientID.MESLAYERINPUT));
         long deadline = System.currentTimeMillis() + timeoutMs;
         while (System.currentTimeMillis() < deadline)
         {
-            Integer mode = onClient(() -> client.getVarcIntValue(
-                net.runelite.api.gameval.VarClientID.MESLAYERMODE));
-            if (mode != null && mode != 0) return true;
-            Thread.sleep(80L);
+            Boolean open = onClient(() -> {
+                // Signal 1: MESLAYERMODE != 0 — fires for InputType modes
+                // SEARCH (GE / bank-search) and PRIVATE_MESSAGE. The GE
+                // search prompt uses this; observed value 14 in live runs.
+                int mode = client.getVarcIntValue(
+                    net.runelite.api.gameval.VarClientID.MESLAYERMODE);
+                if (mode != 0) return true;
+                // Signal 2: MESLAYERINPUT transition from the pre-click
+                // baseline — supposed to flip null → "" when a CS2 numeric
+                // prompt opens. Useful when it works; in practice the
+                // bank "Enter amount:" and GE Set quantity / Set price
+                // prompts often leave it unchanged.
+                String typed = client.getVarcStrValue(
+                    net.runelite.api.gameval.VarClientID.MESLAYERINPUT);
+                if (!java.util.Objects.equals(typed, baseline)) return true;
+                // Signal 3: Chatbox.MES_LAYER renders the prompt title as
+                // a static child whose text starts with "Enter ", "Set ",
+                // or "What " (the OSRS prompt headers). Catches the CS2
+                // numeric prompts that don't move either varc — observed
+                // failure mode in 14:09 bank withdraw-X and 14:25 GE set
+                // quantity. We only count VISIBLE widgets so a hidden
+                // residual title doesn't false-positive.
+                net.runelite.api.widgets.Widget mesLayer = client.getWidget(
+                    net.runelite.api.gameval.InterfaceID.Chatbox.MES_LAYER);
+                if (mesLayer == null || mesLayer.isHidden()) return false;
+                net.runelite.api.widgets.Widget[] kids = mesLayer.getStaticChildren();
+                if (kids != null) {
+                    for (net.runelite.api.widgets.Widget k : kids) {
+                        if (k == null || k.isHidden()) continue;
+                        String t = k.getText();
+                        if (t == null || t.isEmpty()) continue;
+                        String lower = t.toLowerCase();
+                        if (lower.startsWith("enter ")
+                            || lower.startsWith("set ")
+                            || lower.startsWith("what ")) return true;
+                    }
+                }
+                return false;
+            });
+            if (Boolean.TRUE.equals(open)) return true;
+            SequenceSleep.sleep(client, 80L);
         }
         return false;
     }
@@ -1401,20 +1492,90 @@ public class HumanizedInputDispatcher implements InputDispatcher
     {
         if (text == null || text.isEmpty()) return false;
         if (!awaitChatboxInputPrompt(awaitMs)) return false;
+        // Pre-type diagnostic: we need to know if the canvas is the
+        // keyboard-focus owner BEFORE typing. dispatchEvent reaches the
+        // canvas's listeners regardless of focus, but the deob client's
+        // chatbox text router might filter on focus state — observed
+        // failure mode is "title shows the prompt with cursor (*) but
+        // MESLAYERINPUT stays empty after our keystrokes."
+        try {
+            Boolean focused = onClient(() -> {
+                java.awt.Canvas cc = client.getCanvas();
+                return cc != null && cc.isFocusOwner();
+            });
+            log.info("typeChatbox pre-type: canvas.isFocusOwner={}", focused);
+        } catch (Exception ignored) {}
         if (maxDwellMs > 0 && maxDwellMs >= minDwellMs)
         {
             long dwell = minDwellMs
                 + (maxDwellMs > minDwellMs
                     ? rng.nextInt((int) Math.min(Integer.MAX_VALUE, maxDwellMs - minDwellMs + 1))
                     : 0L);
-            Thread.sleep(dwell);
+            SequenceSleep.sleep(client, dwell);
         }
         for (char ch : text.toCharArray())
         {
             typeChar(ch);
-            Thread.sleep(40L + rng.nextInt(60));
+            // Per-key cadence with two regimes:
+            //   - 80% of keys: 180–380ms (~30–50 WPM body text).
+            //   - 20% of keys: an added 350–1100ms "thinking pause".
+            // Tuned after live feedback that 90–220ms felt like a paste —
+            // the engine renders each char instantly so the eye sees no
+            // hesitation. Real typists slow at word boundaries / on the
+            // first char after a UI transition; the long-tail bucket
+            // models that without making every key sluggish.
+            long base = 180L + rng.nextInt(200);
+            long pause = (rng.nextInt(100) < 20) ? (350L + rng.nextInt(750)) : 0L;
+            SequenceSleep.sleep(client, base + pause);
         }
         if (pressEnter) tapKey(java.awt.event.KeyEvent.VK_ENTER);
+        // Post-type diagnostic: log the engine's view of the chatbox after
+        // typing finishes. If MESLAYERINPUT and the search-results widget
+        // text disagree with what we typed, the cs2 input handler ate the
+        // chars somewhere we don't see — turning a silent failure into an
+        // observable one.
+        try {
+            String mli = onClient(() -> client.getVarcStrValue(
+                net.runelite.api.gameval.VarClientID.MESLAYERINPUT));
+            String resultsText = onClient(() -> {
+                net.runelite.api.widgets.Widget w = client.getWidget(
+                    net.runelite.api.gameval.InterfaceID.Chatbox.MES_LAYER_SCROLLCONTENTS);
+                if (w == null) return "(null)";
+                net.runelite.api.widgets.Widget[] kids = w.getDynamicChildren();
+                if (kids == null || kids.length == 0) return "(no kids)";
+                String t = kids[0].getText();
+                return "kids=" + kids.length + " [0].text=\""
+                    + (t == null ? "null" : (t.length() > 80 ? t.substring(0, 80) + "…" : t)
+                        .replaceAll("<[^>]+>", "")) + "\"";
+            });
+            // Also probe MES_LAYER's title text widget — OSRS GE search
+            // renders the typed input AS PART OF the title ("What would
+            // you like to buy? bread*"), not in MESLAYERINPUT. Walk the
+            // static children and dump anything visible whose text starts
+            // with "Enter ", "Set ", or "What " — that's the title.
+            String titleText = onClient(() -> {
+                net.runelite.api.widgets.Widget mes = client.getWidget(
+                    net.runelite.api.gameval.InterfaceID.Chatbox.MES_LAYER);
+                if (mes == null) return "(MES_LAYER null)";
+                net.runelite.api.widgets.Widget[] kids = mes.getStaticChildren();
+                if (kids == null) return "(no static kids)";
+                StringBuilder sb = new StringBuilder();
+                for (net.runelite.api.widgets.Widget k : kids) {
+                    if (k == null || k.isHidden()) continue;
+                    String t = k.getText();
+                    if (t == null || t.isEmpty()) continue;
+                    String stripped = t.replaceAll("<[^>]+>", "").trim();
+                    if (stripped.startsWith("Enter ") || stripped.startsWith("Set ")
+                        || stripped.startsWith("What ")) {
+                        if (sb.length() > 0) sb.append(" | ");
+                        sb.append(stripped);
+                    }
+                }
+                return sb.length() == 0 ? "(no title text)" : sb.toString();
+            });
+            log.info("typeChatbox post-type: typed=\"{}\" enter={} MESLAYERINPUT=\"{}\" title=\"{}\" results={}",
+                text, pressEnter, mli, titleText, resultsText);
+        } catch (Exception ignored) {}
         return true;
     }
 
@@ -1437,7 +1598,7 @@ public class HumanizedInputDispatcher implements InputDispatcher
                 return kids != null && kids.length >= 3;
             });
             if (Boolean.TRUE.equals(ready)) return true;
-            Thread.sleep(80L);
+            SequenceSleep.sleep(client, 80L);
         }
         return false;
     }
@@ -1454,10 +1615,10 @@ public class HumanizedInputDispatcher implements InputDispatcher
         // Press modifier (no release until after the chord).
         c.dispatchEvent(new java.awt.event.KeyEvent(c, java.awt.event.KeyEvent.KEY_PRESSED,
             t, modifierMask, modifierKeyCode, java.awt.event.KeyEvent.CHAR_UNDEFINED));
-        Thread.sleep(20 + rng.nextInt(30));
+        SequenceSleep.sleep(client, 20 + rng.nextInt(30));
         int innerHold = 40 + rng.nextInt(60);
         input.keyTapWithModifier(keyCode, modifierMask, innerHold);
-        Thread.sleep(20 + rng.nextInt(40));
+        SequenceSleep.sleep(client, 20 + rng.nextInt(40));
         c.dispatchEvent(new java.awt.event.KeyEvent(c, java.awt.event.KeyEvent.KEY_RELEASED,
             t, 0, modifierKeyCode, java.awt.event.KeyEvent.CHAR_UNDEFINED));
     }

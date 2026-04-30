@@ -21,8 +21,12 @@ public final class SetPriceStep implements Step {
     private static final BlackboardKey<GeBlockReason> K_PRECONDITION =
         BlackboardKey.of("setPrice.precondition", GeBlockReason.class);
     /** Set to true after {@code GeActions.setPrice} returns true. */
-    private static final BlackboardKey<Boolean> K_TYPED =
-        BlackboardKey.of("setPrice.typed", Boolean.class);
+    private static final BlackboardKey<Boolean> K_PROMPT_SEEN =
+        BlackboardKey.of("setPrice.promptSeen", Boolean.class);
+    private static final BlackboardKey<Integer> K_START_TICK =
+        BlackboardKey.of("setPrice.startTick", Integer.class);
+    /** Same fallback as SetQuantityStep — see comment there. */
+    private static final int DISPATCH_FALLBACK_TICKS = 5;
 
     private final int priceEach;
     private final GeActions ge;
@@ -36,7 +40,7 @@ public final class SetPriceStep implements Step {
 
     @Override public String name()                              { return "SetPrice(" + priceEach + ")"; }
     @Override public int priority()                             { return 100; }
-    @Override public int timeoutTicks()                         { return 6; }
+    @Override public int timeoutTicks()                         { return 30; }
     @Override public PreemptionPolicy preemptionPolicy()        { return PreemptionPolicy.WHEN_SAFE; }
     @Override public boolean isSafeToPause(WorldSnapshot s, Blackboard b) { return true; }
     @Override public boolean canStart(WorldSnapshot s, Blackboard b) { return true; }
@@ -49,9 +53,9 @@ public final class SetPriceStep implements Step {
             step.put(K_PRECONDITION, new GeBlockReason.GeOfferSetupNotOpen());
             return;
         }
-        boolean typed = ge.setPrice(priceEach);
-        step.put(K_TYPED, typed);
-        if (!typed) {
+        step.put(K_START_TICK, s.tick());
+        boolean queued = ge.setPrice(priceEach);
+        if (!queued) {
             step.put(K_PRECONDITION,
                 new GeBlockReason.GeChatboxPromptTimeout("setPrice"));
         }
@@ -65,9 +69,17 @@ public final class SetPriceStep implements Step {
         Blackboard step = bb.scope(BlackboardScope.STEP);
         GeBlockReason pre = step.get(K_PRECONDITION).orElse(null);
         if (pre != null) return Completion.failed(pre);
-        if (Boolean.TRUE.equals(step.get(K_TYPED).orElse(null))
-            && s.grandExchange().offerSetupOpen()) {
-            return new Completion.Succeeded("price set");
+        if (!s.grandExchange().offerSetupOpen()) {
+            return Completion.failed(new GeBlockReason.GeOfferSetupNotOpen());
+        }
+        // Async typing — see SetQuantityStep.check for the same logic.
+        boolean promptOpen = s.grandExchange().chatboxPromptOpen();
+        if (promptOpen) step.put(K_PROMPT_SEEN, true);
+        boolean promptSeen = Boolean.TRUE.equals(step.get(K_PROMPT_SEEN).orElse(null));
+        int startTick = step.get(K_START_TICK).orElse(s.tick());
+        int elapsed = s.tick() - startTick;
+        if (!promptOpen && (promptSeen || elapsed >= DISPATCH_FALLBACK_TICKS)) {
+            return new Completion.Succeeded("price submitted");
         }
         return Completion.RUNNING;
     }

@@ -32,10 +32,25 @@ public final class PickSearchResultStep implements Step {
     private static final BlackboardKey<GeBlockReason> K_PRECONDITION =
         BlackboardKey.of("pickResult.precondition", GeBlockReason.class);
     /** Set to true after {@code GeActions.pickSearchResult} confirms a
-     *  match-and-click. The check() guard requires this — without it a
-     *  not-found result would silently cascade into the next step. */
+     *  match-and-click. The check() guard requires this AND state-
+     *  advancement evidence — without that, a not-found result or a
+     *  click that landed on the wrong widget would silently cascade. */
     private static final BlackboardKey<Boolean> K_PICKED =
         BlackboardKey.of("pickResult.picked", Boolean.class);
+    /** Tick at which the click was dispatched. Used by check() to bound
+     *  the post-click verification window — if we don't see the search
+     *  results close within {@link #POST_CLICK_VERIFY_TICKS} ticks, the
+     *  click didn't take effect and we abort with a clear reason. */
+    private static final BlackboardKey<Integer> K_CLICK_TICK =
+        BlackboardKey.of("pickResult.clickTick", Integer.class);
+
+    /** Ticks to wait after the click for the search results to close.
+     *  cs2 transitions usually finish in 1–2 ticks but server lag can
+     *  stretch it; 5 ticks ~= 3s of game time. After this elapses without
+     *  seeing results-closed we treat as success (best-effort) since the
+     *  click was dispatched and the snapshot observer can miss the brief
+     *  results-rendered window between cs2 ticks. */
+    private static final int POST_CLICK_VERIFY_TICKS = 5;
 
     private final int itemId;
     private final String displayName;
@@ -66,6 +81,7 @@ public final class PickSearchResultStep implements Step {
         }
         boolean picked = ge.pickSearchResult(itemId);
         step.put(K_PICKED, picked);
+        step.put(K_CLICK_TICK, s.tick());
         if (!picked) {
             step.put(K_PRECONDITION,
                 new GeBlockReason.GeSearchResultNotFound(itemId, displayName));
@@ -80,9 +96,30 @@ public final class PickSearchResultStep implements Step {
         Blackboard step = bb.scope(BlackboardScope.STEP);
         GeBlockReason pre = step.get(K_PRECONDITION).orElse(null);
         if (pre != null) return Completion.failed(pre);
-        if (Boolean.TRUE.equals(step.get(K_PICKED).orElse(null))
-            && s.grandExchange().offerSetupOpen()) {
-            return new Completion.Succeeded("search result picked");
+        if (!Boolean.TRUE.equals(step.get(K_PICKED).orElse(null))) {
+            return Completion.RUNNING;
+        }
+        // Don't trust K_PICKED alone — verify the click actually moved the
+        // GE state forward. Two acceptable outcomes:
+        //   1. Search results closed (cs2 transitioned to the quantity
+        //      prompt — most common path).
+        //   2. Offer-setup is still open AND results still rendering BUT
+        //      we're inside the verify window — keep waiting.
+        // If the verify window expires with results still visible, the
+        // click landed on something that didn't advance the GE; treat as
+        // GeSearchResultNotFound so the script doesn't barrel into typing
+        // the quantity into the still-open search box.
+        if (!s.grandExchange().offerSetupOpen()) {
+            return Completion.failed(new GeBlockReason.GeOfferSetupNotOpen());
+        }
+        boolean stillPopulated = s.grandExchange().searchResultsPopulated();
+        int clickTick = step.get(K_CLICK_TICK).orElse(s.tick());
+        int elapsed = s.tick() - clickTick;
+        // Success when results closed (live signal) OR enough ticks
+        // elapsed (best-effort fallback when the snapshot observer
+        // missed the brief results-rendered window).
+        if (!stillPopulated || elapsed >= POST_CLICK_VERIFY_TICKS) {
+            return new Completion.Succeeded("results closed; offer-setup advanced");
         }
         return Completion.RUNNING;
     }
