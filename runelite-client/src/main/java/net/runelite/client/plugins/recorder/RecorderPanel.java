@@ -825,15 +825,24 @@ public final class RecorderPanel extends PluginPanel
         // long list.
         credListPanel.setLayout(new BoxLayout(credListPanel, BoxLayout.Y_AXIS));
 
-        // Bottom: login/stop, status, dump.
-        JPanel buttons = new JPanel(new FlowLayout(FlowLayout.LEFT, 4, 0));
-        buttons.add(loginBtn);
-        buttons.add(stopBtn);
+        // Bottom: V1 login/stop row, V2 login + world row, status.
+        JPanel v1Row = new JPanel(new FlowLayout(FlowLayout.LEFT, 4, 0));
+        v1Row.add(loginBtn);
+        v1Row.add(stopBtn);
+
+        JPanel v2Row = new JPanel(new FlowLayout(FlowLayout.LEFT, 4, 0));
+        v2Row.add(loginV2Btn);
+        v2Row.add(new JLabel("World:"));
+        v2Row.add(worldField);
+
+        JPanel buttons = new JPanel();
+        buttons.setLayout(new BoxLayout(buttons, BoxLayout.Y_AXIS));
+        buttons.add(v1Row);
+        buttons.add(v2Row);
 
         JPanel south = new JPanel(new BorderLayout(4, 4));
         south.add(buttons, BorderLayout.NORTH);
         south.add(loginStatus, BorderLayout.CENTER);
-        south.add(dumpBtn, BorderLayout.SOUTH);
 
         panel.add(header, BorderLayout.NORTH);
         panel.add(credListPanel, BorderLayout.CENTER);
@@ -841,7 +850,7 @@ public final class RecorderPanel extends PluginPanel
 
         loginBtn.addActionListener(e -> onLogin());
         stopBtn.addActionListener(e -> onStopLogin());
-        dumpBtn.addActionListener(e -> onDumpWidgets());
+        loginV2Btn.addActionListener(e -> onLoginV2());
 
         updateButtons();
         return panel;
@@ -1016,6 +1025,17 @@ public final class RecorderPanel extends PluginPanel
         persistLastSelected(username);
         rebuildCredRows();
         updateButtons();
+        populateWorldField(username);
+    }
+
+    /** Fill the V2 world text field with the per-account last-used world,
+     *  or leave it empty if no preference exists. EDT only. */
+    private void populateWorldField(String username)
+    {
+        if (accountPrefs == null) return;
+        if (username == null || username.isBlank()) { worldField.setText(""); return; }
+        Integer w = accountPrefs.lastWorld(username);
+        worldField.setText(w == null ? "" : w.toString());
     }
 
     /** Wire the debug overlay so the panel can clear/set its marked tile.
@@ -1047,6 +1067,21 @@ public final class RecorderPanel extends PluginPanel
      *  go. The plugin owns lifetime and constructs the assistant only when
      *  injection has succeeded. */
     public void setLoginAssistant(LoginAssistant la) { this.loginAssistant = la; }
+
+    /** Wire the V2 login assistant. Independent from V1; both can be set. */
+    public void setLoginAssistantV2(net.runelite.client.sequence.login.LoginAssistantV2 la)
+    {
+        this.loginAssistantV2 = la;
+        SwingUtilities.invokeLater(this::updateButtons);
+    }
+
+    /** Wire the per-account preferences store (last-used world). */
+    public void setAccountPrefs(net.runelite.client.sequence.login.AccountPrefs prefs)
+    {
+        this.accountPrefs = prefs;
+        // Populate the world field if we already know who's selected.
+        SwingUtilities.invokeLater(() -> populateWorldField(selectedUsername));
+    }
 
     /** Wire the credential store used by the credential management buttons. */
     public void setCredentialStore(CredentialStore store)
@@ -1736,6 +1771,7 @@ public final class RecorderPanel extends PluginPanel
         boolean hasSel = selectedUsername != null;
         boolean inFlight = loginInFlight.get();
         loginBtn.setEnabled(hasSel && !inFlight);
+        loginV2Btn.setEnabled(hasSel && !inFlight && loginAssistantV2 != null);
         addCornerBtn.setEnabled(!inFlight);
         stopBtn.setEnabled(inFlight);
     }
@@ -1795,6 +1831,57 @@ public final class RecorderPanel extends PluginPanel
                 SwingUtilities.invokeLater(this::updateButtons);
             }
         }, "login-assistant");
+        t.setDaemon(true);
+        loginThread = t;
+        t.start();
+    }
+
+    private void onLoginV2()
+    {
+        if (loginAssistantV2 == null) { setStatus("login v2 unavailable"); return; }
+        String user = selectedUsername;
+        if (user == null) { setStatus("no character selected"); return; }
+        if (!loginInFlight.compareAndSet(false, true)) return;
+        updateButtons();
+        persistLastSelected(user);
+
+        // Capture world field on EDT before spawning the worker.
+        String worldText = worldField.getText() == null ? "" : worldField.getText().trim();
+        Integer targetWorld;
+        if (worldText.isEmpty())
+        {
+            targetWorld = null;
+        }
+        else
+        {
+            try { targetWorld = Integer.parseInt(worldText); }
+            catch (NumberFormatException nfe)
+            {
+                loginInFlight.set(false);
+                updateButtons();
+                setStatus("world must be a number");
+                return;
+            }
+        }
+
+        LoginCredentials creds = new LoginCredentials(user, credentialStore);
+        final Integer fTargetWorld = targetWorld;
+        Thread t = new Thread(() -> {
+            try
+            {
+                boolean ok = loginAssistantV2.login(creds, fTargetWorld, this::setStatus);
+                if (ok && fTargetWorld != null && accountPrefs != null)
+                {
+                    accountPrefs.setLastWorld(user, fTargetWorld);
+                }
+            }
+            finally
+            {
+                loginInFlight.set(false);
+                loginThread = null;
+                SwingUtilities.invokeLater(this::updateButtons);
+            }
+        }, "login-v2");
         t.setDaemon(true);
         loginThread = t;
         t.start();
@@ -1995,28 +2082,6 @@ public final class RecorderPanel extends PluginPanel
                 java.util.Arrays.fill(pw, '\0');
             }
         }, "creds-edit");
-        t.setDaemon(true);
-        t.start();
-    }
-
-    private void onDumpWidgets()
-    {
-        if (dispatcher == null || client == null) { setStatus("dispatcher unavailable"); return; }
-        Thread t = new Thread(() -> {
-            try
-            {
-                java.nio.file.Path out = dispatcher.runOnClient(() -> {
-                    try { return net.runelite.client.plugins.recorder.debug.WidgetDumper.dump(client); }
-                    catch (java.io.IOException ioe) { throw new RuntimeException(ioe); }
-                });
-                setStatus("widget dump written to " + out);
-            }
-            catch (Exception e)
-            {
-                log.warn("widget dump failed", e);
-                setStatus("dump failed: " + e.getMessage());
-            }
-        }, "widget-dump");
         t.setDaemon(true);
         t.start();
     }

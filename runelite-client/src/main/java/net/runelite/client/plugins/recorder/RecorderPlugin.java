@@ -100,6 +100,7 @@ public class RecorderPlugin extends Plugin
     @Inject private ClientToolbar clientToolbar;
     @Inject private ItemManager itemManager;
     @Inject private OverlayManager overlayManager;
+    @Inject private ConfigManager configManager;
 
     private RecorderManager manager;
     private RecorderPanel panel;
@@ -195,6 +196,17 @@ public class RecorderPlugin extends Plugin
                 });
         panel.setLoginAssistant(loginAssistant);
         panel.setCredentialStore(credentialStore);
+
+        // Login V2 — parallel path; new sprite-frame click coords + per-account
+        // last-world preference. Uses an independent dispatcher so V1/V2 can't
+        // collide on the dispatcher's busy flag.
+        HumanizedInputDispatcher loginV2Dispatcher = new HumanizedInputDispatcher(client, clientThread);
+        net.runelite.client.sequence.login.LoginAssistantV2 loginAssistantV2 =
+            new net.runelite.client.sequence.login.LoginAssistantV2(loginV2Dispatcher, client, clientThread);
+        net.runelite.client.sequence.login.AccountPrefs accountPrefs =
+            new net.runelite.client.sequence.login.AccountPrefs(configManager);
+        panel.setLoginAssistantV2(loginAssistantV2);
+        panel.setAccountPrefs(accountPrefs);
 
         // Chicken combat loop: uses a fresh dispatcher (independent busy flag
         // from the panel's walk-test dispatcher and the login dispatcher).
