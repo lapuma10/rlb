@@ -886,9 +886,32 @@ public final class BankInteraction implements BankActions
     /** Run a Supplier on the client thread and wait for the result. Used
      *  by {@link #clickBankBoothRandom} which needs to read NPC + Scene
      *  state. Bounded at 2s so a wedged client thread doesn't hang the
-     *  caller. */
+     *  caller.
+     *
+     *  <p><b>Threading:</b> short-circuits when the caller is already on
+     *  the client thread — running the supplier inline. Otherwise marshals
+     *  via {@link ClientThread#invoke(Runnable)} which queues for the
+     *  client thread and signals the latch on completion. The short-
+     *  circuit prevents a deadlock when banking steps are dispatched
+     *  inside a sequence-engine tick that already runs on the client
+     *  thread (e.g. {@code GrandExchangeScript} bank-prep variants drive
+     *  {@code engine.advanceTick()} via {@code clientThread.invokeLater},
+     *  putting {@code OpenBankStep.onStart} on the client thread). Without
+     *  the short-circuit, the queued lambda would never run because the
+     *  client thread is blocked on the latch. */
     private <T> T onClient(java.util.function.Supplier<T> s) throws InterruptedException
     {
+        // Short-circuit: already on the client thread → run inline. This
+        // mirrors {@link HumanizedInputDispatcher#onClient} and
+        // {@link net.runelite.client.sequence.internal.ClientObserver#onClient}
+        // and is required for callers that drive the engine on the client
+        // thread (Phase B GE bank-prep). Test environments without a
+        // real client are covered by the null check above the call site.
+        if (client != null && client.isClientThread())
+        {
+            try { return s.get(); }
+            catch (Throwable th) { log.warn("bank: onClient threw inline", th); return null; }
+        }
         java.util.concurrent.atomic.AtomicReference<T> ref = new java.util.concurrent.atomic.AtomicReference<>();
         java.util.concurrent.CountDownLatch latch = new java.util.concurrent.CountDownLatch(1);
         clientThread.invokeLater(() -> {
