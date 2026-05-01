@@ -42,6 +42,7 @@ import net.runelite.client.plugins.recorder.scripts.ChickenFarmV2Script;
 import net.runelite.client.plugins.recorder.scripts.CooksAssistantScript;
 import net.runelite.client.plugins.recorder.scripts.CookingScript;
 import net.runelite.client.plugins.recorder.scripts.GrandExchangeScript;
+import net.runelite.client.plugins.recorder.scripts.PieDishScript;
 import net.runelite.client.sequence.dispatch.InputOwnership;
 import net.runelite.api.coords.WorldArea;
 import net.runelite.client.plugins.recorder.scripts.LumbridgeBankPenScript;
@@ -126,6 +127,7 @@ public class RecorderPlugin extends Plugin
     private TrailRegistry trailRegistry;
     private AnnotatorHudOverlay hudOverlay;
     private CooksAssistantScript cooksAssistantScript;
+    private PieDishScript pieDishScript;
     private AreaSelector areaSelector;
     private net.runelite.client.plugins.recorder.inspector.ClickInspector clickInspector;
 
@@ -303,6 +305,14 @@ public class RecorderPlugin extends Plugin
             client, clientThread, questDispatcher, questResolver, trailRegistry, grandExchangeScript);
         panel.setCooksAssistantScript(cooksAssistantScript);
 
+        // Pie dish script — buy pie dishes + flour + water, craft pastry dough
+        // then pie shells at GE, and sell shells. Uses the same grandExchangeScript
+        // for GE buy/sell. Independent dispatcher so it never collides with
+        // Cook's Assistant on the dispatcher busy flag.
+        HumanizedInputDispatcher pieDispatcher = new HumanizedInputDispatcher(client, clientThread);
+        pieDishScript = new PieDishScript(client, clientThread, pieDispatcher, grandExchangeScript);
+        panel.setPieDishScript(pieDishScript);
+
         // Click inspector — toggleable diagnostic. Subscribes itself to the
         // EventBus only when enabled; safe to leave off by default.
         clickInspector = new net.runelite.client.plugins.recorder.inspector.ClickInspector(
@@ -365,6 +375,7 @@ public class RecorderPlugin extends Plugin
         if (chickenLoop != null) chickenLoop.stop();
         if (miningLoop != null) miningLoop.stop();
         if (cooksAssistantScript != null) { cooksAssistantScript.stop(); cooksAssistantScript = null; }
+        if (pieDishScript != null) { pieDishScript.stop(); pieDishScript = null; }
         if (hudOverlay != null) overlayManager.remove(hudOverlay);
         if (areaSelector != null && areaSelector.isActive()) areaSelector.cancel();
         if (debugOverlay != null) overlayManager.remove(debugOverlay);

@@ -121,8 +121,7 @@ public final class GrandExchangeSequenceFactory {
 
         Step createOffer = new LinearSequence("CreateSellOffer")
             .then(new StartOfferStep(OfferSide.SELL, ge))
-            .then(new SelectItemStep(intent.itemId(), intent.displayName(), ge))
-            .then(new PickSearchResultStep(intent.itemId(), intent.displayName(), ge))
+            .then(new SelectSellItemStep(intent.itemId(), ge))
             .then(new SetQuantityStep(intent.quantity(), ge))
             .then(new SetPriceStep(priceEach, ge))
             .then(new ConfirmOfferStep(intent.itemId(), OfferSide.SELL, intent.quantity(), priceEach, ge));
@@ -265,8 +264,7 @@ public final class GrandExchangeSequenceFactory {
 
         Step createOffer = new LinearSequence("CreateSellOffer")
             .then(new StartOfferStep(OfferSide.SELL, ge))
-            .then(new SelectItemStep(intent.itemId(), intent.displayName(), ge))
-            .then(new PickSearchResultStep(intent.itemId(), intent.displayName(), ge))
+            .then(new SelectSellItemStep(intent.itemId(), ge))
             .then(new SetQuantityStep(intent.quantity(), ge))
             .then(new SetPriceStep(priceEach, ge))
             .then(new ConfirmOfferStep(intent.itemId(), OfferSide.SELL, intent.quantity(), priceEach, ge));

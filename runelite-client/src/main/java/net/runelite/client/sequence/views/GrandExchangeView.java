@@ -49,6 +49,31 @@ public interface GrandExchangeView {
      *  no prompt is open. */
     int chatboxPromptMode();
 
+    /** Raw {@code VarbitID.GE_NEWOFFER_TYPE} value — the engine's signal
+     *  for which side of offer-setup is currently active.
+     *  <ul>
+     *    <li>{@code 0} — no offer-setup active.</li>
+     *    <li>{@code 1} — SELL setup active (verified via click-inspector
+     *        2026-05-01: clicking "Create Sell offer" flipped the varbit
+     *        from 0 → 1 in the same tick).</li>
+     *    <li>{@code 2} — BUY setup active.</li>
+     *  </ul>
+     *  Use this instead of tick-counting after {@code clickOfferSlotButton}
+     *  to know when the setup is truly ready to accept item input — the
+     *  inventory action map (Use/Drop/Examine → Offer-1/.../Offer-All)
+     *  has finished swapping by the time this varbit reads non-zero. */
+    int newOfferType();
+
+    /** Raw {@code VarbitID.GE_NEWOFFER_QUANTITY} value — non-zero iff the
+     *  engine has attached an item to the active sell/buy setup and
+     *  populated a default quantity. Use this to verify a
+     *  select-sell-item click actually landed (don't just trust the
+     *  dispatch — the Inventory.ITEMS widget is hidden when GE setup is
+     *  open, and a CLICK_INV_ITEM that resolves against it silently
+     *  misses). Reading 0 after a click + a few ticks means the click
+     *  didn't reach the right widget. */
+    int newOfferQuantity();
+
     /** True when the OSRS "Your offer is much higher / lower than the guide
      *  price. Are you sure you wish to place this offer?" warning popup is
      *  on screen. Detected via {@code Popupoverlay.UNIVERSE} visibility +
@@ -90,6 +115,8 @@ public interface GrandExchangeView {
         public boolean searchResultsPopulated() { return false; }
         public boolean chatboxPromptOpen()    { return false; }
         public int chatboxPromptMode()        { return 0; }
+        public int newOfferType()             { return 0; }
+        public int newOfferQuantity()         { return 0; }
         public boolean priceWarningOpen()     { return false; }
         public List<GrandExchangeOfferView> offers()              { return emptyOffers; }
         public OptionalInt firstEmptySlot()                       { return OptionalInt.of(0); }

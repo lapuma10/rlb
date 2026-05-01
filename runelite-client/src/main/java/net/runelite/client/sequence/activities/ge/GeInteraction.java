@@ -5,6 +5,7 @@ import java.awt.event.KeyEvent;
 import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.Deque;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Set;
 import java.util.concurrent.ThreadLocalRandom;
@@ -197,16 +198,17 @@ public final class GeInteraction implements GeActions {
 
     @Override
     public void openOfferDetail(int slot) {
-        // Click the slot CONTAINER widget directly (no verb match). Slots with
-        // an existing offer don't carry "Create Buy/Sell offer" buttons —
-        // their default click handler opens the offer-detail / collect view,
-        // which is what we need to expose COLLECT_INV.
+        // Click the slot container with verb "View offer" — the explicit verb
+        // match ensures we trigger the right action (left-click default for
+        // a completed slot) and fall back to right-click + menu select if
+        // needed. Captured from click-inspector 2026-05-01:
+        //   INDEX_2 actions=['View offer'], entryId=1 → left-click default.
         int containerId = slotIndexWidget(slot);
         if (containerId == 0) {
             log.warn("openOfferDetail: slot {} out of range 0..7", slot);
             return;
         }
-        clickWidget(containerId, "openOfferDetail(" + slot + ")");
+        clickWidgetVerb(containerId, "View offer", "openOfferDetail(" + slot + ")");
     }
 
     private static int slotIndexWidget(int slot) {
@@ -236,6 +238,18 @@ public final class GeInteraction implements GeActions {
      *  don't react in <500ms) without making the bot feel comatose. */
     private static final long CHATBOX_DWELL_MIN_MS = 800L;
     private static final long CHATBOX_DWELL_MAX_MS = 2_200L;
+
+    @Override
+    public void selectSellItemFromInventory(int invSlot, int itemId) {
+        ActionRequest req = ActionRequest.builder()
+            .kind(ActionRequest.Kind.CLICK_INV_ITEM)
+            .channel(ActionRequest.Channel.MOUSE)
+            .slot(invSlot)
+            .itemId(itemId)
+            .build();
+        log.info("selectSellItemFromInventory: clicking inv slot={} itemId={}", invSlot, itemId);
+        dispatcher.dispatch(req);
+    }
 
     @Override
     public boolean selectItem(int itemId, String displayName) {
@@ -718,42 +732,151 @@ public final class GeInteraction implements GeActions {
         dispatcher.dispatch(req);
     }
 
+    /** Max times we reopen the slot detail view inside a single collect run.
+     *  One reopen covers the normal case (item collected, detail view closed,
+     *  coins remain); two is a safety net for an additional GE CS2 refresh. */
+    private static final int MAX_DETAIL_REOPENS = 2;
+
     /** Worker-thread implementation of the per-slot collect dance.
      *  Resolves the DETAILS_COLLECT children on the client thread, then
      *  clicks each by bounds+verb on the worker — no re-entry into the
      *  dispatcher's single-flight gate.
      *
+     *  <p>After clicking the item box the GE CS2 sometimes closes the detail
+     *  view before rendering the coins-refund child.  This method reopens the
+     *  slot and collects whatever remains (up to {@link #MAX_DETAIL_REOPENS}
+     *  times) so coins are never left behind.
+     *
      *  <p>Public so the dispatcher can call back via the {@code RUN_TASK}
      *  payload; not meant for step code to invoke directly. */
     public void runCollectFromDetail(int slot) throws InterruptedException {
-        List<CollectButton> hits = dispatcher.runOnClient(this::findCollectButtons);
-        if (hits == null || hits.isEmpty()) {
-            log.warn("collect({}): no DETAILS_COLLECT children visible — detail view not open?", slot);
-            return;
+        List<CollectButton> firstPass = dispatcher.runOnClient(this::findCollectButtons);
+        if (firstPass == null || firstPass.isEmpty()) {
+            // Detail view not open yet — try to open it before giving up.
+            if (!reopenDetailView(slot)) {
+                log.warn("collect({}): no DETAILS_COLLECT children visible — detail view not open?", slot);
+                return;
+            }
+            firstPass = dispatcher.runOnClient(this::findCollectButtons);
+            if (firstPass == null || firstPass.isEmpty()) {
+                log.warn("collect({}): DETAILS_COLLECT still empty after reopening", slot);
+                return;
+            }
         }
-        for (CollectButton b : hits) {
-            log.info("collect({}): click '{}' at {} (item={})",
-                slot, b.verb, b.bounds, b.itemId);
+
+        for (CollectButton b : firstPass) {
+            log.info("ge collect: slot={} itemId={}", slot, b.itemId);
+            log.info("collect({}): click '{}' at {} (item={})", slot, b.verb, b.bounds, b.itemId);
             dispatcher.boundsClickOnWorker(b.bounds, b.verb);
-            // Brief humanizing gap between the two clicks. Real players
-            // never machine-gun item-then-coins in adjacent ticks.
-            SequenceSleep.sleep(client,
-                180L + ThreadLocalRandom.current().nextInt(380));
+            SequenceSleep.sleep(client, 180L + ThreadLocalRandom.current().nextInt(380));
         }
-        // The GE CS2 can render the item child before the coins child on the
-        // same tick. Re-scan once after the first pass so a coins button that
-        // was hidden during the initial findCollectButtons() call isn't left
-        // behind. Skip any item id already clicked to avoid double-clicking.
-        List<CollectButton> second = dispatcher.runOnClient(this::findCollectButtons);
-        if (second == null) return;
-        for (CollectButton b : second) {
-            if (hits.stream().anyMatch(h -> h.itemId() == b.itemId())) continue;
-            log.info("collect({}): late-render click '{}' at {} (item={})",
-                slot, b.verb, b.bounds, b.itemId);
-            dispatcher.boundsClickOnWorker(b.bounds, b.verb);
-            SequenceSleep.sleep(client,
-                180L + ThreadLocalRandom.current().nextInt(380));
+
+        // After the item click the GE CS2 may close the detail view before
+        // rendering the coins-refund child.  Sleep one full tick, then collect
+        // whatever remains — reopening the slot if the view closed.
+        SequenceSleep.sleep(client, 700L + ThreadLocalRandom.current().nextInt(300));
+
+        Set<Integer> clickedItemIds = new HashSet<>();
+        for (CollectButton b : firstPass) clickedItemIds.add(b.itemId);
+
+        for (int i = 0; i < MAX_DETAIL_REOPENS; i++) {
+            List<CollectButton> remaining = dispatcher.runOnClient(this::findCollectButtons);
+            if (remaining == null || remaining.isEmpty()) {
+                // Detail view closed after the item click — reopen to check for coins.
+                if (!reopenDetailView(slot)) break;
+                remaining = dispatcher.runOnClient(this::findCollectButtons);
+                if (remaining == null || remaining.isEmpty()) break;
+            }
+            boolean anyNew = false;
+            for (CollectButton b : remaining) {
+                if (clickedItemIds.contains(b.itemId)) continue;
+                log.info("ge collect: slot={} itemId={}", slot, b.itemId);
+                log.info("collect({}): late click '{}' at {} (item={})", slot, b.verb, b.bounds, b.itemId);
+                dispatcher.boundsClickOnWorker(b.bounds, b.verb);
+                clickedItemIds.add(b.itemId);
+                anyNew = true;
+                SequenceSleep.sleep(client, 180L + ThreadLocalRandom.current().nextInt(380));
+            }
+            if (!anyNew) break;
+            SequenceSleep.sleep(client, 700L + ThreadLocalRandom.current().nextInt(300));
         }
+    }
+
+    /** Ensure DETAILS_COLLECT has at least one visible child.
+     *
+     *  <p>Three cases:
+     *  <ol>
+     *    <li>{@code DETAILS_COLLECT} visible with children: already ready, return immediately.</li>
+     *    <li>{@code DETAILS_COLLECT} visible but empty: CS2 needs 1-2 ticks to render
+     *        the coins/item boxes — poll; do NOT try to click INDEX_N (hidden while
+     *        detail view is showing).</li>
+     *    <li>{@code DETAILS_COLLECT} hidden/null AND {@code INDEX_N} hidden: the detail
+     *        view is open but CS2 has not yet shown the DETAILS_COLLECT sub-container.
+     *        This is the common startup case — the bot dispatches {@code ge.collect}
+     *        in the same engine tick that {@code collectOpen()} first becomes true,
+     *        before the CS2 renders the collect buttons.  Poll exactly like case 2.</li>
+     *    <li>{@code DETAILS_COLLECT} hidden/null AND {@code INDEX_N} visible: detail
+     *        view is genuinely closed — click INDEX_N to open it, then poll.</li>
+     *  </ol>
+     *  Returns true when collect buttons appear within ~2 s; false otherwise. */
+    private boolean reopenDetailView(int slot) throws InterruptedException {
+        // Check DETAILS_COLLECT visibility first.
+        Boolean containerVisible = dispatcher.runOnClient(() -> {
+            Widget w = client.getWidget(InterfaceID.GeOffers.DETAILS_COLLECT);
+            return w != null && !w.isHidden();
+        });
+
+        if (Boolean.TRUE.equals(containerVisible)) {
+            // Case 2: container visible but no children yet.
+            log.info("collect({}): DETAILS_COLLECT visible but empty — waiting for CS2", slot);
+            long deadline = System.currentTimeMillis() + 2_000L;
+            while (System.currentTimeMillis() < deadline) {
+                SequenceSleep.sleep(client, 150L);
+                List<CollectButton> check = dispatcher.runOnClient(this::findCollectButtons);
+                if (check != null && !check.isEmpty()) return true;
+            }
+            log.warn("collect({}): DETAILS_COLLECT did not populate within 2s", slot);
+            return false;
+        }
+
+        // DETAILS_COLLECT is hidden or null. Check INDEX_N to distinguish:
+        //   • INDEX_N hidden  → detail view IS open, DETAILS_COLLECT not yet rendered (case 3)
+        //   • INDEX_N visible → detail view is closed (case 4)
+        // NOTE: INDEX_N is hidden by the GE CS2 while the detail view is showing
+        // (GE_SELECTEDSLOT > 0), so checking it here is safe — the slot-click
+        // comment in the original code noted this edge case.
+        int containerId = slotIndexWidget(slot);
+        if (containerId == 0) return false;
+        Boolean slotVisible = dispatcher.runOnClient(() -> {
+            Widget w = client.getWidget(containerId);
+            return w != null && !w.isHidden();
+        });
+
+        if (!Boolean.TRUE.equals(slotVisible)) {
+            // Case 3: INDEX_N hidden → detail view open, DETAILS_COLLECT not rendered yet.
+            // This is the common race: ge.collect dispatched in the same tick
+            // collectOpen() first fired, before CS2 renders the collect buttons.
+            log.info("collect({}): detail view open but DETAILS_COLLECT hidden — waiting for CS2", slot);
+            long deadline = System.currentTimeMillis() + 2_000L;
+            while (System.currentTimeMillis() < deadline) {
+                SequenceSleep.sleep(client, 150L);
+                List<CollectButton> check = dispatcher.runOnClient(this::findCollectButtons);
+                if (check != null && !check.isEmpty()) return true;
+            }
+            log.warn("collect({}): detail view open but DETAILS_COLLECT never populated within 2s", slot);
+            return false;
+        }
+
+        // Case 4: detail view is closed, INDEX_N is visible — click to open it.
+        log.info("collect({}): reopening offer detail view", slot);
+        dispatcher.widgetClickOnWorker(containerId);
+        long deadline = System.currentTimeMillis() + 2_000L;
+        while (System.currentTimeMillis() < deadline) {
+            SequenceSleep.sleep(client, 150L);
+            List<CollectButton> check = dispatcher.runOnClient(this::findCollectButtons);
+            if (check != null && !check.isEmpty()) return true;
+        }
+        return false;
     }
 
     private record CollectButton(Rectangle bounds, String verb, int itemId) {}
@@ -794,18 +917,48 @@ public final class GeInteraction implements GeActions {
 
     @Override
     public void collectAll() {
-        // GeOffers.COLLECTALL is the "Collect" toolbar button at the top of
-        // the main GE view. One click drains every completed offer (items +
-        // leftover coins from partial fills) into the inventory — no per-slot
-        // detail-view dance needed. Visible whenever the GE main grid is
-        // showing and at least one slot has something to collect.
-        clickWidget(InterfaceID.GeOffers.COLLECTALL, "collectAll");
+        // GeOffers.COLLECTALL toolbar button. Default verb captured from
+        // click-inspector 2026-05-01: actions=['Collect to inventory',
+        // 'Collect to bank'], entryId=1 → left-click = "Collect to inventory".
+        clickWidgetVerb(InterfaceID.GeOffers.COLLECTALL, "Collect to inventory", "collectAll");
     }
 
     @Override
     public void closeGrandExchange() {
         try {
             dispatcher.tapKey(KeyEvent.VK_ESCAPE);
+        } catch (InterruptedException ie) {
+            Thread.currentThread().interrupt();
+        }
+    }
+
+    /** Same as {@link #clickWidget} but dispatches with an explicit verb,
+     *  triggering {@code widgetVerbClick} in the dispatcher (hover-check
+     *  then left-click if default action matches, right-click + menu select
+     *  otherwise). Use when the desired action is NOT the first default
+     *  action on the widget (or to be explicit about what we expect). */
+    private void clickWidgetVerb(int widgetId, String verb, String purpose) {
+        try {
+            Boolean visible = dispatcher.runOnClient(() -> {
+                Widget w = client.getWidget(widgetId);
+                if (w == null) return false;
+                for (Widget cur = w; cur != null; cur = cur.getParent()) {
+                    if (cur.isHidden()) return false;
+                }
+                return true;
+            });
+            if (!Boolean.TRUE.equals(visible)) {
+                log.warn("{}: widget 0x{} unresolved/hidden (ancestor-chain check)",
+                    purpose, Integer.toHexString(widgetId));
+                return;
+            }
+            ActionRequest req = ActionRequest.builder()
+                .kind(ActionRequest.Kind.CLICK_WIDGET)
+                .channel(ActionRequest.Channel.MOUSE)
+                .widgetId(widgetId)
+                .verb(verb)
+                .build();
+            dispatcher.dispatch(req);
         } catch (InterruptedException ie) {
             Thread.currentThread().interrupt();
         }

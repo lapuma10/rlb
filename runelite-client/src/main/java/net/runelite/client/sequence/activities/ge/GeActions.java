@@ -31,6 +31,12 @@ public interface GeActions {
      *  exists on empty slots. */
     void openOfferDetail(int slot);
 
+    /** For SELL offers: after {@link #clickOfferSlotButton} opens the sell-setup
+     *  interface, click the item at {@code invSlot} in the player's inventory to
+     *  select it. The GE pre-fills quantity from the inventory stack. There is no
+     *  search chatbox for sells — the inventory click IS the item selection. */
+    void selectSellItemFromInventory(int invSlot, int itemId);
+
     /** Type the item name into the GE search chatbox WITHOUT submitting.
      *  Returns true if the chatbox-search prompt opened, the name was
      *  typed, and the result list rendered with at least one group of 3

@@ -10,6 +10,7 @@ import net.runelite.api.GrandExchangeOffer;
 import net.runelite.api.GrandExchangeOfferState;
 import net.runelite.api.WorldType;
 import net.runelite.api.gameval.InterfaceID;
+import net.runelite.api.gameval.VarbitID;
 import net.runelite.api.widgets.Widget;
 import net.runelite.client.plugins.recorder.transport.VerbMatcher;
 import net.runelite.client.sequence.views.GrandExchangeOfferView;
@@ -74,6 +75,16 @@ public final class GrandExchangeObserver {
         }
         int promptMode = client.getVarcIntValue(
             net.runelite.api.gameval.VarClientID.MESLAYERMODE);
+        // GE_NEWOFFER_TYPE: 0=none, 1=sell, 2=buy. Flips the same tick the
+        // user clicks "Create Sell offer" / "Create Buy offer" — the
+        // single most reliable "setup is ready for item input" signal.
+        int newOfferType = client.getVarbitValue(VarbitID.GE_NEWOFFER_TYPE);
+        // GE_NEWOFFER_QUANTITY: >0 once the engine has attached an item
+        // to the active setup. Used to verify a select-sell-item click
+        // actually landed (the dispatch can silently miss when it
+        // resolves against the hidden Inventory.ITEMS instead of the
+        // overlaid GeOffersSide.ITEMS).
+        int newOfferQuantity = client.getVarbitValue(VarbitID.GE_NEWOFFER_QUANTITY);
 
         // Members detection: cap usable slots to 3 for F2P. Worlds without
         // the MEMBERS flag are F2P; the locked slot widgets aren't clickable
@@ -106,8 +117,8 @@ public final class GrandExchangeObserver {
         }
 
         return new SnapshotGrandExchangeView(offersOpen, setupOpen, collectOpen,
-            searchPopulated, promptMode, priceWarning, List.copyOf(slots), usableSlots,
-            slotCanCreate);
+            searchPopulated, promptMode, newOfferType, newOfferQuantity,
+            priceWarning, List.copyOf(slots), usableSlots, slotCanCreate);
     }
 
     /** Walk a slot container widget for any descendant whose first non-empty
@@ -231,6 +242,8 @@ public final class GrandExchangeObserver {
         boolean collectOpen,
         boolean searchResultsPopulated,
         int chatboxPromptMode,
+        int newOfferType,
+        int newOfferQuantity,
         boolean priceWarningOpen,
         List<GrandExchangeOfferView> offers,
         int usableSlots,

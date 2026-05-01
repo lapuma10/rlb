@@ -32,6 +32,7 @@ public final class StartOfferStep implements Step {
     private static final BlackboardKey<GeBlockReason> K_PRECONDITION =
         BlackboardKey.of("startOffer.precondition", GeBlockReason.class);
 
+
     private final OfferSide side;
     private final GeActions ge;
     /** Captured from {@link StepContext#dispatcher()} in onStart so check()
@@ -92,17 +93,32 @@ public final class StartOfferStep implements Step {
         if (!s.grandExchange().offerSetupOpen()) {
             return Completion.RUNNING;
         }
-        // SETUP is up — but the slot-click chain may still be running its
-        // post-click humanization (cursor park) and holding the dispatcher
-        // busy. Declaring Succeeded here would let SelectItemStep.onStart
-        // dispatch PICK_GE_SEARCH_RESULT, the busy guard would silently
-        // drop it, the search would never run, and the bot would later
-        // click "Enter quantity" on an item-less SETUP — observed as the
-        // 17:47 / 17:48 GE_SET_QUANTITY chatbox-prompt timeouts.
+        // SELL flow goes through SelectSellItemStep which clicks the
+        // inventory item directly (no search dialog), so it needs the cs2
+        // to have finished swapping the inventory action map (Use/Drop/
+        // Examine → Offer-1/.../Offer-All). Engine signals that by
+        // flipping GE_NEWOFFER_TYPE off zero — verified via click-
+        // inspector 2026-05-01 for the SELL click (0 → 1 same tick).
+        //
+        // BUY flow uses SelectItemStep + PickSearchResultStep which
+        // operate on the chatbox search dialog, NOT the inventory
+        // overlay, so the action-map swap is irrelevant. Empirically
+        // the BUY click does NOT flip GE_NEWOFFER_TYPE in the way the
+        // SELL click does (logs 2026-05-01 13:13:58 showed the BUY
+        // SETUP open but the gate hung the step until timeout). Apply
+        // the gate to SELL only.
+        if (side == OfferSide.SELL && s.grandExchange().newOfferType() == 0) {
+            return Completion.RUNNING;
+        }
+        // SETUP open + correct side latched — gate on the slot-click
+        // chain releasing the dispatcher worker. Declaring Succeeded
+        // while busy would let the next step's onStart dispatch into
+        // the busy guard and silently drop (observed in the GE BUY
+        // flow as 17:47 / 17:48 GE_SET_QUANTITY chatbox-prompt timeouts).
         if (dispatcher != null && dispatcher.isBusy()) {
             return Completion.RUNNING;
         }
-        return new Completion.Succeeded("offer-setup open");
+        return new Completion.Succeeded("offer-setup open + side latched");
     }
 
     @Override

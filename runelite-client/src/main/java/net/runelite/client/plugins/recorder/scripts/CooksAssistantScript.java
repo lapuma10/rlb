@@ -24,6 +24,8 @@ import net.runelite.client.plugins.recorder.trail.TrailWalker;
 import net.runelite.client.plugins.recorder.transport.TransportResolver;
 import net.runelite.client.plugins.recorder.walker.PathSpec;
 import net.runelite.client.plugins.recorder.walker.UniversalWalker;
+import net.runelite.client.plugins.recorder.widget.SidebarTab;
+import net.runelite.client.plugins.recorder.widget.SidebarTabActions;
 import net.runelite.client.sequence.SequenceState;
 import net.runelite.client.sequence.activities.ge.BuyItemIntent;
 import net.runelite.client.sequence.activities.ge.OfferWaitPolicy;
@@ -159,6 +161,7 @@ public final class CooksAssistantScript
     private final TrailWalker trailWalker;
     private final TrailRegistry trailRegistry;
     private final GrandExchangeScript geScript;
+    private final SidebarTabActions sidebarTabs;
 
     // ── Runtime fields ──────────────────────────────────────────────
     private final AtomicReference<State>  state  = new AtomicReference<>(State.IDLE);
@@ -197,6 +200,7 @@ public final class CooksAssistantScript
         this.trailWalker    = new TrailWalker(client, clientThread, dispatcher);
         this.trailRegistry  = trailRegistry;
         this.geScript       = geScript;
+        this.sidebarTabs    = new SidebarTabActions(client, clientThread, dispatcher);
     }
 
     // ── Public API ──────────────────────────────────────────────────
@@ -294,6 +298,13 @@ public final class CooksAssistantScript
     {
         try
         {
+            // Post-login the inventory tab is often closed on the modern
+            // client. Use-bucket-on-cow and the cook-dialog item-give path
+            // both target inventory items, so the tab must be visible
+            // before the first dispatch.
+            if (!sidebarTabs.openTabAndWait(SidebarTab.INVENTORY, 2_000L))
+                log.debug("cooks-assistant: could not confirm inventory tab open at startup");
+
             while (running.get() && !Thread.currentThread().isInterrupted())
             {
                 if (playerPos() == null)

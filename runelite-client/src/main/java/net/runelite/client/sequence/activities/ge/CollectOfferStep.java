@@ -110,7 +110,7 @@ public final class CollectOfferStep implements Step {
 
     @Override public String name()                              { return "CollectOffer"; }
     @Override public int priority()                             { return 100; }
-    @Override public int timeoutTicks()                         { return 12; }
+    @Override public int timeoutTicks()                         { return 18; }
     @Override public PreemptionPolicy preemptionPolicy()        { return PreemptionPolicy.WHEN_SAFE; }
     @Override public boolean isSafeToPause(WorldSnapshot s, Blackboard b) { return true; }
     @Override public boolean canStart(WorldSnapshot s, Blackboard b) { return true; }
@@ -150,11 +150,13 @@ public final class CollectOfferStep implements Step {
             step.put(K_EXPECTED_DELTA_ITEM_ID, persistedItemId);
             step.put(K_EXPECTED_DELTA_START, persistedStart);
             step.put(K_START_TICK, s.tick());
-            // Retry: re-fire if the slot still holds an offer. Re-roll the
-            // strategy — if the prior PER_SLOT attempt got stuck on a hidden
-            // INDEX_N, the retry might land on COLLECT_ALL and recover.
+            // Retry: force COLLECT_ALL unless the detail view is already open.
+            // The typical failure (PER_SLOT collects item, detail view closes,
+            // coins missed) leaves the main GE grid visible — COLLECT_ALL's
+            // toolbar button is available there and drains coins without needing
+            // the detail view dance.
             if (!o.isEmpty()) {
-                dispatchStrategy(ctx, s, slot);
+                dispatchStrategy(ctx, s, slot, /* forceCollectAll= */ true);
             }
             return;
         }
@@ -187,19 +189,23 @@ public final class CollectOfferStep implements Step {
             step.put(K_PARTIAL_MODE, true);
         }
 
-        dispatchStrategy(ctx, s, slot);
+        dispatchStrategy(ctx, s, slot, /* forceCollectAll= */ false);
     }
 
-    /** Pick COLLECT_ALL vs PER_SLOT and dispatch the first click. */
-    private void dispatchStrategy(StepContext ctx, WorldSnapshot s, int slot) {
+    /** Pick COLLECT_ALL vs PER_SLOT and dispatch the first click.
+     *  @param forceCollectAll true on retry — skip PER_SLOT entirely so we
+     *         don't need the detail view to be open (it closed after the
+     *         item was collected, leaving coins behind). */
+    private void dispatchStrategy(StepContext ctx, WorldSnapshot s, int slot, boolean forceCollectAll) {
         Blackboard step = ctx.bb().scope(BlackboardScope.STEP);
         // COLLECT_ALL clicks the toolbar button on the main GE grid — it is
         // hidden while the per-slot detail view is open. If we're already in
         // the detail view (collectOpen), force PER_SLOT so we stay in the
         // right context; re-rolling to COLLECT_ALL here would always no-op.
         boolean detailOpen = s.grandExchange().collectOpen();
-        Strategy strategy = (!detailOpen && useCollectAll.getAsBoolean())
-            ? Strategy.COLLECT_ALL : Strategy.PER_SLOT;
+        Strategy strategy = detailOpen ? Strategy.PER_SLOT
+            : (forceCollectAll || useCollectAll.getAsBoolean()) ? Strategy.COLLECT_ALL
+            : Strategy.PER_SLOT;
         step.put(K_STRATEGY, strategy);
 
         if (strategy == Strategy.COLLECT_ALL) {

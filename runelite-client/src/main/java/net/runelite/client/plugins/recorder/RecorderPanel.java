@@ -226,6 +226,11 @@ public final class RecorderPanel extends PluginPanel
     private final JButton questStartBtn  = new JButton("Start quest");
     private final JButton questStopBtn   = new JButton("Stop");
     private final JLabel  questStatusLabel = new JLabel("Quest: idle");
+    // Pie Dish script.
+    private net.runelite.client.plugins.recorder.scripts.PieDishScript pieDishScript;
+    private final JButton pieDishStartBtn  = new JButton("Start");
+    private final JButton pieDishStopBtn   = new JButton("Stop");
+    private final JLabel  pieDishStatusLabel = new JLabel("Pie Dish: idle");
     // GE Core (Phase A): wired by RecorderPlugin via setGrandExchangeScript.
     private GrandExchangeTab grandExchangeTab;
     private final JTabbedPane tabs = new JTabbedPane();
@@ -271,6 +276,7 @@ public final class RecorderPanel extends PluginPanel
         tabs.addTab("Mining", new JScrollPane(buildMiningTab()));
         tabs.addTab("Cooking", new JScrollPane(buildCookingTab()));
         tabs.addTab("Cook's Quest", new JScrollPane(buildCooksQuestTab()));
+        tabs.addTab("Pie Dish", new JScrollPane(buildPieDishTab()));
         tabs.addTab("Login",  new JScrollPane(buildLoginTab()));
         add(tabs, BorderLayout.CENTER);
 
@@ -1772,6 +1778,64 @@ public final class RecorderPanel extends PluginPanel
             + " — " + cooksAssistantScript.status());
     }
 
+    private JPanel buildPieDishTab()
+    {
+        JPanel p = new JPanel();
+        p.setLayout(new BoxLayout(p, BoxLayout.Y_AXIS));
+        p.setBorder(BorderFactory.createTitledBorder("Pie Dish Crafter"));
+
+        JPanel buttons = new JPanel(new BorderLayout(4, 4));
+        buttons.add(pieDishStartBtn, BorderLayout.CENTER);
+        buttons.add(pieDishStopBtn, BorderLayout.EAST);
+        capHeight(buttons);
+
+        p.add(new JLabel("<html><small>Buys pie dishes, flour &amp; water at GE,<br>"
+            + "crafts pastry dough + pie shells, then sells.<br>"
+            + "Start near GE (Varrock).</small></html>"));
+        p.add(Box.createVerticalStrut(4));
+        p.add(buttons);
+        p.add(pieDishStatusLabel);
+        p.add(Box.createVerticalGlue());
+
+        pieDishStartBtn.addActionListener(e -> onPieDishStart());
+        pieDishStopBtn.addActionListener(e -> onPieDishStop());
+        return p;
+    }
+
+    public void setPieDishScript(net.runelite.client.plugins.recorder.scripts.PieDishScript script)
+    {
+        this.pieDishScript = script;
+    }
+
+    private void onPieDishStart()
+    {
+        if (pieDishScript == null)
+        {
+            pieDishStatusLabel.setText("Pie Dish: unavailable");
+            return;
+        }
+        pieDishScript.start();
+        pieDishStatusLabel.setText("Pie Dish: starting");
+    }
+
+    private void onPieDishStop()
+    {
+        if (pieDishScript == null) return;
+        pieDishScript.stop();
+        pieDishStatusLabel.setText("Pie Dish: stopping");
+    }
+
+    private void refreshPieDish()
+    {
+        if (pieDishScript == null)
+        {
+            pieDishStatusLabel.setText("Pie Dish: unavailable");
+            return;
+        }
+        pieDishStatusLabel.setText(pieDishScript.state()
+            + " — " + pieDishScript.status());
+    }
+
     /** Wire the cooking script. The plugin constructs the script in
      *  startUp and hands it here; the panel only owns the UI surface. */
     public void setCookingScript(CookingScript script)
@@ -2318,6 +2382,7 @@ public final class RecorderPanel extends PluginPanel
         refreshLumby();
         refreshCooking();
         refreshCooksQuest();
+        refreshPieDish();
     }
 
     /** Mirror the bare chicken combat loop's state into the panel labels.

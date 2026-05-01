@@ -4,6 +4,7 @@ import java.util.ArrayList;
 import java.util.List;
 import net.runelite.api.Client;
 import net.runelite.api.Item;
+import net.runelite.api.ItemComposition;
 import net.runelite.api.ItemContainer;
 import net.runelite.api.gameval.InventoryID;
 import net.runelite.client.sequence.views.InventoryView;
@@ -45,7 +46,19 @@ final class InventoryObserver {
         for (int slot = 0; slot < raw.length; slot++) {
             Item it = raw[slot];
             if (it != null && it.getId() != -1 && it.getQuantity() > 0) {
-                items.add(new ItemStack(slot, it.getId(), it.getQuantity()));
+                int id = it.getId();
+                // Resolve canonical (unnoted) id once per slot via ItemComposition.
+                // Per ItemComposition: getNote() returns 799 for noted items
+                // (a marker, NOT the linked id) and -1 for unnoted items;
+                // getLinkedNoteId() returns the unnoted variant when called on
+                // a noted item. So a noted Pie shell (2316) → linked 2315; a
+                // plain Pie shell (2315) keeps unnotedId=2315. ItemComposition
+                // is cached internally by RuneLite — this is a field lookup
+                // per stack.
+                ItemComposition def = client.getItemDefinition(id);
+                int unnotedId = (def != null && def.getNote() == 799)
+                    ? def.getLinkedNoteId() : id;
+                items.add(new ItemStack(slot, id, it.getQuantity(), unnotedId));
             }
         }
 

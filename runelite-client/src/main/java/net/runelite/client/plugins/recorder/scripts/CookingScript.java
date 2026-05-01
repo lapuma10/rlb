@@ -21,6 +21,8 @@ import net.runelite.client.plugins.recorder.cook.CookingLocation;
 import net.runelite.client.plugins.recorder.farm.BankInteraction;
 import net.runelite.client.plugins.recorder.transport.TransportResolver;
 import net.runelite.client.plugins.recorder.walker.UniversalWalker;
+import net.runelite.client.plugins.recorder.widget.SidebarTab;
+import net.runelite.client.plugins.recorder.widget.SidebarTabActions;
 import net.runelite.client.sequence.SequenceState;
 import net.runelite.client.sequence.SequenceManager;
 import net.runelite.client.sequence.Step;
@@ -151,6 +153,7 @@ public final class CookingScript
     private final UniversalWalker walker;
     private final BankInteraction bank;
     private final CookingInteraction cook;
+    private final SidebarTabActions sidebarTabs;
 
     // ── Engine-banking fields ────────────────────────────────────────
     /** Lazily built on first BANKING_VIA_ENGINE entry. */
@@ -280,6 +283,7 @@ public final class CookingScript
         this.walker = new UniversalWalker(client, clientThread, dispatcher, resolver);
         this.bank = new BankInteraction(client, clientThread, dispatcher);
         this.cook = new CookingInteraction(client, clientThread, dispatcher);
+        this.sidebarTabs = new SidebarTabActions(client, clientThread, dispatcher);
     }
 
     public void setLocation(CookingLocation l) { location.set(l); }
@@ -380,6 +384,13 @@ public final class CookingScript
     {
         try
         {
+            // Post-login the inventory tab is often closed on the modern
+            // client. Use-tinderbox-on-logs and use-raw-on-fire both target
+            // inventory items, so the tab must be visible before the first
+            // dispatch.
+            if (!sidebarTabs.openTabAndWait(SidebarTab.INVENTORY, 2_000L))
+                log.debug("cook: could not confirm inventory tab open at startup");
+
             while (running.get() && !Thread.currentThread().isInterrupted())
             {
                 // Player gone (loading screen, hopped, disconnected) —

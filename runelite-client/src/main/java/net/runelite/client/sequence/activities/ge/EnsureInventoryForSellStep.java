@@ -11,10 +11,15 @@ import net.runelite.client.sequence.affordance.GeBlockReason;
 import net.runelite.client.sequence.blackboard.Blackboard;
 import net.runelite.client.sequence.blackboard.BlackboardKey;
 import net.runelite.client.sequence.blackboard.BlackboardScope;
+import net.runelite.client.sequence.views.InventoryView;
 
 /**
  * Pure verifier: aborts with {@link GeBlockReason.InsufficientSellItems} if
- * {@code inv.count(itemId) < quantity}.
+ * the inventory holds none of the sell item (in any form). Uses
+ * {@link InventoryView#countAnyForm} which counts both noted and unnoted
+ * forms so bank-prep flows that withdraw via {@code withdrawAsNoteX} are
+ * not wrongly rejected. Any positive count is accepted — the GE will list
+ * whatever qty we have.
  */
 public final class EnsureInventoryForSellStep implements Step {
 
@@ -31,7 +36,7 @@ public final class EnsureInventoryForSellStep implements Step {
         this.quantity = quantity;
     }
 
-    @Override public String name()                              { return "EnsureInventoryForSell(item=" + itemId + ", qty=" + quantity + ")"; }
+    @Override public String name()                              { return "EnsureInventoryForSell(item=" + itemId + ")"; }
     @Override public int priority()                             { return 100; }
     @Override public int timeoutTicks()                         { return 4; }
     @Override public PreemptionPolicy preemptionPolicy()        { return PreemptionPolicy.NEVER; }
@@ -42,8 +47,8 @@ public final class EnsureInventoryForSellStep implements Step {
     public void onStart(StepContext ctx) {
         WorldSnapshot s = ctx.snapshot();
         Blackboard step = ctx.bb().scope(BlackboardScope.STEP);
-        int have = s.inventory().count(itemId);
-        if (have < quantity) {
+        int have = s.inventory().countAnyForm(itemId);
+        if (have < 1) {
             step.put(K_PRECONDITION, new GeBlockReason.InsufficientSellItems(itemId, quantity, have));
         }
     }

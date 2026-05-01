@@ -2,7 +2,7 @@ package net.runelite.client.plugins.recorder.widget;
 
 import lombok.extern.slf4j.Slf4j;
 import net.runelite.api.Client;
-import net.runelite.api.Varbits;
+import net.runelite.api.gameval.VarClientID;
 import net.runelite.api.widgets.Widget;
 import net.runelite.client.callback.ClientThread;
 import net.runelite.client.sequence.dispatch.HumanizedInputDispatcher;
@@ -56,13 +56,52 @@ public final class SidebarTabActions
 
     /** Returns the active sidebar tab, or null if the engine reports a
      *  value we don't have a {@link SidebarTab} entry for. The engine
-     *  stores the active tab index in {@link Varbits#SIDE_PANELS}. */
+     *  stores the active tab index in {@link VarClientID#TOPLEVEL_PANEL}
+     *  — verified via click-inspector: clicking each STONE# icon in the
+     *  modern toplevel sets this varc to the matching index (STONE3 →
+     *  3 = INVENTORY, STONE13 → 13 = MUSIC, etc.). NOT to be confused
+     *  with {@code Varbits.SIDE_PANELS} (= 4607), which tracks something
+     *  else entirely (left/right side-panel layout) and never moves
+     *  when tabs change.
+     *
+     *  <p>Safe to call from any thread — the varc read is marshalled
+     *  to the client thread internally if needed. */
     public SidebarTab currentTab()
     {
-        int idx = client.getVarbitValue(Varbits.SIDE_PANELS);
+        Integer idxBox = onClient(() -> client.getVarcIntValue(VarClientID.TOPLEVEL_PANEL));
+        if (idxBox == null) return null;
+        int idx = idxBox;
         SidebarTab[] vals = SidebarTab.values();
         if (idx < 0 || idx >= vals.length) return null;
         return vals[idx];
+    }
+
+    private <T> T onClient(java.util.function.Supplier<T> sup)
+    {
+        if (client.isClientThread()) return sup.get();
+        java.util.concurrent.CountDownLatch latch =
+            new java.util.concurrent.CountDownLatch(1);
+        java.util.concurrent.atomic.AtomicReference<T> ref =
+            new java.util.concurrent.atomic.AtomicReference<>();
+        clientThread.invokeLater(() -> {
+            try   { ref.set(sup.get()); }
+            catch (Throwable t) { log.warn("sidebar-tabs: onClient threw", t); }
+            finally { latch.countDown(); }
+        });
+        try
+        {
+            if (!latch.await(2_000, java.util.concurrent.TimeUnit.MILLISECONDS))
+            {
+                log.warn("sidebar-tabs: onClient timed out");
+                return null;
+            }
+        }
+        catch (InterruptedException ie)
+        {
+            Thread.currentThread().interrupt();
+            return null;
+        }
+        return ref.get();
     }
 
     /** Returns true if {@code tab} is currently the active side panel. */

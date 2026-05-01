@@ -77,7 +77,12 @@ public final class WithdrawItemStep implements Step {
         Blackboard step = ctx.bb().scope(BlackboardScope.STEP);
         BankView b = s.bank();
         InventoryView i = s.inventory();
-        int currentCount = i.count(itemId);
+        // Count both noted and unnoted forms together. The bank may withdraw as
+        // noted when inventory is full (different itemId in the slot), and we
+        // want check() to recognise both forms as "the same item". Using
+        // countAnyForm avoids the +1 heuristic — it keys off the canonical
+        // unnoted id resolved from ItemComposition at snapshot time.
+        int currentCount = i.countAnyForm(itemId);
 
         // 1) Fatal preconditions from unexpected bank states — record and bail without dispatching.
         if (!b.open()) {
@@ -129,6 +134,9 @@ public final class WithdrawItemStep implements Step {
         }
 
         // Fresh work — persist target/startTick and dispatch with the delta (NOT the original q).
+        // currentCount and target are in canonical (any-form) units so check()'s
+        // countAnyForm() comparison succeeds whether the bank withdrew noted or
+        // unnoted form.
         step.put(K_OUTCOME, Outcome.FRESH);
         step.put(K_INV_START, currentCount);
         step.put(K_TARGET, target);
@@ -161,7 +169,7 @@ public final class WithdrawItemStep implements Step {
         } else if (qty == 1) {
             inner = () -> bank.withdrawOne(id);
             taskName = "BANK_WITHDRAW_ONE(" + id + ")";
-        } else if (qty == knownBank) {
+        } else if (qty >= knownBank) {
             inner = () -> bank.withdrawAll(id);
             taskName = "BANK_WITHDRAW_ALL(" + id + ")";
         } else {
@@ -198,8 +206,8 @@ public final class WithdrawItemStep implements Step {
         }
 
         int target = step.get(K_TARGET).orElseThrow(() -> new IllegalStateException("K_TARGET missing"));
-        int invStart = step.get(K_INV_START).orElse(s.inventory().count(itemId));
-        int now = s.inventory().count(itemId);
+        int invStart = step.get(K_INV_START).orElse(s.inventory().countAnyForm(itemId));
+        int now = s.inventory().countAnyForm(itemId);
 
         if (now >= target) return new Completion.Succeeded("withdrew " + displayName + " (delta=" + (now - invStart) + ")");
 
@@ -270,14 +278,18 @@ public final class WithdrawItemStep implements Step {
 
     private int resolveTargetCount(int currentCount, int freeSlots, int knownBankCount) {
         if (desired instanceof WithdrawQuantity.AtLeast a) {
-            return Math.max(a.qty(), currentCount);
+            int want = Math.max(a.qty(), currentCount);
+            // Cap to what the bank actually has — prevents WithdrawX typing a
+            // number higher than bank count (which gives "x 65" instead of 65
+            // and then the check fails because target=67 but inv=65).
+            return Math.min(want, currentCount + knownBankCount);
         }
         if (desired instanceof WithdrawQuantity.WithdrawAmount w) {
-            // Withdraw qty MORE — target = current + qty, delta = qty.
-            // Don't cap by knownBankCount here; the BankMissingItem
-            // precondition check will fail-fast if the bank doesn't have
-            // enough.
-            return currentCount + w.qty();
+            // Cap by what the bank actually has — if bank has less than
+            // requested (e.g. 4482 coins vs. 5k nice-buffer), take all
+            // of it. EnsureInventoryForBuyStep then validates the actual
+            // purchase can be funded.
+            return currentCount + Math.min(w.qty(), knownBankCount);
         }
         // FillRemainingInventory: allow partial final trip — cap by knownBankCount (§8.2).
         return currentCount + Math.min(freeSlots, knownBankCount);

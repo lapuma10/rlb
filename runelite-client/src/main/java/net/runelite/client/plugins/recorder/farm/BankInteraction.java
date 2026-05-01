@@ -14,7 +14,6 @@ import net.runelite.api.Client;
 import net.runelite.api.GameObject;
 import net.runelite.api.Item;
 import net.runelite.api.ItemContainer;
-import net.runelite.api.MenuAction;
 import net.runelite.api.NPC;
 import net.runelite.api.NPCComposition;
 import net.runelite.api.ObjectComposition;
@@ -145,11 +144,14 @@ public final class BankInteraction implements BankActions
      *       repeated banking trips don't always click the same one.</li>
      * </ul>
      *
-     * <p>NPCs are clicked via {@link Client#menuAction} on the slot whose
-     * action begins with "Bank" — bankers' L-click default is "Talk-to",
-     * not "Bank", so we have to invoke the right slot explicitly.
-     * GameObject booths are clicked via canvas hull click — their L-click
-     * default is already "Bank Bank booth", so a plain click works.
+     * <p>Both NPC bankers and GameObject booths are dispatched through the
+     * humanized input pipeline ({@link ActionRequest.Kind#CLICK_NPC} /
+     * {@link ActionRequest.Kind#CLICK_GAME_OBJECT}) so the mouse visibly
+     * moves to the target, the camera rotates naturally, WindMouse drives
+     * the cursor path, and the verb is verified before the click is
+     * committed.  For NPC bankers whose left-click default is "Talk-to",
+     * the dispatcher's right-click flow picks the "Bank" option from the
+     * context menu automatically.
      *
      * <p>Returns true if a click was dispatched, false if no candidate
      * was visible (caller can retry next tick — the player may need to
@@ -159,50 +161,39 @@ public final class BankInteraction implements BankActions
     {
         BoothCandidate pick = onClient(this::findBoothCandidate);
         if (pick == null) return false;
-        // Pan camera toward the chosen booth/banker BEFORE the click.
-        // clickCanvas / menuAction don't auto-rotate the way walkClick
-        // and npcClick do, so without this we'd send a click at hull
-        // bounds that may not currently project onto the camera, and
-        // the booth would appear "snapped to" rather than approached.
-        //
-        // NPC.getWorldLocation() / GameObject.getWorldLocation() assert
-        // on the client thread under -ea — read inside onClient.
-        WorldPoint boothTile = onClient(() -> pick.npc != null
-            ? pick.npc.getWorldLocation()
-            : pick.go.getWorldLocation());
-        if (boothTile != null) dispatcher.rotateCameraToward(boothTile);
+
         if (pick.npc != null)
         {
-            return onClient(() -> {
-                MenuAction ma = npcOptionForSlot(pick.slot);
-                if (ma == null) return false;
-                log.info("bank: invoking '{}' on banker {} (slot {})",
-                    pick.actionText, pick.npc.getName(), pick.slot);
-                client.menuAction(0, 0, ma, pick.npc.getIndex(), -1,
-                    pick.actionText, pick.npc.getName());
-                return true;
-            });
+            // Full humanized NPC click: camera rotate → WindMouse to hull →
+            // hover-verify → left-click if "Bank" is the default, otherwise
+            // right-click → pick "Bank" from the context menu.
+            Integer idx = onClient(() -> pick.npc.getIndex());
+            if (idx == null) return false;
+            log.info("bank: CLICK_NPC banker (index={}, verb={})", idx, pick.actionText);
+            dispatcher.dispatch(ActionRequest.builder()
+                .kind(ActionRequest.Kind.CLICK_NPC)
+                .channel(ActionRequest.Channel.MOUSE)
+                .npcIndex(idx)
+                .verb(pick.actionText)
+                .build());
+            return true;
         }
-        // GameObject — L-click default is already "Bank", hull click works.
-        // Re-resolve hull AFTER the camera pan so we click the booth
-        // in its now-on-screen position, not the pre-pan one.
-        Rectangle b = onClient(() -> {
-            Shape h = pick.go.getConvexHull();
-            return h == null ? null : h.getBounds();
-        });
-        if (b == null)
+
+        // GameObject booth — CLICK_GAME_OBJECT resolves the hull, rotates
+        // the camera, moves the mouse via WindMouse, and picks the verb.
+        WorldPoint tile = onClient(() -> pick.go.getWorldLocation());
+        if (tile == null)
         {
-            // Read fields inside onClient — getWorldLocation asserts client
-            // thread; we're on the dispatcher worker here.
-            log.warn("bank: booth has no convex hull (tile={})", boothTile);
+            log.warn("bank: booth {} has no world location", onClient(() -> pick.go.getId()));
             return false;
         }
-        int cx = b.x + b.width / 2;
-        int cy = b.y + b.height / 2;
-        Integer goId = onClient(() -> pick.go.getId());
-        log.info("bank: clicking bank booth (id={}) hull center ({},{})",
-            goId, cx, cy);
-        dispatcher.clickCanvas(cx, cy);
+        log.info("bank: CLICK_GAME_OBJECT booth (tile={}, verb={})", tile, pick.actionText);
+        dispatcher.dispatch(ActionRequest.builder()
+            .kind(ActionRequest.Kind.CLICK_GAME_OBJECT)
+            .channel(ActionRequest.Channel.MOUSE)
+            .tile(tile)
+            .verb(pick.actionText)
+            .build());
         return true;
     }
 
@@ -371,19 +362,6 @@ public final class BankInteraction implements BankActions
         return -1;
     }
 
-    private static MenuAction npcOptionForSlot(int slot)
-    {
-        switch (slot)
-        {
-            case 0:  return MenuAction.NPC_FIRST_OPTION;
-            case 1:  return MenuAction.NPC_SECOND_OPTION;
-            case 2:  return MenuAction.NPC_THIRD_OPTION;
-            case 3:  return MenuAction.NPC_FOURTH_OPTION;
-            case 4:  return MenuAction.NPC_FIFTH_OPTION;
-            default: return null;
-        }
-    }
-
     private NPC findBankBoothNPC() throws InterruptedException
     {
         CompletableFuture<NPC> fut = new CompletableFuture<>();
@@ -530,6 +508,7 @@ public final class BankInteraction implements BankActions
      *  </ul> */
     public boolean tryWithdrawAll(int itemId) throws InterruptedException
     {
+        if (!ensureNoteMode(false)) return false;
         return withdrawWithVerb(itemId, "Withdraw-All");
     }
 
@@ -545,6 +524,7 @@ public final class BankInteraction implements BankActions
      *  Returns true iff a click was dispatched. */
     public boolean tryWithdrawOne(int itemId) throws InterruptedException
     {
+        if (!ensureNoteMode(false)) return false;
         return withdrawWithVerb(itemId, "Withdraw-1");
     }
 
@@ -573,6 +553,18 @@ public final class BankInteraction implements BankActions
     public boolean tryWithdrawX(int itemId, int qty) throws InterruptedException
     {
         if (qty <= 0) return false;
+        if (!ensureNoteMode(false)) return false;
+        return withdrawXInternal(itemId, qty);
+    }
+
+    /** Shared withdraw-X mechanics (right-click → "Withdraw-X" → chatbox
+     *  digits → Enter) — does NOT touch the Note toggle. Both
+     *  {@link #tryWithdrawX} (which forces note-OFF first) and
+     *  {@link #tryWithdrawAsNoteX} (which forces note-ON first) call this
+     *  so the toggle is set exactly once per call site, by the public
+     *  entry point that knows what mode it wants. */
+    private boolean withdrawXInternal(int itemId, int qty) throws InterruptedException
+    {
         boolean picked = withdrawWithVerb(itemId, "Withdraw-X");
         if (!picked) return false;
         // Withdraw-X opens a chatbox numeric prompt. Use the dispatcher's
@@ -602,8 +594,8 @@ public final class BankInteraction implements BankActions
     public boolean tryWithdrawAsNoteX(int itemId, int qty) throws InterruptedException
     {
         if (qty <= 0) return false;
-        if (!ensureNoteModeOn()) return false;
-        return tryWithdrawX(itemId, qty);
+        if (!ensureNoteMode(true)) return false;
+        return withdrawXInternal(itemId, qty);
     }
 
     /** {@inheritDoc} */
@@ -614,34 +606,50 @@ public final class BankInteraction implements BankActions
         tryWithdrawAsNoteX(itemId, qty);
     }
 
-    /** If the bank's withdraw-mode varbit is not in "note" state, click the
-     *  Bankmain.NOTE toggle and wait for the varbit to flip. Returns true
-     *  iff note mode is on (or successfully turned on) when this returns.
+    /** Force the bank's withdraw-mode varbit into the requested state —
+     *  {@code wantNoted=true} for noted (varbit=1), {@code false} for
+     *  item / unnoted (varbit=0). No-op if already in the requested state.
+     *  Returns true iff the bank ends up in the requested mode.
+     *
+     *  <p><b>Why this is the only place note mode is ever changed:</b>
+     *  the toggle is sticky across withdraws AND across bank close/open.
+     *  Without this guard a {@code tryWithdrawAsNoteX} on cycle N would
+     *  leave note mode on, and the next cycle's {@code tryWithdrawX}
+     *  would silently land NOTED items in inventory — breaking any
+     *  subsequent "Use X on Y" / cooking / crafting click since noted
+     *  items can't be used on anything. Every public unnoted-withdraw
+     *  entry point ({@code tryWithdrawAll}, {@code tryWithdrawOne},
+     *  {@code tryWithdrawX}) calls this with {@code false};
+     *  {@code tryWithdrawAsNoteX} calls it with {@code true}. Callers
+     *  must not flip the toggle themselves.
      *
      *  <p>Called from inside the dispatcher worker (we run as part of
-     *  {@code tryWithdrawAsNoteX} which is itself wrapped in a {@code
+     *  {@code tryWithdraw*} which is itself wrapped in a {@code
      *  RUN_TASK}), so we already hold the dispatcher's busy flag. Use
      *  {@link HumanizedInputDispatcher#widgetClickOnWorker} for the
      *  toggle click — calling {@code dispatcher.dispatch(...)} from here
      *  would self-drop on the busy flag, and {@code awaitIdle} would
      *  deadlock waiting for ourselves to finish. */
-    private boolean ensureNoteModeOn() throws InterruptedException
+    private boolean ensureNoteMode(boolean wantNoted) throws InterruptedException
     {
+        int target = wantNoted ? 1 : 0;
         Integer state = onClient(() -> client.getVarbitValue(VarbitID.BANK_WITHDRAWNOTES));
-        if (state != null && state == 1) return true;
+        if (state != null && state == target) return true;
 
         dispatcher.widgetClickOnWorker(InterfaceID.Bankmain.NOTE);
 
         // Poll the varbit briefly — clicking the toggle bumps it within a
-        // tick or two; if it doesn't, bail rather than withdraw in item mode.
+        // tick or two; if it doesn't, bail rather than withdraw in the
+        // wrong mode.
         long deadline = System.currentTimeMillis() + 1500L;
         while (System.currentTimeMillis() < deadline)
         {
             SequenceSleep.sleep(client, 80L);
             Integer cur = onClient(() -> client.getVarbitValue(VarbitID.BANK_WITHDRAWNOTES));
-            if (cur != null && cur == 1) return true;
+            if (cur != null && cur == target) return true;
         }
-        log.warn("bank: note-mode toggle did not flip after click — aborting noted withdraw");
+        log.warn("bank: note-mode toggle did not flip to {} after click — aborting withdraw",
+            wantNoted ? "noted" : "unnoted");
         return false;
     }
 

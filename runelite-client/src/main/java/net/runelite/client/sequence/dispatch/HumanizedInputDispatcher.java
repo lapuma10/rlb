@@ -1031,17 +1031,7 @@ public class HumanizedInputDispatcher implements InputDispatcher
      *  {@code itemContainer.getChild(i)} the same way. */
     private void invSlotClick(int slot, String verb) throws InterruptedException
     {
-        Rectangle bounds = onClient(() -> {
-            // 149 = WidgetInfo.INVENTORY group; child 0 = the inventory
-            // container parent. The slot widgets are dynamic children
-            // of that parent — accessed by index via getChild(slot).
-            Widget parent = client.getWidget(149, 0);
-            if (parent == null || parent.isHidden()) return null;
-            Widget child = parent.getChild(slot);
-            if (child == null || child.isSelfHidden()) return null;
-            Rectangle r = child.getBounds();
-            return r == null || r.isEmpty() ? null : r;
-        });
+        Rectangle bounds = onClient(() -> resolveInvSlotBounds(slot));
         if (bounds == null)
         {
             lastError.set("inv slot " + slot + " not resolvable");
@@ -1088,6 +1078,52 @@ public class HumanizedInputDispatcher implements InputDispatcher
         if (pixel == null) { lastError.set("widget " + widgetId + " not found"); return; }
         moveCursorTo(pixel.getX(), pixel.getY());
         clickPress(MouseEvent.BUTTON1);
+    }
+
+    /** Resolve the screen bounds of inventory slot {@code slot}. The visible
+     *  inventory widget depends on which interface is currently overlaying
+     *  the canvas:
+     *  <ul>
+     *    <li>{@link net.runelite.api.gameval.InterfaceID.GeOffersSide#ITEMS}
+     *        (group 467) — when the GE offer-setup is open. The regular
+     *        {@code Inventory.ITEMS} is hidden behind it; clicking those
+     *        bounds would silently miss because the engine renders
+     *        {@code GeOffersSide.ITEMS} on top with different actions
+     *        (Offer-1/.../Offer-All) for the inv slots.</li>
+     *    <li>{@link net.runelite.api.gameval.InterfaceID.Bankside#ITEMS}
+     *        (group 763) — when the bank is open. Same overlay pattern;
+     *        actions become Deposit-1/.../Deposit-All.</li>
+     *    <li>{@link net.runelite.api.gameval.InterfaceID.Inventory#ITEMS}
+     *        (group 149) — the default sidebar inventory; used when
+     *        nothing overlays.</li>
+     *  </ul>
+     *  Probe in priority order; return the first whose container + child
+     *  resolve to a non-empty visible rect. Verified via click-inspector
+     *  2026-05-01: the user's manual sell click landed on widget id
+     *  {@code 0x01d3_0000} ({@code GeOffersSide.ITEMS}) at the same
+     *  bounds {@code [584,495 36x32]} where {@code Inventory.ITEMS}
+     *  normally sits — the widget swap is invisible to the user but
+     *  the click destination changed.
+     *
+     *  <p>Must be called on the client thread. */
+    private Rectangle resolveInvSlotBounds(int slot)
+    {
+        // Priority order: overlays first, sidebar fallback last.
+        int[] candidateGroups = new int[] {
+            net.runelite.api.gameval.InterfaceID.GeOffersSide.ITEMS >>> 16,
+            net.runelite.api.gameval.InterfaceID.Bankside.ITEMS >>> 16,
+            net.runelite.api.gameval.InterfaceID.Inventory.ITEMS >>> 16,
+        };
+        for (int group : candidateGroups)
+        {
+            Widget parent = client.getWidget(group, 0);
+            if (parent == null || parent.isHidden()) continue;
+            Widget child = parent.getChild(slot);
+            if (child == null || child.isSelfHidden()) continue;
+            Rectangle r = child.getBounds();
+            if (r != null && !r.isEmpty()) return r;
+        }
+        return null;
     }
 
     /** Worker-callable wrapper around {@link #boundsClick} — exposed for
