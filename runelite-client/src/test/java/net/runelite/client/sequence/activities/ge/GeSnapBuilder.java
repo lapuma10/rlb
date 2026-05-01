@@ -160,6 +160,8 @@ public final class GeSnapBuilder {
         List<GrandExchangeOfferView> offers
     ) implements GrandExchangeView {
         @Override public boolean chatboxPromptOpen()      { return chatboxPromptMode != 0; }
+        @Override public int newOfferType()               { return 0; }
+        @Override public int newOfferQuantity()           { return 0; }
         @Override public OptionalInt firstEmptySlot() {
             for (GrandExchangeOfferView o : offers) {
                 if (o.isEmpty()) return OptionalInt.of(o.slot());

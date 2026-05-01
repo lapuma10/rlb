@@ -103,6 +103,36 @@ public class ChickenCombatLoopTest
     }
 
     @Test
+    public void inCombatTick_playerOnlyEngagementThatBreaks_reAttacksInsteadOfHanging()
+    {
+        Player self = mock(Player.class);
+        NPC chicken = mockChicken(15, 3231, 3296, 0);
+        Client client = clientWith(self, new WorldPoint(3230, 3296, 0), chicken);
+        CombatDispatcher dispatcher = mock(CombatDispatcher.class);
+        ChickenCombatLoop loop = new ChickenCombatLoop(dispatcher, client, null,
+            new NpcSelector(ChickenCombatLoop.CHICKEN_NAME),
+            TargetVisibility.alwaysVisible(), s -> {});
+        loop.setTargetForTesting(new CombatTarget(15, "Chicken", 0));
+        loop.setStateForTesting(ChickenCombatLoop.State.IN_COMBAT);
+        CombatStateTracker tracker = new CombatStateTracker(15);
+        CombatTarget ct = loop.currentTarget();
+
+        when(self.getInteracting()).thenReturn(chicken, null, null, null);
+        when(chicken.getInteracting()).thenReturn(null);
+        when(chicken.getHealthRatio()).thenReturn(30);
+
+        assertFalse("first poll should establish one-sided engagement",
+            loop.combatTick(ct, tracker));
+        assertEquals(ChickenCombatLoop.State.IN_COMBAT, loop.state());
+        assertFalse(loop.combatTick(ct, tracker));
+        assertFalse(loop.combatTick(ct, tracker));
+        assertTrue("after >2 lost ticks the loop should re-attack",
+            loop.combatTick(ct, tracker));
+        assertEquals(ChickenCombatLoop.State.ENGAGING, loop.state());
+        verify(dispatcher, never()).dispatch(any());
+    }
+
+    @Test
     public void inCombatTick_chickenLockedOnAnotherPlayer_releasesLockAndReSelects()
     {
         Player self = mock(Player.class);

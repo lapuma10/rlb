@@ -38,6 +38,9 @@ public final class RecordingGeActions implements GeActions {
     @Override public void dismissPriceWarning(boolean accept) {
         calls.add("dismissPriceWarning(" + (accept ? "Yes" : "No") + ")");
     }
+    @Override public void selectSellItemFromInventory(int invSlot, int itemId) {
+        calls.add("selectSellItemFromInventory(slot=" + invSlot + ", itemId=" + itemId + ")");
+    }
     @Override public void collect(int slot)                   { calls.add("collect(slot=" + slot + ")"); }
     @Override public void collectAll()                        { calls.add("collectAll()"); }
     @Override public void closeGrandExchange()                { calls.add("closeGrandExchange()"); }

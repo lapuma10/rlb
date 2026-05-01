@@ -97,7 +97,18 @@ public final class CombatStateTracker
             return;
         }
         Actor interacting = lockedNpc.getInteracting();
-        boolean engagedWithUs = interacting != null && self != null && interacting == self;
+        Actor selfInteracting = self == null ? null : self.getInteracting();
+        boolean selfTargetingLockedNpc =
+            selfInteracting instanceof NPC
+                && ((NPC) selfInteracting).getIndex() == npcIndex;
+        // Match ChickenCombatLoop#doEngage: combat is live as soon as either
+        // side has locked the other. In live play the player often acquires the
+        // NPC target a tick before the NPC's interacting pointer flips back to
+        // us; if we only trust npc.getInteracting()==self, IN_COMBAT can enter
+        // successfully and then sit forever with everEngaged=false.
+        boolean engagedWithUs =
+            (interacting != null && self != null && interacting == self)
+                || selfTargetingLockedNpc;
         boolean engagedByOther = interacting instanceof Player && interacting != self;
         if (engagedWithUs) everEngaged = true;
 

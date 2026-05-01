@@ -13,6 +13,7 @@ import lombok.extern.slf4j.Slf4j;
 import net.runelite.api.Client;
 import net.runelite.api.GameObject;
 import net.runelite.api.Item;
+import net.runelite.api.ItemComposition;
 import net.runelite.api.ItemContainer;
 import net.runelite.api.NPC;
 import net.runelite.api.NPCComposition;
@@ -60,6 +61,41 @@ public final class BankInteraction implements BankActions
      *  (no point walking past a closer one). Beyond it, candidates are
      *  randomised so repeated trips don't always click the same target. */
     public static final int BOOTH_NEAR_RADIUS = 1;
+
+    // ────────────────────────────────────────────────────────────────
+    // Verified-primitive plumbing.
+    //
+    // Every {@code tryDepositAll}, {@code depositAllInventory}, and
+    // {@code tryWithdraw*} below dispatches its click chain and then
+    // POLLS the inventory until the change actually lands (or a timeout
+    // elapses). Returning {@code true} therefore means "the engine
+    // actually moved items", not just "the click was sent" — which is
+    // the contract our scripts depend on but the old fire-and-hope
+    // primitives could not honour.
+    // ────────────────────────────────────────────────────────────────
+
+    /** Max wait for a deposit-all click chain (orb or per-item) to empty
+     *  the targeted slot(s). Set generously: large stacks of noted items
+     *  occasionally take 2+ ticks to vanish from inventory after the
+     *  Deposit-All menu pick fires. */
+    private static final long DEPOSIT_VERIFY_TIMEOUT_MS  = 3_000L;
+
+    /** Max wait for a withdraw click chain (Withdraw-X / -All / -1) to
+     *  show up in inventory. Covers the pathological cases:
+     *  Withdraw-X where the chatbox prompt is delayed by ~1 tick after
+     *  the menu pick, plus the engine's drip-feed of items over 2-3
+     *  ticks for very large stacks. */
+    private static final long WITHDRAW_VERIFY_TIMEOUT_MS = 4_000L;
+
+    /** Inventory polling cadence inside the verify loop. 80ms ≈ one
+     *  game tick — we don't need a tighter beat than the engine's own. */
+    private static final long POLL_INTERVAL_MS           = 80L;
+
+    /** Player inventory size — used by the no-space pre-check that
+     *  refuses a withdraw when all 28 slots are taken AND no slot of the
+     *  received item form already exists (engine would silently drop
+     *  every withdrawn item, looking like the click did nothing). */
+    private static final int  INVENTORY_CAPACITY         = 28;
 
     private final Client client;
     private final ClientThread clientThread;
@@ -495,21 +531,118 @@ public final class BankInteraction implements BankActions
         return n == null ? 0L : n;
     }
 
+    /** Total quantity of {@code itemId} in the player's inventory
+     *  (sums stack quantities for stackables; counts each non-stackable
+     *  occurrence as 1). Used by the verify-poll loops in
+     *  {@link #tryDepositAll}, {@link #tryWithdrawAll}, {@link #tryWithdrawX}
+     *  to detect when the engine has actually moved items. */
+    private int inventoryAmount(int itemId) throws InterruptedException
+    {
+        Integer n = onClient(() -> {
+            ItemContainer inv = client.getItemContainer(InventoryID.INV);
+            if (inv == null) return 0;
+            Item[] items = inv.getItems();
+            if (items == null) return 0;
+            int total = 0;
+            for (Item it : items)
+                if (it != null && it.getId() == itemId)
+                    total += Math.max(1, it.getQuantity());
+            return total;
+        });
+        return n == null ? 0 : n;
+    }
+
+    /** Number of inventory slots holding any item (0..28). Used by the
+     *  no-space pre-check in withdraw primitives and by
+     *  {@link #depositAllInventory}'s verify loop. */
+    private int inventorySlotsUsed() throws InterruptedException
+    {
+        Integer n = onClient(() -> {
+            ItemContainer inv = client.getItemContainer(InventoryID.INV);
+            if (inv == null) return 0;
+            Item[] items = inv.getItems();
+            if (items == null) return 0;
+            int count = 0;
+            for (Item it : items)
+                if (it != null && it.getId() > 0) count++;
+            return count;
+        });
+        return n == null ? 0 : n;
+    }
+
+    /** Linked noted form of {@code itemId}, or -1 if the item has no
+     *  noted form (e.g. coins, already-stackable items). Used by
+     *  {@link #tryWithdrawAsNoteX} to know which item id will land in
+     *  inventory after a noted withdraw. */
+    private int notedIdFor(int itemId) throws InterruptedException
+    {
+        Integer noted = onClient(() -> {
+            ItemComposition comp = client.getItemDefinition(itemId);
+            return comp == null ? -1 : comp.getLinkedNoteId();
+        });
+        return noted == null ? -1 : noted;
+    }
+
     /** Withdraw all of {@code itemId} from the bank via the slot's
-     *  right-click "Withdraw-All" option. The bank must be open. Returns
-     *  true iff a click was dispatched.
+     *  right-click "Withdraw-All" option. The bank must be open.
      *
-     *  <p>Failure paths (returns false, sets no error):
+     *  <p><b>Returns {@code true} only after at least one item of
+     *  {@code itemId} has actually appeared in the inventory.</b>
+     *  Failure paths (return {@code false} with a warn log):
      *  <ul>
-     *    <li>bank not open / item not in bank — call
-     *        {@link #bankContainsItem} first to differentiate.</li>
-     *    <li>bank slot widget is scrolled out and we couldn't make it
-     *        visible — caller falls back to a different strategy.</li>
+     *    <li>{@link #ensureNoteMode} could not flip the bank to unnoted
+     *        mode — {@code ensureNoteMode} logs why.</li>
+     *    <li>Inventory is full (28/28) AND no existing slot already
+     *        holds {@code itemId} — withdraw can't possibly land.</li>
+     *    <li>Slot widget couldn't be located / scrolled to —
+     *        {@link #withdrawWithVerb} logs the timeout.</li>
+     *    <li>Click chain dispatched but inventory never moved within
+     *        {@link #WITHDRAW_VERIFY_TIMEOUT_MS}.</li>
+     *    <li>Bank widget closed mid-poll.</li>
      *  </ul> */
     public boolean tryWithdrawAll(int itemId) throws InterruptedException
     {
+        assertWorkerThread("tryWithdrawAll");
         if (!ensureNoteMode(false)) return false;
-        return withdrawWithVerb(itemId, "Withdraw-All");
+        return withdrawAllAndVerify(itemId);
+    }
+
+    /** Click chain + inventory poll for "Withdraw-All". Shared by
+     *  {@link #tryWithdrawAll} and any future caller that wants the
+     *  verified contract. */
+    private boolean withdrawAllAndVerify(int itemId) throws InterruptedException
+    {
+        int baseline   = inventoryAmount(itemId);
+        int slotsUsed  = inventorySlotsUsed();
+        if (baseline == 0 && slotsUsed >= INVENTORY_CAPACITY)
+        {
+            log.warn("bank: cannot withdrawAll itemId={} — inventory full ({}/{}) and no existing slot",
+                itemId, slotsUsed, INVENTORY_CAPACITY);
+            return false;
+        }
+        if (!withdrawWithVerb(itemId, "Withdraw-All")) return false;
+
+        long deadline = System.currentTimeMillis() + WITHDRAW_VERIFY_TIMEOUT_MS;
+        while (System.currentTimeMillis() < deadline)
+        {
+            SequenceSleep.sleep(client, POLL_INTERVAL_MS);
+            if (inventoryAmount(itemId) > baseline)
+            {
+                // Brief settle: engine drip-feeds large stacks over a
+                // tick or two; sleep once more so the caller observes
+                // the final stable count rather than a mid-transfer one.
+                SequenceSleep.sleep(client, 200);
+                return true;
+            }
+            if (!Boolean.TRUE.equals(onClient(this::isBankOpen)))
+            {
+                log.warn("bank: bank closed mid-withdrawAll for itemId={}", itemId);
+                return false;
+            }
+        }
+        log.warn("bank: withdrawAll verify TIMEOUT — no inventory change for itemId={} after {}ms",
+            itemId, WITHDRAW_VERIFY_TIMEOUT_MS);
+        return false;
     }
 
     /** {@inheritDoc} */
@@ -520,12 +653,37 @@ public final class BankInteraction implements BankActions
         tryWithdrawAll(itemId);
     }
 
-    /** Withdraw 1 of {@code itemId}. Same shape as {@link #tryWithdrawAll}.
-     *  Returns true iff a click was dispatched. */
+    /** Withdraw 1 of {@code itemId}. Same verified-result contract as
+     *  {@link #tryWithdrawAll}: returns {@code true} only after the
+     *  inventory count for {@code itemId} has strictly increased. */
     public boolean tryWithdrawOne(int itemId) throws InterruptedException
     {
+        assertWorkerThread("tryWithdrawOne");
         if (!ensureNoteMode(false)) return false;
-        return withdrawWithVerb(itemId, "Withdraw-1");
+        int baseline   = inventoryAmount(itemId);
+        int slotsUsed  = inventorySlotsUsed();
+        if (baseline == 0 && slotsUsed >= INVENTORY_CAPACITY)
+        {
+            log.warn("bank: cannot withdrawOne itemId={} — inventory full ({}/{})",
+                itemId, slotsUsed, INVENTORY_CAPACITY);
+            return false;
+        }
+        if (!withdrawWithVerb(itemId, "Withdraw-1")) return false;
+
+        long deadline = System.currentTimeMillis() + WITHDRAW_VERIFY_TIMEOUT_MS;
+        while (System.currentTimeMillis() < deadline)
+        {
+            SequenceSleep.sleep(client, POLL_INTERVAL_MS);
+            if (inventoryAmount(itemId) > baseline) return true;
+            if (!Boolean.TRUE.equals(onClient(this::isBankOpen)))
+            {
+                log.warn("bank: bank closed mid-withdrawOne for itemId={}", itemId);
+                return false;
+            }
+        }
+        log.warn("bank: withdrawOne verify TIMEOUT — no inventory change for itemId={} after {}ms",
+            itemId, WITHDRAW_VERIFY_TIMEOUT_MS);
+        return false;
     }
 
     /** {@inheritDoc} */
@@ -540,30 +698,26 @@ public final class BankInteraction implements BankActions
      *
      *  <p>Flow: right-click the bank slot → pick "Withdraw-X" → the game
      *  opens a chatbox quantity dialog → type the quantity as individual
-     *  characters → press Enter to confirm.
+     *  characters → press Enter to confirm. Then we POLL inventory until
+     *  {@code itemId}'s quantity has risen by {@code qty} (full success),
+     *  the deadline elapses (partial returns true with a log line, zero
+     *  returns false), or the bank widget closes mid-flow.
      *
-     *  <p>Uses {@link HumanizedInputDispatcher#rightClickAndPickMenu} to
-     *  scroll-and-right-click the slot (same as {@link #tryWithdrawAll} /
-     *  {@link #tryWithdrawOne}), then {@link HumanizedInputDispatcher#typeChar}
-     *  per digit and {@link HumanizedInputDispatcher#tapKey} for Enter.
-     *
-     *  <p>Returns true iff the slot was found, the "Withdraw-X" menu pick
-     *  was dispatched, and the quantity was typed. The caller should wait
-     *  for the quantity dialog to appear before expecting inventory change. */
+     *  <p>Returns {@code true} only after the engine actually moved at
+     *  least one item into the inventory. */
     public boolean tryWithdrawX(int itemId, int qty) throws InterruptedException
     {
+        assertWorkerThread("tryWithdrawX");
         if (qty <= 0) return false;
         if (!ensureNoteMode(false)) return false;
-        return withdrawXInternal(itemId, qty);
+        return withdrawXAndVerify(itemId, qty, itemId);
     }
 
-    /** Shared withdraw-X mechanics (right-click → "Withdraw-X" → chatbox
-     *  digits → Enter) — does NOT touch the Note toggle. Both
-     *  {@link #tryWithdrawX} (which forces note-OFF first) and
-     *  {@link #tryWithdrawAsNoteX} (which forces note-ON first) call this
-     *  so the toggle is set exactly once per call site, by the public
-     *  entry point that knows what mode it wants. */
-    private boolean withdrawXInternal(int itemId, int qty) throws InterruptedException
+    /** Click chain only — right-click the slot, pick "Withdraw-X", type
+     *  digits, press Enter. Returns {@code true} iff the chatbox prompt
+     *  opened and was typed into. NOT verified against inventory; the
+     *  caller in {@link #withdrawXAndVerify} does the verify poll. */
+    private boolean withdrawXClickChain(int itemId, int qty) throws InterruptedException
     {
         boolean picked = withdrawWithVerb(itemId, "Withdraw-X");
         if (!picked) return false;
@@ -579,6 +733,59 @@ public final class BankInteraction implements BankActions
         return true;
     }
 
+    /** Click chain + inventory poll for Withdraw-X / Withdraw-as-note-X.
+     *
+     *  <p>{@code receivedId} is the item id we expect to land in
+     *  inventory: same as {@code itemId} for unnoted withdraws, the
+     *  linked noted form for noted withdraws (so noted-shells of
+     *  unnoted-id 2315 are tracked under noted-id 2316). */
+    private boolean withdrawXAndVerify(int itemId, int qty, int receivedId) throws InterruptedException
+    {
+        int baseline   = inventoryAmount(receivedId);
+        int slotsUsed  = inventorySlotsUsed();
+        if (baseline == 0 && slotsUsed >= INVENTORY_CAPACITY)
+        {
+            log.warn("bank: cannot withdraw {} of itemId={} — inventory full ({}/{}), no existing slot for received id {}",
+                qty, itemId, slotsUsed, INVENTORY_CAPACITY, receivedId);
+            return false;
+        }
+
+        if (!withdrawXClickChain(itemId, qty)) return false;
+
+        long deadline = System.currentTimeMillis() + WITHDRAW_VERIFY_TIMEOUT_MS;
+        while (System.currentTimeMillis() < deadline)
+        {
+            SequenceSleep.sleep(client, POLL_INTERVAL_MS);
+            int cur = inventoryAmount(receivedId);
+            if (cur >= baseline + qty) return true;     // full requested qty arrived
+            if (!Boolean.TRUE.equals(onClient(this::isBankOpen)))
+            {
+                if (cur > baseline)
+                {
+                    log.warn("bank: bank closed mid-withdraw — got partial {} of {} (itemId={})",
+                        cur - baseline, qty, itemId);
+                    return true;
+                }
+                log.warn("bank: bank closed mid-withdraw with zero items received (itemId={})", itemId);
+                return false;
+            }
+        }
+        int finalCur = inventoryAmount(receivedId);
+        if (finalCur > baseline)
+        {
+            // Bank had less stock than requested: the engine gave us
+            // what it had and the loop timed out waiting for the rest.
+            // Counts as success — the caller will see the partial fill
+            // and re-call if it wants more.
+            log.info("bank: withdraw partial — got {} of {} for itemId={} (bank likely had less stock)",
+                finalCur - baseline, qty, itemId);
+            return true;
+        }
+        log.warn("bank: withdraw verify TIMEOUT — no inventory change after {}ms (itemId={}, qty={}, receivedId={})",
+            WITHDRAW_VERIFY_TIMEOUT_MS, itemId, qty, receivedId);
+        return false;
+    }
+
     /** {@inheritDoc} */
     @Override
     public void withdrawX(int itemId, int qty) throws InterruptedException
@@ -590,12 +797,19 @@ public final class BankInteraction implements BankActions
     /** Withdraw {@code qty} of {@code itemId} as a noted stack — flips the
      *  bank's "Note" toggle on first if needed, then runs the same right-
      *  click "Withdraw-X" flow as {@link #tryWithdrawX}. The result lands
-     *  in a single inventory slot (a noted stack) regardless of qty. */
+     *  in a single inventory slot (a noted stack) regardless of qty.
+     *
+     *  <p>The verify poll watches the *noted* item id (resolved via
+     *  {@link ItemComposition#getLinkedNoteId()}); if the unnoted id has
+     *  no linked noted form, falls back to polling the unnoted id (the
+     *  bank silently delivers unnoted in that case). */
     public boolean tryWithdrawAsNoteX(int itemId, int qty) throws InterruptedException
     {
+        assertWorkerThread("tryWithdrawAsNoteX");
         if (qty <= 0) return false;
         if (!ensureNoteMode(true)) return false;
-        return withdrawXInternal(itemId, qty);
+        int notedId = notedIdFor(itemId);
+        return withdrawXAndVerify(itemId, qty, notedId > 0 ? notedId : itemId);
     }
 
     /** {@inheritDoc} */
@@ -654,11 +868,13 @@ public final class BankInteraction implements BankActions
     }
 
     /** Deposit all of {@code itemId} from the inventory via the slot's
-     *  right-click "Deposit-All" option. The bank must be open. Returns
-     *  true iff a click was dispatched (item was found in inventory and
-     *  the slot widget resolved); the caller checks
-     *  {@link HumanizedInputDispatcher#lastErrorMessage()} on the next
-     *  tick to see whether the menu pick actually landed.
+     *  right-click "Deposit-All" option. The bank must be open.
+     *
+     *  <p><b>Verified contract:</b> returns {@code true} only after the
+     *  inventory's quantity of {@code itemId} has dropped to 0 (or the
+     *  caller had nothing of that item to begin with — short-circuit).
+     *  Returns {@code false} on widget-unresolved, bank-closed-mid-poll,
+     *  or verify timeout, each with a warn log naming the cause.
      *
      *  <p>Use this instead of the deposit-inventory orb whenever any
      *  inventory item must STAY across the bank → cook → bank loop
@@ -667,6 +883,10 @@ public final class BankInteraction implements BankActions
      *  is both wasteful and very bot-tell. */
     public boolean tryDepositAll(int itemId) throws InterruptedException
     {
+        assertWorkerThread("tryDepositAll");
+        int baseline = inventoryAmount(itemId);
+        if (baseline == 0) return true;     // nothing to deposit — already at the goal state
+
         Rectangle b = onClient(() -> resolveInvSlotBoundsForDeposit(itemId));
         if (b == null)
         {
@@ -686,9 +906,73 @@ public final class BankInteraction implements BankActions
             + (int) (Math.random() * Math.max(1, b.width - 2 * marginX));
         int cy = b.y + marginY
             + (int) (Math.random() * Math.max(1, b.height - 2 * marginY));
-        log.info("bank: deposit-all itemId={} via inv slot bounds={}", itemId, b);
+        log.info("bank: deposit-all itemId={} (baseline qty={}) via inv slot bounds={}",
+            itemId, baseline, b);
         dispatcher.rightClickAndPickMenu(cx, cy, "Deposit-All");
-        return true;
+
+        long deadline = System.currentTimeMillis() + DEPOSIT_VERIFY_TIMEOUT_MS;
+        while (System.currentTimeMillis() < deadline)
+        {
+            SequenceSleep.sleep(client, POLL_INTERVAL_MS);
+            if (inventoryAmount(itemId) == 0) return true;
+            if (!Boolean.TRUE.equals(onClient(this::isBankOpen)))
+            {
+                log.warn("bank: bank closed mid-depositAll for itemId={}", itemId);
+                return false;
+            }
+        }
+        log.warn("bank: depositAll itemId={} — verify TIMEOUT (qty {} → {} after {}ms)",
+            itemId, baseline, inventoryAmount(itemId), DEPOSIT_VERIFY_TIMEOUT_MS);
+        return false;
+    }
+
+    /**
+     * Click the bank's "Deposit inventory" orb (everything in inv).
+     *
+     * <p><b>Verified contract:</b> returns {@code true} only after every
+     * inventory slot is empty. Returns {@code false} on
+     * widget-unresolved (orb hidden / bank closed), bank-closed-mid-poll,
+     * or verify timeout, each with a warn log.
+     *
+     * <p>Worker-thread only — sleeps inside the verify loop. Callers on
+     * the client thread will hit {@link SequenceSleep}'s assertion.
+     */
+    public boolean depositAllInventory() throws InterruptedException
+    {
+        assertWorkerThread("depositAllInventory");
+        int baseline = inventorySlotsUsed();
+        if (baseline == 0) return true;     // already empty
+
+        Rectangle b = onClient(() -> {
+            Widget w = client.getWidget(InterfaceID.Bankmain.DEPOSITINV);
+            if (w == null || w.isHidden()) return null;
+            Rectangle r = w.getBounds();
+            return r == null || r.isEmpty() ? null : r;
+        });
+        if (b == null)
+        {
+            log.warn("bank: depositAllInventory — orb widget not found / hidden"
+                + " (bank closed? Bankmain.DEPOSITINV unrendered?)");
+            return false;
+        }
+        log.info("bank: deposit-all-inventory orb (baseline {} slots used)", baseline);
+        dispatcher.clickCanvas(b.x + b.width / 2, b.y + b.height / 2);
+
+        long deadline = System.currentTimeMillis() + DEPOSIT_VERIFY_TIMEOUT_MS;
+        while (System.currentTimeMillis() < deadline)
+        {
+            SequenceSleep.sleep(client, POLL_INTERVAL_MS);
+            int curSlots = inventorySlotsUsed();
+            if (curSlots == 0) return true;
+            if (!Boolean.TRUE.equals(onClient(this::isBankOpen)))
+            {
+                log.warn("bank: bank closed mid-depositAllInventory ({} slots still used)", curSlots);
+                return false;
+            }
+        }
+        log.warn("bank: depositAllInventory — verify TIMEOUT, {} slots still used after {}ms",
+            inventorySlotsUsed(), DEPOSIT_VERIFY_TIMEOUT_MS);
+        return false;
     }
 
     /** {@inheritDoc} */

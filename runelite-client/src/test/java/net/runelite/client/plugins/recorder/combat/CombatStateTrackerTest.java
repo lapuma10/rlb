@@ -58,6 +58,22 @@ public class CombatStateTrackerTest
     }
 
     @Test
+    public void playerTargetingLockedNpc_countsAsEngaged()
+    {
+        Player self = mock(Player.class);
+        NPC lockedNpc = mockNpcWith(23, 30, null);
+        when(self.getInteracting()).thenReturn(lockedNpc);
+
+        CombatStateTracker t = new CombatStateTracker(23);
+        t.observe(lockedNpc, self);
+
+        assertTrue("player-side interaction alone should count as engagement",
+            t.isEngagedWithUs());
+        assertTrue(t.wasEngaged());
+        assertFalse(t.isDead());
+    }
+
+    @Test
     public void engagementBroken_lessThanThreshold_isNotBroken()
     {
         Player self = mock(Player.class);
@@ -84,6 +100,24 @@ public class CombatStateTrackerTest
         t.observe(mockNpcWith(9, 30, null), self);
         t.observe(mockNpcWith(9, 30, null), self);
         assertTrue(t.isEngagementBroken(2));
+        assertFalse(t.isDead());
+    }
+
+    @Test
+    public void playerOnlyEngagement_thenLostTarget_overThreshold_flagsBroken()
+    {
+        Player self = mock(Player.class);
+        NPC lockedNpc = mockNpcWith(25, 30, null);
+        when(self.getInteracting()).thenReturn(lockedNpc, null, null, null);
+
+        CombatStateTracker t = new CombatStateTracker(25);
+        t.observe(lockedNpc, self);
+        t.observe(mockNpcWith(25, 30, null), self);
+        t.observe(mockNpcWith(25, 30, null), self);
+        t.observe(mockNpcWith(25, 30, null), self);
+
+        assertTrue("one-sided engagement must still break after >2 lost ticks",
+            t.isEngagementBroken(2));
         assertFalse(t.isDead());
     }
 

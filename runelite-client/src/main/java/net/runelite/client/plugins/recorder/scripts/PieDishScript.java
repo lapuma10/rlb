@@ -93,6 +93,11 @@ public final class PieDishScript
     private static final long BANK_PACE_MS          = 1_500;
     private static final long SKILLMULTI_TIMEOUT_MS = 5_000;
     private static final long CRAFT_TIMEOUT_MS      = 90_000;
+    /** Consecutive verified-bank-primitive failures before aborting the
+     *  script. The primitives in {@link BankInteraction} now return
+     *  false only after their own poll-and-verify timeout, so a false
+     *  here is a real failure to act, not a transient busy/throttle. */
+    private static final int  MAX_BANK_FAILURES     = 3;
 
     // ─── GE area ─────────────────────────────────────────────────────────────
     /** Covers the GE exchange floor and the bank booths just inside. */
@@ -143,12 +148,16 @@ public final class PieDishScript
 
     // Crafting (shared by MAKING_PASTRY_DOUGH + MAKING_PIE_SHELLS via tickCraftBatch).
     private boolean craftBankDone;          // bank trip complete, items in inventory
-    private boolean craftDepositDone;       // deposit-all fired this trip — gate so the
-                                            // first withdraw doesn't get re-deposited next tick
+    private boolean craftDepositDone;       // deposit-all returned verified-true (inv is empty)
     private boolean craftClicksDone;        // Use+target clicks sent
     private boolean skillmultiConfirmed;    // Space pressed on Make-All dialog
     private long    skillmultiWaitMs;
     private long    craftWaitMs;
+
+    /** Consecutive {@link BankInteraction} primitive failures (the ones
+     *  that already poll-and-verify). Reset on the next successful call;
+     *  abort after {@link #MAX_BANK_FAILURES}. */
+    private int bankFailures;
 
     // Selling.
     private boolean sellBankDone;       // noted shells in inventory
@@ -274,14 +283,33 @@ public final class PieDishScript
         }
         if (!bank.bankReady()) { status.set("check: waiting for bank contents"); return; }
 
-        flourAmt  = (int) bank.bankItemAmount(POT_FLOUR);
-        waterAmt  = (int) bank.bankItemAmount(JUG_WATER);
-        dishAmt   = (int) bank.bankItemAmount(PIEDISH);
-        pastryAmt = (int) bank.bankItemAmount(PASTRY_DOUGH);
-        shellAmt  = (int) bank.bankItemAmount(PIE_SHELL);
+        int bankFlour  = (int) bank.bankItemAmount(POT_FLOUR);
+        int bankWater  = (int) bank.bankItemAmount(JUG_WATER);
+        int bankDish   = (int) bank.bankItemAmount(PIEDISH);
+        int bankPastry = (int) bank.bankItemAmount(PASTRY_DOUGH);
+        int bankShell  = (int) bank.bankItemAmount(PIE_SHELL);
 
-        log.info("pie-dish check: flour={} water={} dish={} pastry={} shell={}",
-            flourAmt, waterAmt, dishAmt, pastryAmt, shellAmt);
+        int invFlour  = inventoryCount(POT_FLOUR);
+        int invWater  = inventoryCount(JUG_WATER);
+        int invDish   = inventoryCount(PIEDISH);
+        int invPastry = inventoryCount(PASTRY_DOUGH);
+        int invShell  = inventoryCount(PIE_SHELL);
+
+        // Supply planning must look at TOTAL available stock, not just what's
+        // still sitting in the bank. A prior GE collect can leave ingredients
+        // in inventory, and rebuying them is both wasteful and destabilizing.
+        flourAmt  = bankFlour + invFlour;
+        waterAmt  = bankWater + invWater;
+        dishAmt   = bankDish + invDish;
+        pastryAmt = bankPastry + invPastry;
+        shellAmt  = bankShell + invShell;
+
+        log.info("pie-dish check: flour={} (bank={} inv={}) water={} (bank={} inv={}) dish={} (bank={} inv={}) pastry={} (bank={} inv={}) shell={} (bank={} inv={})",
+            flourAmt, bankFlour, invFlour,
+            waterAmt, bankWater, invWater,
+            dishAmt, bankDish, invDish,
+            pastryAmt, bankPastry, invPastry,
+            shellAmt, bankShell, invShell);
 
         // Priority A–E: close bank only when transitioning to BUYING_SUPPLIES
         // (which walks to a GE clerk). All other states reopen or keep the bank,
@@ -369,21 +397,38 @@ public final class PieDishScript
 
         if (next == State.BUYING_SUPPLIES)
         {
-            // Withdraw coins for the upcoming buys while the bank is still open.
+            // Withdraw coins for the upcoming buys while the bank is still
+            // open. Both tryWithdraw* are poll-verified, so a false return
+            // here means coins did NOT land in inventory — bail without
+            // transitioning so we retry next tick instead of starting GE
+            // buys with an empty wallet.
             int bankCoins = (int) bank.bankItemAmount(COINS);
             if (bankCoins > 0)
             {
+                boolean ok;
                 if (bankCoins <= 1_000_000)
                 {
                     log.info("pie-dish: withdraw-all coins (bank={})", bankCoins);
-                    bank.tryWithdrawAll(COINS);
+                    ok = bank.tryWithdrawAll(COINS);
                 }
                 else
                 {
                     log.info("pie-dish: withdraw {} coins (bank={})", plannedBuyCost, bankCoins);
-                    bank.tryWithdrawX(COINS, plannedBuyCost);
+                    ok = bank.tryWithdrawX(COINS, plannedBuyCost);
                 }
-                SequenceSleep.sleep(client, 500);
+                if (!ok)
+                {
+                    if (++bankFailures >= MAX_BANK_FAILURES)
+                    {
+                        abortWith("withdraw coins failed " + bankFailures + " consecutive times");
+                        return;
+                    }
+                    // Stay in CHECKING_BANK; next tick recomputes the plan
+                    // and retries. Don't close the bank — keep it open so
+                    // the retry is one click away.
+                    return;
+                }
+                bankFailures = 0;
             }
             bank.tryCloseBank();
             SequenceSleep.sleep(client, 400);
@@ -469,21 +514,39 @@ public final class PieDishScript
             }
             if (!bank.bankReady()) { status.set("buy: bank loading"); return; }
 
-            if (inventoryCount(PIEDISH) > 0)
+            // tryDepositAll is poll-verified now: true means the inventory's
+            // count of that item is 0; false means the verify timed out and
+            // we count it toward MAX_BANK_FAILURES. The 400ms sleeps the
+            // fire-and-hope version needed are gone — the primitive already
+            // waits for the engine to actually move the items.
+            if (inventoryCount(PIEDISH) > 0 && !bank.tryDepositAll(PIEDISH))
             {
-                bank.tryDepositAll(PIEDISH);
-                SequenceSleep.sleep(client, 400);
+                if (++bankFailures >= MAX_BANK_FAILURES)
+                {
+                    abortWith("buy-deposit pie dish failed " + bankFailures + " consecutive times");
+                    return;
+                }
+                return;
             }
-            if (inventoryCount(POT_FLOUR) > 0)
+            if (inventoryCount(POT_FLOUR) > 0 && !bank.tryDepositAll(POT_FLOUR))
             {
-                bank.tryDepositAll(POT_FLOUR);
-                SequenceSleep.sleep(client, 400);
+                if (++bankFailures >= MAX_BANK_FAILURES)
+                {
+                    abortWith("buy-deposit pot of flour failed " + bankFailures + " consecutive times");
+                    return;
+                }
+                return;
             }
-            if (inventoryCount(JUG_WATER) > 0)
+            if (inventoryCount(JUG_WATER) > 0 && !bank.tryDepositAll(JUG_WATER))
             {
-                bank.tryDepositAll(JUG_WATER);
-                SequenceSleep.sleep(client, 400);
+                if (++bankFailures >= MAX_BANK_FAILURES)
+                {
+                    abortWith("buy-deposit jug of water failed " + bankFailures + " consecutive times");
+                    return;
+                }
+                return;
             }
+            bankFailures     = 0;
             lastBankActionMs = System.currentTimeMillis();
             bank.tryCloseBank();
             SequenceSleep.sleep(client, 400);
@@ -801,26 +864,29 @@ public final class PieDishScript
         }
         if (!bank.bankReady()) { status.set("craft bank: waiting for contents"); return; }
 
-        // Deposit any leftovers from the previous batch — but ONLY ONCE per
-        // bank trip. Without this gate, the very first withdraw lands 9 jugs
-        // in the inventory, the next tick sees "non-empty" and deposits them
-        // straight back — infinite withdraw/deposit loop.
+        // Deposit any leftovers from the previous batch. bank.depositAllInventory()
+        // returns true only after the inventory is verified empty, so we no longer
+        // need a re-check here: a true return is "done", a false return means the
+        // primitive's own verify timed out and we count it toward MAX_BANK_FAILURES.
         if (!craftDepositDone)
         {
-            if (!isInventoryEmpty())
+            status.set("craft bank: depositing inventory");
+            if (!bank.depositAllInventory())
             {
-                status.set("craft bank: depositing inventory");
-                depositAllInventory();
-                lastBankActionMs = System.currentTimeMillis();
-                SequenceSleep.sleep(client, 500);
+                if (++bankFailures >= MAX_BANK_FAILURES)
+                {
+                    abortWith("deposit-all-inventory failed " + bankFailures + " consecutive times");
+                    return;
+                }
+                return;
             }
             craftDepositDone = true;
+            bankFailures     = 0;
             return;
         }
 
-        // Check supply. Count already-withdrawn inv items toward available total
-        // so we don't re-deposit them on the next tick and so the batch is
-        // sized against what we can actually make this trip.
+        // Count already-withdrawn inv items toward available total so the
+        // batch is sized against what we can actually make this trip.
         long bankUseAmt    = bank.bankItemAmount(useItem);
         long bankTargetAmt = bank.bankItemAmount(targetItem);
         int  invUse        = inventoryCount(useItem);
@@ -830,44 +896,61 @@ public final class PieDishScript
 
         if (totalUse <= 0 || totalTarget <= 0)
         {
-            // Leave bank open — CHECKING_BANK skips the open step when the
-            // bank is already up, avoiding a pointless close → reopen cycle.
             log.info("pie-dish: bank+inv supplies exhausted (use={}, target={}) — re-checking bank",
                 totalUse, totalTarget);
             setState(State.CHECKING_BANK);
             return;
         }
 
-        // Batch = min(both totals, maxBatch cap). Smaller stack dictates qty.
         int batchSize = Math.min(batch, Math.min(totalUse, totalTarget));
 
-        // Withdraw use-item if not yet fully in inventory.
         if (invUse < batchSize)
         {
             long now = System.currentTimeMillis();
             if (now - lastBankActionMs < BANK_PACE_MS) { status.set("craft bank: pacing withdraw"); return; }
             int need = batchSize - invUse;
             status.set("craft bank: withdraw " + need + " use-item");
-            if (bankUseAmt <= need)
-                bank.tryWithdrawAll(useItem);
+            boolean ok = (bankUseAmt <= need)
+                ? bank.tryWithdrawAll(useItem)
+                : bank.tryWithdrawX(useItem, need);
+            lastBankActionMs = System.currentTimeMillis();
+            if (!ok)
+            {
+                if (++bankFailures >= MAX_BANK_FAILURES)
+                {
+                    abortWith("withdraw use-item " + useItem + " failed " + bankFailures + " consecutive times");
+                    return;
+                }
+            }
             else
-                bank.tryWithdrawX(useItem, need);
-            lastBankActionMs = now;
+            {
+                bankFailures = 0;
+            }
             return;
         }
 
-        // Withdraw target-item if not yet fully in inventory.
         if (invTarget < batchSize)
         {
             long now = System.currentTimeMillis();
             if (now - lastBankActionMs < BANK_PACE_MS) { status.set("craft bank: pacing withdraw"); return; }
             int need = batchSize - invTarget;
             status.set("craft bank: withdraw " + need + " target-item");
-            if (bankTargetAmt <= need)
-                bank.tryWithdrawAll(targetItem);
+            boolean ok = (bankTargetAmt <= need)
+                ? bank.tryWithdrawAll(targetItem)
+                : bank.tryWithdrawX(targetItem, need);
+            lastBankActionMs = System.currentTimeMillis();
+            if (!ok)
+            {
+                if (++bankFailures >= MAX_BANK_FAILURES)
+                {
+                    abortWith("withdraw target-item " + targetItem + " failed " + bankFailures + " consecutive times");
+                    return;
+                }
+            }
             else
-                bank.tryWithdrawX(targetItem, need);
-            lastBankActionMs = now;
+            {
+                bankFailures = 0;
+            }
             return;
         }
 
@@ -950,18 +1033,24 @@ public final class PieDishScript
         }
         if (!bank.bankReady()) { status.set("sell bank: loading"); return; }
 
-        // Deposit anything in inventory first — ONCE. The noted-shell
-        // withdraw lands a noted stack in the inv, and we must not let
-        // the next tick deposit it back (mirror of the craft-deposit bug).
+        // Deposit anything in inventory first. bank.depositAllInventory()
+        // returns true only after the inventory is verified empty, so the
+        // gate is the boolean — no need for a once-per-trip guard around
+        // a fire-and-hope click any more.
         if (!sellDepositDone)
         {
-            if (!isInventoryEmpty())
+            if (!bank.depositAllInventory())
             {
-                depositAllInventory();
-                lastBankActionMs = System.currentTimeMillis();
-                SequenceSleep.sleep(client, 500);
+                if (++bankFailures >= MAX_BANK_FAILURES)
+                {
+                    abortWith("sell-deposit-all-inventory failed " + bankFailures + " consecutive times");
+                    return;
+                }
+                return;
             }
-            sellDepositDone = true;
+            lastBankActionMs = System.currentTimeMillis();
+            sellDepositDone  = true;
+            bankFailures     = 0;
             return;
         }
 
@@ -975,10 +1064,22 @@ public final class PieDishScript
         shellAmt = (int) bankShells;
 
         // Withdraw all pie shells as noted — one inventory slot for up to BATCH_QTY.
+        // tryWithdrawAsNoteX is now poll-verified: true means a noted stack
+        // actually arrived in inventory; false means timeout / no-space / bank
+        // closed mid-withdraw and we must NOT proceed to GE sell.
         status.set("sell bank: withdraw " + shellAmt + " noted pie shells");
-        bank.tryWithdrawAsNoteX(PIE_SHELL, shellAmt);
+        if (!bank.tryWithdrawAsNoteX(PIE_SHELL, shellAmt))
+        {
+            if (++bankFailures >= MAX_BANK_FAILURES)
+            {
+                abortWith("sell-withdraw-as-note failed " + bankFailures + " consecutive times");
+                return;
+            }
+            lastBankActionMs = System.currentTimeMillis();
+            return;
+        }
+        bankFailures     = 0;
         lastBankActionMs = System.currentTimeMillis();
-        SequenceSleep.sleep(client, 500);
 
         bank.tryCloseBank();
         SequenceSleep.sleep(client, 400);
@@ -1011,6 +1112,7 @@ public final class PieDishScript
         sellBankDone        = false;
         sellDepositDone     = false;
         sellStarted         = false;
+        bankFailures        = 0;
     }
 
     private void abortWith(String reason)
@@ -1029,19 +1131,6 @@ public final class PieDishScript
             return true;
         if (dispatcher.isBusy()) return false;
         return sidebarTabs.openTabAndWait(SidebarTab.INVENTORY, 2_000L);
-    }
-
-    private boolean isInventoryEmpty()
-    {
-        Integer n = onClient(() -> {
-            ItemContainer inv = client.getItemContainer(InventoryID.INV);
-            if (inv == null) return 0;
-            int count = 0;
-            for (Item it : inv.getItems())
-                if (it != null && it.getId() > 0) count++;
-            return count;
-        });
-        return n == null || n == 0;
     }
 
     private int inventoryCount(int itemId)
@@ -1094,23 +1183,6 @@ public final class PieDishScript
         if (child == null || child.isSelfHidden()) return null;
         Rectangle r = child.getBounds();
         return r == null || r.isEmpty() ? null : r;
-    }
-
-    /**
-     * Click the "Deposit inventory" orb in the bank UI.
-     * Marshals the widget-bounds read to the client thread, then dispatches
-     * the canvas click on the calling (worker) thread.
-     */
-    private void depositAllInventory() throws InterruptedException
-    {
-        Rectangle b = onClient(() -> {
-            Widget w = client.getWidget(InterfaceID.Bankmain.DEPOSITINV);
-            if (w == null || w.isHidden()) return null;
-            Rectangle r = w.getBounds();
-            return r == null || r.isEmpty() ? null : r;
-        });
-        if (b == null) { log.warn("pie-dish: deposit-all orb not found"); return; }
-        dispatcher.clickCanvas(b.x + b.width / 2, b.y + b.height / 2);
     }
 
     private <T> T onClient(Supplier<T> s)

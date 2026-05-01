@@ -133,11 +133,12 @@ public final class GeInteraction implements GeActions {
             }
             log.info("clickOfferSlotButton(slot={}, side={}): bounds={} verb=\"{}\"",
                 slot, side, hit.bounds, hit.verb);
+            // GE slot buttons are safe default left-click targets. Avoid the
+            // right-click/ESC fallback path inside GE flows.
             ActionRequest req = ActionRequest.builder()
                 .kind(ActionRequest.Kind.CLICK_BOUNDS)
                 .channel(ActionRequest.Channel.MOUSE)
                 .bounds(hit.bounds)
-                .verb(hit.verb)
                 .build();
             dispatcher.dispatch(req);
         } catch (InterruptedException ie) {
@@ -198,17 +199,19 @@ public final class GeInteraction implements GeActions {
 
     @Override
     public void openOfferDetail(int slot) {
-        // Click the slot container with verb "View offer" — the explicit verb
-        // match ensures we trigger the right action (left-click default for
-        // a completed slot) and fall back to right-click + menu select if
-        // needed. Captured from click-inspector 2026-05-01:
-        //   INDEX_2 actions=['View offer'], entryId=1 → left-click default.
+        // Plain left-click on the slot container. "View offer" is the slot's
+        // default (entryId=1) when it holds an offer, so a left-click hits it
+        // directly. We deliberately do NOT route through clickWidgetVerb here:
+        // its right-click fallback fires VK_ESCAPE on verb-mismatch, which
+        // closes the GE entirely — exactly what we're trying to interact with.
+        // Better to silently miss a click and retry than to dismiss the GE
+        // out from under the next step.
         int containerId = slotIndexWidget(slot);
         if (containerId == 0) {
             log.warn("openOfferDetail: slot {} out of range 0..7", slot);
             return;
         }
-        clickWidgetVerb(containerId, "View offer", "openOfferDetail(" + slot + ")");
+        clickWidget(containerId, "openOfferDetail(" + slot + ")");
     }
 
     private static int slotIndexWidget(int slot) {
@@ -428,15 +431,15 @@ public final class GeInteraction implements GeActions {
         log.info("runPickSearchResult: itemId={} matched name=\"{}\" action=\"{}\" bounds={}",
             itemId, wantedName, row.matchedAction, row.bounds);
 
-        // Step 3: pre-click human dwell, then click the row.
+        // Step 3: pre-click human dwell, then plain left-click the row.
         long dwell = CHATBOX_DWELL_MIN_MS
             + java.util.concurrent.ThreadLocalRandom.current()
                 .nextLong(CHATBOX_DWELL_MAX_MS - CHATBOX_DWELL_MIN_MS + 1);
         SequenceSleep.sleep(client, dwell);
-        // Click directly on the worker thread — call the dispatcher's
-        // boundsClick helper (we're already inside a worker dispatch chain,
-        // already holding the busy flag).
-        dispatcher.boundsClickOnWorker(row.bounds, row.matchedAction);
+        // GE search rows must not fall back to right-click + ESC on a transient
+        // hover-verb mismatch; that closes the search prompt and derails the
+        // whole buy flow.
+        dispatcher.boundsClickOnWorker(row.bounds, null);
         SequenceSleep.sleep(client, 500L);
         logPostClickState(itemId);
     }
@@ -466,15 +469,36 @@ public final class GeInteraction implements GeActions {
         if (container == null || container.isHidden()) return null;
         Widget[] kids = container.getDynamicChildren();
         if (kids == null) return null;
+        // Canvas dimensions for the on-screen sanity check below. Rows whose
+        // bounds fall outside the canvas (engine returns x=-1,y=-1 when a row
+        // hasn't been laid out yet, or it's been scrolled off the visible
+        // area) are unclickable — the dispatcher would hover empty space,
+        // fail the verb match, right-click, and ESCAPE the GE shut.
+        int cw = client.getCanvasWidth();
+        int ch = client.getCanvasHeight();
         String wantedNorm = VerbMatcher.normalise(wantedName);
         for (Widget k : kids) {
             if (k == null || k.isHidden()) continue;
             if (!rowMatches(k, wantedNorm)) continue;
             Rectangle b = k.getBounds();
-            if (b == null || b.isEmpty()) continue;
+            if (!boundsClickable(b, cw, ch)) continue;
             return new ResultRow("Select", b);
         }
         return null;
+    }
+
+    /** True only when {@code b} is a non-empty rectangle that lies on the
+     *  visible canvas. Engine returns negative coordinates for rows that
+     *  haven't been rendered yet or have been scrolled out of view; those
+     *  rectangles still report positive width/height, so {@link Rectangle#isEmpty}
+     *  alone doesn't catch them. Clicking them is destructive — see the
+     *  fix-site comment in {@link #findResultRowFor}. */
+    private static boolean boundsClickable(Rectangle b, int canvasW, int canvasH) {
+        if (b == null || b.isEmpty()) return false;
+        if (b.x < 0 || b.y < 0) return false;
+        if (canvasW > 0 && b.x + b.width > canvasW) return false;
+        if (canvasH > 0 && b.y + b.height > canvasH) return false;
+        return true;
     }
 
     /** Three-way name match for a search result row: getName(), getText(),
@@ -677,7 +701,9 @@ public final class GeInteraction implements GeActions {
         }
         log.info("runClickSetupChildThenType({}, verb=\"{}\", type=\"{}\"): bounds={}",
             childIndex, verb, digits, bounds);
-        dispatcher.boundsClickOnWorker(bounds, verb);
+        // GE setup controls are also plain left-clicks. A missed click can be
+        // retried; a right-click/ESC fallback closes the GE entirely.
+        dispatcher.boundsClickOnWorker(bounds, null);
         boolean typed = dispatcher.typeChatboxOnWorker(
             digits, CHATBOX_AWAIT_MS, CHATBOX_DWELL_MIN_MS, CHATBOX_DWELL_MAX_MS, true);
         if (!typed) {
@@ -710,14 +736,13 @@ public final class GeInteraction implements GeActions {
         // GeOffers.DETAILS_COLLECT widget (0x01d10018). Captured live
         // from the click-inspector (2026-04-30 tick=979/981):
         //   idx=2 — bought item / refund. actions=[Collect-notes,
-        //           Collect-items, Bank, Examine]. We pick "Collect-items"
-        //           so inv.count(itemId) tracks (Collect-notes goes to
-        //           the noted item id, which inventory.count ignores).
+        //           Collect-items, Bank, Examine]. Default left-click is
+        //           Collect-notes, which matches the live GE UI.
         //   idx=3 — leftover coins. actions=[Collect, Bank, Examine].
         // Both children share the parent's packed widget id (dynamic
         // children of DETAILS_COLLECT), so we walk the children and
-        // dispatch CLICK_BOUNDS by verb — same pattern as
-        // clickOfferSlotButton's findSideButton.
+        // click their tight bounds directly. GE detail clicks must stay
+        // on plain left-clicks only.
         //
         // Two clicks need to be sequenced — bundle into a RUN_TASK so the
         // dispatcher's busy flag stays held across both, mirroring the
@@ -739,8 +764,8 @@ public final class GeInteraction implements GeActions {
 
     /** Worker-thread implementation of the per-slot collect dance.
      *  Resolves the DETAILS_COLLECT children on the client thread, then
-     *  clicks each by bounds+verb on the worker — no re-entry into the
-     *  dispatcher's single-flight gate.
+     *  plain-left-clicks each by bounds on the worker — no re-entry into
+     *  the dispatcher's single-flight gate.
      *
      *  <p>After clicking the item box the GE CS2 sometimes closes the detail
      *  view before rendering the coins-refund child.  This method reopens the
@@ -750,16 +775,22 @@ public final class GeInteraction implements GeActions {
      *  <p>Public so the dispatcher can call back via the {@code RUN_TASK}
      *  payload; not meant for step code to invoke directly. */
     public void runCollectFromDetail(int slot) throws InterruptedException {
-        List<CollectButton> firstPass = dispatcher.runOnClient(this::findCollectButtons);
-        if (firstPass == null || firstPass.isEmpty()) {
-            // Detail view not open yet — try to open it before giving up.
+        // CollectOfferStep dispatches us the SAME tick that collectOpen() first
+        // becomes true — collectOpen() only means GeOffers.DETAILS is visible,
+        // NOT that DETAILS_COLLECT's child icons are populated. CS2 typically
+        // renders the item + coins icons 1–3 ticks after the detail view opens,
+        // so a one-shot read here would always miss them and we'd exit without
+        // clicking. Wait up to 4s for the children to appear; only then bail.
+        List<CollectButton> firstPass = waitForCollectButtons(slot, 4_000L);
+        if (firstPass.isEmpty()) {
+            // Detail view may not be open at all — try one reopen as a safety net.
             if (!reopenDetailView(slot)) {
-                log.warn("collect({}): no DETAILS_COLLECT children visible — detail view not open?", slot);
+                log.warn("collect({}): no DETAILS_COLLECT children visible after 4s — detail view not open?", slot);
                 return;
             }
-            firstPass = dispatcher.runOnClient(this::findCollectButtons);
-            if (firstPass == null || firstPass.isEmpty()) {
-                log.warn("collect({}): DETAILS_COLLECT still empty after reopening", slot);
+            firstPass = waitForCollectButtons(slot, 2_000L);
+            if (firstPass.isEmpty()) {
+                log.warn("collect({}): DETAILS_COLLECT still empty after reopen", slot);
                 return;
             }
         }
@@ -767,39 +798,79 @@ public final class GeInteraction implements GeActions {
         for (CollectButton b : firstPass) {
             log.info("ge collect: slot={} itemId={}", slot, b.itemId);
             log.info("collect({}): click '{}' at {} (item={})", slot, b.verb, b.bounds, b.itemId);
-            dispatcher.boundsClickOnWorker(b.bounds, b.verb);
+            dispatcher.boundsClickOnWorker(b.bounds, null);
             SequenceSleep.sleep(client, 180L + ThreadLocalRandom.current().nextInt(380));
         }
-
-        // After the item click the GE CS2 may close the detail view before
-        // rendering the coins-refund child.  Sleep one full tick, then collect
-        // whatever remains — reopening the slot if the view closed.
-        SequenceSleep.sleep(client, 700L + ThreadLocalRandom.current().nextInt(300));
 
         Set<Integer> clickedItemIds = new HashSet<>();
         for (CollectButton b : firstPass) clickedItemIds.add(b.itemId);
 
         for (int i = 0; i < MAX_DETAIL_REOPENS; i++) {
-            List<CollectButton> remaining = dispatcher.runOnClient(this::findCollectButtons);
-            if (remaining == null || remaining.isEmpty()) {
-                // Detail view closed after the item click — reopen to check for coins.
-                if (!reopenDetailView(slot)) break;
-                remaining = dispatcher.runOnClient(this::findCollectButtons);
-                if (remaining == null || remaining.isEmpty()) break;
-            }
+            // Poll until a new (unclicked) button appears or the container
+            // clears. Once we've successfully clicked at least one button
+            // (firstPass), an empty/missing DETAILS_COLLECT is the TERMINAL
+            // SUCCESS state — every collectable was drained. Do NOT call
+            // reopenDetailView here: its case-3 branch ("detail open but
+            // DETAILS_COLLECT hidden") burns 2s polling for a child that
+            // will never appear, and the resulting busy-worker time blows
+            // CollectOfferStep's tick budget — the bot then times out and
+            // aborts after a SUCCESSFUL collect.
+            List<CollectButton> remaining = pollForNewOrClearedButtons(clickedItemIds);
+            if (remaining == null || remaining.isEmpty()) return;
             boolean anyNew = false;
             for (CollectButton b : remaining) {
                 if (clickedItemIds.contains(b.itemId)) continue;
                 log.info("ge collect: slot={} itemId={}", slot, b.itemId);
                 log.info("collect({}): late click '{}' at {} (item={})", slot, b.verb, b.bounds, b.itemId);
-                dispatcher.boundsClickOnWorker(b.bounds, b.verb);
+                dispatcher.boundsClickOnWorker(b.bounds, null);
                 clickedItemIds.add(b.itemId);
                 anyNew = true;
                 SequenceSleep.sleep(client, 180L + ThreadLocalRandom.current().nextInt(380));
             }
-            if (!anyNew) break;
-            SequenceSleep.sleep(client, 700L + ThreadLocalRandom.current().nextInt(300));
+            if (!anyNew) return;
         }
+    }
+
+    /** Poll DETAILS_COLLECT every 100ms for up to {@code timeoutMs}, returning
+     *  as soon as at least one populated collect-button child is visible.
+     *  Returns an empty list on timeout. Used at entry to {@code runCollect-
+     *  FromDetail}: the GE CS2 takes 1–3 ticks to render the icons after the
+     *  detail view opens, and CollectOfferStep dispatches us the moment the
+     *  detail view becomes visible — so we MUST patiently wait for the
+     *  children rather than treating the empty initial read as failure. */
+    private List<CollectButton> waitForCollectButtons(int slot, long timeoutMs)
+            throws InterruptedException {
+        long deadline = System.currentTimeMillis() + timeoutMs;
+        List<CollectButton> buttons = dispatcher.runOnClient(this::findCollectButtons);
+        if (buttons != null && !buttons.isEmpty()) return buttons;
+        while (System.currentTimeMillis() < deadline) {
+            SequenceSleep.sleep(client, 100L);
+            buttons = dispatcher.runOnClient(this::findCollectButtons);
+            if (buttons != null && !buttons.isEmpty()) return buttons;
+        }
+        return List.of();
+    }
+
+    /** Poll DETAILS_COLLECT every 150ms for up to 2s, returning as soon as a
+     *  NEW (not-yet-clicked) button appears or the container empties/closes.
+     *  Falls back to the current widget state after the timeout.
+     *
+     *  <p>The GE CS2 renders the coins-refund child ~800ms after the item
+     *  button is clicked; a flat sleep risks reading mid-transition (item
+     *  widget still visible, coins not yet shown).  The anyNew==false early-
+     *  exit in the caller then breaks the loop before coins are ever clicked. */
+    private List<CollectButton> pollForNewOrClearedButtons(Set<Integer> clickedItemIds)
+            throws InterruptedException {
+        long deadline = System.currentTimeMillis() + 2_000L;
+        while (System.currentTimeMillis() < deadline) {
+            SequenceSleep.sleep(client, 150L);
+            List<CollectButton> buttons = dispatcher.runOnClient(this::findCollectButtons);
+            if (buttons == null || buttons.isEmpty()) return buttons;
+            for (CollectButton b : buttons) {
+                if (!clickedItemIds.contains(b.itemId)) return buttons;
+            }
+        }
+        return dispatcher.runOnClient(this::findCollectButtons);
     }
 
     /** Ensure DETAILS_COLLECT has at least one visible child.
@@ -920,7 +991,10 @@ public final class GeInteraction implements GeActions {
         // GeOffers.COLLECTALL toolbar button. Default verb captured from
         // click-inspector 2026-05-01: actions=['Collect to inventory',
         // 'Collect to bank'], entryId=1 → left-click = "Collect to inventory".
-        clickWidgetVerb(InterfaceID.GeOffers.COLLECTALL, "Collect to inventory", "collectAll");
+        // Plain left-click — see openOfferDetail for why we avoid the
+        // verb-routed path here (its right-click fallback closes the GE on
+        // verb mismatch via VK_ESCAPE).
+        clickWidget(InterfaceID.GeOffers.COLLECTALL, "collectAll");
     }
 
     @Override

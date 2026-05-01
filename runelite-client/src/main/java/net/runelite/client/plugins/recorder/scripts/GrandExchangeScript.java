@@ -397,6 +397,16 @@ public final class GrandExchangeScript {
         List<TelemetryRecord> recent = recentTelemetry();
         if (recent.isEmpty()) return "";
         TelemetryRecord r = recent.get(recent.size() - 1);
+        for (int i = recent.size() - 1; i >= 0; i--) {
+            TelemetryRecord candidate = recent.get(i);
+            if (candidate.event() == TelemetryRecord.Event.CHECK
+                && candidate.payload() != null
+                && candidate.payload().startsWith("canStart=false")) {
+                continue;
+            }
+            r = candidate;
+            break;
+        }
         return r.stepName() + " " + r.event()
             + (r.payload() == null || r.payload().isEmpty() ? "" : " " + r.payload());
     }
