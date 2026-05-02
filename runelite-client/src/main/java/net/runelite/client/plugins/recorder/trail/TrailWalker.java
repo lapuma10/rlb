@@ -1,8 +1,13 @@
 package net.runelite.client.plugins.recorder.trail;
 
+import java.awt.Shape;
+import java.util.ArrayList;
 import java.util.List;
+import java.util.Optional;
+import java.util.Random;
 import java.util.concurrent.ThreadLocalRandom;
 import java.util.concurrent.atomic.AtomicReference;
+import java.util.function.Predicate;
 import javax.annotation.Nullable;
 import lombok.extern.slf4j.Slf4j;
 import net.runelite.api.Client;
@@ -12,6 +17,9 @@ import net.runelite.api.WorldView;
 import net.runelite.api.coords.LocalPoint;
 import net.runelite.api.coords.WorldPoint;
 import net.runelite.client.callback.ClientThread;
+import net.runelite.client.plugins.recorder.transport.TransportResolver;
+import net.runelite.client.plugins.recorder.walker.Reachability;
+import net.runelite.client.plugins.recorder.walker.Reachability.ReachabilityMap;
 import net.runelite.client.sequence.dispatch.HumanizedInputDispatcher;
 import net.runelite.client.sequence.internal.ActionRequest;
 
@@ -24,11 +32,12 @@ import net.runelite.client.sequence.internal.ActionRequest;
  *  <ol>
  *    <li>Read the player's tile on the client thread.</li>
  *    <li>{@link #chooseLegIndex} — monotonic-forward leg pick.</li>
- *    <li>WALK leg → click a randomly-chosen tile from the "ahead" window
- *        (humanizes which tile we click on each pass).</li>
- *    <li>TRANSPORT leg → walk to the transport tile if not adjacent;
- *        once adjacent, dispatch CLICK_GAME_OBJECT with the recorded
- *        verb / objectId.</li>
+ *    <li>WALK leg → click a chosen tile from the ahead window. Optional
+ *        corridor walking may replace that pick with a nearby safe tile
+ *        around the same forward target.</li>
+ *    <li>TRANSPORT leg → walk to the transport tile if not directly
+ *        clickable; once reachable, dispatch CLICK_GAME_OBJECT with the
+ *        recorded verb / objectId.</li>
  *    <li>If the player hasn't moved for {@link #STUCK_AFTER_MS}, return
  *        {@link Status#STUCK}.</li>
  *  </ol>
@@ -45,28 +54,78 @@ public final class TrailWalker
     public static final long INTERACT_THROTTLE_MS = 3_000;
     public static final long STUCK_AFTER_MS = 15_000;
     public static final int TRANSPORT_ADJACENCY = 1;
+
     /** Chebyshev distance within which a visible transport object is clicked
-     *  directly (OSRS pathfinds and queues the verb). Beyond this the walker
-     *  walks closer first to ensure the engine can route the player. */
+     *  directly. Beyond this the walker walks closer first. */
     public static final int TRANSPORT_DIRECT_CLICK_TILES = 13;
+
+    /** v2 cap for opportunistic transport clicks. Set just below
+     *  {@link #TRANSPORT_DIRECT_CLICK_TILES}=13 so that inside this radius
+     *  the OSRS server's pathfind from the click target stays close to the
+     *  recorded trail's intended route; beyond it, the engine may detour
+     *  through unintended tiles. The visibility-gated transport click in
+     *  {@link #handleTransportLeg} uses this constant instead of the
+     *  legacy {@link #TRANSPORT_ADJACENCY}=1 rule. */
+    public static final int MAX_TRANSPORT_CLICK_DISTANCE = 12;
+
     /** Distance-to-pick must improve at least once within this window for
-     *  the click to be considered "still making progress". When neither
-     *  movement nor distance progress has been observed AND the reclick
-     *  cooldown has elapsed, we treat the click as dropped and re-issue.
-     *  Without this gate, a player slow-walking past obstacles for >2.5s
-     *  would trigger redundant reclicks even though the engine was
-     *  faithfully routing them. */
+     *  the click to be considered still making progress. */
     public static final long PROGRESS_TIMEOUT_MS = 4_000;
+
+    /** Maximum Chebyshev distance the engine's minimap walk-click reliably
+     *  routes. Picks beyond this are out of range. */
+    static final int MAX_HOP_TILES = 16;
+
+    /** A transport that has been fired but whose effect we must wait for
+     *  before treating a missing verb as already-complete. */
+    static final long TRANSPORT_VERB_GRACE_TICKS = 4;
+
+    /** Hard cap for experimental corridor offset. Radius 1–2 is the useful
+     *  range; radius 3 is allowed for testing but should not be the default. */
+    static final int MAX_CORRIDOR_RADIUS = 3;
 
     private final Client client;
     private final ClientThread clientThread;
     private final HumanizedInputDispatcher dispatcher;
     private final net.runelite.client.plugins.recorder.transport.TransportResolver transportResolver;
-    /** Pluggable on-canvas probe. Default delegates to {@link #computeIsTileOnCanvas}
-     *  which uses {@link Perspective#localToCanvas}. Tests swap in a fixed
-     *  predicate via {@link #setOnCanvasProbeForTest} because Mockito-driven
-     *  Perspective math requires stubbing the full camera/viewport state. */
-    private java.util.function.Predicate<WorldPoint> onCanvasProbe = this::computeIsTileOnCanvas;
+
+    /** Pluggable on-canvas probe. Default delegates to {@link #computeIsTileOnCanvas}. */
+    private Predicate<WorldPoint> onCanvasProbe = this::computeIsTileOnCanvas;
+
+    /** Pluggable walkability probe. Default is conservative/no-op: true.
+     *  Wire this to a collision-aware helper once the repo's movement helper
+     *  is identified. Corridor mode is off by default, so this cannot affect
+     *  existing behavior unless explicitly enabled. */
+    private Predicate<WorldPoint> walkableProbe = tile -> true;
+
+    /** Corridor walking master toggle. Default on in v2 — the
+     *  {@link Reachability}-backed probe wired in
+     *  {@link #maybeApplyCorridorPick} validates each candidate against
+     *  the engine's collision flags, so off-trail walls are excluded
+     *  automatically. Opt out per walker via
+     *  {@link #setCorridorWalkingEnabled}. */
+    private boolean corridorWalkingEnabled = true;
+
+    /** v1 holdover: when true, compute and log corridor candidates but
+     *  keep clicking the original trail pick. v2 default is false (the
+     *  corridor pick actually applies). Tests still flip this on to
+     *  exercise the picker independently of the dispatcher. */
+    private boolean corridorDebugOnly = false;
+
+    /** Radius around the normal forward pick. Default 1, max 3. */
+    private int corridorRadius = 1;
+
+    /** Chance to replace the original pick when corridor mode is enabled
+     *  and not debug-only. v2 raises the default to 100 — every walk pick
+     *  is corridor-selected when a candidate exists, falling back to the
+     *  centerline when not. The 20% v1 default existed because the
+     *  walkable probe was a no-op and clicking arbitrary nearby tiles
+     *  was risky; with the BFS-backed probe wired the risk is gone. */
+    private int corridorChancePercent = 100;
+
+    /** v2: visibility checker for opportunistic transport clicks. Default
+     *  binds to the live client; tests inject {@link ObjectVisibility#alwaysVisible()}. */
+    private ObjectVisibility objectVisibility;
 
     private TrailPath currentPath;
     private int legIdx;
@@ -76,31 +135,54 @@ public final class TrailWalker
     private long lastInteractMs;
     private int lastClickLegIdx = -1;
     private WorldPoint lastWalkPick;
-    /** Best (smallest) Chebyshev distance from the player to
-     *  {@link #lastWalkPick} observed since the click was issued. When
-     *  this strictly decreases, {@link #lastProgressMs} is bumped — the
-     *  engine is faithfully routing us, so don't fire a redundant
-     *  reclick. Reset to {@link Integer#MAX_VALUE} on every new click. */
+
+    /** Best distance to {@link #lastWalkPick} observed since the click was issued. */
     private int bestDistToPick = Integer.MAX_VALUE;
-    /** Wall-clock of the last observation that the player closed distance
-     *  to the current pick. Used by {@link #handleWalkLeg}'s stale check. */
+
+    /** Wall-clock of the last observation that the player closed distance to the current pick. */
     private long lastProgressMs;
-    /** When the verb on a TRANSPORT leg can't be found on any object at the
-     *  recorded tile (e.g. "Open" on a gate that's already open and now
-     *  shows "Close"), we treat the transport as already done and advance
-     *  past it. This counter records how many ticks we've waited for the
-     *  verb to reappear before giving up; without a small grace window we
-     *  could skip a transport whose object hasn't loaded into the scene yet. */
+
+    /** Missing-verb grace counter for already-completed transports. */
     private int transportVerbMissingTicks;
+
+    /** v2 transport flow: have we already rotated the camera once for
+     *  the active transport leg? Reset on leg advance. Prevents tight
+     *  re-rotation loops when the visibility check still fails after
+     *  the streamed yaw arrives (rotation takes 500-1500 ms; multiple
+     *  ticks pass during it). */
+    private boolean rotatedThisLeg;
+
+    /** v2 route state — see {@link #walkRoute(Route)}. {@code activeRoute}
+     *  is the route the caller most recently asked us to walk;
+     *  {@code activeRoutePath} is the {@link TrailPath} compiled from
+     *  the trail we picked from that route; {@code lastPickedTrail} is
+     *  remembered across calls for {@link Route#noRepeat()} support. */
+    @Nullable private Route activeRoute;
+    @Nullable private TrailPath activeRoutePath;
+    @Nullable private Trail lastPickedTrail;
 
     public TrailWalker(Client client, ClientThread clientThread,
                        HumanizedInputDispatcher dispatcher)
+    {
+        this(client, clientThread, dispatcher,
+            client == null ? ObjectVisibility.alwaysVisible() : ObjectVisibility.forClient(client));
+    }
+
+    /** Test/integration constructor allowing a non-default
+     *  {@link ObjectVisibility} (typically {@link ObjectVisibility#alwaysVisible()}
+     *  in unit tests where there's no live client to read viewport/HUD from). */
+    public TrailWalker(Client client, ClientThread clientThread,
+                       HumanizedInputDispatcher dispatcher,
+                       ObjectVisibility objectVisibility)
     {
         this.client = client;
         this.clientThread = clientThread;
         this.dispatcher = dispatcher;
         this.transportResolver = client == null ? null
-            : new net.runelite.client.plugins.recorder.transport.TransportResolver(client);
+            : new TransportResolver(client);
+        this.objectVisibility = objectVisibility == null
+            ? ObjectVisibility.alwaysVisible()
+            : objectVisibility;
         reset();
     }
 
@@ -117,26 +199,126 @@ public final class TrailWalker
         bestDistToPick = Integer.MAX_VALUE;
         lastProgressMs = System.currentTimeMillis();
         transportVerbMissingTicks = 0;
-        // Clear the debug overlay so a stale path/pick doesn't linger
-        // after the walker is reset between scripts / sessions.
+        rotatedThisLeg = false;
+        // Note: activeRoute / activeRoutePath / lastPickedTrail are NOT
+        // reset here. reset() runs on path swap inside tick(); leaving
+        // route state alone lets walkRoute manage its own lifecycle.
         TrailOverlay.publishActiveTrail(null);
         TrailOverlay.publishCurrentPick(null);
     }
 
-    public int currentLegIndex() { return legIdx; }
+    public int currentLegIndex()
+    {
+        return legIdx;
+    }
 
-    /** Pick the active leg index for the given player position. Pure
-     *  function — exposed package-public for unit testing. */
+    /** Runtime toggle for testing corridor walking without changing constructor wiring. */
+    public void setCorridorWalkingEnabled(boolean enabled)
+    {
+        this.corridorWalkingEnabled = enabled;
+    }
+
+    /** Runtime toggle. When true, corridor picks are computed/logged but not clicked. */
+    public void setCorridorDebugOnly(boolean debugOnly)
+    {
+        this.corridorDebugOnly = debugOnly;
+    }
+
+    /** Runtime radius setter. Clamped to 0..3. */
+    public void setCorridorRadius(int radius)
+    {
+        this.corridorRadius = Math.max(0, Math.min(MAX_CORRIDOR_RADIUS, radius));
+    }
+
+    /** Runtime probability setter. Clamped to 0..100. */
+    public void setCorridorChancePercent(int chancePercent)
+    {
+        this.corridorChancePercent = Math.max(0, Math.min(100, chancePercent));
+    }
+
+    /** Test / integration hook for collision-aware corridor walking. */
+    void setWalkableProbeForTest(Predicate<WorldPoint> probe)
+    {
+        this.walkableProbe = probe == null ? tile -> true : probe;
+    }
+
+    /** Test/integration hook to inject an alternate {@link ObjectVisibility}
+     *  (e.g. {@link ObjectVisibility#alwaysVisible()} so unit tests don't
+     *  need a live viewport). Production callers pick up the live-client
+     *  binding via the default constructor. */
+    public void setObjectVisibility(ObjectVisibility v)
+    {
+        this.objectVisibility = v == null ? ObjectVisibility.alwaysVisible() : v;
+    }
+
+    /** Pick a trail from {@code route} (weighted-random, with
+     *  {@link Route#noRepeat()} respected against the trail this walker
+     *  most recently picked) and drive it to ARRIVED/STUCK/ERROR. Caller
+     *  invokes once per outer-loop tick; the walker tracks which trail
+     *  it's currently on across calls and re-picks once the trail
+     *  finishes (or breaks).
+     *
+     *  <p>The route's {@link Route#corridorRadius()} is applied to this
+     *  walker for the trail's lifetime — a side effect, but the simplest
+     *  way to let different routes carry different corridor preferences.
+     *  When the trail finishes, the radius stays at whatever the route
+     *  set it to until a new route changes it.
+     *
+     *  <p>{@code lastPickedTrail} is reset to {@code null} on route
+     *  switch <i>only</i> if the new route doesn't include the last
+     *  pick — keeps no-repeat tracking working across callers that flip
+     *  between two overlapping routes. */
+    public Status walkRoute(Route route) throws InterruptedException
+    {
+        if (route == null) return Status.ERROR;
+
+        if (activeRoute != route || activeRoutePath == null)
+        {
+            // Switching routes: drop the no-repeat memory if the
+            // previously-picked trail isn't part of the new route, so
+            // the new route's first pick isn't artificially constrained.
+            if (activeRoute != route && lastPickedTrail != null)
+            {
+                boolean stillRelevant = route.entries().stream()
+                    .anyMatch(e -> e.trail() == lastPickedTrail);
+                if (!stillRelevant) lastPickedTrail = null;
+            }
+            activeRoute = route;
+            Trail picked = route.pickWeightedRandom(
+                route.noRepeat() ? lastPickedTrail : null,
+                ThreadLocalRandom.current());
+            lastPickedTrail = picked;
+            activeRoutePath = TrailPath.fromTrail(picked);
+            setCorridorRadius(route.corridorRadius());
+            log.info("trail-walker: route picked trail '{}' (route entries={}, corridor radius={}, noRepeat={})",
+                picked.name(), route.entries().size(),
+                route.corridorRadius(), route.noRepeat());
+        }
+
+        Status s = tick(activeRoutePath);
+        if (s == Status.ARRIVED || s == Status.STUCK || s == Status.ERROR)
+        {
+            // Next walkRoute call will pick a fresh trail.
+            activeRoutePath = null;
+        }
+        return s;
+    }
+
+    /** Most recently picked trail across all {@link #walkRoute} calls.
+     *  Exposed for tests + scripts that want to see the no-repeat state. */
+    @Nullable public Trail lastPickedTrail() { return lastPickedTrail; }
+
+    /** Test-only hook. Swaps the on-canvas probe so handoff / transport
+     *  decisions can be exercised without stubbing the full Perspective state. */
+    void setOnCanvasProbeForTest(Predicate<WorldPoint> probe)
+    {
+        this.onCanvasProbe = probe == null ? this::computeIsTileOnCanvas : probe;
+    }
+
+    /** Pick the active leg index for the given player position. Pure function. */
     static int chooseLegIndex(TrailPath path, int minIdx, WorldPoint pos)
     {
         List<Leg> legs = path.legs();
-        // Single-step monotonic advance: flip to leg i+1 if either
-        //   (a) the player is already standing in leg i+1's tile-set, or
-        //   (b) leg i is a WALK and the player has reached its final tile
-        //       (otherwise the walker stalls at the end of a walk leg
-        //       whose successor is a TRANSPORT — the transport's tile is
-        //       not the same as the walk's last tile, so condition (a)
-        //       never fires).
         int idx = minIdx;
         while (idx < legs.size() - 1)
         {
@@ -145,6 +327,7 @@ public final class TrailWalker
                 idx++;
                 continue;
             }
+
             Leg cur = legs.get(idx);
             if (cur instanceof Leg.Walk w
                 && pos.equals(w.tiles().get(w.tiles().size() - 1)))
@@ -152,34 +335,29 @@ public final class TrailWalker
                 idx++;
                 continue;
             }
-            // Forward-scan: the player's tile may live more than one leg
-            // ahead. Two cases this catches:
-            //   - After a TRANSPORT: the engine teleported the player past
-            //     a 1-tile post-stair WALK leg (the post-stair tile also
-            //     belongs to the next WALK leg). Without this the walker
-            //     sits on the transport leg whose action has already fired.
-            //   - After an unexpected plane change mid-WALK leg (user
-            //     manually climbed stairs, an external action moved us):
-            //     the current leg's tiles are on a plane the player is no
-            //     longer on, so the single-step checks above all miss. Hop
-            //     to the first future leg the player can be located on.
+
             int hop = -1;
             for (int j = idx + 2; j < legs.size(); j++)
             {
-                if (legContainsTile(legs.get(j), pos)) { hop = j; break; }
+                if (legContainsTile(legs.get(j), pos))
+                {
+                    hop = j;
+                    break;
+                }
             }
-            // Plane-based fallback: no future leg contains the exact
-            // player tile, but the current leg has no tiles on the
-            // player's plane — means the player drifted off the trail's
-            // plane. Hop to the first future leg that has any tile on the
-            // player's plane so the walker can resume on the right floor.
+
             if (hop < 0 && !legHasPlane(cur, pos.getPlane()))
             {
                 for (int j = idx + 1; j < legs.size(); j++)
                 {
-                    if (legHasPlane(legs.get(j), pos.getPlane())) { hop = j; break; }
+                    if (legHasPlane(legs.get(j), pos.getPlane()))
+                    {
+                        hop = j;
+                        break;
+                    }
                 }
             }
+
             if (hop > idx)
             {
                 log.warn("trail-walker: forward-scan recovered — leg {} → {} "
@@ -188,6 +366,7 @@ public final class TrailWalker
                 idx = hop;
                 continue;
             }
+
             break;
         }
         return idx;
@@ -227,77 +406,42 @@ public final class TrailWalker
         return false;
     }
 
-    /** Choose a tile inside {@code leg} that is "ahead" of the player.
-     *  Ahead = later in {@code leg.tiles()} than the closest tile to the
-     *  player. From those candidates, pick one uniformly at random — this
-     *  is the click humanization that makes a real player's "I'll click
-     *  somewhere over there" different on every pass.
-     *
-     *  <p>If the player isn't in the leg's tile list at all, we fall back
-     *  to the farthest tile (== the leg's destination), matching the
-     *  spec's "farthest tile in this leg that is still ahead of the
-     *  player". */
-    /** Maximum Chebyshev distance the engine's minimap walk-click reliably
-     *  routes (default OSRS minimap zoom). Picks beyond this are out of
-     *  range — the click would resolve to "Cancel". */
-    static final int MAX_HOP_TILES = 16;
-
-    static WorldPoint pickAheadTile(Leg.Walk leg, WorldPoint player, java.util.Random rng)
+    /** Choose a tile inside {@code leg} that is ahead of the player. */
+    static WorldPoint pickAheadTile(Leg.Walk leg, WorldPoint player, Random rng)
     {
         List<WorldPoint> tiles = leg.tiles();
-        // Closest tile to the player on the same plane.
         int closestIdx = -1;
         int closestDist = Integer.MAX_VALUE;
         for (int i = 0; i < tiles.size(); i++)
         {
             WorldPoint t = tiles.get(i);
             if (t.getPlane() != player.getPlane()) continue;
-            int dx = Math.abs(t.getX() - player.getX());
-            int dy = Math.abs(t.getY() - player.getY());
-            int d = Math.max(dx, dy);
-            if (d < closestDist) { closestDist = d; closestIdx = i; }
+            int d = chebyshev(player, t);
+            if (d < closestDist)
+            {
+                closestDist = d;
+                closestIdx = i;
+            }
         }
+
         if (closestIdx < 0) return tiles.get(tiles.size() - 1);
         int firstAhead = closestIdx + 1;
         if (firstAhead >= tiles.size()) return tiles.get(tiles.size() - 1);
 
-        // Walk forward through the leg, tracking the FARTHEST tile in the
-        // leg that is still within minimap walk range of the player. That
-        // tile is our preferred click target — beyond it the engine drops
-        // the click. If the leg's last tile is within range, we want to
-        // be able to pick IT (which advances the walker past this leg).
         int farthestIdx = closestIdx;
         for (int i = firstAhead; i < tiles.size(); i++)
         {
             WorldPoint t = tiles.get(i);
-            int dx = Math.abs(t.getX() - player.getX());
-            int dy = Math.abs(t.getY() - player.getY());
-            int d = Math.max(dx, dy);
+            int d = chebyshev(player, t);
             if (d > MAX_HOP_TILES) break;
             farthestIdx = i;
         }
+
         if (farthestIdx <= closestIdx)
         {
-            // No tile ahead is within hop range — the leg is far away or
-            // we're at the very end. Fall back to the leg's last tile.
             return tiles.get(tiles.size() - 1);
         }
 
-        // Humanization: pick uniformly within the LAST HALF of the
-        // in-range ahead window. This trades off:
-        //   - consistent far hops (always ~half the window or more —
-        //     for a typical 16-tile in-range window, every pick is at
-        //     least 8-9 game tiles ahead, never 3-5) so the bot doesn't
-        //     crawl when travelling
-        //   - enough candidate tiles (8 for a 16-tile window) that
-        //     consecutive cycles don't click the exact same tile,
-        //     breaking the "always (3220,3219) → (3232,3219) → ..."
-        //     pattern.
-        // Earlier iterations had a "mid hop" branch picking from the
-        // first half of the window — that produced the 3-5 tile hops
-        // the user flagged. Real players always click far when
-        // travelling; the only randomization that matters is WHICH
-        // far tile, not whether to click far at all.
         int windowSize = farthestIdx - firstAhead + 1;
         int pickIdx;
         if (windowSize <= 3)
@@ -313,6 +457,83 @@ public final class TrailWalker
         return tiles.get(pickIdx);
     }
 
+    /** Experimental corridor tile selector. Candidates are around the normal
+     *  forward pick, not around the player. This keeps the recorded trail as
+     *  the centerline while allowing a small walkable corridor around it.
+     *
+     *  <p>A candidate must:
+     *  <ul>
+     *    <li>be on the player's plane</li>
+     *    <li>be within {@link #MAX_HOP_TILES} of the player (minimap-clickable)</li>
+     *    <li>be within {@code effectiveRadius} of some tile in the leg
+     *        (the corridor invariant — no off-trail wandering)</li>
+     *    <li>not lose forward progress: its Chebyshev distance to the leg's
+     *        end tile must be {@code <= playerDistToEnd + 1}</li>
+     *    <li>pass the {@code walkable} probe (collision-aware in production)</li>
+     *  </ul>
+     */
+    static Optional<WorldPoint> pickCorridorTile(
+        Leg.Walk leg,
+        WorldPoint player,
+        WorldPoint originalPick,
+        int radius,
+        Random rng,
+        Predicate<WorldPoint> walkable)
+    {
+        if (leg == null || player == null || originalPick == null) return Optional.empty();
+        if (radius <= 0) return Optional.empty();
+        int effectiveRadius = Math.min(MAX_CORRIDOR_RADIUS, radius);
+
+        List<WorldPoint> tiles = leg.tiles();
+        if (tiles == null || tiles.isEmpty()) return Optional.empty();
+
+        WorldPoint legEnd = tiles.get(tiles.size() - 1);
+        int playerDistToEnd = chebyshev(player, legEnd);
+        List<WorldPoint> candidates = new ArrayList<>();
+
+        for (int dx = -effectiveRadius; dx <= effectiveRadius; dx++)
+        {
+            for (int dy = -effectiveRadius; dy <= effectiveRadius; dy++)
+            {
+                if (dx == 0 && dy == 0) continue;
+
+                WorldPoint c = new WorldPoint(
+                    originalPick.getX() + dx,
+                    originalPick.getY() + dy,
+                    originalPick.getPlane());
+
+                if (c.getPlane() != player.getPlane()) continue;
+                if (chebyshev(player, c) > MAX_HOP_TILES) continue;
+                // Corridor invariant: reject tiles that drift more than
+                // effectiveRadius from any leg tile. This subsumes the old
+                // canReconnectSoon check (which was strictly more permissive
+                // and therefore redundant after this filter).
+                if (distanceToNearestTile(c, tiles) > effectiveRadius) continue;
+
+                int candidateDistToEnd = chebyshev(c, legEnd);
+                if (candidateDistToEnd > playerDistToEnd + 1) continue;
+
+                if (walkable != null && !walkable.test(c)) continue;
+
+                candidates.add(c);
+            }
+        }
+
+        if (candidates.isEmpty()) return Optional.empty();
+        return Optional.of(candidates.get(rng.nextInt(candidates.size())));
+    }
+
+    static int distanceToNearestTile(WorldPoint p, List<WorldPoint> tiles)
+    {
+        int best = Integer.MAX_VALUE;
+        for (WorldPoint t : tiles)
+        {
+            if (t.getPlane() != p.getPlane()) continue;
+            best = Math.min(best, chebyshev(p, t));
+        }
+        return best;
+    }
+
     public Status tick(TrailPath path) throws InterruptedException
     {
         if (path == null || path.isEmpty()) return Status.ARRIVED;
@@ -321,10 +542,7 @@ public final class TrailWalker
             reset();
             currentPath = path;
         }
-        // Publish to the debug overlay (no-op when unregistered). Done
-        // every tick so the path stays visible across leg advances and
-        // catches the case where the script hands us a fresh path
-        // mid-run (return-trail vs. outbound-trail swap).
+
         TrailOverlay.publishActiveTrail(path);
         if (legIdx >= path.size()) return Status.ARRIVED;
 
@@ -338,7 +556,6 @@ public final class TrailWalker
             lastMovementMs = now;
         }
 
-        // Locate the active leg. Monotonic forward.
         int newIdx = chooseLegIndex(path, legIdx, pos);
         if (newIdx > legIdx)
         {
@@ -350,19 +567,9 @@ public final class TrailWalker
         }
         if (legIdx >= path.size()) return Status.ARRIVED;
 
-        // Interaction-ready handoff. The OSRS pathfinder may land the
-        // player on a tile adjacent to (but not equal to) a WALK leg's
-        // last tile. Without this peek-ahead, the walker stays on the
-        // WALK leg and burns 2-6 ticks issuing 1-tile micro-walks before
-        // the player happens to land on the exact recorded tile,
-        // chooseLegIndex finally advances, and the TRANSPORT click fires.
-        // If the next leg is a TRANSPORT whose verb is callable RIGHT
-        // NOW from the player's position, skip those tail-end clicks —
-        // OSRS will path the player to the object as part of the verb
-        // dispatch.
-        if (tryAdvanceToReachableTransport(pos, now)) {
-            // Fall through with the new legIdx; let the TRANSPORT
-            // handler take it from here.
+        if (tryAdvanceToReachableTransport(pos, now))
+        {
+            // Fall through with the new legIdx; let the TRANSPORT handler take it from here.
         }
         if (legIdx >= path.size()) return Status.ARRIVED;
 
@@ -379,8 +586,6 @@ public final class TrailWalker
             return Status.STUCK;
         }
 
-        // ARRIVED only when the very last leg is satisfied — player must be
-        // standing on the leg's final tile.
         if (s == Status.IN_PROGRESS && legIdx == path.size() - 1
             && active instanceof Leg.Walk fin
             && pos.equals(fin.tiles().get(fin.tiles().size() - 1)))
@@ -394,13 +599,9 @@ public final class TrailWalker
     {
         if (legContainsTile(leg, pos) && pos.equals(leg.tiles().get(leg.tiles().size() - 1)))
         {
-            // Reached the final tile of THIS leg — let the next tick
-            // advance to the next leg.
             return Status.IN_PROGRESS;
         }
-        // Update the distance-progress tracker BEFORE the click decision
-        // so a tick where the player is closing distance counts as
-        // progress even if we haven't crossed a tile boundary yet.
+
         if (lastWalkPick != null && pos.getPlane() == lastWalkPick.getPlane())
         {
             int distToPick = chebyshev(pos, lastWalkPick);
@@ -410,25 +611,9 @@ public final class TrailWalker
                 lastProgressMs = now;
             }
         }
-        // Don't dispatch while the previous click is still in flight; the
-        // dispatcher silently drops re-entrant requests and we'd burn the
-        // 3s reclick timer on dropped clicks.
+
         if (dispatcher.isBusy()) return Status.IN_PROGRESS;
-        // Click cadence: only re-pick + re-click when there's a real reason
-        // to. Calling pickAheadTile every tick produces a NEW random target
-        // each call (humanization), and dispatching a fresh WALK click on
-        // each new target redirects the engine's pathfinder mid-walk —
-        // the player oscillates between tiles and never makes progress.
-        // Reasons to click:
-        //   1. Leg changed (we just advanced past a transport / another leg)
-        //   2. Player reached the previous pick tile (advance the target)
-        //   3. RECLICK_AFTER_MS elapsed AND player has been still for
-        //      STILL_THRESHOLD_MS AND no distance progress to the pick
-        //      within PROGRESS_TIMEOUT_MS. The progress gate matters when
-        //      the player is squeezing past an NPC / through a doorway:
-        //      they may not change tiles for >2.5s but distance to the
-        //      pick is still falling, so the engine is on it — don't
-        //      reclick.
+
         boolean legChanged = legIdx != lastClickLegIdx;
         boolean reachedPrevPick = lastWalkPick != null && pos.equals(lastWalkPick);
         long sinceClick = lastClickMs == 0 ? Long.MAX_VALUE : now - lastClickMs;
@@ -440,38 +625,106 @@ public final class TrailWalker
         boolean staleClick = !recentClick && !stillWalking && !recentProgress;
         if (!legChanged && !reachedPrevPick && !staleClick)
         {
-            // Engine is still walking the player toward our previous click.
-            // Don't pick a new tile and don't click — wait.
             return Status.IN_PROGRESS;
         }
-        WorldPoint pick = pickAheadTile(leg, pos, ThreadLocalRandom.current());
+
+        WorldPoint originalPick = pickAheadTile(leg, pos, ThreadLocalRandom.current());
+        WorldPoint pick = maybeApplyCorridorPick(leg, pos, originalPick);
         WorldPoint legEnd = leg.tiles().get(leg.tiles().size() - 1);
-        log.info("trail-walker: WALK leg {} pick={} reason={} dist-to-pick={} dist-to-legEnd={} "
-            + "sinceClick={}ms sinceMove={}ms sinceProgress={}ms",
-            legIdx, pick,
+
+        log.info("trail-walker: WALK leg {} pick={} originalPick={} reason={} dist-to-pick={} "
+            + "dist-to-legEnd={} sinceClick={}ms sinceMove={}ms sinceProgress={}ms corridorEnabled={} debugOnly={}",
+            legIdx, pick, originalPick,
             legChanged ? "leg-changed"
                 : reachedPrevPick ? "reached-prev"
                 : "stale",
             chebyshev(pos, pick), chebyshev(pos, legEnd),
             sinceClick == Long.MAX_VALUE ? -1 : sinceClick,
             sinceMove,
-            sinceProgress == Long.MAX_VALUE ? -1 : sinceProgress);
+            sinceProgress == Long.MAX_VALUE ? -1 : sinceProgress,
+            corridorWalkingEnabled,
+            corridorDebugOnly);
+
         ActionRequest req = ActionRequest.builder()
             .kind(ActionRequest.Kind.WALK)
             .channel(ActionRequest.Channel.MOUSE)
             .tile(pick)
             .build();
         dispatcher.dispatch(req);
+
         lastClickMs = now;
         lastClickLegIdx = legIdx;
         lastWalkPick = pick;
-        // New pick → reset the progress tracker. Seed with the current
-        // distance so the first time it strictly decreases counts as
-        // progress.
         bestDistToPick = chebyshev(pos, pick);
         lastProgressMs = now;
         TrailOverlay.publishCurrentPick(pick);
         return Status.IN_PROGRESS;
+    }
+
+    private WorldPoint maybeApplyCorridorPick(Leg.Walk leg, WorldPoint pos, WorldPoint originalPick)
+    {
+        if (!corridorWalkingEnabled || corridorRadius <= 0)
+        {
+            return originalPick;
+        }
+
+        Random rng = ThreadLocalRandom.current();
+
+        // v2: snapshot a Reachability map from the player and compose
+        // the existing walkableProbe with two BFS gates — candidate
+        // must be in the visited set, and its hop-distance must be
+        // within `centerlineDist + 1` (no detours). Tolerance of 1
+        // absorbs BFS-vs-server tile-ordering quirks. Snapshot is
+        // cheap (~256 expansions at depth 16) and runs on the client
+        // thread because canTravelInDirection reads collision flags
+        // from the loaded scene.
+        final ReachabilityMap reach = onClient(() -> {
+            WorldView wv = client == null ? null : client.getTopLevelWorldView();
+            if (wv == null) return null;
+            return Reachability.compute(wv, pos);
+        });
+        final int centerlineDist = reach == null ? -1 : reach.distance(originalPick);
+
+        Predicate<WorldPoint> compoundProbe = candidate -> {
+            if (walkableProbe != null && !walkableProbe.test(candidate)) return false;
+            if (reach == null) return true;            // can't validate, allow
+            if (centerlineDist < 0) return true;       // centerline itself off-BFS, allow
+            if (!reach.isReachable(candidate)) return false;
+            return reach.distance(candidate) <= centerlineDist + 1;
+        };
+
+        Optional<WorldPoint> candidate = pickCorridorTile(
+            leg,
+            pos,
+            originalPick,
+            corridorRadius,
+            rng,
+            compoundProbe);
+
+        boolean chancePasses = corridorChancePercent >= 100
+            || (corridorChancePercent > 0 && rng.nextInt(100) < corridorChancePercent);
+        boolean accepted = candidate.isPresent() && chancePasses && !corridorDebugOnly;
+
+        // Only INFO-log when we actually swapped the pick — that's a
+        // behavior-changing decision worth seeing in normal operation.
+        // The compute-and-skip path runs on every walk click and is only
+        // useful when actively debugging the corridor selector.
+        if (accepted)
+        {
+            log.info("trail-walker: corridor APPLIED originalPick={} selected={} radius={} chance={}",
+                originalPick, candidate.get(),
+                corridorRadius, corridorChancePercent);
+            return candidate.get();
+        }
+        if (log.isDebugEnabled())
+        {
+            log.debug("trail-walker: corridor skipped originalPick={} candidate={} radius={} chance={} debugOnly={} chancePassed={}",
+                originalPick,
+                candidate.map(Object::toString).orElse("none"),
+                corridorRadius, corridorChancePercent,
+                corridorDebugOnly, chancePasses);
+        }
+        return originalPick;
     }
 
     private static int chebyshev(WorldPoint a, WorldPoint b)
@@ -479,38 +732,20 @@ public final class TrailWalker
         return Math.max(Math.abs(a.getX() - b.getX()), Math.abs(a.getY() - b.getY()));
     }
 
-    /** Common bookkeeping when {@code legIdx} jumps to a new leg, whether
-     *  via {@link #chooseLegIndex} or {@link #tryAdvanceToReachableTransport}.
-     *  Clears the per-pick state (so the next tick picks fresh) and seeds
-     *  the progress tracker for the new leg. */
     private void onLegAdvancedReset(long now)
     {
         lastWalkPick = null;
         bestDistToPick = Integer.MAX_VALUE;
         lastProgressMs = now;
+        rotatedThisLeg = false;
         TrailOverlay.publishCurrentPick(null);
     }
 
-    /** Dispatches to {@link #onCanvasProbe} so tests can substitute a
-     *  deterministic answer. Production code calls only this method. */
     private boolean isTileOnCanvas(WorldPoint tile)
     {
         return tile != null && onCanvasProbe.test(tile);
     }
 
-    /** True iff the given world tile's centre projects to a non-null
-     *  canvas point under the current camera. Used to gate
-     *  CLICK_GAME_OBJECT — when the verb-bearing object is in the loaded
-     *  scene (verb PRESENT) but the tile is off-canvas (camera mid-rotate
-     *  or pointed away), {@link
-     *  net.runelite.client.sequence.dispatch.PixelResolver} can't sample
-     *  a screen pixel from the hull or tile poly and the dispatcher logs
-     *  "pixel unresolvable". Walking closer / waiting for the camera to
-     *  finish rotating is the correct response, not retrying the click.
-     *
-     *  <p>Marshals to the client thread because all canvas projection
-     *  reads require it. Returns {@code false} on any null intermediate
-     *  (no world view, tile out of scene, projection off-screen). */
     private boolean computeIsTileOnCanvas(WorldPoint tile)
     {
         Boolean visible = onClient(() -> {
@@ -524,39 +759,21 @@ public final class TrailWalker
         return Boolean.TRUE.equals(visible);
     }
 
-    /** Test-only hook. Swaps the on-canvas probe so handoff / transport
-     *  decisions can be exercised without stubbing the full Perspective
-     *  camera+viewport state. Package-private — production code never
-     *  calls this. */
-    void setOnCanvasProbeForTest(java.util.function.Predicate<WorldPoint> probe)
-    {
-        this.onCanvasProbe = probe;
-    }
-
-    /** Rotate the camera toward a tile inside the now-active leg so we
-     *  don't walk staring at the back of our head. Cheap and best-effort —
-     *  any failure is logged and swallowed. */
     private void rotateCameraToActiveLeg()
     {
         if (currentPath == null || legIdx >= currentPath.size()) return;
         WorldPoint focus = legFocusTile(currentPath.legs().get(legIdx));
         if (focus == null) return;
-        try { dispatcher.rotateCameraToward(focus); }
-        catch (Throwable t) { log.debug("camera rotate failed", t); }
+        try
+        {
+            dispatcher.rotateCameraToward(focus);
+        }
+        catch (Throwable t)
+        {
+            log.debug("camera rotate failed", t);
+        }
     }
 
-    /** If the current leg is a WALK and the next leg is a TRANSPORT whose
-     *  verb is callable from {@code pos}, advance {@code legIdx} past the
-     *  WALK leg. Returns {@code true} when an advance happened.
-     *
-     *  <p>This is the fix for the "WALK → TRANSPORT handoff lag" bug —
-     *  the OSRS pathfinder routinely lands the player on a tile adjacent
-     *  to (but not equal to) a WALK leg's last recorded tile, which
-     *  caused the walker to spend several ticks issuing 1-tile micro-walks
-     *  trying to reach the exact recorded tile before chooseLegIndex
-     *  finally advanced. By peeking ahead, we let the TRANSPORT click
-     *  fire as soon as it's reachable; the engine pathfinds the player
-     *  to the object as part of dispatching the verb. */
     private boolean tryAdvanceToReachableTransport(WorldPoint pos, long now)
     {
         if (currentPath == null) return false;
@@ -566,35 +783,20 @@ public final class TrailWalker
         Leg next = currentPath.legs().get(legIdx + 1);
         if (!(next instanceof Leg.Transport tr)) return false;
         if (pos.getPlane() != tr.tile().getPlane()) return false;
-        // Cheap range check before the client-thread hop. The verb won't
-        // pathfind from beyond minimap range either, so there's no point
-        // probing the resolver.
+
         int dist = chebyshev(pos, tr.tile());
         if (dist > TRANSPORT_DIRECT_CLICK_TILES) return false;
-        // The verb-presence probe matters because the resolver returns
-        // PRESENT only when a loaded scene object actually advertises the
-        // recorded verb. UNKNOWN (tile not loaded) and MISSING (object
-        // already in post-state) both mean "don't fast-forward" — let
-        // handleTransportLeg apply its existing grace + walk-closer logic.
+
         TransportVerbState verbState = checkVerbPresence(tr.tile(), tr.verb());
         if (verbState != TransportVerbState.PRESENT) return false;
-        // PRESENT (in scene) is necessary but not sufficient: the camera
-        // may still be rotating, leaving the object off-canvas for the
-        // first few ticks. {@link
-        // net.runelite.client.sequence.dispatch.PixelResolver} returns
-        // null when neither the convex hull nor the canvas tile poly
-        // projects, and the dispatcher logs "pixel unresolvable" — the
-        // 2026-05-02 STUCK loop on the Lumbridge p=2 stairs was exactly
-        // this. Require the tile center to project to canvas before
-        // handing off; otherwise the WALK leg keeps running, the player
-        // closes distance, and the camera follow brings the object into
-        // view naturally.
+
         if (!isTileOnCanvas(tr.tile()))
         {
-            log.debug("trail-walker: handoff deferred — transport tile {} "
-                + "not on-canvas yet (verb={} dist={})", tr.tile(), tr.verb(), dist);
+            log.debug("trail-walker: handoff deferred — transport tile {} not on-canvas yet (verb={} dist={})",
+                tr.tile(), tr.verb(), dist);
             return false;
         }
+
         log.info("trail-walker: handoff WALK leg {} → TRANSPORT leg {} "
             + "(verb='{}' tile={} dist={}) — skipping tail-end micro-walks",
             legIdx, legIdx + 1, tr.verb(), tr.tile(), dist);
@@ -604,33 +806,20 @@ public final class TrailWalker
         return true;
     }
 
-    /** A transport that has been fired but whose effect we must wait for
-     *  (e.g. stair animation + plane change). After this many ms with no
-     *  observed player movement, retry the click. */
-    static final long TRANSPORT_VERB_GRACE_TICKS = 4;
-
+    /** v2 transport flow — opportunistic, visibility-gated, with one
+     *  camera rotation per leg before falling back to walking closer.
+     *
+     *  <p>Old v1 rule: walk until Chebyshev≤1, then click.
+     *  New v2 rule: click as soon as the matched object is reachable AND
+     *  visible AND within {@link #MAX_TRANSPORT_CLICK_DISTANCE}. The OSRS
+     *  server pathfinds and triggers the verb; saves the dead time the v1
+     *  rule spent on tail-end micro-walks toward the transport tile. */
     private Status handleTransportLeg(Leg.Transport leg, WorldPoint pos, long now)
         throws InterruptedException
     {
         WorldPoint t = leg.tile();
-        // Don't fire ANY clicks while the dispatcher's previous one is
-        // still in flight — its busy flag silently drops re-entrant
-        // dispatches and we'd block forever on the verb retry.
         if (dispatcher.isBusy()) return Status.IN_PROGRESS;
-        boolean adjacent = pos.getPlane() == t.getPlane()
-            && Math.abs(pos.getX() - t.getX()) <= TRANSPORT_ADJACENCY
-            && Math.abs(pos.getY() - t.getY()) <= TRANSPORT_ADJACENCY;
 
-        // Check verb presence BEFORE deciding whether to walk or click.
-        // When the object is PRESENT in the scene, dispatch CLICK_GAME_OBJECT
-        // directly — OSRS pathfinds the player to it and executes the verb,
-        // exactly like a human clicking stairs from 5 tiles away. The old
-        // "walk adjacent first, then click" path always fell back to minimap
-        // because hovering the transport tile shows the verb (e.g.
-        // "Climb-down"), never "Walk here", causing oscillation near the
-        // object as minimap routing overshot or undershot the 1-tile adjacency
-        // threshold. UNKNOWN (tile not yet in scene) keeps the walk-adjacent
-        // fallback so we don't spin dispatching a verb the resolver can't find.
         TransportVerbState verbState = checkVerbPresence(t, leg.verb());
 
         if (verbState == TransportVerbState.MISSING)
@@ -644,70 +833,84 @@ public final class TrailWalker
                 advanceLegAfterAlreadyDone();
                 return Status.IN_PROGRESS;
             }
-            log.debug("trail-walker: verb '{}' not found at {} (tick {}/{}) — "
-                + "waiting for object", leg.verb(), t,
-                transportVerbMissingTicks, TRANSPORT_VERB_GRACE_TICKS);
+            log.debug("trail-walker: verb '{}' not found at {} (tick {}/{}) — waiting for object",
+                leg.verb(), t, transportVerbMissingTicks, TRANSPORT_VERB_GRACE_TICKS);
             return Status.IN_PROGRESS;
         }
         transportVerbMissingTicks = 0;
 
-        int distToTransport = Math.max(
-            Math.abs(pos.getX() - t.getX()), Math.abs(pos.getY() - t.getY()));
-        boolean withinDirectClickRange = distToTransport <= TRANSPORT_DIRECT_CLICK_TILES;
-        // Object can be in scene (verb PRESENT) yet off-canvas — camera
-        // is mid-rotate, or pointed away after a teleport. Trying to fire
-        // CLICK_GAME_OBJECT in that state burns 5+ ticks on
-        // "pixel unresolvable" because PixelResolver can't sample the
-        // hull or tile poly. When that's the case, fall back to the
-        // walk-closer branch (minimap WALK works fine for off-canvas
-        // world tiles) and re-issue the camera rotate so the next tick
-        // can see the object.
-        boolean onCanvas = adjacent || isTileOnCanvas(t);
+        int distToTransport = chebyshev(pos, t);
+        boolean withinClickRange = distToTransport <= MAX_TRANSPORT_CLICK_DISTANCE;
+        boolean adjacent = distToTransport <= TRANSPORT_ADJACENCY;
 
-        if (!adjacent && (verbState == TransportVerbState.UNKNOWN
-                || !withinDirectClickRange
-                || !onCanvas))
+        // Walk closer when too far OR when verb state is unknown (resolver
+        // couldn't see the tile yet — scene streaming race). Adjacent +
+        // UNKNOWN is the v1 fallback case: trust the recorded verb,
+        // click anyway, skip the visibility gate (the hull lookup would
+        // also have returned null for the same reason as the verb miss).
+        if (!adjacent && (verbState == TransportVerbState.UNKNOWN || !withinClickRange))
         {
-            // Walk closer first: either the object isn't loaded in scene yet,
-            // we're beyond the direct-click range, or the camera hasn't
-            // brought the object into view.
-            if (shouldClick(now, t))
-            {
-                log.info("trail-walker: walk-to-transport {} (verb {}, dist={}, verbState={}, onCanvas={})",
-                    t, leg.verb(), distToTransport, verbState, onCanvas);
-                ActionRequest req = ActionRequest.builder()
-                    .kind(ActionRequest.Kind.WALK)
-                    .channel(ActionRequest.Channel.MOUSE)
-                    .tile(t)
-                    .build();
-                dispatcher.dispatch(req);
-                lastClickMs = now;
-                lastClickLegIdx = legIdx;
-                lastWalkPick = t;
-                // Re-issue the camera rotate when off-canvas so the next
-                // tick can see the object. Cheap: if the camera is
-                // already pointed at the tile, the dispatcher no-ops.
-                if (!onCanvas) rotateCameraToActiveLeg();
-            }
+            walkCloserToTransport(t, leg.verb(), now, distToTransport, verbState,
+                "out-of-range-or-unknown");
             return Status.IN_PROGRESS;
         }
 
-        // Object is PRESENT (or UNKNOWN but adjacent) — click it.
-        if (now - lastInteractMs < INTERACT_THROTTLE_MS) return Status.IN_PROGRESS;
-        // When already adjacent, wait for idle pose so we don't interrupt a
-        // walk animation with a second click mid-step. When not adjacent but
-        // PRESENT, skip idle — the game queues the verb and executes it on
-        // arrival, so clicking while walking is correct and expected.
-        if (adjacent)
+        // From here we're either: verb PRESENT + withinClickRange, OR
+        // adjacent (regardless of verb state). The latter falls through
+        // to the click using the recorded verb without a visibility check.
+        boolean trustRecordedAdjacent = adjacent && verbState != TransportVerbState.PRESENT;
+
+        if (!trustRecordedAdjacent)
         {
-            Boolean settled = onClient(() -> {
-                Player self = client.getLocalPlayer();
-                return self != null && self.getPoseAnimation() == self.getIdlePoseAnimation();
-            });
-            if (settled == null || !settled) return Status.IN_PROGRESS;
+            // Standard v2 path: snapshot hull + reach, run visibility.
+            TransportSnapshot snap = onClient(() -> snapshotTransport(t, leg.verb(), pos));
+            if (snap == null || snap.player == null)
+            {
+                // Couldn't get player or scene state — treat as not-yet-resolvable.
+                return Status.IN_PROGRESS;
+            }
+
+            ObjectVisibility.Reason reason = objectVisibility.whyHidden(
+                t, snap.hull, snap.player, snap.reach);
+
+            if (reason != null)
+            {
+                if (reason.fixableByRotation() && !rotatedThisLeg)
+                {
+                    log.info("trail-walker: rotating camera toward transport {} (reason={}, dist={})",
+                        t, reason, distToTransport);
+                    try
+                    {
+                        dispatcher.rotateCameraToward(t, true);
+                    }
+                    catch (Throwable th)
+                    {
+                        log.debug("trail-walker: rotateCameraToward failed", th);
+                    }
+                    rotatedThisLeg = true;
+                    return Status.IN_PROGRESS;
+                }
+
+                // Either rotation can't fix it (HUD / menu / unreachable / plane)
+                // OR rotation already attempted and the visibility check still
+                // failed. Walk closer and try again next tick.
+                walkCloserToTransport(t, leg.verb(), now, distToTransport, verbState,
+                    "vis=" + reason + (rotatedThisLeg ? " (post-rotate)" : ""));
+                return Status.IN_PROGRESS;
+            }
         }
-        log.info("trail-walker: CLICK_GAME_OBJECT verb '{}' tile {} id {} (adjacent={})",
-            leg.verb(), t, leg.objectId(), adjacent);
+
+        // Visible (or adjacent-trust fallback) — settle on idle pose, then click.
+        if (now - lastInteractMs < INTERACT_THROTTLE_MS) return Status.IN_PROGRESS;
+        Boolean settled = onClient(() -> {
+            Player self = client.getLocalPlayer();
+            return self != null && self.getPoseAnimation() == self.getIdlePoseAnimation();
+        });
+        if (settled == null || !settled) return Status.IN_PROGRESS;
+
+        log.info("trail-walker: CLICK_GAME_OBJECT verb '{}' tile {} id {} (dist={}, mode={})",
+            leg.verb(), t, leg.objectId(), distToTransport,
+            trustRecordedAdjacent ? "adjacent-trust" : "opportunistic");
         ActionRequest req = ActionRequest.builder()
             .kind(ActionRequest.Kind.CLICK_GAME_OBJECT)
             .channel(ActionRequest.Channel.MOUSE)
@@ -720,17 +923,80 @@ public final class TrailWalker
         return Status.IN_PROGRESS;
     }
 
-    /** Result of probing whether a given verb is callable at the given
-     *  tile. Used to short-circuit transports whose effect has already
-     *  taken place (open gates, doors that swung open last trip). */
+    /** Snapshot taken on the client thread before the visibility check.
+     *  Bundles the resolved object's hull (or null if no object matched
+     *  the recorded verb), the live {@code Player}, and a fresh BFS
+     *  reachability map from the player's tile. */
+    private static final class TransportSnapshot
+    {
+        @Nullable final Shape hull;
+        @Nullable final Player player;
+        @Nullable final ReachabilityMap reach;
+        TransportSnapshot(@Nullable Shape hull, @Nullable Player player, @Nullable ReachabilityMap reach)
+        {
+            this.hull = hull; this.player = player; this.reach = reach;
+        }
+    }
+
+    /** Client-thread: resolve the transport object on {@code tile} and
+     *  pull its convex hull. Walls / game objects / decorative / ground
+     *  each have their own {@code getConvexHull()} accessor; the {@code
+     *  TransportResolver.Match} encodes which one matched. */
+    @Nullable
+    private TransportSnapshot snapshotTransport(WorldPoint tile, String verb, WorldPoint playerPos)
+    {
+        Player self = client == null ? null : client.getLocalPlayer();
+        if (self == null) return null;
+
+        Shape hull = null;
+        if (transportResolver != null)
+        {
+            try
+            {
+                TransportResolver.Match m = transportResolver.findTransport(tile, verb);
+                if (m != null && m.isSuccess())
+                {
+                    if (m.wallObject() != null)            hull = m.wallObject().getConvexHull();
+                    else if (m.gameObject() != null)       hull = m.gameObject().getConvexHull();
+                    else if (m.decorativeObject() != null) hull = m.decorativeObject().getConvexHull();
+                    else if (m.groundObject() != null)     hull = m.groundObject().getConvexHull();
+                }
+            }
+            catch (Throwable th)
+            {
+                log.debug("trail-walker: snapshotTransport resolver threw", th);
+            }
+        }
+
+        WorldView wv = client.getTopLevelWorldView();
+        ReachabilityMap reach = wv == null ? null : Reachability.compute(wv, playerPos);
+        return new TransportSnapshot(hull, self, reach);
+    }
+
+    /** Issue a WALK toward the transport tile. Throttled by
+     *  {@link #shouldClick}. Extracted from {@link #handleTransportLeg}
+     *  so the v2 fall-back branches share one implementation. */
+    private void walkCloserToTransport(WorldPoint t, String verb, long now,
+                                       int dist, TransportVerbState verbState,
+                                       String reason)
+        throws InterruptedException
+    {
+        if (!shouldClick(now, t)) return;
+        log.info("trail-walker: walk-to-transport {} (verb {}, dist={}, verbState={}, why={})",
+            t, verb, dist, verbState, reason);
+        ActionRequest req = ActionRequest.builder()
+            .kind(ActionRequest.Kind.WALK)
+            .channel(ActionRequest.Channel.MOUSE)
+            .tile(t)
+            .build();
+        dispatcher.dispatch(req);
+        lastClickMs = now;
+        lastClickLegIdx = legIdx;
+        lastWalkPick = t;
+    }
+
     enum TransportVerbState { PRESENT, MISSING, UNKNOWN }
 
-    /** Look at every object on {@code tile} and report whether {@code verb}
-     *  matches any of their actions. {@code UNKNOWN} when the scene isn't
-     *  loaded or the resolver is unavailable — caller treats UNKNOWN as
-     *  "dispatch anyway, the engine's hover will tell us the truth". Only
-     *  {@code MISSING} (tile loaded, no object on it advertises the verb)
-     *  triggers the already-completed advance path. */
     private TransportVerbState checkVerbPresence(WorldPoint tile, String verb)
     {
         if (transportResolver == null || tile == null || verb == null) return TransportVerbState.UNKNOWN;
@@ -748,29 +1014,22 @@ public final class TrailWalker
                 {
                     return TransportVerbState.UNKNOWN;
                 }
-                // Tile is loaded but no object on it has the verb —
-                // almost always means the transport is already in its
-                // post-state (gate already open).
                 return TransportVerbState.MISSING;
             }
-            catch (Throwable th) { return TransportVerbState.UNKNOWN; }
+            catch (Throwable th)
+            {
+                return TransportVerbState.UNKNOWN;
+            }
         });
         return s == null ? TransportVerbState.UNKNOWN : s;
     }
 
-    /** Mark the current TRANSPORT leg as already-done and bump the leg
-     *  pointer so the next tick handles the following leg. Resets the
-     *  transient verb-grace counter. */
     private void advanceLegAfterAlreadyDone()
     {
         legIdx = Math.min(legIdx + 1, currentPath == null ? legIdx + 1 : currentPath.size());
         lastWalkPick = null;
         lastClickLegIdx = -1;
         transportVerbMissingTicks = 0;
-        // Reset movement timer — we just made progress in the path even
-        // though the player didn't physically move. Without this the STUCK
-        // timer would fire if the next leg's first click is delayed by
-        // dispatcher idle / camera rotate.
         lastMovementMs = System.currentTimeMillis();
     }
 
@@ -798,15 +1057,30 @@ public final class TrailWalker
     private <T> T onClient(java.util.function.Supplier<T> sup)
     {
         AtomicReference<T> ref = new AtomicReference<>();
-        java.util.concurrent.CountDownLatch latch =
-            new java.util.concurrent.CountDownLatch(1);
+        java.util.concurrent.CountDownLatch latch = new java.util.concurrent.CountDownLatch(1);
         clientThread.invokeLater(() -> {
-            try { ref.set(sup.get()); }
-            catch (Throwable th) { log.warn("trail-walker: onClient threw", th); }
-            finally { latch.countDown(); }
+            try
+            {
+                ref.set(sup.get());
+            }
+            catch (Throwable th)
+            {
+                log.warn("trail-walker: onClient threw", th);
+            }
+            finally
+            {
+                latch.countDown();
+            }
         });
-        try { latch.await(); }
-        catch (InterruptedException ie) { Thread.currentThread().interrupt(); return null; }
+        try
+        {
+            latch.await();
+        }
+        catch (InterruptedException ie)
+        {
+            Thread.currentThread().interrupt();
+            return null;
+        }
         return ref.get();
     }
 

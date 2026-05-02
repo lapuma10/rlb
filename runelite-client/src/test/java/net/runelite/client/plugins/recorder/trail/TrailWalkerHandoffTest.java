@@ -101,7 +101,8 @@ public class TrailWalkerHandoffTest
             new Leg.Transport(stairs, "Climb-up", 56230, "GameObject", 36, 61),
             new Leg.Walk(List.of(new WorldPoint(5, 6, 1)))));
 
-        TrailWalker w = new TrailWalker(client, clientThread, dispatcher);
+        TrailWalker w = new TrailWalker(client, clientThread, dispatcher,
+            ObjectVisibility.alwaysVisible());
         // Pretend the staircase is on the visible canvas — the on-canvas
         // gate would otherwise fail under the mock Perspective state.
         w.setOnCanvasProbeForTest(tile -> true);
@@ -143,7 +144,8 @@ public class TrailWalkerHandoffTest
             new Leg.Transport(stairs, "Climb-up", 56230, "GameObject", 36, 61),
             new Leg.Walk(List.of(new WorldPoint(5, 6, 1)))));
 
-        TrailWalker w = new TrailWalker(client, clientThread, dispatcher);
+        TrailWalker w = new TrailWalker(client, clientThread, dispatcher,
+            ObjectVisibility.alwaysVisible());
         // Object is NOT on canvas yet (camera mid-rotate).
         w.setOnCanvasProbeForTest(tile -> false);
         w.tick(path);
@@ -175,7 +177,8 @@ public class TrailWalkerHandoffTest
             new Leg.Transport(stairs, "Climb-up", 56230, "GameObject", 36, 61),
             new Leg.Walk(List.of(new WorldPoint(5, 31, 1)))));
 
-        TrailWalker w = new TrailWalker(client, clientThread, dispatcher);
+        TrailWalker w = new TrailWalker(client, clientThread, dispatcher,
+            ObjectVisibility.alwaysVisible());
         w.tick(path);
         assertEquals("handoff must not fire — transport is 27 tiles away",
             0, w.currentLegIndex());
@@ -202,7 +205,8 @@ public class TrailWalkerHandoffTest
             new Leg.Transport(stairs, "Climb-up", 56230, "GameObject", 36, 61),
             new Leg.Walk(List.of(new WorldPoint(5, 6, 1)))));
 
-        TrailWalker w = new TrailWalker(client, clientThread, dispatcher);
+        TrailWalker w = new TrailWalker(client, clientThread, dispatcher,
+            ObjectVisibility.alwaysVisible());
         w.tick(path);
         assertEquals("handoff must not fire — recorded verb absent from scene",
             0, w.currentLegIndex());
