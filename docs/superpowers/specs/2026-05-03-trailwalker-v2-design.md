@@ -88,35 +88,57 @@ weights, call the existing `walker.start(trail)`, return whatever
 
 ### Opportunistic transport interaction
 
-Today (TrailWalker.java:657-735), the Transport leg handler:
+Today (TrailWalker.java:657-735), the Transport leg handler waits
+until the player is Chebyshev ≤ 1 from the recorded target tile,
+then clicks. v2 clicks as soon as the **object** is properly visible
+(camera-rotated if needed) and BFS-reachable.
 
-```
-if Chebyshev(player, target) > TRANSPORT_ADJACENCY (=1):
-    walk toward target
-    return IN_PROGRESS
-elif pose != idle:
-    return IN_PROGRESS
-else:
-    resolve verb, dispatch CLICK_GAME_OBJECT
-```
+#### Visibility pipeline — `ObjectVisibility`
 
-In v2:
+A new component mirroring the combat package's `TargetVisibility`
+(see `combat/TargetVisibility.java`). Same 6-stage cull pipeline,
+adapted from NPC-tile-poly to game-object convex hull:
+
+| Stage | Reason if culled | Adapted from TargetVisibility how |
+|---|---|---|
+| 0 | `PLANE_MISMATCH` | identical (player vs target tile plane) |
+| 1 | `NOT_REACHABLE` | reuses `Reachability` snapshot the corridor builds; same `WorldArea.canTravelInDirection` primitive TargetVisibility uses |
+| 2 | `OFF_CANVAS` | `obj.getConvexHull() == null` (instead of `npc.getCanvasTilePoly() == null`) — hull is the model's actual rendered shape, more accurate than tile poly for multi-tile objects (banker desks, large stairs) |
+| 3 | `OUTSIDE_VIEWPORT` | hull's centroid pixel inside `client.getViewportXOffset/YOffset/Width/Height` rect — identical logic |
+| 4 | `UNDER_OPEN_MENU` | hull centroid inside `client.getMenu()` rect when `isMenuOpen()` — identical logic |
+| 5 | `UNDER_HUD` | resizable mode only; recursive descent of `HUD_CONTAINER_FRONT` looking for contentful (sprite/text/item/model) widget covering the centroid — copied verbatim from `ClientVisibility.containsContentfulChild` |
+
+Returns `Reason` enum (or `null` if visible). Production binding
+`forClient(client)`; tests use `alwaysVisible()` stub.
+
+#### Transport click flow in v2
 
 ```
 verb = TransportResolver.findTransport(target, recordedVerb)
-canClickFromHere = (
-    verb is present
-    AND tile is on canvas
-    AND reach.isReachable(target)
-    AND Chebyshev(player, target) <= MAX_TRANSPORT_CLICK_DISTANCE  // 12
-)
-if canClickFromHere:
+if verb is null:
+    fall back to walk-closer (existing transportVerbMissingTicks grace path)
+
+reach = (the snapshot the corridor walker already built this tick)
+if not reach.isReachable(target):
+    fall back to walk-closer
+if Chebyshev(player, target) > MAX_TRANSPORT_CLICK_DISTANCE:  // 12
+    fall back to walk-closer
+
+reason = objectVisibility.whyHidden(transportObject, player)
+switch (reason):
+  case null:  // visible — click it
     if pose != idle: return IN_PROGRESS
     dispatch CLICK_GAME_OBJECT
-    return IN_PROGRESS  (advance on completion as today)
-else:
-    walk toward target (existing logic)
     return IN_PROGRESS
+
+  case OFF_CANVAS, OUTSIDE_VIEWPORT:  // camera can fix this
+    if not yet rotated this leg:
+      dispatcher.rotateCameraToward(target, force=true)
+      mark "rotated this leg"
+    return IN_PROGRESS  // re-check next tick after rotation settles
+
+  case UNDER_OPEN_MENU, UNDER_HUD, NOT_REACHABLE, PLANE_MISMATCH:
+    fall back to walk-closer  // rotation can't fix these
 ```
 
 The OSRS server then pathfinds the player to the object and triggers
@@ -132,6 +154,14 @@ The existing `transportVerbMissingTicks` grace counter (4 ticks) is
 unchanged — verb-missing still gives the engine time to re-stream
 the object before bailing.
 
+`force=true` on rotation is the same flag cooking uses
+(`CookingInteraction.java:329` + `:459`) — it skips the
+"tile poly inside viewport rect" early-exit, which is exactly the
+case for "object behind a wall but tile geometrically projects to
+the viewport." The "rotated this leg" guard prevents re-rotating
+every tick if the visibility check still fails post-rotation
+(rotation takes ~500-1500ms streaming; multiple ticks pass).
+
 ## Files
 
 | Path | Change |
@@ -139,6 +169,8 @@ the object before bailing.
 | `runelite-client/src/main/java/.../recorder/trail/Route.java` | NEW (~80 lines): builder, weighted picker, no-repeat tracker, validation |
 | `runelite-client/src/main/java/.../recorder/trail/TrailWalker.java` | MODIFY: add `walkRoute(Route)`; default `corridorDebugOnly=false`; wire `Reachability`-backed `walkableProbe`; relax transport-click adjacency |
 | `runelite-client/src/main/java/.../recorder/trail/TrailRepository.java` | NEW (~40 lines): `Route.fromPattern` glob loader scoped to `~/.runelite/recorder/trails/` |
+| `runelite-client/src/main/java/.../recorder/trail/ObjectVisibility.java` | NEW (~180 lines): mirror of `combat/TargetVisibility` for game objects via `obj.getConvexHull()`; reuses the same `Reason` enum shape |
+| `runelite-client/src/test/java/.../recorder/trail/ObjectVisibilityTest.java` | NEW: per-stage cull tests; rotation prompts on OFF_CANVAS/OUTSIDE_VIEWPORT but not on UNDER_HUD/UNDER_MENU |
 | `runelite-client/src/test/java/.../recorder/trail/RouteTest.java` | NEW: weighted picker (chi-square style sample distribution), no-repeat toggle, missing-trail validation, single-trail degenerate case |
 | `runelite-client/src/test/java/.../recorder/trail/TrailWalkerCorridorTest.java` | UPDATE existing: assert corridor active when `walkableProbe` accepts; assert fallback to centerline when probe rejects all candidates |
 | `runelite-client/src/test/java/.../recorder/trail/TrailWalkerTransportTest.java` | NEW: opportunistic click fires when target is visible+reachable+within distance; falls back to walk-closer outside any of those conditions |
