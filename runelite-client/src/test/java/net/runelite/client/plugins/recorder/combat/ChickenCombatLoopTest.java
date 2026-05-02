@@ -24,6 +24,7 @@
  */
 package net.runelite.client.plugins.recorder.combat;
 
+import net.runelite.api.ChatMessageType;
 import net.runelite.api.Client;
 import net.runelite.api.IndexedObjectSet;
 import net.runelite.api.NPC;
@@ -31,6 +32,7 @@ import net.runelite.api.NPCComposition;
 import net.runelite.api.Player;
 import net.runelite.api.WorldView;
 import net.runelite.api.coords.WorldPoint;
+import net.runelite.api.events.ChatMessage;
 import net.runelite.client.sequence.internal.ActionRequest;
 import org.junit.Test;
 import org.mockito.ArgumentCaptor;
@@ -56,6 +58,7 @@ public class ChickenCombatLoopTest
         when(self.getInteracting()).thenReturn(chicken);
 
         ChickenCombatLoop loop = new ChickenCombatLoop(dispatcher, client, null,
+            null,
             new NpcSelector(ChickenCombatLoop.CHICKEN_NAME),
             TargetVisibility.alwaysVisible(), s -> {});
         boolean picked = loop.doSelect();
@@ -83,6 +86,7 @@ public class ChickenCombatLoopTest
         CombatDispatcher dispatcher = mock(CombatDispatcher.class);
 
         ChickenCombatLoop loop = new ChickenCombatLoop(dispatcher, client, null,
+            null,
             new NpcSelector(ChickenCombatLoop.CHICKEN_NAME),
             TargetVisibility.alwaysVisible(), s -> {});
 
@@ -103,6 +107,7 @@ public class ChickenCombatLoopTest
         CombatDispatcher dispatcher = mock(CombatDispatcher.class);
 
         ChickenCombatLoop loop = new ChickenCombatLoop(dispatcher, client, null,
+            null,
             new NpcSelector(ChickenCombatLoop.CHICKEN_NAME),
             TargetVisibility.alwaysVisible(), s -> {});
 
@@ -121,6 +126,7 @@ public class ChickenCombatLoopTest
         Client client = clientWith(self, new WorldPoint(3230, 3296, 0), chicken);
         CombatDispatcher dispatcher = mock(CombatDispatcher.class);
         ChickenCombatLoop loop = new ChickenCombatLoop(dispatcher, client, null,
+            null,
             new NpcSelector(ChickenCombatLoop.CHICKEN_NAME),
             TargetVisibility.alwaysVisible(), s -> {});
         loop.setTargetForTesting(new CombatTarget(7, "Chicken", 0));
@@ -150,6 +156,7 @@ public class ChickenCombatLoopTest
         Client client = clientWith(self, new WorldPoint(3230, 3296, 0), chicken);
         CombatDispatcher dispatcher = mock(CombatDispatcher.class);
         ChickenCombatLoop loop = new ChickenCombatLoop(dispatcher, client, null,
+            null,
             new NpcSelector(ChickenCombatLoop.CHICKEN_NAME),
             TargetVisibility.alwaysVisible(), s -> {});
         loop.setTargetForTesting(new CombatTarget(15, "Chicken", 0));
@@ -181,6 +188,7 @@ public class ChickenCombatLoopTest
         Client client = clientWith(self, new WorldPoint(3230, 3296, 0), chicken);
         CombatDispatcher dispatcher = mock(CombatDispatcher.class);
         ChickenCombatLoop loop = new ChickenCombatLoop(dispatcher, client, null,
+            null,
             new NpcSelector(ChickenCombatLoop.CHICKEN_NAME),
             TargetVisibility.alwaysVisible(), s -> {});
         loop.setTargetForTesting(new CombatTarget(13, "Chicken", 0));
@@ -210,6 +218,7 @@ public class ChickenCombatLoopTest
         Client client = mock(Client.class);
         CombatDispatcher dispatcher = mock(CombatDispatcher.class);
         ChickenCombatLoop loop = new ChickenCombatLoop(dispatcher, client, null,
+            null,
             new NpcSelector(ChickenCombatLoop.CHICKEN_NAME),
             TargetVisibility.alwaysVisible(), s -> {});
         loop.setTargetForTesting(new CombatTarget(99, "Chicken", 0));
@@ -219,6 +228,34 @@ public class ChickenCombatLoopTest
         assertNull("lock must be released after KILLED", loop.currentTarget());
         assertEquals(1, loop.killCount());
         assertEquals(ChickenCombatLoop.State.SELECTING, loop.state());
+    }
+
+    @Test
+    public void doEngage_chatRejectsAlreadyFighting_targetReleasesImmediately()
+    {
+        Player self = mock(Player.class);
+        NPC chicken = mockChicken(46, 3231, 3296, 0);
+        Client client = clientWith(self, new WorldPoint(3230, 3296, 0), chicken);
+        CombatDispatcher dispatcher = mock(CombatDispatcher.class);
+        when(dispatcher.lastErrorMessage()).thenReturn(null);
+
+        ChickenCombatLoop loop = new ChickenCombatLoop(dispatcher, client, null,
+            null,
+            new NpcSelector(ChickenCombatLoop.CHICKEN_NAME),
+            TargetVisibility.alwaysVisible(), s -> {});
+        loop.setTargetForTesting(new CombatTarget(46, "Chicken", 0));
+        loop.setStateForTesting(ChickenCombatLoop.State.ENGAGING);
+        when(dispatcher.isBusy()).thenAnswer(inv -> {
+            loop.onChatMessage(new ChatMessage(null, ChatMessageType.GAMEMESSAGE, null,
+                "Someone else is fighting that.", null, 0));
+            return false;
+        });
+
+        loop.doEngage();
+
+        assertEquals(ChickenCombatLoop.State.SELECTING, loop.state());
+        assertNull(loop.currentTarget());
+        verify(dispatcher, times(1)).dispatch(any());
     }
 
     // ----- helpers -----

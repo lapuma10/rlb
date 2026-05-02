@@ -96,7 +96,7 @@ public final class ChickenFarmV3Script
         this.registry = registry;
         this.walker = new TrailWalker(client, clientThread, dispatcher);
         this.bank = new BankInteraction(client, clientThread, dispatcher);
-        this.combat = new ChickenCombatLoop(dispatcher, client, clientThread, PEN_AREA);
+        this.combat = new ChickenCombatLoop(dispatcher, client, clientThread, PEN_AREA, eventBus);
         this.trainingSession = new TrainingSession(client, clientThread, dispatcher, eventBus);
         this.logoutHelper = new LogoutHelper(client, clientThread, dispatcher);
     }

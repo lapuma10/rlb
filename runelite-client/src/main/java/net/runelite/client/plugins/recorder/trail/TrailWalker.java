@@ -6,7 +6,10 @@ import java.util.concurrent.atomic.AtomicReference;
 import javax.annotation.Nullable;
 import lombok.extern.slf4j.Slf4j;
 import net.runelite.api.Client;
+import net.runelite.api.Perspective;
 import net.runelite.api.Player;
+import net.runelite.api.WorldView;
+import net.runelite.api.coords.LocalPoint;
 import net.runelite.api.coords.WorldPoint;
 import net.runelite.client.callback.ClientThread;
 import net.runelite.client.sequence.dispatch.HumanizedInputDispatcher;
@@ -59,6 +62,11 @@ public final class TrailWalker
     private final ClientThread clientThread;
     private final HumanizedInputDispatcher dispatcher;
     private final net.runelite.client.plugins.recorder.transport.TransportResolver transportResolver;
+    /** Pluggable on-canvas probe. Default delegates to {@link #computeIsTileOnCanvas}
+     *  which uses {@link Perspective#localToCanvas}. Tests swap in a fixed
+     *  predicate via {@link #setOnCanvasProbeForTest} because Mockito-driven
+     *  Perspective math requires stubbing the full camera/viewport state. */
+    private java.util.function.Predicate<WorldPoint> onCanvasProbe = this::computeIsTileOnCanvas;
 
     private TrailPath currentPath;
     private int legIdx;
@@ -483,6 +491,48 @@ public final class TrailWalker
         TrailOverlay.publishCurrentPick(null);
     }
 
+    /** Dispatches to {@link #onCanvasProbe} so tests can substitute a
+     *  deterministic answer. Production code calls only this method. */
+    private boolean isTileOnCanvas(WorldPoint tile)
+    {
+        return tile != null && onCanvasProbe.test(tile);
+    }
+
+    /** True iff the given world tile's centre projects to a non-null
+     *  canvas point under the current camera. Used to gate
+     *  CLICK_GAME_OBJECT — when the verb-bearing object is in the loaded
+     *  scene (verb PRESENT) but the tile is off-canvas (camera mid-rotate
+     *  or pointed away), {@link
+     *  net.runelite.client.sequence.dispatch.PixelResolver} can't sample
+     *  a screen pixel from the hull or tile poly and the dispatcher logs
+     *  "pixel unresolvable". Walking closer / waiting for the camera to
+     *  finish rotating is the correct response, not retrying the click.
+     *
+     *  <p>Marshals to the client thread because all canvas projection
+     *  reads require it. Returns {@code false} on any null intermediate
+     *  (no world view, tile out of scene, projection off-screen). */
+    private boolean computeIsTileOnCanvas(WorldPoint tile)
+    {
+        Boolean visible = onClient(() -> {
+            WorldView wv = client.getTopLevelWorldView();
+            if (wv == null) return Boolean.FALSE;
+            LocalPoint lp = LocalPoint.fromWorld(wv, tile);
+            if (lp == null) return Boolean.FALSE;
+            net.runelite.api.Point p = Perspective.localToCanvas(client, lp, tile.getPlane());
+            return p != null;
+        });
+        return Boolean.TRUE.equals(visible);
+    }
+
+    /** Test-only hook. Swaps the on-canvas probe so handoff / transport
+     *  decisions can be exercised without stubbing the full Perspective
+     *  camera+viewport state. Package-private — production code never
+     *  calls this. */
+    void setOnCanvasProbeForTest(java.util.function.Predicate<WorldPoint> probe)
+    {
+        this.onCanvasProbe = probe;
+    }
+
     /** Rotate the camera toward a tile inside the now-active leg so we
      *  don't walk staring at the back of our head. Cheap and best-effort —
      *  any failure is logged and swallowed. */
@@ -528,6 +578,23 @@ public final class TrailWalker
         // handleTransportLeg apply its existing grace + walk-closer logic.
         TransportVerbState verbState = checkVerbPresence(tr.tile(), tr.verb());
         if (verbState != TransportVerbState.PRESENT) return false;
+        // PRESENT (in scene) is necessary but not sufficient: the camera
+        // may still be rotating, leaving the object off-canvas for the
+        // first few ticks. {@link
+        // net.runelite.client.sequence.dispatch.PixelResolver} returns
+        // null when neither the convex hull nor the canvas tile poly
+        // projects, and the dispatcher logs "pixel unresolvable" — the
+        // 2026-05-02 STUCK loop on the Lumbridge p=2 stairs was exactly
+        // this. Require the tile center to project to canvas before
+        // handing off; otherwise the WALK leg keeps running, the player
+        // closes distance, and the camera follow brings the object into
+        // view naturally.
+        if (!isTileOnCanvas(tr.tile()))
+        {
+            log.debug("trail-walker: handoff deferred — transport tile {} "
+                + "not on-canvas yet (verb={} dist={})", tr.tile(), tr.verb(), dist);
+            return false;
+        }
         log.info("trail-walker: handoff WALK leg {} → TRANSPORT leg {} "
             + "(verb='{}' tile={} dist={}) — skipping tail-end micro-walks",
             legIdx, legIdx + 1, tr.verb(), tr.tile(), dist);
@@ -587,15 +654,27 @@ public final class TrailWalker
         int distToTransport = Math.max(
             Math.abs(pos.getX() - t.getX()), Math.abs(pos.getY() - t.getY()));
         boolean withinDirectClickRange = distToTransport <= TRANSPORT_DIRECT_CLICK_TILES;
+        // Object can be in scene (verb PRESENT) yet off-canvas — camera
+        // is mid-rotate, or pointed away after a teleport. Trying to fire
+        // CLICK_GAME_OBJECT in that state burns 5+ ticks on
+        // "pixel unresolvable" because PixelResolver can't sample the
+        // hull or tile poly. When that's the case, fall back to the
+        // walk-closer branch (minimap WALK works fine for off-canvas
+        // world tiles) and re-issue the camera rotate so the next tick
+        // can see the object.
+        boolean onCanvas = adjacent || isTileOnCanvas(t);
 
-        if (!adjacent && (verbState == TransportVerbState.UNKNOWN || !withinDirectClickRange))
+        if (!adjacent && (verbState == TransportVerbState.UNKNOWN
+                || !withinDirectClickRange
+                || !onCanvas))
         {
             // Walk closer first: either the object isn't loaded in scene yet,
-            // or we're beyond the direct-click range.
+            // we're beyond the direct-click range, or the camera hasn't
+            // brought the object into view.
             if (shouldClick(now, t))
             {
-                log.info("trail-walker: walk-to-transport {} (verb {}, dist={}, verbState={})",
-                    t, leg.verb(), distToTransport, verbState);
+                log.info("trail-walker: walk-to-transport {} (verb {}, dist={}, verbState={}, onCanvas={})",
+                    t, leg.verb(), distToTransport, verbState, onCanvas);
                 ActionRequest req = ActionRequest.builder()
                     .kind(ActionRequest.Kind.WALK)
                     .channel(ActionRequest.Channel.MOUSE)
@@ -605,6 +684,10 @@ public final class TrailWalker
                 lastClickMs = now;
                 lastClickLegIdx = legIdx;
                 lastWalkPick = t;
+                // Re-issue the camera rotate when off-canvas so the next
+                // tick can see the object. Cheap: if the camera is
+                // already pointed at the tile, the dispatcher no-ops.
+                if (!onCanvas) rotateCameraToActiveLeg();
             }
             return Status.IN_PROGRESS;
         }

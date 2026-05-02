@@ -102,6 +102,9 @@ public class TrailWalkerHandoffTest
             new Leg.Walk(List.of(new WorldPoint(5, 6, 1)))));
 
         TrailWalker w = new TrailWalker(client, clientThread, dispatcher);
+        // Pretend the staircase is on the visible canvas — the on-canvas
+        // gate would otherwise fail under the mock Perspective state.
+        w.setOnCanvasProbeForTest(tile -> true);
         // First tick advances the walker INTO the transport leg via
         // the handoff. We don't make assertions on dispatch yet — the
         // handoff itself doesn't dispatch, it just bumps legIdx.
@@ -117,6 +120,39 @@ public class TrailWalkerHandoffTest
             .anyMatch(r -> r.getKind() == ActionRequest.Kind.CLICK_GAME_OBJECT);
         assertTrue("expected CLICK_GAME_OBJECT after handoff; got "
             + cap.getAllValues(), sawTransportClick);
+    }
+
+    @Test
+    public void handoffDefersWhenTransportTileNotOnCanvas() throws InterruptedException
+    {
+        // 2026-05-02 STUCK loop: handoff fired toward Lumbridge p=2 stairs
+        // while the camera was still rotating, leaving the staircase tile
+        // off-canvas. PixelResolver returned null on every retry. Now the
+        // handoff should DEFER — staying on the WALK leg so the player
+        // closes distance and the camera follow brings the object into
+        // view.
+        WorldPoint stairs = new WorldPoint(5, 6, 0);
+        mockSceneWithGameObject(stairs, 56230, "Climb-up");
+
+        playerPos.set(new WorldPoint(5, 3, 0));
+        TrailPath path = new TrailPath(List.of(
+            new Leg.Walk(List.of(
+                new WorldPoint(5, 3, 0),
+                new WorldPoint(5, 4, 0),
+                new WorldPoint(5, 5, 0))),
+            new Leg.Transport(stairs, "Climb-up", 56230, "GameObject", 36, 61),
+            new Leg.Walk(List.of(new WorldPoint(5, 6, 1)))));
+
+        TrailWalker w = new TrailWalker(client, clientThread, dispatcher);
+        // Object is NOT on canvas yet (camera mid-rotate).
+        w.setOnCanvasProbeForTest(tile -> false);
+        w.tick(path);
+        assertEquals("handoff must defer until object is on-canvas",
+            0, w.currentLegIndex());
+        // It should fall through to handleWalkLeg which dispatches a WALK.
+        ArgumentCaptor<ActionRequest> cap = ArgumentCaptor.forClass(ActionRequest.class);
+        verify(dispatcher, atLeastOnce()).dispatch(cap.capture());
+        assertEquals(ActionRequest.Kind.WALK, cap.getValue().getKind());
     }
 
     @Test

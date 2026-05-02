@@ -26,6 +26,7 @@ package net.runelite.client.plugins.recorder.combat;
 
 import lombok.extern.slf4j.Slf4j;
 import net.runelite.api.Actor;
+import net.runelite.api.ChatMessageType;
 import net.runelite.api.Client;
 import net.runelite.api.ItemContainer;
 import net.runelite.api.NPC;
@@ -37,11 +38,15 @@ import net.runelite.api.WorldView;
 import net.runelite.api.coords.LocalPoint;
 import net.runelite.api.coords.WorldArea;
 import net.runelite.api.coords.WorldPoint;
+import net.runelite.api.events.ChatMessage;
 import net.runelite.api.gameval.InventoryID;
 import net.runelite.client.callback.ClientThread;
+import net.runelite.client.eventbus.EventBus;
+import net.runelite.client.eventbus.Subscribe;
 import net.runelite.client.sequence.dispatch.HumanizedInputDispatcher;
 import net.runelite.client.sequence.dispatch.SequenceSleep;
 import net.runelite.client.sequence.internal.ActionRequest;
+import net.runelite.client.util.Text;
 import javax.annotation.Nullable;
 import java.util.Random;
 import java.util.concurrent.CompletableFuture;
@@ -122,10 +127,12 @@ public final class ChickenCombatLoop
      *  600ms cadence — covers a brief loading-screen flicker but bails fast
      *  if the user started the loop on the title screen. */
     private static final int NOT_READY_GRACE_TICKS = 3;
+    private static final String ALREADY_FIGHTING_MESSAGE = "Someone else is fighting that.";
 
     private final CombatDispatcher dispatcher;
     private final Client client;
     @Nullable private final ClientThread clientThread;
+    @Nullable private final EventBus eventBus;
     private final NpcSelector selector;
     private final TargetVisibility visibility;
     private final Consumer<String> statusSink;
@@ -159,6 +166,8 @@ public final class ChickenCombatLoop
      *  successful snapshot. Triggers an early abort once it crosses
      *  {@link #NOT_READY_GRACE_TICKS}. */
     private int notReadyTicks = 0;
+    private volatile boolean registeredOnEventBus = false;
+    private final AtomicBoolean serverRejectedAttack = new AtomicBoolean(false);
 
     /** Convenience: wrap the humanized dispatcher and use the default
      *  selector + visibility filter (LOS / canvas / viewport / open menu)
@@ -167,7 +176,7 @@ public final class ChickenCombatLoop
                              Client client,
                              @Nullable ClientThread clientThread)
     {
-        this(CombatDispatcher.forHumanized(dispatcher), client, clientThread,
+        this(CombatDispatcher.forHumanized(dispatcher), client, clientThread, null,
             new NpcSelector(CHICKEN_NAME), TargetVisibility.forClient(client), s -> {});
     }
 
@@ -178,7 +187,21 @@ public final class ChickenCombatLoop
                              @Nullable ClientThread clientThread,
                              @Nullable WorldArea confineTo)
     {
-        this(CombatDispatcher.forHumanized(dispatcher), client, clientThread,
+        this(CombatDispatcher.forHumanized(dispatcher), client, clientThread, null,
+            new NpcSelector(CHICKEN_NAME, NpcSelector.DEFAULT_RANGE, confineTo),
+            TargetVisibility.forClient(client), s -> {});
+    }
+
+    /** V3 production ctor — same as the area-constrained constructor, but
+     *  with an EventBus so the loop can react immediately to server-side
+     *  engage rejection chat lines. */
+    public ChickenCombatLoop(HumanizedInputDispatcher dispatcher,
+                             Client client,
+                             @Nullable ClientThread clientThread,
+                             @Nullable WorldArea confineTo,
+                             @Nullable EventBus eventBus)
+    {
+        this(CombatDispatcher.forHumanized(dispatcher), client, clientThread, eventBus,
             new NpcSelector(CHICKEN_NAME, NpcSelector.DEFAULT_RANGE, confineTo),
             TargetVisibility.forClient(client), s -> {});
     }
@@ -188,6 +211,7 @@ public final class ChickenCombatLoop
     public ChickenCombatLoop(CombatDispatcher dispatcher,
                              Client client,
                              @Nullable ClientThread clientThread,
+                             @Nullable EventBus eventBus,
                              NpcSelector selector,
                              TargetVisibility visibility,
                              Consumer<String> statusSink)
@@ -195,6 +219,7 @@ public final class ChickenCombatLoop
         this.dispatcher = dispatcher;
         this.client = client;
         this.clientThread = clientThread;
+        this.eventBus = eventBus;
         this.selector = selector;
         this.visibility = visibility == null ? TargetVisibility.alwaysVisible() : visibility;
         this.statusSink = statusSink == null ? s -> {} : statusSink;
@@ -213,6 +238,12 @@ public final class ChickenCombatLoop
         stopAfterKill.set(false);
         target.set(null);
         killCount.set(0);
+        serverRejectedAttack.set(false);
+        if (eventBus != null && !registeredOnEventBus)
+        {
+            eventBus.register(this);
+            registeredOnEventBus = true;
+        }
         setState(State.SELECTING);
         setStatus("starting");
         Thread t = new Thread(this::runLoop, "chicken-combat-loop");
@@ -227,6 +258,11 @@ public final class ChickenCombatLoop
     public void stop()
     {
         stopRequested.set(true);
+        if (eventBus != null && registeredOnEventBus)
+        {
+            eventBus.unregister(this);
+            registeredOnEventBus = false;
+        }
         Thread t = worker;
         if (t != null) t.interrupt();
         setStatus("stopping");
@@ -297,6 +333,11 @@ public final class ChickenCombatLoop
         }
         finally
         {
+            if (eventBus != null && registeredOnEventBus)
+            {
+                eventBus.unregister(this);
+                registeredOnEventBus = false;
+            }
             // On stop, release the lock and reset to IDLE.
             target.set(null);
             setState(State.IDLE);
@@ -390,6 +431,7 @@ public final class ChickenCombatLoop
             setState(State.SELECTING);
             return;
         }
+        serverRejectedAttack.set(false);
         ActionRequest req = ActionRequest.builder()
             .kind(ActionRequest.Kind.CLICK_NPC)
             .channel(ActionRequest.Channel.MOUSE)
@@ -403,6 +445,14 @@ public final class ChickenCombatLoop
             if (stopRequested.get()) return;
             if (System.currentTimeMillis() > until) break;
             sleepQuiet(60);
+        }
+        if (serverRejectedAttack.getAndSet(false))
+        {
+            log.info("server rejected attack on chicken #{} — releasing lock", ct.npcIndex());
+            target.set(null);
+            setStatus("server rejected: already in combat");
+            setState(State.SELECTING);
+            return;
         }
         String err = dispatcher.lastErrorMessage();
         if (err != null)
@@ -424,6 +474,15 @@ public final class ChickenCombatLoop
         while (System.currentTimeMillis() < deadline)
         {
             if (stopRequested.get()) return;
+            if (serverRejectedAttack.getAndSet(false))
+            {
+                log.info("server rejected attack on chicken #{} during engage wait — releasing lock",
+                    ct.npcIndex());
+                target.set(null);
+                setStatus("server rejected: already in combat");
+                setState(State.SELECTING);
+                return;
+            }
             Boolean engaged = onClient(() -> {
                 Player self = client.getLocalPlayer();
                 if (self == null) return false;
@@ -712,6 +771,17 @@ public final class ChickenCombatLoop
         {
             log.debug("findOurLootItemId failed at {}", tile, th);
             return null;
+        }
+    }
+
+    @Subscribe
+    public void onChatMessage(ChatMessage event)
+    {
+        if (event == null || event.getType() != ChatMessageType.GAMEMESSAGE) return;
+        String msg = Text.removeTags(event.getMessage());
+        if (ALREADY_FIGHTING_MESSAGE.equals(msg))
+        {
+            serverRejectedAttack.set(true);
         }
     }
 
