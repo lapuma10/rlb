@@ -46,6 +46,8 @@ public final class CollectAllCompletedOffersStep implements Step {
         BlackboardKey.of("collectAll.strategy", Strategy.class);
     private static final BlackboardKey<Phase> K_PHASE =
         BlackboardKey.of("collectAll.phase", Phase.class);
+    private static final BlackboardKey<Integer> K_LAST_DISPATCH_TICK =
+        BlackboardKey.of("collectAll.lastDispatchTick", Integer.class);
 
     /** Default coin flip — 63% returns true (use COLLECTALL toolbar). The
      *  remainder uses the per-slot detail-view dance. Tuned per user
@@ -54,6 +56,7 @@ public final class CollectAllCompletedOffersStep implements Step {
      *  variation for a meaningful minority of sessions. */
     private static final BooleanSupplier DEFAULT_USE_COLLECT_ALL =
         () -> ThreadLocalRandom.current().nextInt(100) < 63;
+    private static final int REDISPATCH_COOLDOWN_TICKS = 2;
 
     private final GeActions ge;
     private final BooleanSupplier useCollectAll;
@@ -105,6 +108,7 @@ public final class CollectAllCompletedOffersStep implements Step {
             // One click drains every completed offer.
             ge.collectAll();
             step.put(K_PHASE, Phase.AWAIT_DRAIN);
+            step.put(K_LAST_DISPATCH_TICK, s.tick());
             return;
         }
 
@@ -112,9 +116,11 @@ public final class CollectAllCompletedOffersStep implements Step {
         if (gx.collectOpen()) {
             step.put(K_PHASE, Phase.CLICK_COLLECT_INV);
             ge.collect(firstComplete);
+            step.put(K_LAST_DISPATCH_TICK, s.tick());
         } else {
             step.put(K_PHASE, Phase.OPEN_COLLECT);
             ge.openOfferDetail(firstComplete);
+            step.put(K_LAST_DISPATCH_TICK, s.tick());
         }
     }
 
@@ -136,6 +142,7 @@ public final class CollectAllCompletedOffersStep implements Step {
             if (firstComplete < 0) return;
             step.put(K_PHASE, Phase.CLICK_COLLECT_INV);
             ge.collect(firstComplete);
+            step.put(K_LAST_DISPATCH_TICK, ctx.snapshot().tick());
         }
     }
 
@@ -154,6 +161,15 @@ public final class CollectAllCompletedOffersStep implements Step {
         }
         if (firstCompleteSlot(s.grandExchange()) < 0) {
             return new Completion.Succeeded("all completed offers collected");
+        }
+        if (step.get(K_STRATEGY).orElse(null) == Strategy.COLLECT_ALL) {
+            Integer lastDispatch = step.get(K_LAST_DISPATCH_TICK).orElse(null);
+            if (lastDispatch == null
+                || s.tick() - lastDispatch >= REDISPATCH_COOLDOWN_TICKS) {
+                ge.collectAll();
+                step.put(K_LAST_DISPATCH_TICK, s.tick());
+            }
+            return Completion.RUNNING;
         }
         // PER_SLOT phase progression: collect view opened.
         Phase ph = step.get(K_PHASE).orElse(Phase.OPEN_COLLECT);

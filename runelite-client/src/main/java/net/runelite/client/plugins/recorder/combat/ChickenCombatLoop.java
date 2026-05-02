@@ -339,6 +339,15 @@ public final class ChickenCombatLoop
             return false;
         }
         notReadyTicks = 0;
+        CombatTarget adopted = onClient(() -> detectActiveChickenCombat(snap));
+        if (adopted != null)
+        {
+            justEnteredSelecting = false;
+            target.set(adopted);
+            setStatus("already in combat with " + adopted.npcName() + " #" + adopted.npcIndex());
+            setState(State.IN_COMBAT);
+            return true;
+        }
         // pick + diagnostic both touch NPC accessors (getWorldLocation,
         // getHealthRatio, getInteracting, getComposition) — all of which
         // assert isClientThread() under -ea. Run them on the client thread
@@ -757,6 +766,55 @@ public final class ChickenCombatLoop
             closestDist == Integer.MAX_VALUE ? -1 : closestDist,
             outOfArea, outOfRange, wrongPlane, dying, engagedByOther,
             NpcSelector.DEFAULT_RANGE);
+    }
+
+    /** If the player is already fighting a chicken when SELECTING starts
+     *  (e.g. a stray loot misclick or auto-retaliate engaged one), adopt that
+     *  fight instead of trying to click a second target. */
+    @Nullable
+    private CombatTarget detectActiveChickenCombat(Snapshot snap)
+    {
+        if (snap.self == null) return null;
+        NPC adopted = null;
+        Actor selfInteracting = snap.self.getInteracting();
+        if (selfInteracting instanceof NPC npc && isAdoptableChicken(npc, snap.playerPos))
+        {
+            adopted = npc;
+        }
+        if (adopted == null)
+        {
+            for (NPC npc : snap.npcs)
+            {
+                if (npc == null || !isAdoptableChicken(npc, snap.playerPos)) continue;
+                if (npc.getInteracting() == snap.self)
+                {
+                    adopted = npc;
+                    break;
+                }
+            }
+        }
+        if (adopted == null) return null;
+        NPCComposition c = adopted.getComposition();
+        String name = c == null ? adopted.getName() : c.getName();
+        int tick = client.getTickCount();
+        return new CombatTarget(adopted.getIndex(),
+            name == null || name.isBlank() ? CHICKEN_NAME : name,
+            tick);
+    }
+
+    private boolean isAdoptableChicken(NPC npc, @Nullable WorldPoint playerPos)
+    {
+        if (npc == null) return false;
+        NPCComposition c = npc.getComposition();
+        String name = c == null ? npc.getName() : c.getName();
+        if (name == null || !CHICKEN_NAME.equalsIgnoreCase(name.replaceAll("<[^>]+>", "").trim()))
+        {
+            return false;
+        }
+        if (npc.getHealthRatio() == 0) return false;
+        WorldPoint loc = npc.getWorldLocation();
+        if (loc == null) return false;
+        return playerPos == null || loc.getPlane() == playerPos.getPlane();
     }
 
     // ----- helpers -----

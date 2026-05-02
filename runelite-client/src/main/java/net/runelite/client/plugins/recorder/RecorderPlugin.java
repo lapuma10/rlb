@@ -65,6 +65,7 @@ import net.runelite.client.plugins.recorder.debug.TileMarker;
 import net.runelite.client.plugins.recorder.hotkey.HotkeyHandler;
 import net.runelite.client.plugins.recorder.mining.MiningLoop;
 import net.runelite.client.plugins.recorder.session.SessionDirectory;
+import net.runelite.client.plugins.recorder.trail.TrailOverlay;
 import net.runelite.client.plugins.recorder.transport.RouteOverlay;
 import net.runelite.client.sequence.dispatch.HumanizedInputDispatcher;
 import net.runelite.client.sequence.dispatch.InputOwnership;
@@ -119,6 +120,7 @@ public class RecorderPlugin extends Plugin
     private LoginDebugOverlay loginDebugOverlay;
     private ChickenOverlay chickenOverlay;
     private RouteOverlay routeOverlay;
+    private TrailOverlay trailOverlay;
     private TileMarker tileMarker;
     private ChickenCombatLoop chickenLoop;
     private MiningLoop miningLoop;
@@ -163,6 +165,10 @@ public class RecorderPlugin extends Plugin
         chickenOverlay = new ChickenOverlay(client, config);
         routeOverlay = new RouteOverlay(client);
         panel.setRouteOverlay(routeOverlay);
+        // TrailWalker pushes its active path + current click pick to the
+        // overlay via static publish helpers, so this single instance
+        // visualises whichever script is currently driving the walker.
+        trailOverlay = new TrailOverlay(client, config);
         panel.setTransportResolver(new TransportResolver(client));
         tileMarker = new TileMarker(client);
         panel.setDebugOverlay(debugOverlay);
@@ -175,6 +181,7 @@ public class RecorderPlugin extends Plugin
         overlayManager.add(loginDebugOverlay);
         overlayManager.add(chickenOverlay);
         overlayManager.add(routeOverlay);
+        overlayManager.add(trailOverlay);
         overlayManager.add(hudOverlay);
 
         // Wire login assistant. We construct a fresh dispatcher here for
@@ -382,6 +389,7 @@ public class RecorderPlugin extends Plugin
         if (loginDebugOverlay != null) overlayManager.remove(loginDebugOverlay);
         if (chickenOverlay != null) overlayManager.remove(chickenOverlay);
         if (routeOverlay != null) overlayManager.remove(routeOverlay);
+        if (trailOverlay != null) { overlayManager.remove(trailOverlay); trailOverlay.detach(); }
         if (navButton != null) clientToolbar.removeNavigation(navButton);
         if (panel != null) panel.dispose();
         if (markerListener != null) keyManager.unregisterKeyListener(markerListener);
@@ -407,7 +415,7 @@ public class RecorderPlugin extends Plugin
             clickInspector.setEnabled(false);
             clickInspector = null;
         }
-        panel = null; navButton = null; debugOverlay = null; chickenOverlay = null; routeOverlay = null; tileMarker = null;
+        panel = null; navButton = null; debugOverlay = null; chickenOverlay = null; routeOverlay = null; trailOverlay = null; tileMarker = null;
         hudOverlay = null; areaSelector = null;
         markerListener = null; toggleListener = null;
         mouseCapture = null; keyCapture = null; focusCapture = null;

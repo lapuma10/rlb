@@ -3,6 +3,7 @@ package net.runelite.client.plugins.recorder.cook;
 import java.awt.Rectangle;
 import java.awt.Shape;
 import java.awt.event.KeyEvent;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.function.Supplier;
 import lombok.extern.slf4j.Slf4j;
 import net.runelite.api.AnimationID;
@@ -275,35 +276,34 @@ public final class CookingInteraction
      *  with verb "Use" — engine enters use-mode where the next click is
      *  interpreted as the use-target.
      *
-     *  <p>The dispatcher's CLICK_INV_ITEM with a non-default verb performs
-     *  a hover → right-click → menu-pick if "Use" isn't already the
-     *  L-click default (it usually is for the tinderbox).
-     *
-     *  <p>Blocks the calling thread until the dispatch completes — the
-     *  follow-up canvas click for the use-target must NOT interleave
-     *  with the inventory cursor move, so the caller relies on this
-     *  method returning after the dispatcher's async worker finishes. */
+     *  <p>Runs under the dispatcher's exclusive cursor ownership so the
+     *  cooking flow does not rely on the older async CLICK_INV_ITEM path,
+     *  whose generic recovery logic still uses Escape in non-cooking
+     *  contexts. */
     public boolean useTinderbox() throws InterruptedException
+    {
+        AtomicBoolean ok = new AtomicBoolean(false);
+        boolean ran = dispatcher.runExclusive(() -> ok.set(useTinderboxOnWorker()));
+        if (!ran)
+        {
+            log.info("cook: useTinderbox skipped — dispatcher busy");
+            return false;
+        }
+        return ok.get();
+    }
+
+    /** Exclusive/worker variant for lighting fallback. Verifies this is a
+     *  clean direct inventory selection of Tinderbox, not an existing
+     *  use-mode action like "Use Raw chicken -> Tinderbox". */
+    public boolean useTinderboxOnWorker() throws InterruptedException
     {
         int slot = inventorySlotOf(ItemID.TINDERBOX);
         if (slot < 0) return false;
-        // Clear any prior dispatcher error so we observe THIS dispatch's
-        // outcome. Without this we'd inherit a stale error from a
-        // previous failed action and abort spuriously — or worse,
-        // proceed thinking the dispatch worked when it didn't.
-        dispatcher.lastErrorMessage();
-        ActionRequest req = ActionRequest.builder()
-            .kind(ActionRequest.Kind.CLICK_INV_ITEM)
-            .channel(ActionRequest.Channel.MOUSE)
-            .slot(slot)
-            .verb("Use")
-            .build();
-        dispatcher.dispatch(req);
-        waitForDispatcherIdle();
-        String err = dispatcher.lastErrorMessage();
-        if (err != null)
+        dispatcher.clearLastError();
+        if (!dispatcher.invSlotClickVerifiedOnWorker(slot, "Use", "Tinderbox"))
         {
-            log.info("cook: useTinderbox dispatch failed — {}", err);
+            String err = dispatcher.lastErrorMessage();
+            if (err != null) log.info("cook: verified tinderbox click failed — {}", err);
             return false;
         }
         return true;
@@ -333,77 +333,182 @@ public final class CookingInteraction
         int cy = b.y + b.height / 2;
         log.info("cook: clicking ground-logs tile {} at ({},{}) [light fire]",
             logsMatch.tile, cx, cy);
-        // boundsClickOnWorker settles 60ms then checks isTopMenuVerb("Use") before
-        // left-clicking. If use-mode dropped between useTinderbox() and here, the
-        // left-click default on the tile is "Take" — we'd silently pick up our own
-        // fuel. The pre-check catches that: verb mismatch → right-click attempted
-        // → "Use" absent from menu → lastError set, menu escaped, no Take fired.
-        dispatcher.boundsClickOnWorker(b, "Use");
-        String err = dispatcher.lastErrorMessage();
-        if (err != null)
+        // Require the exact target text. "Use Raw chicken -> Logs" is also a
+        // verb=Use hover, but it is the wrong selected item and must never be
+        // clicked.
+        if (!dispatcher.boundsClickVerifiedAction(b, "Use", "Tinderbox", "Logs"))
         {
-            log.info("cook: logs click aborted (use-mode guard) — {}", err);
+            String err = dispatcher.lastErrorMessage();
+            log.info("cook: logs click aborted (tinderbox-use guard) — {}", err);
             return false;
         }
         return true;
     }
 
-    /** Step 1 of cooking: select the raw food in the inventory with
-     *  verb "Use" — engine enters use-mode for the next click.
-     *  Blocks until the dispatch completes (same reason as
-     *  {@link #useTinderbox}). Returns false if the food isn't in
-     *  the inventory. */
-    public boolean useRawFood(int rawFoodId) throws InterruptedException
+    /** Right-click the ground-logs tile item and select "Light" from the
+     *  context menu. Uses CLICK_GROUND_ITEM so the dispatcher resolves the
+     *  item's own clickbox pixel (via resolveGroundItemPixel) rather than
+     *  the raw tile-poly bounds — the tile poly can overlap the inventory
+     *  panel at Lumbridge P2, causing the right-click to open an inventory
+     *  item's context menu instead of the log's. Requires a Tinderbox in
+     *  inventory — OSRS hides "Light" otherwise. */
+    public boolean lightLogsViaClick(Match logsMatch) throws InterruptedException
     {
-        int slot = inventorySlotOf(rawFoodId);
-        if (slot < 0) return false;
-        dispatcher.lastErrorMessage();   // clear stale error
-        ActionRequest req = ActionRequest.builder()
-            .kind(ActionRequest.Kind.CLICK_INV_ITEM)
+        if (logsMatch == null || logsMatch.tile == null || logsMatch.tileItem == null)
+            return false;
+        int itemId = logsMatch.tileItem.getId();
+        log.info("cook: dispatching CLICK_GROUND_ITEM Light — tile={} itemId={}", logsMatch.tile, itemId);
+        dispatcher.dispatch(ActionRequest.builder()
+            .kind(ActionRequest.Kind.CLICK_GROUND_ITEM)
             .channel(ActionRequest.Channel.MOUSE)
-            .slot(slot)
-            .verb("Use")
-            .build();
-        dispatcher.dispatch(req);
+            .tile(logsMatch.tile)
+            .itemId(itemId)
+            .verb("Light")
+            .build());
         waitForDispatcherIdle();
         String err = dispatcher.lastErrorMessage();
         if (err != null)
         {
-            log.info("cook: useRawFood dispatch failed — {}", err);
+            log.info("cook: logs Light click failed — {}", err);
+            dispatcher.dismissOpenMenuByMovingAway();
+            dispatcher.clearSelectedWidgetTargetMode();
+            return false;
+        }
+        return true;
+    }
+
+    /** Select the raw food in the inventory with verb "Use" — engine enters
+     *  use-mode for the next click.
+     *
+     *  <p>Runs under the dispatcher's exclusive cursor ownership so the
+     *  cooking flow does not depend on the older async CLICK_INV_ITEM
+     *  recovery path. Returns false if the food isn't in the inventory OR if
+     *  the slot changed to cooked/burnt food before the verified click lands. */
+    public boolean useRawFood(int rawFoodId) throws InterruptedException
+    {
+        AtomicBoolean ok = new AtomicBoolean(false);
+        boolean ran = dispatcher.runExclusive(() -> ok.set(useRawFoodOnWorker(rawFoodId)));
+        if (!ran)
+        {
+            log.info("cook: useRawFood skipped — dispatcher busy");
+            return false;
+        }
+        return ok.get();
+    }
+
+    /** Worker-thread/exclusive variant of {@link #useRawFood}. The caller
+     *  must already hold {@link HumanizedInputDispatcher#runExclusive}; this
+     *  avoids the async dispatch race where the inventory click can be
+     *  dropped while the script still continues to the fire click. */
+    public boolean useRawFoodOnWorker(int rawFoodId) throws InterruptedException
+    {
+        int slot = inventorySlotOf(rawFoodId);
+        if (slot < 0) return false;
+        String rawName = itemName(rawFoodId);
+        if (rawName == null || rawName.isBlank())
+        {
+            log.info("cook: raw food definition missing for id={} — refusing to click", rawFoodId);
+            return false;
+        }
+
+        dispatcher.clearLastError();
+        if (!dispatcher.invSlotClickVerifiedOnWorker(slot, "Use", rawName))
+        {
+            String err = dispatcher.lastErrorMessage();
+            if (err != null) log.info("cook: verified raw-food click failed — {}", err);
+            return false;
+        }
+
+        Integer slotId = onClient(() -> {
+            ItemContainer inv = client.getItemContainer(InventoryID.INV);
+            if (inv == null) return -1;
+            Item[] items = inv.getItems();
+            if (items == null || slot >= items.length) return -1;
+            Item it = items[slot];
+            return it == null ? -1 : it.getId();
+        });
+        if (slotId == null || slotId != rawFoodId)
+        {
+            log.warn("cook: slot {} changed to id={} after verified click — cancelling use-mode", slot, slotId);
+            dispatcher.clearSelectedWidgetTargetMode();
             return false;
         }
         return true;
     }
 
     /** Step 2 of cooking: click the heat source (Fire / Range) after
-     *  use-mode is engaged on a raw-food slot. Plain canvas click on the
-     *  hull — the L-click default is "Use raw-food -&gt; Fire/Range",
-     *  same use-mode semantics as the firemaking step.
+     *  use-mode is engaged on a raw-food slot. Verifies the cursor's
+     *  L-click action reads "Use Raw {food} -&gt; {heatSourceName}" before
+     *  committing the click — guards against (a) Cook-All having raced our
+     *  use-mode dispatch and put cooked food in the slot we selected, and
+     *  (b) an obstructing object (log pile, table, fence) sitting between
+     *  us and the fire and intercepting the click.
      *
-     *  <p>Pans the camera toward the heat source if the tile isn't
-     *  already comfortably on-screen — same humanization the
-     *  dispatcher's NPC/object clicks use. Falls back to the tile
-     *  polygon if the hull resolution returns null (some particle-
-     *  effect objects render without a clickable model). */
-    public boolean clickHeatSourceForCook(Match heatMatch) throws InterruptedException
+     *  <p>If the hover mismatches: clears use-mode only when the current
+     *  hover confirms an item is actually selected, then returns false. The
+     *  caller's next tick re-engages use-mode on a fresh raw slot.
+     *
+     *  <p>Camera is rotated toward the tile (force=true) so the heat source
+     *  is in view even when wall occlusion would otherwise hide it. */
+    public boolean clickHeatSourceForCook(Match heatMatch, int rawFoodId,
+                                          String heatSourceName)
+        throws InterruptedException
     {
         if (heatMatch == null || heatMatch.tile == null) return false;
-        // force=true so the camera pans even when the fire's tile poly
-        // technically projects into the viewport (wall occlusion case).
+        if (heatSourceName == null || heatSourceName.isBlank()) return false;
         dispatcher.rotateCameraToward(heatMatch.tile, true);
+        // Look up the raw food's display name AND the heat-source bounds in
+        // one client-thread hop.
+        String rawName = itemName(rawFoodId);
+        if (rawName == null || rawName.isBlank())
+        {
+            log.info("cook: raw food definition missing for id={} — refusing heat click", rawFoodId);
+            return false;
+        }
         Rectangle b = onClient(() -> {
             Rectangle hull = gameObjectBounds(heatMatch);
             if (hull != null) return hull;
-            // Fallback: use the canvas tile poly when the model hull
-            // isn't available (rare, but defensive).
             return tileItemBounds(heatMatch);
         });
         if (b == null) return false;
-        int cx = b.x + b.width / 2;
-        int cy = b.y + b.height / 2;
-        log.info("cook: clicking heat source {} at ({},{})", heatMatch.tile, cx, cy);
-        dispatcher.clickCanvas(cx, cy);
+        log.info("cook: heat-source verify-click — wanted 'Use {} -> {}' bounds={}",
+            rawName, heatSourceName, b);
+        // Verify L-click action: option=='Use', target contains BOTH the raw
+        // food name (e.g. "Raw chicken") AND the heat source name ("Fire").
+        // Both fragments are required — "Raw" alone could match "Raw beef"
+        // we accidentally have selected; "Fire" alone passes if cooked food
+        // is in use-mode on the fire (the bug the user reported).
+        boolean clicked = dispatcher.boundsClickVerifiedAction(
+            b, "Use", rawName, heatSourceName);
+        if (!clicked)
+        {
+            // Hover doesn't show "Use Raw {food} -> {heat}". Possible causes:
+            //   1. Cook-All processed our slot mid-dispatch; use-mode is on
+            //      cooked food now — clicking would burn good food / waste
+            //      it as fuel.
+            //   2. An obstructing object (log pile, NPC, scenery) sits between
+            //      the cursor and the fire — the hover resolves to that.
+            // In either case, cancel use-mode and let the FSM re-engage on a
+            // fresh raw slot next tick.
+            log.info("cook: heat-source hover mismatch — cancelling use-mode");
+            dispatcher.clearSelectedWidgetTargetMode();
+            return false;
+        }
         return true;
+    }
+
+    private String itemName(int itemId) throws InterruptedException
+    {
+        String name = onClient(() -> {
+            try
+            {
+                net.runelite.api.ItemComposition comp = client.getItemDefinition(itemId);
+                String n = comp == null ? null : comp.getName();
+                return n == null ? "" : n;
+            }
+            catch (Throwable th) { return ""; }
+        });
+        return name == null ? "" : name;
     }
 
     private Rectangle gameObjectBounds(Match m)

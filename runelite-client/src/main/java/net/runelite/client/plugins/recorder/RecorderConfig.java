@@ -114,6 +114,26 @@ public interface RecorderConfig extends Config
 	}
 
 	@ConfigSection(
+		name = "Trail overlay",
+		description = "Debug overlay for the trail walker. Paints the recorded trail in yellow (transports in orange) and the walker's most recent click pick in blue.",
+		position = 90,
+		closedByDefault = true
+	)
+	String trailOverlaySection = "trailOverlay";
+
+	@ConfigItem(
+		keyName = "trailOverlay",
+		name = "Show trail overlay",
+		description = "When on, the active TrailWalker path is drawn on the world (recorded tiles in yellow, transports in orange) and the latest dispatched walk-click target is highlighted in blue.",
+		section = trailOverlaySection,
+		position = 0
+	)
+	default boolean trailOverlay()
+	{
+		return false;
+	}
+
+	@ConfigSection(
 		name = "Chicken overlay",
 		description = "Debug overlay that highlights chickens by selector eligibility. Closest eligible chicken (= what the combat loop would pick next) gets a brighter colour and a thicker outline.",
 		position = 100,

@@ -31,10 +31,12 @@ import net.runelite.api.Menu;
 import net.runelite.api.MenuAction;
 import net.runelite.api.MenuEntry;
 import net.runelite.api.NPC;
+import net.runelite.api.Player;
 import net.runelite.api.Perspective;
 import net.runelite.api.Point;
 import net.runelite.api.Tile;
 import net.runelite.api.TileItem;
+import net.runelite.api.WorldView;
 import net.runelite.api.WallObject;
 import net.runelite.api.coords.LocalPoint;
 import net.runelite.api.coords.WorldPoint;
@@ -101,10 +103,14 @@ public class HumanizedInputDispatcher implements InputDispatcher
         this.wind = new WindMouse();
     }
 
-    /** Last failure reason from the most recent dispatch — used by the side
-     *  panel to surface "out of reach" / "menu mismatch" instead of silent
-     *  no-ops. Cleared at the start of each dispatch. */
-    public String lastErrorMessage() { return lastError.get(); }
+    /** Consume and return the last failure reason (get-and-clear). Returns
+     *  null when no error occurred. Callers that previously called this only
+     *  to "clear" a stale error now get the clear for free. */
+    public String lastErrorMessage() { return lastError.getAndSet(null); }
+
+    /** Clear the last failure reason without treating it as the result of
+     *  a just-finished action. */
+    public void clearLastError() { lastError.set(null); }
 
     /** Underlying pixel resolver — exposed so route planners can ask for
      *  the engine's actual minimap range when sizing intermediate hops. */
@@ -354,7 +360,7 @@ public class HumanizedInputDispatcher implements InputDispatcher
             case CLICK_NPC -> npcClick(req.getNpcIndex(),
                 req.getVerb() == null || req.getVerb().isBlank() ? "Attack" : req.getVerb());
             case CLICK_GAME_OBJECT -> gameObjectClick(req.getTile(), req.getVerb());
-            case CLICK_GROUND_ITEM -> groundItemClick(req.getTile(), req.getItemId());
+            case CLICK_GROUND_ITEM -> groundItemClick(req.getTile(), req.getItemId(), req.getVerb());
             case CLICK_WIDGET -> {
                 String verb = req.getVerb();
                 if (verb != null && !verb.isBlank()) widgetVerbClick(req.getWidgetId(), verb);
@@ -685,10 +691,69 @@ public class HumanizedInputDispatcher implements InputDispatcher
                 : client.getMenu().getMenuEntries();
             if (entries == null || entries.length == 0) return false;
             MenuEntry top = entries[entries.length - 1];
-            return VerbMatcher.matches("Take", top.getOption())
-                && top.getIdentifier() == itemId;
+            return isTakeOnGroundItemEntry(top, itemId);
         }
         catch (Throwable th) { return false; }
+    }
+
+    static boolean isTakeOnGroundItemEntry(MenuEntry entry, int itemId)
+    {
+        return entry != null
+            && VerbMatcher.matches("Take", entry.getOption())
+            && entry.getIdentifier() == itemId
+            && isGroundItemMenuAction(entry.getType());
+    }
+
+    static boolean isGroundItemMenuAction(MenuAction action)
+    {
+        return action == MenuAction.GROUND_ITEM_FIRST_OPTION
+            || action == MenuAction.GROUND_ITEM_SECOND_OPTION
+            || action == MenuAction.GROUND_ITEM_THIRD_OPTION
+            || action == MenuAction.GROUND_ITEM_FOURTH_OPTION
+            || action == MenuAction.GROUND_ITEM_FIFTH_OPTION;
+    }
+
+    /** Client-thread check used immediately before a loot left-click. Safe
+     *  means: the engine's current left-click action is the exact ground-item
+     *  row we want, and no other actor is standing on the pile tile. Keeping
+     *  this as one final check right before the press makes the left-click path
+     *  human-like while still refusing obvious attack races. */
+    private boolean isSafeLeftClickTake(WorldPoint tile, int itemId)
+    {
+        return isTopTakeOnItem(itemId) && !tileHasConflictingActor(tile);
+    }
+
+    /** Client-thread check: is there another actor standing on this loot tile?
+     *  If so, force right-click selection rather than trusting a left click.
+     *  This is the "chicken wandered onto the feather pile" safety net: a
+     *  right-click may fail cleanly if the cursor drifted onto the NPC, but a
+     *  left click can accidentally start combat. */
+    boolean tileHasConflictingActor(WorldPoint tile)
+    {
+        if (tile == null) return false;
+        try
+        {
+            WorldView wv = client.getTopLevelWorldView();
+            if (wv == null) return false;
+            Player self = client.getLocalPlayer();
+            for (NPC npc : wv.npcs())
+            {
+                if (npc == null) continue;
+                WorldPoint loc = npc.getWorldLocation();
+                if (tile.equals(loc)) return true;
+            }
+            for (Player p : wv.players())
+            {
+                if (p == null || p == self) continue;
+                WorldPoint loc = p.getWorldLocation();
+                if (tile.equals(loc)) return true;
+            }
+        }
+        catch (Throwable th)
+        {
+            return false;
+        }
+        return false;
     }
 
     /** Take a ground item with id {@code itemId} from {@code tile}. Same
@@ -701,10 +766,13 @@ public class HumanizedInputDispatcher implements InputDispatcher
      *  failure modes that matter are: item already picked up by another
      *  player, ground stack changed (hover shows a different item on top),
      *  the cursor landing on a non-interactable corner of the tile. */
-    private void groundItemClick(WorldPoint tile, int itemId) throws InterruptedException
+    private void groundItemClick(WorldPoint tile, int itemId, String verb) throws InterruptedException
     {
+        if (verb == null || verb.isBlank()) verb = "Take";
+        final String v = verb;
+        final boolean isTake = "Take".equalsIgnoreCase(v);
         if (tile == null) { lastError.set("null tile for groundItemClick"); return; }
-        // Phase 1 — verify the item is on the tile and find its world point.
+        // Phase 1 — verify the item is on the tile.
         Boolean exists = onClient(() -> tileHasItem(tile, itemId));
         if (!Boolean.TRUE.equals(exists))
         {
@@ -714,11 +782,9 @@ public class HumanizedInputDispatcher implements InputDispatcher
         // Phase 2 — rotate camera so the tile is centred-ish.
         rotateCameraToward(tile);
         // Phase 3 — pre-aim on the actual item sprite, not just somewhere
-        // inside the tile poly. Ground items occupy a small clickbox at the
-        // tile centre; sampling the full tile polygon routinely landed on
-        // a corner where the right-click menu had no "Take" entry for our
-        // item. resolveGroundItemPixel uses Perspective.getClickbox on the
-        // item's own model and falls back to the tile pixel if that fails.
+        // inside the tile poly. resolveGroundItemPixel uses the item's own
+        // clickbox, which avoids landing on UI panels that may overlap the
+        // tile poly (e.g. the inventory panel at Lumbridge P2 bank area).
         Point preAim = onClient(() -> resolver.resolveGroundItemPixel(tile, itemId));
         if (preAim == null)
         {
@@ -728,10 +794,15 @@ public class HumanizedInputDispatcher implements InputDispatcher
         moveCursorTo(preAim.getX(), preAim.getY());
         // Phase 4 — pre-click settle.
         SequenceSleep.sleep(client, 180 + rng.nextInt(220));   // 180..400ms
-        // Phase 5 — verify hover top is "Take" with our item id. Item tiles
-        // don't have a separate "model hull" worth re-resolving; the tile
-        // is the interactable area, so no Phase-5-style re-aim.
-        Boolean topMatches = onClient(() -> isTopTakeOnItem(itemId));
+        // Phase 5 — immediate pre-press verification.
+        // For Take: do one final client-thread check immediately before the
+        // click with no extra sleep afterwards. If the engine's current
+        // left-click action is still the exact ground-item row we want AND no
+        // NPC/other player is on the tile, take the human left-click path.
+        // Otherwise degrade to right-click exact-row selection.
+        Boolean topMatches = isTake
+            ? onClient(() -> isSafeLeftClickTake(tile, itemId))
+            : onClient(() -> isTopMenuVerb(v));
         if (Boolean.TRUE.equals(topMatches))
         {
             input.mousePress(MouseEvent.BUTTON1);
@@ -740,22 +811,30 @@ public class HumanizedInputDispatcher implements InputDispatcher
             SequenceSleep.sleep(client, 100 + rng.nextInt(250));
             return;
         }
-        // Phase 6 — top of menu is a different action (Walk here, or
-        // "Take" for a different item in the stack — chickens drop feather
-        // + raw chicken + bones, the engine picks one for the left-click
-        // default). Right-click is safe here in a way it isn't for NPC
-        // clicks: tileHasItem confirmed our item IS on this tile, so a
-        // right-click WILL include our "Take" entry. No risk of opening
-        // a menu on empty grass.
-        log.info("ground item {} not at top of menu at {} — right-click flow", itemId, tile);
+        if (isTake)
+        {
+            log.info("ground item {} left-click unsafe at {} — right-click flow",
+                itemId, tile);
+        }
+        // Phase 6 — verb is not the left-click default; right-click and pick
+        // from the context menu. tileHasItem confirmed the item IS on this
+        // tile, so the verb should appear in the menu if it's valid for this
+        // item (e.g. "Light" requires a tinderbox in inventory).
+        log.info("ground item {} verb='{}' not at top of menu at {} — right-click flow",
+            itemId, v, tile);
         clickPress(MouseEvent.BUTTON3);
         SequenceSleep.sleep(client, 120);
-        MenuRow row = onClient(() -> findMenuRow(
-            e -> VerbMatcher.matches("Take", e.getOption()) && e.getIdentifier() == itemId));
+        // For "Take": also match item ID so we pick OUR item in a stack.
+        // For other verbs: verb match alone is sufficient.
+        MenuRow row = onClient(() -> isTake
+            ? findMenuRow(e -> isTakeOnGroundItemEntry(e, itemId))
+            : findMenuRow(e -> VerbMatcher.matches(v, e.getOption())));
         if (row == null)
         {
-            lastError.set("menu missing 'Take' on item " + itemId + " at " + tile);
-            log.info("right-click menu did not contain 'Take' for item {} at {}", itemId, tile);
+            lastError.set("menu missing '" + v + "' on item " + itemId + " at " + tile);
+            log.info("right-click menu did not contain '{}' for item {} at {}", v, itemId, tile);
+            dismissOpenMenuByMovingAway();
+            clearSelectedWidgetTargetMode();
             return;
         }
         moveCursorTo(row.x, row.y);
@@ -850,9 +929,50 @@ public class HumanizedInputDispatcher implements InputDispatcher
         }
         // Camera rotation toward the tile keeps the object visible.
         rotateCameraToward(tile);
+
+        // Try the convex-hull pixel first (matches the visible model
+        // body — works for most objects). If the hover doesn't produce
+        // the verb in the engine's menu, retry inside the same call
+        // with the tile-footprint polygon, which is the actual hit-test
+        // region for transport-style GameObjects (Lumbridge stairs,
+        // ladders, doors). This avoids the 2-3 s walker-driven retry
+        // burning ticks while the staircase model is right under the
+        // cursor — the engine just doesn't accept clicks on the upper
+        // hull region.
+        if (tryGameObjectAttempt(match, tile, verb,
+                PixelResolver.GameObjectStrategy.HULL))
+        {
+            return;
+        }
+        log.info("gameObjectClick {} verb='{}' — HULL miss, retrying TILE_POLY",
+            tile, verb);
+        if (tryGameObjectAttempt(match, tile, verb,
+                PixelResolver.GameObjectStrategy.TILE_POLY))
+        {
+            lastError.set(null);  // HULL partial failure; TILE_POLY succeeded — no net error
+            return;
+        }
+        log.info("gameObjectClick {} verb='{}' — TILE_POLY miss, giving up",
+            tile, verb);
+    }
+
+    /** One resolve+hover+click attempt for a GameObject under the
+     *  requested {@link PixelResolver.GameObjectStrategy}. Returns
+     *  {@code true} when the click landed (left-click default OR
+     *  right-click menu match); {@code false} when the verb is missing
+     *  from the menu under this strategy and the caller should retry
+     *  with a different strategy. On a {@code false} return, any open
+     *  right-click menu has been dismissed and the cursor is settled
+     *  for the next attempt. */
+    private boolean tryGameObjectAttempt(TransportResolver.Match match,
+                                         WorldPoint tile, String verb,
+                                         PixelResolver.GameObjectStrategy strategy)
+        throws InterruptedException
+    {
         Point pixel = onClient(() -> {
             if (match.wallObject() != null) return resolver.resolveWallObject(match.wallObject());
-            if (match.gameObject() != null) return resolver.resolveGameObject(match.gameObject());
+            if (match.gameObject() != null)
+                return resolver.resolveGameObject(match.gameObject(), strategy);
             // Decorative + Ground objects: use their tile polygon directly.
             // PixelResolver doesn't have a custom path for these, but the
             // generic walk-target resolver will pick a clean pixel inside
@@ -861,42 +981,52 @@ public class HumanizedInputDispatcher implements InputDispatcher
         });
         if (pixel == null)
         {
-            lastError.set("transport pixel unresolvable (off-screen?) at " + tile);
-            log.info("gameObjectClick {} — pixel unresolvable", tile);
-            return;
+            lastError.set("transport pixel unresolvable (off-screen?) at " + tile
+                + " strategy=" + strategy);
+            log.info("gameObjectClick {} — pixel unresolvable (strategy={})",
+                tile, strategy);
+            return false;
         }
-        log.info("gameObjectClick → world {} via screen ({},{}) verb='{}' (matched '{}', id={})",
-            tile, pixel.getX(), pixel.getY(), verb, match.matchedVerb(), match.matchedObjectId());
+        log.info("gameObjectClick → world {} via screen ({},{}) verb='{}' "
+                + "(matched '{}', id={}, strategy={})",
+            tile, pixel.getX(), pixel.getY(), verb,
+            match.matchedVerb(), match.matchedObjectId(), strategy);
         moveCursorTo(pixel.getX(), pixel.getY());
         // Give the engine ~2 render frames to compute hover-state menu entries.
         SequenceSleep.sleep(client, 60);
 
-        // If the engine's top-of-menu (left-click action) already matches the
-        // verb, a single left-click is enough — the same path a real player
-        // takes when an object's primary action is what they want.
+        // Left-click default? Single-click and we're done.
         boolean isTop = onClient(() -> isTopMenuVerb(verb));
         if (isTop)
         {
-            log.info("verb '{}' is left-click default — single click", verb);
+            log.info("verb '{}' is left-click default — single click (strategy={})",
+                verb, strategy);
             clickPress(MouseEvent.BUTTON1);
-            return;
+            return true;
         }
-        // Verb is somewhere else in the menu — right-click to open, then
-        // navigate the open menu.
-        log.info("verb '{}' not at top of menu — right-click flow", verb);
+        // Verb is somewhere else in the menu — right-click to open it.
+        String topLbl = onClient(this::topMenuLabel);
+        log.info("verb '{}' not at top of menu (top='{}') — right-click flow (strategy={})",
+            verb, topLbl, strategy);
         clickPress(MouseEvent.BUTTON3);
         // Wait one render frame so the engine actually populates / opens the
         // mini-menu. Engine ticks are ~50ms; one or two should be plenty.
         SequenceSleep.sleep(client, 120);
-        boolean ok = selectMenuVerb(verb);
-        if (!ok)
-        {
-            lastError.set("menu open but verb '" + verb + "' not present");
-            log.info("right-click menu did not contain verb '{}'", verb);
-            // Dismiss stuck menu (see boundsClick comment).
-            try { tapKey(java.awt.event.KeyEvent.VK_ESCAPE); }
-            catch (InterruptedException ie) { Thread.currentThread().interrupt(); }
-        }
+        if (selectMenuVerb(verb)) return true;
+
+        // Verb missing from the right-click menu under this strategy.
+        // Dismiss the open menu so the next attempt can hover cleanly,
+        // and report enough context for diagnosis.
+        String menuDump = onClient(this::fullMenuDump);
+        lastError.set("menu open but verb '" + verb + "' not present (strategy="
+            + strategy + ")");
+        log.info("right-click menu did not contain verb '{}' (strategy={}, top='{}', {})",
+            verb, strategy, topLbl, menuDump);
+        try { tapKey(java.awt.event.KeyEvent.VK_ESCAPE); }
+        catch (InterruptedException ie) { Thread.currentThread().interrupt(); throw ie; }
+        // Let the right-click menu actually close before the next hover.
+        SequenceSleep.sleep(client, 120);
+        return false;
     }
 
     /** True if the engine's left-click action at the current cursor position
@@ -1133,6 +1263,306 @@ public class HumanizedInputDispatcher implements InputDispatcher
     public void boundsClickOnWorker(java.awt.Rectangle bounds, String verb) throws InterruptedException
     {
         boundsClick(bounds, verb);
+    }
+
+    /** Worker-callable: move cursor inside {@code bounds}, settle, and verify
+     *  an action of {@code verb} on a target whose color-stripped text
+     *  contains every fragment in {@code targetFragments} (case-insensitive)
+     *  is available — first as the L-click default, falling back to the
+     *  right-click context menu if not. On match: clicks the matching entry
+     *  and returns true. On miss in BOTH paths: sets {@link #lastError},
+     *  escapes any open menu, returns false WITHOUT firing a click on the
+     *  wrong target.
+     *
+     *  <p>Right-click fallback handles the "logs respawned on top of a fire"
+     *  case — the L-click default at the fire's tile resolves to the logs
+     *  (topmost interactable) so target check fails on the L-click, but the
+     *  full menu still contains "Use Raw chicken -&gt; Fire" further down. */
+    public boolean boundsClickVerifiedAction(java.awt.Rectangle bounds,
+                                             String verb,
+                                             String... targetFragments)
+        throws InterruptedException
+    {
+        if (bounds == null || bounds.isEmpty())
+        {
+            lastError.set("boundsClickVerifiedAction: null or empty bounds");
+            return false;
+        }
+        int marginX = Math.max(1, bounds.width / 6);
+        int marginY = Math.max(1, bounds.height / 6);
+        int x = bounds.x + marginX
+            + rng.nextInt(Math.max(1, bounds.width - 2 * marginX));
+        int y = bounds.y + marginY
+            + rng.nextInt(Math.max(1, bounds.height - 2 * marginY));
+        moveCursorTo(x, y);
+        SequenceSleep.sleep(client, 60);
+
+        // Phase 1 — L-click verification.
+        Boolean topOk = onClient(() -> {
+            try
+            {
+                MenuEntry[] entries = client.getMenu() == null ? null
+                    : client.getMenu().getMenuEntries();
+                if (entries == null || entries.length == 0) return false;
+                return menuEntryMatches(entries[entries.length - 1], verb, targetFragments);
+            }
+            catch (Throwable th) { return false; }
+        });
+        if (Boolean.TRUE.equals(topOk))
+        {
+            clickPress(MouseEvent.BUTTON1);
+            return true;
+        }
+
+        // Phase 2 — right-click + menu search. Handles the case where another
+        // interactable (e.g. respawned logs on top of a fire) takes priority
+        // for the L-click but the desired action is still in the full menu.
+        String topLbl = onClient(this::topMenuLabel);
+        log.info("boundsClickVerifiedAction: L-click mismatch (top='{}') — right-click flow for verb='{}' fragments={}",
+            topLbl, verb, java.util.Arrays.toString(targetFragments));
+        clickPress(MouseEvent.BUTTON3);
+        SequenceSleep.sleep(client, 120);
+        MenuRow row = onClient(() -> findMenuRow(
+            e -> menuEntryMatches(e, verb, targetFragments)));
+        if (row == null)
+        {
+            String want = "verb='" + verb + "' target~"
+                + java.util.Arrays.toString(targetFragments);
+            String dump = onClient(this::fullMenuDump);
+            lastError.set("boundsClickVerifiedAction: action not in menu — wanted "
+                + want);
+            log.info("boundsClickVerifiedAction: menu missing wanted={} (top='{}', menu={})",
+                want, topLbl, dump);
+            dismissOpenMenuByMovingAway();
+            clearSelectedWidgetTargetMode();
+            return false;
+        }
+        moveCursorTo(row.x, row.y);
+        SequenceSleep.sleep(client, 40 + rng.nextInt(60));
+        input.mousePress(MouseEvent.BUTTON1);
+        SequenceSleep.sleep(client, 40 + rng.nextInt(40));
+        input.mouseRelease(MouseEvent.BUTTON1);
+        SequenceSleep.sleep(client, 80 + rng.nextInt(180));
+        return true;
+    }
+
+    /** Worker-callable inventory click variant that verifies both verb and
+     *  target fragments before clicking. This is stricter than
+     *  {@link #invSlotClickOnWorker}: selecting a cooking item must show
+     *  "Use Raw {food}" on that exact slot, never "Eat" or "Use" on cooked
+     *  food that landed in the slot during a Cook-All race. */
+    public boolean invSlotClickVerifiedOnWorker(int slot, String verb,
+                                                String... targetFragments)
+        throws InterruptedException
+    {
+        Rectangle bounds = onClient(() -> resolveInvSlotBounds(slot));
+        if (bounds == null)
+        {
+            lastError.set("inv slot " + slot + " not resolvable");
+            return false;
+        }
+        int marginX = Math.max(1, bounds.width / 6);
+        int marginY = Math.max(1, bounds.height / 6);
+        int x = bounds.x + marginX
+            + rng.nextInt(Math.max(1, bounds.width - 2 * marginX));
+        int y = bounds.y + marginY
+            + rng.nextInt(Math.max(1, bounds.height - 2 * marginY));
+        moveCursorTo(x, y);
+        SequenceSleep.sleep(client, 60);
+
+        Boolean topOk = onClient(() -> {
+            try
+            {
+                MenuEntry[] entries = client.getMenu() == null ? null
+                    : client.getMenu().getMenuEntries();
+                if (entries == null || entries.length == 0) return false;
+                return menuEntryMatchesDirectTarget(entries[entries.length - 1],
+                    verb, targetFragments);
+            }
+            catch (Throwable th) { return false; }
+        });
+        if (Boolean.TRUE.equals(topOk))
+        {
+            clickPress(MouseEvent.BUTTON1);
+            return true;
+        }
+
+        String topLbl = onClient(this::topMenuLabel);
+        log.info("invSlotClickVerifiedOnWorker: L-click mismatch slot={} top='{}' verb='{}' fragments={}",
+            slot, topLbl, verb, java.util.Arrays.toString(targetFragments));
+        clickPress(MouseEvent.BUTTON3);
+        SequenceSleep.sleep(client, 120);
+        MenuRow row = onClient(() -> findMenuRow(
+            e -> menuEntryMatchesDirectTarget(e, verb, targetFragments)));
+        if (row == null)
+        {
+            String dump = onClient(this::fullMenuDump);
+            lastError.set("inv slot " + slot + " menu missing verified verb '"
+                + verb + "' target~" + java.util.Arrays.toString(targetFragments));
+            log.info("invSlotClickVerifiedOnWorker: menu missing slot={} verb='{}' fragments={} ({})",
+                slot, verb, java.util.Arrays.toString(targetFragments), dump);
+            dismissOpenMenuByMovingAway();
+            clearSelectedWidgetTargetMode();
+            return false;
+        }
+        moveCursorTo(row.x, row.y);
+        SequenceSleep.sleep(client, 40 + rng.nextInt(60));
+        input.mousePress(MouseEvent.BUTTON1);
+        SequenceSleep.sleep(client, 40 + rng.nextInt(40));
+        input.mouseRelease(MouseEvent.BUTTON1);
+        SequenceSleep.sleep(client, 80 + rng.nextInt(180));
+        return true;
+    }
+
+    /** Press Escape only when the current hover proves an item is selected
+     *  for use-mode. This avoids the old blind-Escape path that could close
+     *  the inventory/sidebar after a dropped dispatch or non-use mismatch. */
+    public boolean cancelUseModeIfActiveOnCurrentHover() throws InterruptedException
+    {
+        SequenceSleep.sleep(client, 40);
+        Boolean active = onClient(() -> {
+            try
+            {
+                MenuEntry[] entries = client.getMenu() == null ? null
+                    : client.getMenu().getMenuEntries();
+                if (entries == null || entries.length == 0) return false;
+                return menuEntryLooksLikeUseMode(entries[entries.length - 1]);
+            }
+            catch (Throwable th) { return false; }
+        });
+        if (!Boolean.TRUE.equals(active)) return false;
+        tapKey(java.awt.event.KeyEvent.VK_ESCAPE);
+        SequenceSleep.sleep(client, 80);
+        return true;
+    }
+
+    /** Close an open right-click menu by moving the cursor just outside its
+     *  bounds, instead of pressing Escape. Used on recovery paths where
+     *  Escape can have unwanted side effects such as closing the inventory
+     *  sidebar. Returns true if the menu is gone afterwards. */
+    public boolean dismissOpenMenuByMovingAway() throws InterruptedException
+    {
+        Boolean open = onClient(client::isMenuOpen);
+        if (!Boolean.TRUE.equals(open)) return true;
+
+        for (int attempt = 0; attempt < 2; attempt++)
+        {
+            Point target = onClient(this::menuDismissTarget);
+            if (target == null) return false;
+            moveCursorTo(target.getX(), target.getY());
+            SequenceSleep.sleep(client, 80 + rng.nextInt(120));
+            Boolean closed = onClient(() -> !client.isMenuOpen());
+            if (Boolean.TRUE.equals(closed)) return true;
+        }
+        return Boolean.TRUE.equals(onClient(() -> !client.isMenuOpen()));
+    }
+
+    /** Clear any selected widget target mode (inventory item/spell "Use")
+     *  without sending Escape. This is a recovery lever for cooking flows
+     *  where stale use-mode is worse than a direct deselect. */
+    public boolean clearSelectedWidgetTargetMode() throws InterruptedException
+    {
+        Boolean hadSelected = onClient(() -> client.getSelectedWidget() != null);
+        if (!Boolean.TRUE.equals(hadSelected)) return false;
+        onClient(() -> {
+            client.setWidgetSelected(false);
+            return null;
+        });
+        SequenceSleep.sleep(client, 60);
+        return true;
+    }
+
+    private Point menuDismissTarget()
+    {
+        try
+        {
+            if (!client.isMenuOpen()) return null;
+            Menu menu = client.getMenu();
+            if (menu == null) return null;
+            java.awt.Canvas c = client.getCanvas();
+            if (c == null) return null;
+            int canvasW = Math.max(10, c.getWidth());
+            int canvasH = Math.max(10, c.getHeight());
+            int x = menu.getMenuX();
+            int y = menu.getMenuY();
+            int w = Math.max(1, menu.getMenuWidth());
+            int h = Math.max(1, menu.getMenuHeight());
+            int offset = 12 + rng.nextInt(25);   // 12..36 px outside the menu
+            int bleed = 6 + rng.nextInt(19);     // 6..24 px side slack
+
+            int tx, ty;
+            switch (rng.nextInt(4))
+            {
+                case 0 -> {
+                    tx = x - offset;
+                    ty = y - bleed + rng.nextInt(Math.max(1, h + 2 * bleed));
+                }
+                case 1 -> {
+                    tx = x + w + offset;
+                    ty = y - bleed + rng.nextInt(Math.max(1, h + 2 * bleed));
+                }
+                case 2 -> {
+                    tx = x - bleed + rng.nextInt(Math.max(1, w + 2 * bleed));
+                    ty = y - offset;
+                }
+                default -> {
+                    tx = x - bleed + rng.nextInt(Math.max(1, w + 2 * bleed));
+                    ty = y + h + offset;
+                }
+            }
+            tx = clampInt(tx, 4, Math.max(5, canvasW - 4));
+            ty = clampInt(ty, 4, Math.max(5, canvasH - 4));
+            return new Point(tx, ty);
+        }
+        catch (Throwable th)
+        {
+            return null;
+        }
+    }
+
+    /** Client-thread predicate: does {@code entry} have option matching
+     *  {@code verb} (via {@link VerbMatcher}) AND a color-stripped target
+     *  containing every fragment in {@code fragments} (case-insensitive)?
+     *  Null/blank fragments are skipped. */
+    private static boolean menuEntryMatches(MenuEntry entry, String verb,
+                                            String[] fragments)
+    {
+        if (entry == null) return false;
+        if (!VerbMatcher.matches(verb, entry.getOption())) return false;
+        String target = entry.getTarget();
+        String stripped = (target == null ? "" : target.replaceAll("<[^>]+>", ""))
+            .toLowerCase();
+        if (fragments == null) return true;
+        for (String frag : fragments)
+        {
+            if (frag == null || frag.isBlank()) continue;
+            if (!stripped.contains(frag.toLowerCase())) return false;
+        }
+        return true;
+    }
+
+    /** Like {@link #menuEntryMatches}, but rejects use-mode targets such as
+     *  "Raw chicken -> Tinderbox". Inventory item selection needs this:
+     *  hovering a slot while another item is already selected still shows
+     *  option "Use" and contains the slot's item name, but clicking would use
+     *  the currently selected item ON that slot instead of selecting it. */
+    private static boolean menuEntryMatchesDirectTarget(MenuEntry entry,
+                                                       String verb,
+                                                       String[] fragments)
+    {
+        if (!menuEntryMatches(entry, verb, fragments)) return false;
+        String target = entry.getTarget();
+        String stripped = target == null ? "" : target.replaceAll("<[^>]+>", "");
+        return !stripped.contains("->");
+    }
+
+    private static boolean menuEntryLooksLikeUseMode(MenuEntry entry)
+    {
+        if (entry == null || !VerbMatcher.matches("Use", entry.getOption()))
+            return false;
+        String target = entry.getTarget();
+        String stripped = (target == null ? "" : target.replaceAll("<[^>]+>", ""));
+        return stripped.contains("->");
     }
 
     /** Worker-callable wrapper around {@link #typeChatboxInternal} — same

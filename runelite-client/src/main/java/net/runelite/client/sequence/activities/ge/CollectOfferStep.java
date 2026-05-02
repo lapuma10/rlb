@@ -1,6 +1,5 @@
 package net.runelite.client.sequence.activities.ge;
 
-import java.util.concurrent.ThreadLocalRandom;
 import java.util.function.BooleanSupplier;
 import net.runelite.client.sequence.Completion;
 import net.runelite.client.sequence.Failure;
@@ -27,14 +26,15 @@ import net.runelite.client.sequence.views.OfferSide;
  * waits for the slot to become EMPTY AND the inventory count to rise above
  * that baseline.
  *
- * <p>Two collect strategies, picked randomly per onStart for humanization
- * (real players don't always tap the toolbar shortcut):
+ * <p>Primary flow: once a specific buy/sell offer completes, OSRS returns to
+ * the main GE slot grid. In that view the correct first action is the top-
+ * right {@code GeOffers.COLLECTALL} button; only the per-slot detail view
+ * exposes the individual item/coins collect widgets. So we:
  * <ul>
- *   <li>{@code COLLECT_ALL} (~63%): one click on
- *       {@code GeOffers.COLLECTALL} drains every completed offer (items
- *       AND leftover coins from partial fills) into the inventory.</li>
- *   <li>{@code PER_SLOT} (~37%): click the slot's container to open the
- *       offer-detail / collect view, then click {@code COLLECT_INV}.</li>
+ *   <li>use {@code COLLECT_ALL} whenever we're already on the main slot
+ *       grid after the offer completes,</li>
+ *   <li>use {@code PER_SLOT} only when the detail view is already open or
+ *       when a caller explicitly forces that path in tests.</li>
  * </ul>
  *
  * <p>Already-satisfied: slot already EMPTY (collect happened externally).
@@ -55,6 +55,8 @@ public final class CollectOfferStep implements Step {
         BlackboardKey.of("collectOffer.expectedDeltaStart", Integer.class);
     private static final BlackboardKey<Integer> K_START_TICK =
         BlackboardKey.of("collectOffer.startTick", Integer.class);
+    private static final BlackboardKey<Integer> K_LAST_DISPATCH_TICK =
+        BlackboardKey.of("collectOffer.lastDispatchTick", Integer.class);
     private static final BlackboardKey<Boolean> K_ALREADY_EMPTY =
         BlackboardKey.of("collectOffer.alreadyEmpty", Boolean.class);
     private static final BlackboardKey<Strategy> K_STRATEGY =
@@ -85,11 +87,16 @@ public final class CollectOfferStep implements Step {
      *  the partial collect done. Generous — the in-grid detail collect can
      *  take 2–3 ticks for both DETAILS_COLLECT children to land. */
     private static final int PARTIAL_GRACE_TICKS = 5;
+    /** If the toolbar/detail click misses, don't just stare at the slot until
+     *  timeout. Re-dispatch the collect action once the worker is idle and a
+     *  brief GE-refresh window has passed. */
+    private static final int REDISPATCH_COOLDOWN_TICKS = 2;
 
-    /** 63% COLLECT_ALL / 37% PER_SLOT — see CollectAllCompletedOffersStep
-     *  for the humanization rationale. */
+    /** Production default: completed offers normally return to the main GE
+     *  slot grid, so prefer the toolbar collect button there. Tests can still
+     *  force PER_SLOT via the override constructor. */
     private static final BooleanSupplier DEFAULT_USE_COLLECT_ALL =
-        () -> ThreadLocalRandom.current().nextInt(100) < 63;
+        () -> true;
 
     private final GeActions ge;
     private final BooleanSupplier useCollectAll;
@@ -193,15 +200,13 @@ public final class CollectOfferStep implements Step {
     }
 
     /** Pick COLLECT_ALL vs PER_SLOT and dispatch the first click.
-     *  @param forceCollectAll true on retry — skip PER_SLOT entirely so we
-     *         don't need the detail view to be open (it closed after the
-     *         item was collected, leaving coins behind). */
+     *  {@code COLLECT_ALL} is the canonical path from the main GE grid; the
+     *  detail view uses PER_SLOT because the toolbar button is hidden there. */
     private void dispatchStrategy(StepContext ctx, WorldSnapshot s, int slot, boolean forceCollectAll) {
         Blackboard step = ctx.bb().scope(BlackboardScope.STEP);
         // COLLECT_ALL clicks the toolbar button on the main GE grid — it is
         // hidden while the per-slot detail view is open. If we're already in
-        // the detail view (collectOpen), force PER_SLOT so we stay in the
-        // right context; re-rolling to COLLECT_ALL here would always no-op.
+        // the detail view, stay there and collect the visible item/coins.
         boolean detailOpen = s.grandExchange().collectOpen();
         Strategy strategy = detailOpen ? Strategy.PER_SLOT
             : (forceCollectAll || useCollectAll.getAsBoolean()) ? Strategy.COLLECT_ALL
@@ -211,6 +216,7 @@ public final class CollectOfferStep implements Step {
         if (strategy == Strategy.COLLECT_ALL) {
             ge.collectAll();
             step.put(K_PHASE, Phase.AWAIT_DRAIN);
+            step.put(K_LAST_DISPATCH_TICK, s.tick());
             return;
         }
 
@@ -218,9 +224,11 @@ public final class CollectOfferStep implements Step {
         if (s.grandExchange().collectOpen()) {
             step.put(K_PHASE, Phase.CLICK_COLLECT_INV);
             ge.collect(slot);
+            step.put(K_LAST_DISPATCH_TICK, s.tick());
         } else {
             step.put(K_PHASE, Phase.OPEN_COLLECT);
             ge.openOfferDetail(slot);
+            step.put(K_LAST_DISPATCH_TICK, s.tick());
         }
     }
 
@@ -237,6 +245,7 @@ public final class CollectOfferStep implements Step {
             if (slotBox != null) {
                 step.put(K_PHASE, Phase.CLICK_COLLECT_INV);
                 ge.collect(slotBox);
+                step.put(K_LAST_DISPATCH_TICK, ctx.snapshot().tick());
             }
         }
     }
@@ -318,7 +327,17 @@ public final class CollectOfferStep implements Step {
         if (dispatcher != null && dispatcher.isBusy()) {
             return Completion.RUNNING;
         }
-        if (step.get(K_STRATEGY).orElse(null) == Strategy.PER_SLOT) {
+        Strategy strategy = step.get(K_STRATEGY).orElse(null);
+        if (strategy == Strategy.COLLECT_ALL) {
+            Integer lastDispatch = step.get(K_LAST_DISPATCH_TICK).orElse(null);
+            if (lastDispatch == null
+                || s.tick() - lastDispatch >= REDISPATCH_COOLDOWN_TICKS) {
+                ge.collectAll();
+                step.put(K_LAST_DISPATCH_TICK, s.tick());
+            }
+            return Completion.RUNNING;
+        }
+        if (strategy == Strategy.PER_SLOT) {
             Phase ph = step.get(K_PHASE).orElse(Phase.OPEN_COLLECT);
             if (ph == Phase.OPEN_COLLECT && s.grandExchange().collectOpen()) {
                 step.put(K_PHASE, Phase.AWAIT_COLLECT_VIEW);

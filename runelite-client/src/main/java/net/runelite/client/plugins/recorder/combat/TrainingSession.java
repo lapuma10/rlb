@@ -90,12 +90,13 @@ public class TrainingSession
     private boolean styleNeedsCheck = true;
     /** True until we've verified auto-retaliate matches the plan once. */
     private boolean retaliateNeedsCheck = true;
-    /** Snapshot of the sidebar tab the user/script had open BEFORE we
-     *  opened Combat to enforce style/retaliate. Restored on the same
-     *  tick we finish the enforcement so the player sees their previous
-     *  tab back where they left it. {@code null} when we have nothing
-     *  to restore (we never opened Combat for this round). */
-    private SidebarTab tabToRestoreAfter = null;
+    /** True while we've opened the COMBAT sidebar tab ourselves to
+     *  enforce style/retaliate. Once the engine confirms our change
+     *  via varplayer, we restore INVENTORY — the chicken-farm bot
+     *  needs inventory open for the next loot pickup (see CLAUDE.md
+     *  "UI tab discipline"), so we always return there rather than
+     *  to whatever tab happened to be open before we touched Combat. */
+    private boolean openedCombatTab = false;
 
     /** Level at the start of the last tick, keyed by Skill. Used to detect level-ups. */
     private final Map<Skill, Integer> lastSeenLevels = new HashMap<>();
@@ -339,14 +340,16 @@ public class TrainingSession
         if (!retaliateMismatched && !styleMismatched)
         {
             // Nothing to do. If we'd previously opened Combat to make a
-            // change, restore the prior tab now and clear the snapshot.
+            // change, switch to INVENTORY so the next loot pickup has
+            // the inventory tab visible (see CLAUDE.md "UI tab
+            // discipline").
             if (sidebarTabs != null
-                && tabToRestoreAfter != null
+                && openedCombatTab
                 && combatTab.isCombatTabOpen())
             {
-                log.info("training: restoring previous tab {}", tabToRestoreAfter);
-                sidebarTabs.openTab(tabToRestoreAfter);
-                tabToRestoreAfter = null;
+                log.info("training: opening INVENTORY tab after combat-tab work");
+                sidebarTabs.openTab(SidebarTab.INVENTORY);
+                openedCombatTab = false;
             }
             return;
         }
@@ -361,7 +364,7 @@ public class TrainingSession
         {
             if (!combatTab.isCombatTabOpen())
             {
-                if (tabToRestoreAfter == null) tabToRestoreAfter = sidebarTabs.currentTab();
+                openedCombatTab = true;
                 if (!sidebarTabs.openTab(SidebarTab.COMBAT))
                 {
                     log.debug("training: openTab(COMBAT) couldn't dispatch this tick");
@@ -458,12 +461,14 @@ public class TrainingSession
             // before we acquire it for the hover.
             if (!dispatcher.awaitIdle(2_000L)) return;
             holdAndHover(iconId);
-            // Restore prior tab if we knew what it was. {@code null}
-            // means the engine reported a tab id we don't recognise
-            // (e.g. login screen) — leave Stats open in that case.
+            // Switch to INVENTORY after the hover — the chicken-farm
+            // bot needs inventory open for the next loot pickup (see
+            // CLAUDE.md "UI tab discipline"). Skip when prior is null
+            // (login/loading screen reported an unrecognised tab id);
+            // openTab would silently fail anyway.
             if (prior != null)
             {
-                sidebarTabs.openTabAndWait(prior, 2_000L);
+                sidebarTabs.openTabAndWait(SidebarTab.INVENTORY, 2_000L);
             }
         }
         catch (InterruptedException ie)

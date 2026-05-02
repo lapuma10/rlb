@@ -1104,45 +1104,60 @@ public final class CookingScript
             return;
         }
 
-        status.set("light: use tinderbox");
-        if (!cook.useTinderbox())
+        // Right-click logs → "Light" (tinderbox must be in inventory for
+        // the option to appear; no use-mode dance needed).
+        status.set("light: right-click logs — Light");
+        if (!cook.lightLogsViaClick(logs))
         {
-            // The use-tinderbox dispatch errored (e.g. cursor missed
-            // the slot, tinderbox briefly invisible). Back off and try
-            // again next tick — DO NOT click logs without use-mode
-            // engaged or the click resolves to "Take logs" and picks
-            // up our own fuel.
-            status.set("light: useTinderbox failed — backing off");
-            lightingBackoffUntilMs = now + 1500L;
-            return;
+            status.set("light: Light missing — trying tinderbox on logs");
+            AtomicBoolean clickedLogs = new AtomicBoolean(false);
+            AtomicReference<String> lightFailure = new AtomicReference<>(null);
+            boolean ranLightFallback = dispatcher.runExclusive(() -> {
+                // If the failed right-click was caused by stale raw-food
+                // use-mode, this hover is still on/near the logs and can
+                // now be cleared directly without touching the sidebar state.
+                dispatcher.clearSelectedWidgetTargetMode();
+                if (!cook.useTinderboxOnWorker())
+                {
+                    lightFailure.set("light: tinderbox use failed");
+                    return;
+                }
+                SequenceSleep.sleep(client, 350);
+                CookingInteraction.Match logs2 = cook.findGroundLogs(logsId);
+                if (logs2 == null)
+                {
+                    dispatcher.clearSelectedWidgetTargetMode();
+                    lightFailure.set("light: logs despawned during tinderbox use");
+                    return;
+                }
+                if (!logs.tile.equals(logs2.tile))
+                {
+                    dispatcher.clearSelectedWidgetTargetMode();
+                    lightFailure.set("light: logs moved during tinderbox use");
+                    return;
+                }
+                if (!cook.clickLogsForLight(logs2))
+                {
+                    lightFailure.set("light: tinderbox-on-logs verify failed");
+                    return;
+                }
+                clickedLogs.set(true);
+            });
+            if (!ranLightFallback)
+            {
+                status.set("light: dispatcher busy");
+                return;
+            }
+            if (!clickedLogs.get())
+            {
+                status.set(lightFailure.get() == null
+                    ? "light: logs click failed — backing off"
+                    : lightFailure.get());
+                lightingBackoffUntilMs = now + 1200L;
+                return;
+            }
         }
-
-        // Use-mode is engaged. Brief settle, re-resolve logs, click.
-        SequenceSleep.sleep(client, 400);
-        CookingInteraction.Match logs2 = cook.findGroundLogs(logsId);
-        if (logs2 == null)
-        {
-            status.set("light: logs despawned during use-mode");
-            lightingBackoffUntilMs = System.currentTimeMillis() + 1000L;
-            return;
-        }
-        if (!logs.tile.equals(logs2.tile))
-        {
-            status.set("light: logs moved during use-mode — retry");
-            lightingBackoffUntilMs = System.currentTimeMillis() + 800L;
-            return;
-        }
-        if (!cook.clickLogsForLight(logs2))
-        {
-            status.set("light: logs tile didn't project — retry");
-            lightingBackoffUntilMs = System.currentTimeMillis() + 800L;
-            return;
-        }
-        // Dispatch sent. Remember THIS tile — next tick(s) verify a
-        // Fire spawns on it. If lighting fails the engine doesn't
-        // tell us; we just don't see a Fire on the tile, time out,
-        // and retry.
-        litFireTile = logs2.tile;
+        litFireTile = logs.tile;
         seenFiremakingAnimSinceDispatch = false;
         lightDispatchedAtMs = System.currentTimeMillis();
         status.set("light: clicked logs at " + litFireTile + " — waiting for fire");
@@ -1332,27 +1347,79 @@ public final class CookingScript
             return;
         }
 
-        status.set("cook: use raw food on heat source");
-        if (!cook.useRawFood(rawId))
+        if (!ensureInventoryTabOpen())
         {
-            status.set("cook: raw food slot vanished — re-checking");
+            status.set("cook: waiting for inventory tab");
             return;
         }
-        SequenceSleep.sleep(client, 400);
-        // Re-resolve heat source after brief wait. FIRE_FROM_LOGS must
-        // target the tile we lit — generic by-name returns whatever
-        // fire is closest (incl. another player's), which is bot-tell
-        // behaviour and would also drift away from our tracked fire.
-        CookingInteraction.Match heat2 =
-            l.kind() == CookingLocation.SourceKind.FIRE_FROM_LOGS
-                ? cook.findFireAt(l.heatSourceName(), litFireTile)
-                : cook.findHeatSource(l.heatSourceName());
-        if (heat2 == null)
+
+        status.set("cook: use raw food on heat source");
+        AtomicBoolean clickedHeat = new AtomicBoolean(false);
+        AtomicBoolean rawGoneAfterSettle = new AtomicBoolean(false);
+        AtomicBoolean heatVanished = new AtomicBoolean(false);
+        AtomicReference<String> cookClickFailure = new AtomicReference<>(null);
+        boolean ranCookClick = dispatcher.runExclusive(() -> {
+            if (!cook.useRawFoodOnWorker(rawId))
+            {
+                cookClickFailure.set("cook: raw food use-mode failed — re-checking");
+                return;
+            }
+            SequenceSleep.sleep(client, 400);
+            // Secondary guard: Cook-All may have processed the selected slot
+            // during the settle sleep. If no raw remains, cancel use-mode only
+            // when it is visibly active; blind Escape can close the inventory.
+            if (cook.inventoryAmount(rawId) == 0)
+            {
+                dispatcher.clearSelectedWidgetTargetMode();
+                rawGoneAfterSettle.set(true);
+                return;
+            }
+            // Re-resolve heat source after brief wait. FIRE_FROM_LOGS must
+            // target the tile we lit — generic by-name returns whatever
+            // fire is closest (incl. another player's), which is bot-tell
+            // behaviour and would also drift away from our tracked fire.
+            CookingInteraction.Match heat2 =
+                l.kind() == CookingLocation.SourceKind.FIRE_FROM_LOGS
+                    ? cook.findFireAt(l.heatSourceName(), litFireTile)
+                    : cook.findHeatSource(l.heatSourceName());
+            if (heat2 == null)
+            {
+                dispatcher.clearSelectedWidgetTargetMode();
+                heatVanished.set(true);
+                return;
+            }
+            // Verifies "Use Raw {food} -> {heatName}" and falls back to the
+            // right-click menu when logs/other objects steal L-click priority.
+            if (!cook.clickHeatSourceForCook(heat2, rawId, l.heatSourceName()))
+            {
+                cookClickFailure.set("cook: heat-source verify failed — use-mode cancelled, retry");
+                return;
+            }
+            clickedHeat.set(true);
+        });
+        if (!ranCookClick)
+        {
+            status.set("cook: dispatcher busy");
+            return;
+        }
+        if (rawGoneAfterSettle.get())
+        {
+            status.set("cook: all raw cooked during settle — heading to bank");
+            setState(State.WALK_TO_BANK);
+            return;
+        }
+        if (heatVanished.get())
         {
             status.set("cook: heat source vanished mid-use");
             return;
         }
-        cook.clickHeatSourceForCook(heat2);
+        if (!clickedHeat.get())
+        {
+            status.set(cookClickFailure.get() == null
+                ? "cook: verified cook click failed — retry"
+                : cookClickFailure.get());
+            return;
+        }
         lastCookActionAtMs = System.currentTimeMillis();
     }
 
@@ -1470,6 +1537,17 @@ public final class CookingScript
         return p.getPlane() == a.getPlane()
             && p.getX() >= a.getX() && p.getX() < a.getX() + a.getWidth()
             && p.getY() >= a.getY() && p.getY() < a.getY() + a.getHeight();
+    }
+
+    /** Worker-thread guard: ensures the inventory tab is the active sidebar
+     *  panel, dispatching a click + waiting up to 2s if not. Returns false
+     *  if the tab couldn't be opened (dispatcher busy, unknown layout). */
+    private boolean ensureInventoryTabOpen() throws InterruptedException
+    {
+        if (Boolean.TRUE.equals(onClient(() -> sidebarTabs.isOpen(SidebarTab.INVENTORY))))
+            return true;
+        if (dispatcher.isBusy()) return false;
+        return sidebarTabs.openTabAndWait(SidebarTab.INVENTORY, 2_000L);
     }
 
     /** Returns BANKING_VIA_ENGINE or BANKING_LEGACY depending on config. */

@@ -154,6 +154,40 @@ public class CollectOfferStepTest {
     }
 
     @Test
+    public void buyCollectViaCollectAllRetriesWhileSlotStaysComplete() {
+        WorldSnapshot pre = new GeSnapBuilder().tick(0).geOpen(true)
+            .offer(0, OfferSide.BUY, OfferStatus.COMPLETE, 4151, 1, 1, 1_500_000)
+            .build();
+        List<WorldSnapshot> snaps = new ArrayList<>();
+        snaps.add(pre);
+        // Missed first toolbar click: slot stays COMPLETE for a few ticks.
+        for (int t = 1; t < 4; t++) {
+            snaps.add(new GeSnapBuilder().tick(t).geOpen(true)
+                .offer(0, OfferSide.BUY, OfferStatus.COMPLETE, 4151, 1, 1, 1_500_000)
+                .build());
+        }
+        // Later retry lands: slot drains.
+        for (int t = 4; t < 12; t++) {
+            snaps.add(new GeSnapBuilder().tick(t).geOpen(true)
+                .invItem(4151, 1).build());
+        }
+        RecordingGeActions a = new RecordingGeActions();
+        GeEngineHarness h = new GeEngineHarness().queue(snaps);
+        h.run(new LinearSequence("collectWrap")
+            .then(new SlotWriter(0))
+            .then(new CollectOfferStep(a, ALWAYS_COLLECT_ALL)));
+        h.advance(12);
+
+        assertEquals(SequenceState.IDLE, h.state());
+        int count = 0;
+        for (String call : a.calls()) {
+            if (call.equals("collectAll()")) count++;
+        }
+        assertTrue("collectAll retried while slot stayed complete: " + a.calls(),
+            count >= 2);
+    }
+
+    @Test
     public void sellCollectSucceedsOnCoinsDelta() {
         // SELL collect: expected delta is COINS, not the sold itemId.
         WorldSnapshot pre = new GeSnapBuilder().tick(0).geOpen(true)

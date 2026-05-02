@@ -46,6 +46,14 @@ public final class TrailWalker
      *  directly (OSRS pathfinds and queues the verb). Beyond this the walker
      *  walks closer first to ensure the engine can route the player. */
     public static final int TRANSPORT_DIRECT_CLICK_TILES = 13;
+    /** Distance-to-pick must improve at least once within this window for
+     *  the click to be considered "still making progress". When neither
+     *  movement nor distance progress has been observed AND the reclick
+     *  cooldown has elapsed, we treat the click as dropped and re-issue.
+     *  Without this gate, a player slow-walking past obstacles for >2.5s
+     *  would trigger redundant reclicks even though the engine was
+     *  faithfully routing them. */
+    public static final long PROGRESS_TIMEOUT_MS = 4_000;
 
     private final Client client;
     private final ClientThread clientThread;
@@ -60,6 +68,15 @@ public final class TrailWalker
     private long lastInteractMs;
     private int lastClickLegIdx = -1;
     private WorldPoint lastWalkPick;
+    /** Best (smallest) Chebyshev distance from the player to
+     *  {@link #lastWalkPick} observed since the click was issued. When
+     *  this strictly decreases, {@link #lastProgressMs} is bumped — the
+     *  engine is faithfully routing us, so don't fire a redundant
+     *  reclick. Reset to {@link Integer#MAX_VALUE} on every new click. */
+    private int bestDistToPick = Integer.MAX_VALUE;
+    /** Wall-clock of the last observation that the player closed distance
+     *  to the current pick. Used by {@link #handleWalkLeg}'s stale check. */
+    private long lastProgressMs;
     /** When the verb on a TRANSPORT leg can't be found on any object at the
      *  recorded tile (e.g. "Open" on a gate that's already open and now
      *  shows "Close"), we treat the transport as already done and advance
@@ -89,7 +106,13 @@ public final class TrailWalker
         lastInteractMs = 0;
         lastClickLegIdx = -1;
         lastWalkPick = null;
+        bestDistToPick = Integer.MAX_VALUE;
+        lastProgressMs = System.currentTimeMillis();
         transportVerbMissingTicks = 0;
+        // Clear the debug overlay so a stale path/pick doesn't linger
+        // after the walker is reset between scripts / sessions.
+        TrailOverlay.publishActiveTrail(null);
+        TrailOverlay.publishCurrentPick(null);
     }
 
     public int currentLegIndex() { return legIdx; }
@@ -290,6 +313,11 @@ public final class TrailWalker
             reset();
             currentPath = path;
         }
+        // Publish to the debug overlay (no-op when unregistered). Done
+        // every tick so the path stays visible across leg advances and
+        // catches the case where the script hands us a fresh path
+        // mid-run (return-trail vs. outbound-trail swap).
+        TrailOverlay.publishActiveTrail(path);
         if (legIdx >= path.size()) return Status.ARRIVED;
 
         WorldPoint pos = readPlayerTile();
@@ -309,15 +337,24 @@ public final class TrailWalker
             log.info("trail-walker: advancing leg {} → {} (player at {})",
                 legIdx, newIdx, pos);
             legIdx = newIdx;
-            lastWalkPick = null;
-            // Camera rotate to a tile inside the new leg so we don't walk
-            // staring at the back of our head.
-            WorldPoint focus = legFocusTile(path.legs().get(legIdx));
-            if (focus != null)
-            {
-                try { dispatcher.rotateCameraToward(focus); }
-                catch (Throwable t) { log.debug("camera rotate failed", t); }
-            }
+            onLegAdvancedReset(now);
+            rotateCameraToActiveLeg();
+        }
+        if (legIdx >= path.size()) return Status.ARRIVED;
+
+        // Interaction-ready handoff. The OSRS pathfinder may land the
+        // player on a tile adjacent to (but not equal to) a WALK leg's
+        // last tile. Without this peek-ahead, the walker stays on the
+        // WALK leg and burns 2-6 ticks issuing 1-tile micro-walks before
+        // the player happens to land on the exact recorded tile,
+        // chooseLegIndex finally advances, and the TRANSPORT click fires.
+        // If the next leg is a TRANSPORT whose verb is callable RIGHT
+        // NOW from the player's position, skip those tail-end clicks —
+        // OSRS will path the player to the object as part of the verb
+        // dispatch.
+        if (tryAdvanceToReachableTransport(pos, now)) {
+            // Fall through with the new legIdx; let the TRANSPORT
+            // handler take it from here.
         }
         if (legIdx >= path.size()) return Status.ARRIVED;
 
@@ -353,6 +390,18 @@ public final class TrailWalker
             // advance to the next leg.
             return Status.IN_PROGRESS;
         }
+        // Update the distance-progress tracker BEFORE the click decision
+        // so a tick where the player is closing distance counts as
+        // progress even if we haven't crossed a tile boundary yet.
+        if (lastWalkPick != null && pos.getPlane() == lastWalkPick.getPlane())
+        {
+            int distToPick = chebyshev(pos, lastWalkPick);
+            if (distToPick < bestDistToPick)
+            {
+                bestDistToPick = distToPick;
+                lastProgressMs = now;
+            }
+        }
         // Don't dispatch while the previous click is still in flight; the
         // dispatcher silently drops re-entrant requests and we'd burn the
         // 3s reclick timer on dropped clicks.
@@ -366,14 +415,21 @@ public final class TrailWalker
         //   1. Leg changed (we just advanced past a transport / another leg)
         //   2. Player reached the previous pick tile (advance the target)
         //   3. RECLICK_AFTER_MS elapsed AND player has been still for
-        //      STILL_THRESHOLD_MS (engine dropped our previous click).
+        //      STILL_THRESHOLD_MS AND no distance progress to the pick
+        //      within PROGRESS_TIMEOUT_MS. The progress gate matters when
+        //      the player is squeezing past an NPC / through a doorway:
+        //      they may not change tiles for >2.5s but distance to the
+        //      pick is still falling, so the engine is on it — don't
+        //      reclick.
         boolean legChanged = legIdx != lastClickLegIdx;
         boolean reachedPrevPick = lastWalkPick != null && pos.equals(lastWalkPick);
         long sinceClick = lastClickMs == 0 ? Long.MAX_VALUE : now - lastClickMs;
         long sinceMove = now - lastMovementMs;
+        long sinceProgress = lastProgressMs == 0 ? Long.MAX_VALUE : now - lastProgressMs;
         boolean stillWalking = sinceMove < STILL_THRESHOLD_MS;
         boolean recentClick = sinceClick < RECLICK_AFTER_MS;
-        boolean staleClick = !recentClick && !stillWalking;
+        boolean recentProgress = lastWalkPick != null && sinceProgress < PROGRESS_TIMEOUT_MS;
+        boolean staleClick = !recentClick && !stillWalking && !recentProgress;
         if (!legChanged && !reachedPrevPick && !staleClick)
         {
             // Engine is still walking the player toward our previous click.
@@ -381,11 +437,17 @@ public final class TrailWalker
             return Status.IN_PROGRESS;
         }
         WorldPoint pick = pickAheadTile(leg, pos, ThreadLocalRandom.current());
-        log.info("trail-walker: WALK leg {} → tile {} ({})",
+        WorldPoint legEnd = leg.tiles().get(leg.tiles().size() - 1);
+        log.info("trail-walker: WALK leg {} pick={} reason={} dist-to-pick={} dist-to-legEnd={} "
+            + "sinceClick={}ms sinceMove={}ms sinceProgress={}ms",
             legIdx, pick,
             legChanged ? "leg-changed"
                 : reachedPrevPick ? "reached-prev"
-                : "stale");
+                : "stale",
+            chebyshev(pos, pick), chebyshev(pos, legEnd),
+            sinceClick == Long.MAX_VALUE ? -1 : sinceClick,
+            sinceMove,
+            sinceProgress == Long.MAX_VALUE ? -1 : sinceProgress);
         ActionRequest req = ActionRequest.builder()
             .kind(ActionRequest.Kind.WALK)
             .channel(ActionRequest.Channel.MOUSE)
@@ -395,7 +457,84 @@ public final class TrailWalker
         lastClickMs = now;
         lastClickLegIdx = legIdx;
         lastWalkPick = pick;
+        // New pick → reset the progress tracker. Seed with the current
+        // distance so the first time it strictly decreases counts as
+        // progress.
+        bestDistToPick = chebyshev(pos, pick);
+        lastProgressMs = now;
+        TrailOverlay.publishCurrentPick(pick);
         return Status.IN_PROGRESS;
+    }
+
+    private static int chebyshev(WorldPoint a, WorldPoint b)
+    {
+        return Math.max(Math.abs(a.getX() - b.getX()), Math.abs(a.getY() - b.getY()));
+    }
+
+    /** Common bookkeeping when {@code legIdx} jumps to a new leg, whether
+     *  via {@link #chooseLegIndex} or {@link #tryAdvanceToReachableTransport}.
+     *  Clears the per-pick state (so the next tick picks fresh) and seeds
+     *  the progress tracker for the new leg. */
+    private void onLegAdvancedReset(long now)
+    {
+        lastWalkPick = null;
+        bestDistToPick = Integer.MAX_VALUE;
+        lastProgressMs = now;
+        TrailOverlay.publishCurrentPick(null);
+    }
+
+    /** Rotate the camera toward a tile inside the now-active leg so we
+     *  don't walk staring at the back of our head. Cheap and best-effort —
+     *  any failure is logged and swallowed. */
+    private void rotateCameraToActiveLeg()
+    {
+        if (currentPath == null || legIdx >= currentPath.size()) return;
+        WorldPoint focus = legFocusTile(currentPath.legs().get(legIdx));
+        if (focus == null) return;
+        try { dispatcher.rotateCameraToward(focus); }
+        catch (Throwable t) { log.debug("camera rotate failed", t); }
+    }
+
+    /** If the current leg is a WALK and the next leg is a TRANSPORT whose
+     *  verb is callable from {@code pos}, advance {@code legIdx} past the
+     *  WALK leg. Returns {@code true} when an advance happened.
+     *
+     *  <p>This is the fix for the "WALK → TRANSPORT handoff lag" bug —
+     *  the OSRS pathfinder routinely lands the player on a tile adjacent
+     *  to (but not equal to) a WALK leg's last recorded tile, which
+     *  caused the walker to spend several ticks issuing 1-tile micro-walks
+     *  trying to reach the exact recorded tile before chooseLegIndex
+     *  finally advanced. By peeking ahead, we let the TRANSPORT click
+     *  fire as soon as it's reachable; the engine pathfinds the player
+     *  to the object as part of dispatching the verb. */
+    private boolean tryAdvanceToReachableTransport(WorldPoint pos, long now)
+    {
+        if (currentPath == null) return false;
+        if (legIdx >= currentPath.size() - 1) return false;
+        Leg cur = currentPath.legs().get(legIdx);
+        if (!(cur instanceof Leg.Walk)) return false;
+        Leg next = currentPath.legs().get(legIdx + 1);
+        if (!(next instanceof Leg.Transport tr)) return false;
+        if (pos.getPlane() != tr.tile().getPlane()) return false;
+        // Cheap range check before the client-thread hop. The verb won't
+        // pathfind from beyond minimap range either, so there's no point
+        // probing the resolver.
+        int dist = chebyshev(pos, tr.tile());
+        if (dist > TRANSPORT_DIRECT_CLICK_TILES) return false;
+        // The verb-presence probe matters because the resolver returns
+        // PRESENT only when a loaded scene object actually advertises the
+        // recorded verb. UNKNOWN (tile not loaded) and MISSING (object
+        // already in post-state) both mean "don't fast-forward" — let
+        // handleTransportLeg apply its existing grace + walk-closer logic.
+        TransportVerbState verbState = checkVerbPresence(tr.tile(), tr.verb());
+        if (verbState != TransportVerbState.PRESENT) return false;
+        log.info("trail-walker: handoff WALK leg {} → TRANSPORT leg {} "
+            + "(verb='{}' tile={} dist={}) — skipping tail-end micro-walks",
+            legIdx, legIdx + 1, tr.verb(), tr.tile(), dist);
+        legIdx++;
+        onLegAdvancedReset(now);
+        rotateCameraToActiveLeg();
+        return true;
     }
 
     /** A transport that has been fired but whose effect we must wait for

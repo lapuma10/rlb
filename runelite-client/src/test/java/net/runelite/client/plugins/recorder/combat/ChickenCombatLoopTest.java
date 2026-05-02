@@ -74,6 +74,46 @@ public class ChickenCombatLoopTest
     }
 
     @Test
+    public void doSelect_playerAlreadyTargetingChicken_adoptsCombat()
+    {
+        Player self = mock(Player.class);
+        NPC chicken = mockChicken(44, 3231, 3296, 0);
+        when(self.getInteracting()).thenReturn(chicken);
+        Client client = clientWith(self, new WorldPoint(3230, 3296, 0), chicken);
+        CombatDispatcher dispatcher = mock(CombatDispatcher.class);
+
+        ChickenCombatLoop loop = new ChickenCombatLoop(dispatcher, client, null,
+            new NpcSelector(ChickenCombatLoop.CHICKEN_NAME),
+            TargetVisibility.alwaysVisible(), s -> {});
+
+        assertTrue(loop.doSelect());
+        assertEquals(ChickenCombatLoop.State.IN_COMBAT, loop.state());
+        assertNotNull(loop.currentTarget());
+        assertEquals(44, loop.currentTarget().npcIndex());
+        verify(dispatcher, never()).dispatch(any());
+    }
+
+    @Test
+    public void doSelect_chickenAlreadyTargetingPlayer_adoptsCombat()
+    {
+        Player self = mock(Player.class);
+        NPC chicken = mockChicken(45, 3231, 3296, 0);
+        when(chicken.getInteracting()).thenReturn(self);
+        Client client = clientWith(self, new WorldPoint(3230, 3296, 0), chicken);
+        CombatDispatcher dispatcher = mock(CombatDispatcher.class);
+
+        ChickenCombatLoop loop = new ChickenCombatLoop(dispatcher, client, null,
+            new NpcSelector(ChickenCombatLoop.CHICKEN_NAME),
+            TargetVisibility.alwaysVisible(), s -> {});
+
+        assertTrue(loop.doSelect());
+        assertEquals(ChickenCombatLoop.State.IN_COMBAT, loop.state());
+        assertNotNull(loop.currentTarget());
+        assertEquals(45, loop.currentTarget().npcIndex());
+        verify(dispatcher, never()).dispatch(any());
+    }
+
+    @Test
     public void inCombatTick_doesNotDispatch_andTransitionsToKilledOnHpZero()
     {
         Player self = mock(Player.class);

@@ -414,20 +414,68 @@ public final class PixelResolver
         return null;
     }
 
-    /** Pick a pixel inside the game object's convex hull (preferred — accounts
-     *  for the object's actual rendered model, e.g. a tall ladder), falling
-     *  back to the canvas tile polygon if no hull is available (some objects
-     *  don't expose one). Returns null if neither produces an on-canvas pixel.
-     *
-     *  <p>Rejection against the recent-click history applies the same way as
-     *  for NPCs — chain-clicking the same door twice in a row should land on
-     *  different pixels each time. */
+    /** Sampling region for {@link #resolveGameObject(GameObject, GameObjectStrategy)}.
+     *  Different objects have different "what does the engine accept a
+     *  click on" footprints; this enum lets the dispatcher iterate
+     *  strategies when the first hover doesn't produce the requested
+     *  verb (see in-call retry in {@code HumanizedInputDispatcher.gameObjectClick}). */
+    public enum GameObjectStrategy
+    {
+        /** Sample inside the object's convex hull. The hull tracks the
+         *  visible 3D model — correct for objects whose entire body is
+         *  the click target (saplings, lecterns, banks-as-clickable-bodies).
+         *  Wrong for tall multi-segment models (Lumbridge stairs, ladders,
+         *  banister-topped staircases) whose hull also covers decorative
+         *  geometry the engine does NOT accept clicks on; in those cases
+         *  the menu comes back without the verb. Falls back to tile-poly
+         *  when the hull isn't available. */
+        HULL,
+        /** Sample inside the object's tile-footprint polygon
+         *  ({@link GameObject#getCanvasTilePoly()}). The engine's per-tile
+         *  hit-test for GameObjects always fires inside this footprint —
+         *  use this for stair / ladder / door / transport objects whose
+         *  hull is wider than the actual click region. */
+        TILE_POLY
+    }
+
+    /** Convenience: legacy callers default to {@link GameObjectStrategy#HULL},
+     *  which preserves the historic behaviour. */
     @Nullable
     public Point resolveGameObject(GameObject obj)
     {
+        return resolveGameObject(obj, GameObjectStrategy.HULL);
+    }
+
+    /** Pick a pixel inside the game object using the requested
+     *  {@link GameObjectStrategy}.
+     *
+     *  <p>HULL → samples the convex hull (with tile-poly as fallback when
+     *  the hull is unavailable). Best first attempt for general objects.
+     *
+     *  <p>TILE_POLY → samples the canvas projection of the object's tile
+     *  footprint. This is what the OSRS engine hit-tests for the
+     *  per-GameObject menu, so the hover reliably produces the object's
+     *  verb. Use this as the retry strategy when HULL produced a pixel
+     *  the engine didn't accept (the staircase / ladder pattern: hull
+     *  contains decorative geometry above the clickable base).
+     *
+     *  <p>Rejection against the recent-click history applies the same
+     *  way as for NPCs — chain-clicking the same door twice in a row
+     *  should land on different pixels each time. */
+    @Nullable
+    public Point resolveGameObject(GameObject obj, GameObjectStrategy strategy)
+    {
         if (obj == null) return null;
-        Polygon poly = shapeToPolygon(obj.getConvexHull());
-        if (poly == null || poly.npoints < 3) poly = obj.getCanvasTilePoly();
+        Polygon poly;
+        switch (strategy)
+        {
+            case TILE_POLY -> poly = obj.getCanvasTilePoly();
+            case HULL -> {
+                poly = shapeToPolygon(obj.getConvexHull());
+                if (poly == null || poly.npoints < 3) poly = obj.getCanvasTilePoly();
+            }
+            default -> poly = null;
+        }
         if (poly == null || poly.npoints < 3) return null;
         Point p = sampleInsidePolygon(poly);
         if (p != null && isOnCanvas(p)) { record(p); return p; }
