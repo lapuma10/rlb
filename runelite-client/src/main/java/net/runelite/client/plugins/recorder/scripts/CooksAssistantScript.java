@@ -153,7 +153,11 @@ public final class CooksAssistantScript
         IDLE,
         CHECK_BANK,            // Open bank, withdraw missing ingredients, close
         WALK_TO_GE,            // Lumbridge bank → GE (only if bank didn't supply everything)
-        BUYING,                // GE buy loop — one ingredient at a time
+        BUYING,                // GE buy loop — one ingredient at a time (each buy
+                               // self-funds: opens GE bank → withdraws coins → buys)
+        DEPOSIT_CASH_AT_GE,    // After buys: dump leftover coins at the GE bank
+                               // before walking back, so we never carry trade
+                               // money between zones.
         WALK_BACK_TO_LUMBRIDGE,// GE → Lumbridge bank
         WALK_TO_COOK,          // Lumbridge bank (p2) → Cook (kitchen, p0)
         TALKING_TO_COOK,
@@ -357,6 +361,7 @@ public final class CooksAssistantScript
                     case CHECK_BANK             -> tickCheckBank();
                     case WALK_TO_GE             -> tickRouteWalk(cur, State.BUYING);
                     case BUYING                 -> tickBuying();
+                    case DEPOSIT_CASH_AT_GE     -> tickDepositCashAtGe();
                     case WALK_BACK_TO_LUMBRIDGE -> tickRouteWalk(cur, State.WALK_TO_COOK);
                     case WALK_TO_COOK           -> tickRouteWalk(cur, State.TALKING_TO_COOK);
                     case TALKING_TO_COOK        -> tickTalkToCook();
@@ -601,9 +606,9 @@ public final class CooksAssistantScript
 
         if (haveFlour && haveEgg && haveMilk)
         {
-            log.info("cooks-assistant: GE supplied everything — heading back to Lumbridge");
+            log.info("cooks-assistant: GE supplied everything — depositing leftover coins");
             currentBuyItemId = 0;
-            setState(State.WALK_BACK_TO_LUMBRIDGE);
+            setState(State.DEPOSIT_CASH_AT_GE);
             return;
         }
 
@@ -638,15 +643,131 @@ public final class CooksAssistantScript
 
     private void startGeBuy(BuyItemIntent intent)
     {
-        boolean ok = geScript.startBuy(intent);
+        // startBuyWithPrep self-funds the buy: if inventory doesn't already
+        // hold enough coins, the GE engine opens the GE bank booth, withdraws
+        // a buffered amount, closes the bank, then buys. We deliberately
+        // never withdraw cash at the Lumbridge bank — keeps trade money
+        // local to GE so a script abort mid-flow doesn't strand coins
+        // outside our destination zone.
+        boolean ok = geScript.startBuyWithPrep(intent);
         if (!ok)
         {
-            abortWith("GE: failed to start buy for " + intent.displayName());
+            abortWith("GE: failed to start buy-with-prep for " + intent.displayName());
             return;
         }
         currentBuyItemId = intent.itemId();
-        status.set("GE: buy submitted for " + intent.displayName());
-        log.info("cooks-assistant: GE buy submitted for {}", intent.displayName());
+        status.set("GE: buy-with-prep submitted for " + intent.displayName());
+        log.info("cooks-assistant: GE buy-with-prep submitted for {}", intent.displayName());
+    }
+
+    /** After all GE buys complete: dump leftover coins into the GE bank
+     *  before walking back to Lumbridge. The startBuyWithPrep flow leaves
+     *  whatever wasn't spent in inventory; the user wants to land at the
+     *  Cook with no trade money in hand.
+     *
+     *  <p>Same shape as {@link #tickCheckBank} (open booth → wait
+     *  ready → mutate → close), but the "mutate" phase is a single
+     *  depositAll(coins) call. Reuses {@link #bankSessionDone},
+     *  {@link #lastBoothClickMs}, and {@link #boothClickAttempts}
+     *  because they were reset in {@link #setState} on entry to this
+     *  state — the prior CHECK_BANK session at Lumbridge can't
+     *  contaminate. */
+    private void tickDepositCashAtGe() throws InterruptedException
+    {
+        // Fast path: no coins in inventory, nothing to deposit.
+        if (!bankSessionDone && inventoryCount(ItemID.COINS) == 0)
+        {
+            log.info("cooks-assistant: no leftover coins to deposit — skipping GE bank trip");
+            setState(State.WALK_BACK_TO_LUMBRIDGE);
+            return;
+        }
+
+        boolean bankOpen = bank.isBankOpen();
+
+        // Phase 1: open the GE bank booth.
+        if (!bankOpen && !bankSessionDone)
+        {
+            if (bank.isBankPinUp())
+            {
+                abortWith("ge-bank: PIN keypad is up — enter your PIN manually then restart");
+                return;
+            }
+            long now = System.currentTimeMillis();
+            if (lastBoothClickMs > 0 && now - lastBoothClickMs < BANK_OPEN_TIMEOUT_MS)
+            {
+                status.set("ge-bank: waiting for window (clicked "
+                    + (now - lastBoothClickMs) + "ms ago)");
+                return;
+            }
+            if (dispatcher.isBusy()) { status.set("ge-bank: dispatcher busy"); return; }
+            if (lastBoothClickMs > 0)
+            {
+                boothClickAttempts++;
+                log.info("cooks-assistant: ge-bank booth click attempt {} timed out after {}ms",
+                    boothClickAttempts, BANK_OPEN_TIMEOUT_MS);
+                if (boothClickAttempts >= MAX_BOOTH_CLICK_ATTEMPTS)
+                {
+                    abortWith("ge-bank: " + boothClickAttempts
+                        + " booth-click attempts failed to open the window");
+                    return;
+                }
+            }
+            BankInteraction.BoothPrep prep = bank.ensureBoothInClickRange();
+            if (prep == BankInteraction.BoothPrep.NO_CANDIDATE)
+            {
+                abortWith("ge-bank: no booth/banker in click range");
+                return;
+            }
+            if (prep == BankInteraction.BoothPrep.WALKED_CLOSER)
+            {
+                status.set("ge-bank: walking closer to booth (off-canvas)");
+                return;
+            }
+            boolean ok = bank.tryClickBankBoothRandom();
+            if (!ok)
+            {
+                abortWith("ge-bank: no booth/banker in click range");
+                return;
+            }
+            lastBoothClickMs = now;
+            lastDispatchMs   = now;
+            status.set("ge-bank: booth clicked, waiting for window");
+            return;
+        }
+
+        if (bankOpen)
+        {
+            lastBoothClickMs   = 0;
+            boothClickAttempts = 0;
+
+            // Phase 2: wait for the bank container.
+            if (!bank.bankReady())
+            {
+                status.set("ge-bank: waiting for container to load");
+                return;
+            }
+
+            // Phase 3: deposit all coins. depositAll right-clicks the
+            // coin slot and picks "Deposit-All", which is a no-op when
+            // the slot doesn't exist (no coins in inventory) — but the
+            // fast path above caught that, so by here we have coins.
+            int coinsBefore = inventoryCount(ItemID.COINS);
+            if (coinsBefore > 0)
+            {
+                log.info("cooks-assistant: depositing {} coins at GE bank", coinsBefore);
+                bank.depositAll(ItemID.COINS);
+                status.set("ge-bank: deposited " + coinsBefore + " coins");
+            }
+
+            // Phase 4: close, latch session-done.
+            bank.closeBank();
+            bankSessionDone = true;
+            return;
+        }
+
+        // Phase 5: bank closed AND session done — walk back.
+        log.info("cooks-assistant: GE bank deposit complete, walking back to Lumbridge");
+        setState(State.WALK_BACK_TO_LUMBRIDGE);
     }
 
     private void tickTalkToCook() throws InterruptedException

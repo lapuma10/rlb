@@ -667,6 +667,16 @@ public final class TrailWalker
         {
             return originalPick;
         }
+        // Don't jitter near the destination. Once we're a tile or two
+        // from either the original pick or the leg's final tile, ±1
+        // wandering produces "walk skipped — already on target tile"
+        // and "WALK pick=X reason=reached-prev dist=0/1" loops while
+        // the player oscillates around the endpoint. Above that
+        // distance the jitter is the whole point of the corridor —
+        // keeps the path visibly human, off the dead-centerline.
+        if (chebyshev(pos, originalPick) <= 1) return originalPick;
+        WorldPoint legEnd = leg.tiles().get(leg.tiles().size() - 1);
+        if (chebyshev(pos, legEnd) <= 1) return originalPick;
 
         Random rng = ThreadLocalRandom.current();
 
