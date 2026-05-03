@@ -31,7 +31,26 @@ import net.runelite.client.sequence.dispatch.SequenceSleep;
 @Slf4j
 public final class NpcInteraction
 {
+    /** Outcome of one full {@link #talkTo} cycle. */
+    public enum TalkResult
+    {
+        /** Click landed, dialogue widget rendered, completeDialogue
+         *  drove it through to its natural close. */
+        OPENED_AND_COMPLETED,
+        /** Click was issued but no dialogue widget became visible
+         *  inside the timeout. The caller's next tick should retry
+         *  (re-resolve npcIndex first — the scene may have shifted). */
+        NEVER_OPENED
+    }
+
     private enum State { NONE, NPC_CONTINUES, PLAYER_CONTINUES, OPTION_MENU, LEVELUP }
+
+    /** Cadence for the dialogue-open poll inside {@link #talkTo}. Each
+     *  poll marshals to the client thread to read the dialogue widgets,
+     *  so going below 250 ms wastes hops without meaningfully improving
+     *  responsiveness — server tick is 600 ms, the dialog won't render
+     *  faster than that. */
+    private static final long DIALOGUE_POLL_INTERVAL_MS = 250L;
 
     private final Client client;
     private final ClientThread clientThread;
@@ -172,6 +191,93 @@ public final class NpcInteraction
             || isVisible(InterfaceID.Chatmenu.UNIVERSE)
             || isVisible(InterfaceID.LevelupDisplay.UNIVERSE));
         return Boolean.TRUE.equals(result);
+    }
+
+    /**
+     * Run one full talk cycle: click {@code npcIndex} with {@code verb},
+     * wait for any dialogue widget to render, then drive
+     * {@link #completeDialogue(String...)} until the dialogue closes.
+     *
+     * <p>Must run on the dispatcher worker thread (i.e. inside a
+     * {@link net.runelite.client.sequence.internal.ActionRequest.Kind#RUN_TASK}).
+     * Calling on the OSRS client thread would freeze the game during the
+     * {@link SequenceSleep} between polls and the cs2 that renders the
+     * dialogue would never run — see the "Threading model" section at
+     * top of {@code CLAUDE.md}. The runtime guard throws
+     * {@link IllegalStateException} on misuse so the failure mode is
+     * loud, not a silent hang.
+     *
+     * <p>Returns {@link TalkResult#OPENED_AND_COMPLETED} once the dialogue
+     * closes naturally (no widget visible). Returns
+     * {@link TalkResult#NEVER_OPENED} if the dialogue never appeared inside
+     * {@code dialogueOpenTimeoutMs} — covers both "click was rejected"
+     * (dispatcher's {@code lastError} carries the reason) and "click
+     * succeeded but the cs2 didn't render the dialog (NPC out of range,
+     * busy, etc.)". Caller decides what to do next: retry, abort,
+     * relocate.
+     *
+     * @param npcIndex              the NPC's scene index from a prior
+     *                              {@link #findOnScene}; must still be
+     *                              valid when this runs (NPC indices
+     *                              are stable while the chunk stays
+     *                              loaded).
+     * @param verb                  e.g. {@code "Talk-to"}, {@code "Trade with"}.
+     *                              Passed verbatim to
+     *                              {@link HumanizedInputDispatcher#npcClickOnWorker}.
+     * @param dialogueOpenTimeoutMs how long to wait for any dialogue
+     *                              widget to appear after the click.
+     *                              5 seconds is the cooks-assistant
+     *                              default.
+     * @param options               picked by {@link #completeDialogue}
+     *                              when an option-menu state appears.
+     *                              Empty array advances Continue prompts
+     *                              only.
+     */
+    public TalkResult talkTo(int npcIndex, String verb,
+                             long dialogueOpenTimeoutMs, String... options)
+        throws InterruptedException
+    {
+        if (client != null && client.isClientThread())
+        {
+            throw new IllegalStateException(
+                "NpcInteraction.talkTo called on the OSRS client thread — "
+                    + "this would freeze the game during the dialogue-open "
+                    + "poll and the cs2 that renders the dialog would never "
+                    + "run. Wrap the call in an ActionRequest.Kind.RUN_TASK "
+                    + "and dispatcher.dispatch(...) it from your tick loop.");
+        }
+
+        log.info("npc: talkTo idx={} verb='{}' (dialogue timeout {}ms, options={})",
+            npcIndex, verb, dialogueOpenTimeoutMs, options == null ? 0 : options.length);
+
+        // Step 1: click. npcClickOnWorker is synchronous — blocks until the
+        // click chain (camera rotate → WindMouse → hover/verify → click)
+        // completes. On click failure it sets dispatcher.lastError and
+        // returns; we don't bail here, we let the dialogue-open poll
+        // catch it as NEVER_OPENED. That keeps the contract simple — one
+        // failure mode, not two.
+        dispatcher.npcClickOnWorker(npcIndex, verb);
+
+        // Step 2: poll for the dialogue widget. The cs2 that renders the
+        // dialogue runs on the client thread; we sleep between polls so
+        // that thread isn't starved.
+        long deadline = System.currentTimeMillis() + dialogueOpenTimeoutMs;
+        while (System.currentTimeMillis() < deadline)
+        {
+            if (inDialogue())
+            {
+                log.info("npc: talkTo idx={} — dialogue opened, completing", npcIndex);
+                completeDialogue(options);
+                log.info("npc: talkTo idx={} → OPENED_AND_COMPLETED", npcIndex);
+                return TalkResult.OPENED_AND_COMPLETED;
+            }
+            SequenceSleep.sleep(client, DIALOGUE_POLL_INTERVAL_MS);
+        }
+
+        log.warn("npc: talkTo idx={} verb='{}' → NEVER_OPENED (waited {}ms; lastError='{}')",
+            npcIndex, verb, dialogueOpenTimeoutMs,
+            dispatcher == null ? "n/a" : dispatcher.lastErrorMessage());
+        return TalkResult.NEVER_OPENED;
     }
 
     /**

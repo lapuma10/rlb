@@ -175,11 +175,11 @@ public final class CooksAssistantScript
     // ── Timing ──────────────────────────────────────────────────────
     private static final long TICK_MS           = 650;
     private static final long DISPATCH_PACE_MS  = 2_000;
-    /** After clicking the Cook, wait this long before checking if the
-     *  dialogue rendered (server round-trip + client render). */
-    private static final long DIALOGUE_WAIT_MS  = 1_500;
-    /** Give up waiting for dialogue this long after the initial click,
-     *  then retry. */
+    /** Passed to {@link NpcInteraction#talkTo} as the dialogue-open
+     *  timeout. {@code talkTo} polls {@link NpcInteraction#inDialogue}
+     *  internally; if the dialog never appears within this window we
+     *  get back {@code NEVER_OPENED} and the script retries on the
+     *  next tick. */
     private static final long DIALOGUE_RETRY_MS = 5_000;
     private static final int  WALKER_MAX_STUCK  = 3;
 
@@ -220,10 +220,11 @@ public final class CooksAssistantScript
 
     /** Epoch-ms of the last dispatcher call — throttles re-dispatches. */
     private long lastDispatchMs;
-    /** True once CLICK_NPC("Talk-to") has been dispatched toward the Cook. */
+    /** True once the RUN_TASK that runs {@link NpcInteraction#talkTo}
+     *  has been dispatched for this talk attempt. Reset by
+     *  {@link #setState} on entry and after a finished talk that didn't
+     *  consume the ingredients (caller-driven retry). */
     private boolean cookClickDispatched;
-    /** True once the RUN_TASK for completeDialogue() has been dispatched. */
-    private boolean dialogueTaskDispatched;
     /** Count of completed cook talk cycles — incremented after each
      *  dialogue session ends. Capped at {@link #MAX_COOK_TALKS}. */
     private int talkAttempts;
@@ -887,57 +888,26 @@ public final class CooksAssistantScript
                 return;
             }
             // Hull may be null this exact frame (camera mid-rotate, behind a
-            // wall) — let the dispatcher's npcClick re-resolve when it runs.
-            // It already rotates the camera + re-fetches the hull at click
-            // time, and bails with "not on screen" if it still can't see him.
-            status.set("cook: clicking " + VERB_TALK_TO + " (idx=" + scan.npcIndex() + ")");
-            log.info("cooks-assistant: dispatching CLICK_NPC Talk-to cook idx={} tile={}",
-                scan.npcIndex(), scan.tile());
-            dispatcher.dispatch(ActionRequest.builder()
-                .kind(ActionRequest.Kind.CLICK_NPC)
-                .channel(ActionRequest.Channel.MOUSE)
-                .npcIndex(scan.npcIndex())
-                .verb(VERB_TALK_TO)
-                .build());
-            cookClickDispatched = true;
-            lastDispatchMs = System.currentTimeMillis();
-            return;
-        }
-
-        if (!dialogueTaskDispatched)
-        {
-            long elapsed = System.currentTimeMillis() - lastDispatchMs;
-            if (elapsed < DIALOGUE_WAIT_MS)
-            {
-                status.set("cook: waiting for dialogue (" + elapsed + "ms)");
-                return;
-            }
-            if (dispatcher.isBusy())
-            {
-                status.set("cook: click still in flight");
-                return;
-            }
-            boolean inDlg = npcInteraction.inDialogue();
-            if (!inDlg)
-            {
-                if (elapsed < DIALOGUE_RETRY_MS)
-                {
-                    status.set("cook: dialogue not open yet — waiting");
-                    return;
-                }
-                log.info("cooks-assistant: dialogue not opened after {}ms — retrying click", elapsed);
-                cookClickDispatched = false;
-                lastDispatchMs = 0;
-                return;
-            }
-            status.set("cook: dialogue open — completing quest dialogue (talk #" + (talkAttempts + 1) + ")");
+            // wall) — let the dispatcher's npcClick re-resolve when talkTo
+            // runs. It already rotates the camera + re-fetches the hull
+            // at click time, and bails with "not on screen" if it still
+            // can't see him.
+            final int idx = scan.npcIndex();
+            final WorldPoint tile = scan.tile();
+            status.set("cook: talking (idx=" + idx + ", talk #" + (talkAttempts + 1) + ")");
+            log.info("cooks-assistant: dispatching talkTo cook idx={} tile={} (talk #{})",
+                idx, tile, talkAttempts + 1);
             dispatcher.dispatch(ActionRequest.builder()
                 .kind(ActionRequest.Kind.RUN_TASK)
                 .channel(ActionRequest.Channel.MOUSE)
-                .task(() -> npcInteraction.completeDialogue(COOK_DIALOGUE_OPTIONS))
-                .taskName("CooksAssistant.completeDialogue")
+                .task(() -> {
+                    NpcInteraction.TalkResult r = npcInteraction.talkTo(
+                        idx, VERB_TALK_TO, DIALOGUE_RETRY_MS, COOK_DIALOGUE_OPTIONS);
+                    log.info("cooks-assistant: talkTo cook idx={} → {}", idx, r);
+                })
+                .taskName("CooksAssistant.talkTo")
                 .build());
-            dialogueTaskDispatched = true;
+            cookClickDispatched = true;
             return;
         }
 
@@ -947,7 +917,7 @@ public final class CooksAssistantScript
             return;
         }
 
-        // Dialogue task finished. The Cook only consumes ingredients on
+        // Talk task finished. The Cook only consumes ingredients on
         // the *second* talk (first talk starts the quest, second hands
         // them over). Inventory check is the truth source — items gone =
         // quest complete; items still here = need another talk.
@@ -975,7 +945,6 @@ public final class CooksAssistantScript
         log.info("cooks-assistant: ingredients still present after talk #{} — talking again", talkAttempts);
         status.set("cook: talk " + talkAttempts + " done, items still here — talking again");
         cookClickDispatched    = false;
-        dialogueTaskDispatched = false;
         lastDispatchMs         = 0;
     }
 
@@ -986,7 +955,6 @@ public final class CooksAssistantScript
         state.set(s);
         lastDispatchMs         = 0;
         cookClickDispatched    = false;
-        dialogueTaskDispatched = false;
         walkerStuckCount       = 0;
         currentBuyItemId       = 0;
         lastBoothClickMs       = 0;
