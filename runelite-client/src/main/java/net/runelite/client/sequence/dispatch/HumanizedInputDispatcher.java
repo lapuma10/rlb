@@ -25,6 +25,7 @@
 package net.runelite.client.sequence.dispatch;
 
 import lombok.extern.slf4j.Slf4j;
+import net.runelite.api.Actor;
 import net.runelite.api.Client;
 import net.runelite.api.GameObject;
 import net.runelite.api.Menu;
@@ -586,6 +587,7 @@ public class HumanizedInputDispatcher implements InputDispatcher
      */
     private void npcClick(int npcIndex, String verb) throws InterruptedException
     {
+        boolean attackVerb = VerbMatcher.matches("Attack", verb);
         // Phase 1 — read the NPC's world tile + a rough on-canvas pre-aim
         // point (tile centre is "in the area"; final aim uses the model
         // hull a few hundred ms from now).
@@ -640,6 +642,16 @@ public class HumanizedInputDispatcher implements InputDispatcher
         }
         SequenceSleep.sleep(client, 40 + rng.nextInt(40));     // 40..80ms final settle
 
+        Boolean claimedByOther = attackVerb
+            ? onClient(() -> isNpcClaimedByOtherPlayer(npcIndex))
+            : Boolean.FALSE;
+        if (Boolean.TRUE.equals(claimedByOther))
+        {
+            lastError.set("npc already in combat with another player " + npcIndex);
+            log.info("npc {} already in combat with another player — refusing attack click", npcIndex);
+            return;
+        }
+
         // Phase 7 — verify hover is `verb` on OUR npc, just before press.
         Boolean topMatches = onClient(() -> isTopVerbOnNpc(verb, npcIndex));
         if (Boolean.TRUE.equals(topMatches))
@@ -647,6 +659,15 @@ public class HumanizedInputDispatcher implements InputDispatcher
             // Phase 8 — left-click. Settle above already covered the
             // "commit" beat; another long pre-click sleep would just give
             // the chicken time to step out from under us.
+            claimedByOther = attackVerb
+                ? onClient(() -> isNpcClaimedByOtherPlayer(npcIndex))
+                : Boolean.FALSE;
+            if (Boolean.TRUE.equals(claimedByOther))
+            {
+                lastError.set("npc already in combat with another player " + npcIndex);
+                log.info("npc {} became claimed before left-click — refusing attack", npcIndex);
+                return;
+            }
             input.mousePress(MouseEvent.BUTTON1);
             SequenceSleep.sleep(client, 40 + rng.nextInt(40));
             input.mouseRelease(MouseEvent.BUTTON1);
@@ -668,8 +689,32 @@ public class HumanizedInputDispatcher implements InputDispatcher
             log.info("right-click menu did not contain '{}' for npc {}", verb, npcIndex);
             return;
         }
+        claimedByOther = attackVerb
+            ? onClient(() -> isNpcClaimedByOtherPlayer(npcIndex))
+            : Boolean.FALSE;
+        if (Boolean.TRUE.equals(claimedByOther))
+        {
+            lastError.set("npc already in combat with another player " + npcIndex);
+            log.info("npc {} became claimed before menu click — refusing attack", npcIndex);
+            try { tapKey(java.awt.event.KeyEvent.VK_ESCAPE); }
+            catch (InterruptedException ie) { Thread.currentThread().interrupt(); throw ie; }
+            SequenceSleep.sleep(client, 120);
+            return;
+        }
         moveCursorTo(row.x, row.y);
         SequenceSleep.sleep(client, 40 + rng.nextInt(60));
+        claimedByOther = attackVerb
+            ? onClient(() -> isNpcClaimedByOtherPlayer(npcIndex))
+            : Boolean.FALSE;
+        if (Boolean.TRUE.equals(claimedByOther))
+        {
+            lastError.set("npc already in combat with another player " + npcIndex);
+            log.info("npc {} became claimed before menu left-click — refusing attack", npcIndex);
+            try { tapKey(java.awt.event.KeyEvent.VK_ESCAPE); }
+            catch (InterruptedException ie) { Thread.currentThread().interrupt(); throw ie; }
+            SequenceSleep.sleep(client, 120);
+            return;
+        }
         input.mousePress(MouseEvent.BUTTON1);
         SequenceSleep.sleep(client, 40 + rng.nextInt(40));
         input.mouseRelease(MouseEvent.BUTTON1);
@@ -680,6 +725,22 @@ public class HumanizedInputDispatcher implements InputDispatcher
      *  camera-rotate step; {@code preAim} is the rough cursor target for
      *  the long humanized move. Final click pixel is re-resolved later. */
     private record NpcAim(@javax.annotation.Nullable WorldPoint world, Point preAim) {}
+
+    private boolean isNpcClaimedByOtherPlayer(int npcIndex)
+    {
+        try
+        {
+            Player self = client.getLocalPlayer();
+            NPC npc = findNpc(npcIndex);
+            if (self == null || npc == null) return false;
+            Actor interacting = npc.getInteracting();
+            return interacting instanceof Player && interacting != self;
+        }
+        catch (Throwable th)
+        {
+            return false;
+        }
+    }
 
     /** Client-thread check: is the engine's current left-click action
      *  "Take" targeting ground item id {@code itemId}? */

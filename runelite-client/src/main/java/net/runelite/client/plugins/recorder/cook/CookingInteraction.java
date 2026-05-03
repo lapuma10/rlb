@@ -199,6 +199,17 @@ public final class CookingInteraction
             scanner.findTileItemById(itemId, SEARCH_RADIUS)));
     }
 
+    /** Variant used by V2 cooking: picks uniformly at random among log
+     *  piles within {@code jitter} Chebyshev tiles of the closest match.
+     *  jitter=2 lights a different pile every trip when a cluster of
+     *  spawns surrounds the cook spot. V1 still uses the strict-closest
+     *  {@link #findGroundLogs} above. */
+    public Match findGroundLogsVaried(int itemId, int jitter) throws InterruptedException
+    {
+        return onClient(() -> Match.wrap(
+            scanner.findTileItemByIdRandomNear(itemId, SEARCH_RADIUS, jitter)));
+    }
+
     /** Find a Fire game object whose composition name matches
      *  {@code namePattern} and whose tile equals {@code targetTile}.
      *  Used to verify the fire we just lit actually appeared — vs.

@@ -55,7 +55,7 @@ public class ChickenCombatLoopTest
         // immediately. We run the loop via the package-private hooks, not via
         // start() — start() spawns a thread which would call doEngage which
         // includes a 5s wait for engagement; we want a synchronous unit test.
-        when(self.getInteracting()).thenReturn(chicken);
+        when(self.getInteracting()).thenReturn(null, null, chicken);
 
         ChickenCombatLoop loop = new ChickenCombatLoop(dispatcher, client, null,
             null,
@@ -256,6 +256,63 @@ public class ChickenCombatLoopTest
         assertEquals(ChickenCombatLoop.State.SELECTING, loop.state());
         assertNull(loop.currentTarget());
         verify(dispatcher, times(1)).dispatch(any());
+    }
+
+    @Test
+    public void doEngage_chickenClaimedBeforeClick_releasesWithoutDispatch()
+    {
+        Player self = mock(Player.class);
+        Player otherPlayer = mock(Player.class);
+        NPC chicken = mockChicken(47, 3231, 3296, 0);
+        when(chicken.getInteracting()).thenReturn(otherPlayer);
+        Client client = clientWith(self, new WorldPoint(3230, 3296, 0), chicken);
+        CombatDispatcher dispatcher = mock(CombatDispatcher.class);
+
+        ChickenCombatLoop loop = new ChickenCombatLoop(dispatcher, client, null,
+            null,
+            new NpcSelector(ChickenCombatLoop.CHICKEN_NAME),
+            TargetVisibility.alwaysVisible(), s -> {});
+        loop.setTargetForTesting(new CombatTarget(47, "Chicken", 0));
+        loop.setStateForTesting(ChickenCombatLoop.State.ENGAGING);
+
+        loop.doEngage();
+
+        assertEquals(ChickenCombatLoop.State.SELECTING, loop.state());
+        assertNull(loop.currentTarget());
+        verify(dispatcher, never()).dispatch(any());
+    }
+
+    @Test
+    public void doSelect_skipsRecentlyServerRejectedChicken()
+    {
+        Player self = mock(Player.class);
+        NPC rejected = mockChicken(48, 3231, 3296, 0);
+        NPC alternate = mockChicken(49, 3233, 3296, 0);
+        Client client = clientWith(self, new WorldPoint(3230, 3296, 0), rejected, alternate);
+        CombatDispatcher dispatcher = mock(CombatDispatcher.class);
+        final ChickenCombatLoop[] loopHolder = new ChickenCombatLoop[1];
+        when(dispatcher.lastErrorMessage()).thenReturn(null);
+        when(dispatcher.isBusy()).thenAnswer(inv -> {
+            loopHolder[0].onChatMessage(new ChatMessage(null, ChatMessageType.GAMEMESSAGE, null,
+                "Someone else is fighting that.", null, 0));
+            return false;
+        });
+
+        ChickenCombatLoop loop = new ChickenCombatLoop(dispatcher, client, null,
+            null,
+            new NpcSelector(ChickenCombatLoop.CHICKEN_NAME),
+            TargetVisibility.alwaysVisible(), s -> {});
+        loopHolder[0] = loop;
+        loop.setTargetForTesting(new CombatTarget(48, "Chicken", 0));
+        loop.setStateForTesting(ChickenCombatLoop.State.ENGAGING);
+
+        loop.doEngage();
+        assertEquals(ChickenCombatLoop.State.SELECTING, loop.state());
+
+        assertTrue(loop.doSelect());
+        assertNotNull(loop.currentTarget());
+        assertEquals("should avoid immediately re-picking the rejected chicken",
+            49, loop.currentTarget().npcIndex());
     }
 
     // ----- helpers -----

@@ -1,6 +1,9 @@
 package net.runelite.client.sequence.activities.ge;
 
 import java.util.function.BooleanSupplier;
+import javax.annotation.Nullable;
+import lombok.extern.slf4j.Slf4j;
+import net.runelite.api.Client;
 import net.runelite.client.sequence.Completion;
 import net.runelite.client.sequence.Failure;
 import net.runelite.client.sequence.PreemptionPolicy;
@@ -13,6 +16,7 @@ import net.runelite.client.sequence.blackboard.Blackboard;
 import net.runelite.client.sequence.blackboard.BlackboardKey;
 import net.runelite.client.sequence.blackboard.BlackboardScope;
 import net.runelite.client.sequence.dispatch.InputDispatcher;
+import net.runelite.client.sequence.util.ItemNames;
 import net.runelite.client.sequence.views.GrandExchangeOfferView;
 import net.runelite.client.sequence.views.OfferSide;
 
@@ -43,6 +47,7 @@ import net.runelite.client.sequence.views.OfferSide;
  * observedDelta)} when the slot transitions to EMPTY but the expected
  * inventory delta is not observed within the timeout.
  */
+@Slf4j
 public final class CollectOfferStep implements Step {
 
     private static final int COINS_ITEM_ID = 995;
@@ -100,19 +105,33 @@ public final class CollectOfferStep implements Step {
 
     private final GeActions ge;
     private final BooleanSupplier useCollectAll;
+    /** Optional — used only to resolve item id → name for log lines via
+     *  {@link ItemNames}. Null in tests; falls back to "item#&lt;id&gt;". */
+    @Nullable private final Client client;
     private InputDispatcher dispatcher;
 
     public CollectOfferStep(GeActions ge) {
-        this(ge, DEFAULT_USE_COLLECT_ALL);
+        this(ge, DEFAULT_USE_COLLECT_ALL, null);
+    }
+
+    /** Production constructor — pass {@code client} so log lines show item
+     *  names ("Lobster") instead of ids ("item#377"). */
+    public CollectOfferStep(GeActions ge, @Nullable Client client) {
+        this(ge, DEFAULT_USE_COLLECT_ALL, client);
     }
 
     /** Test/override constructor: pin the strategy via a deterministic
      *  {@link BooleanSupplier}. */
     public CollectOfferStep(GeActions ge, BooleanSupplier useCollectAll) {
+        this(ge, useCollectAll, null);
+    }
+
+    public CollectOfferStep(GeActions ge, BooleanSupplier useCollectAll, @Nullable Client client) {
         if (ge == null) throw new IllegalArgumentException("GeActions must not be null");
         if (useCollectAll == null) throw new IllegalArgumentException("useCollectAll must not be null");
         this.ge = ge;
         this.useCollectAll = useCollectAll;
+        this.client = client;
     }
 
     @Override public String name()                              { return "CollectOffer"; }
@@ -129,6 +148,7 @@ public final class CollectOfferStep implements Step {
         this.dispatcher = ctx.dispatcher();
 
         if (!s.grandExchange().open()) {
+            log.warn("collect: GE not open, aborting");
             step.put(K_PRECONDITION, new GeBlockReason.GeNotOpen());
             return;
         }
@@ -136,16 +156,21 @@ public final class CollectOfferStep implements Step {
         Integer slotBox = ctx.bb().scope(BlackboardScope.SEQUENCE)
             .get(GeBlackboardKeys.K_GE_OFFER_SLOT).orElse(null);
         if (slotBox == null) {
+            log.warn("collect: no offer slot recorded on SEQUENCE blackboard");
             step.put(K_PRECONDITION, new GeBlockReason.GeOfferRejected("no offer slot recorded"));
             return;
         }
         int slot = slotBox;
         var offers = s.grandExchange().offers();
         if (slot < 0 || slot >= offers.size()) {
+            log.warn("collect: slot {} out of range 0..{}", slot, offers.size() - 1);
             step.put(K_PRECONDITION, new GeBlockReason.GeOfferRejected("slot out of range: " + slot));
             return;
         }
         GrandExchangeOfferView o = offers.get(slot);
+        log.info("collect: offer \"{}\" completed at slot {} (status={} side={} itemId={} qty={}/{} priceEach={})",
+            ItemNames.nameOrId(client, o.itemId()), slot, o.status(), o.side(),
+            o.itemId(), o.completedQuantity(), o.requestedQuantity(), o.priceEach());
 
         // If a previous attempt persisted expected item / baseline (Retry path),
         // reuse them instead of re-deriving from the now-empty slot.
@@ -171,6 +196,7 @@ public final class CollectOfferStep implements Step {
         // First attempt: compute expected delta target from the live slot.
         int expectedItemId = (o.side() == OfferSide.SELL) ? COINS_ITEM_ID : o.itemId();
         if (expectedItemId == 0 && o.isEmpty()) {
+            log.info("collect: slot {} already empty (no offer to collect)", slot);
             step.put(K_ALREADY_EMPTY, true);
             return;
         }
@@ -182,6 +208,7 @@ public final class CollectOfferStep implements Step {
         ctx.bb().scope(BlackboardScope.SEQUENCE).put(K_DELTA_START_PERSISTED, startCount);
 
         if (o.isEmpty()) {
+            log.info("collect: slot {} already empty (collected externally)", slot);
             step.put(K_ALREADY_EMPTY, true);
             return;
         }
@@ -193,6 +220,8 @@ public final class CollectOfferStep implements Step {
         // leaves the remainder running. Different success criterion in
         // check() — see K_PARTIAL_MODE handling.
         if (o.status() == net.runelite.client.sequence.views.OfferStatus.PARTIALLY_COMPLETE) {
+            log.info("collect: slot {} is PARTIALLY_COMPLETE — collecting filled portion, leaving remainder active",
+                slot);
             step.put(K_PARTIAL_MODE, true);
         }
 
@@ -213,7 +242,11 @@ public final class CollectOfferStep implements Step {
             : Strategy.PER_SLOT;
         step.put(K_STRATEGY, strategy);
 
+        int slotItemId = s.grandExchange().offers().get(slot).itemId();
+        String itemName = ItemNames.nameOrId(client, slotItemId);
         if (strategy == Strategy.COLLECT_ALL) {
+            log.info("collect: collecting \"{}\" from ge — dispatching COLLECT_ALL toolbar click (slot={}, forceCollectAll={})",
+                itemName, slot, forceCollectAll);
             ge.collectAll();
             step.put(K_PHASE, Phase.AWAIT_DRAIN);
             step.put(K_LAST_DISPATCH_TICK, s.tick());
@@ -222,10 +255,13 @@ public final class CollectOfferStep implements Step {
 
         // PER_SLOT: open the slot's detail view if not already there.
         if (s.grandExchange().collectOpen()) {
+            log.info("collect: collecting \"{}\" from ge — dispatching PER_SLOT inventory-collect click (slot={}, detail already open)",
+                itemName, slot);
             step.put(K_PHASE, Phase.CLICK_COLLECT_INV);
             ge.collect(slot);
             step.put(K_LAST_DISPATCH_TICK, s.tick());
         } else {
+            log.info("collect: opening offer detail view for slot {} \"{}\" (PER_SLOT path)", slot, itemName);
             step.put(K_PHASE, Phase.OPEN_COLLECT);
             ge.openOfferDetail(slot);
             step.put(K_LAST_DISPATCH_TICK, s.tick());
@@ -332,6 +368,8 @@ public final class CollectOfferStep implements Step {
             Integer lastDispatch = step.get(K_LAST_DISPATCH_TICK).orElse(null);
             if (lastDispatch == null
                 || s.tick() - lastDispatch >= REDISPATCH_COOLDOWN_TICKS) {
+                log.info("collect: slot {} not empty after {} ticks — re-dispatching COLLECT_ALL",
+                    slot, lastDispatch == null ? -1 : (s.tick() - lastDispatch));
                 ge.collectAll();
                 step.put(K_LAST_DISPATCH_TICK, s.tick());
             }
@@ -352,6 +390,9 @@ public final class CollectOfferStep implements Step {
             int expectedItemId = step.get(K_EXPECTED_DELTA_ITEM_ID).orElse(-1);
             int startCount = step.get(K_EXPECTED_DELTA_START).orElse(0);
             int now = (expectedItemId > 0) ? s.inventory().count(expectedItemId) : 0;
+            log.warn("collect: FAILED to collect \"{}\" from slot {} after {} ticks — strategy={} expectedItemId={} unnotedDelta={} (delta is unreliable for noted collects)",
+                ItemNames.nameOrId(client, expectedItemId), slot, s.tick() - startTick,
+                strategy, expectedItemId, now - startCount);
             return Completion.failed(new GeBlockReason.GeCollectFailed(
                 slot, expectedItemId, now - startCount));
         }

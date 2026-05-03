@@ -6,7 +6,9 @@ import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.Deque;
 import java.util.HashSet;
+import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.ThreadLocalRandom;
 import lombok.extern.slf4j.Slf4j;
@@ -15,6 +17,7 @@ import net.runelite.api.NPC;
 import net.runelite.api.WorldView;
 import net.runelite.api.gameval.InterfaceID;
 import net.runelite.api.gameval.NpcID;
+import net.runelite.api.gameval.VarbitID;
 import net.runelite.api.widgets.Widget;
 import net.runelite.client.callback.ClientThread;
 import net.runelite.client.plugins.recorder.transport.VerbMatcher;
@@ -399,28 +402,73 @@ public final class GeInteraction implements GeActions {
      *  <p>This is a public entry point for the dispatcher to call back
      *  into; it's NOT meant to be called from step code. */
     public void runPickSearchResult(int itemId, String wantedName) throws InterruptedException {
-        // Step 1: type the search text. typeText was passed via the
-        // ActionRequest; we pull it from the request via this method's
-        // caller path. We type lowercase (no shift) to avoid bot tells.
+        ThreadLocalRandom rng = ThreadLocalRandom.current();
+        // We type lowercase (no shift) to avoid bot tells.
         String typed = wantedName.toLowerCase(java.util.Locale.ROOT);
-        log.info("runPickSearchResult: typing \"{}\" for itemId={}", typed, itemId);
-        // Use the dispatcher's typeChatboxInternal directly — we're
-        // already on the worker thread holding the busy flag, so this is
-        // safe and doesn't try to acquire the flag again.
-        boolean typedOk = dispatcher.typeChatboxOnWorker(typed, CHATBOX_AWAIT_MS,
+        log.info("runPickSearchResult: typing \"{}\" for itemId={} (peek-and-continue)",
+            typed, itemId);
+        // Real players typically don't type the entire item name —
+        // they type a prefix, glance at the search results, and click
+        // the moment the row appears. We mimic that:
+        //   1. Pick a first-peek length in 3..6 (clamped to name length).
+        //   2. Type that prefix WITHOUT Enter, opening the prompt.
+        //   3. Loop: poll the result list for ~300-600ms, click on a
+        //      hit; otherwise type 1-2 more chars and peek again.
+        //   4. If we run out of chars without a hit, keep polling up to
+        //      CHATBOX_AWAIT_MS — the cs2 may render the rows late.
+        int firstPeekLen = Math.max(1, Math.min(typed.length(), 3 + rng.nextInt(4)));
+        String firstChunk = typed.substring(0, firstPeekLen);
+        boolean typedOk = dispatcher.typeChatboxOnWorker(firstChunk, CHATBOX_AWAIT_MS,
             CHATBOX_DWELL_MIN_MS, CHATBOX_DWELL_MAX_MS, false);
         if (!typedOk) {
-            log.warn("runPickSearchResult: typing \"{}\" failed (chatbox prompt timeout)", typed);
+            log.warn("runPickSearchResult: typing \"{}\" failed (chatbox prompt timeout)",
+                firstChunk);
             return;
         }
-
-        // Step 2: poll for the matching row.
-        long deadline = System.currentTimeMillis() + CHATBOX_AWAIT_MS;
+        int typedSoFar = firstPeekLen;
         ResultRow row = null;
-        while (System.currentTimeMillis() < deadline) {
-            row = dispatcher.runOnClient(() -> findResultRowFor(wantedName));
+        // Peek-then-type loop. Each iteration glances at the list for a
+        // "natural reading window" (~300-600ms) before deciding whether
+        // to type more. Once typed >= full name, fall through to the
+        // long-deadline poll.
+        while (typedSoFar < typed.length()) {
+            row = peekForResultRow(wantedName, 300L + rng.nextLong(301));
             if (row != null) break;
-            SequenceSleep.sleep(client, 120L);
+            // Re-verify the chatbox prompt is still open before typing
+            // the next chunk. typeChar bypasses awaitChatboxInputPrompt,
+            // so if the prompt closed between chunks (focus loss,
+            // unrelated dispatch, accidental ESC) the keystrokes go
+            // nowhere and the search silently fails. Bail loudly instead.
+            Integer mode = dispatcher.runOnClient(() ->
+                client.getVarcIntValue(net.runelite.api.gameval.VarClientID.MESLAYERMODE));
+            if (mode == null || mode == 0) {
+                log.warn("runPickSearchResult: chatbox prompt closed mid-typing (MESLAYERMODE={}, typed={}/{}) — aborting",
+                    mode, typedSoFar, typed.length());
+                return;
+            }
+            // Pick 1-2 more chars and type them with the same per-key
+            // cadence as typeChatboxInternal (180-380ms + 20% chance of
+            // a 350-1100ms thinking pause).
+            int chunk = 1 + rng.nextInt(2);
+            int end = Math.min(typed.length(), typedSoFar + chunk);
+            for (int i = typedSoFar; i < end; i++) {
+                dispatcher.typeChar(typed.charAt(i));
+                long base = 180L + rng.nextLong(200);
+                long pause = (rng.nextInt(100) < 20) ? (350L + rng.nextLong(750)) : 0L;
+                SequenceSleep.sleep(client, base + pause);
+            }
+            typedSoFar = end;
+        }
+        // Whether the name's fully typed (no early hit) or we already
+        // matched mid-typing, give the cs2 the same long deadline as
+        // before to render late rows.
+        if (row == null) {
+            long deadline = System.currentTimeMillis() + CHATBOX_AWAIT_MS;
+            while (System.currentTimeMillis() < deadline) {
+                row = dispatcher.runOnClient(() -> findResultRowFor(wantedName));
+                if (row != null) break;
+                SequenceSleep.sleep(client, 120L);
+            }
         }
         if (row == null) {
             dumpResultRowsForDiagnostic(itemId);
@@ -428,12 +476,12 @@ public final class GeInteraction implements GeActions {
                 wantedName, CHATBOX_AWAIT_MS);
             return;
         }
-        log.info("runPickSearchResult: itemId={} matched name=\"{}\" action=\"{}\" bounds={}",
-            itemId, wantedName, row.matchedAction, row.bounds);
+        log.info("runPickSearchResult: itemId={} matched name=\"{}\" action=\"{}\" bounds={} typedChars={}/{}",
+            itemId, wantedName, row.matchedAction, row.bounds, typedSoFar, typed.length());
 
-        // Step 3: pre-click human dwell, then plain left-click the row.
+        // Pre-click human dwell, then plain left-click the row.
         long dwell = CHATBOX_DWELL_MIN_MS
-            + java.util.concurrent.ThreadLocalRandom.current()
+            + ThreadLocalRandom.current()
                 .nextLong(CHATBOX_DWELL_MAX_MS - CHATBOX_DWELL_MIN_MS + 1);
         SequenceSleep.sleep(client, dwell);
         // GE search rows must not fall back to right-click + ESC on a transient
@@ -442,6 +490,21 @@ public final class GeInteraction implements GeActions {
         dispatcher.boundsClickOnWorker(row.bounds, null);
         SequenceSleep.sleep(client, 500L);
         logPostClickState(itemId);
+    }
+
+    /** Poll {@code findResultRowFor} every 120 ms for up to {@code peekMs},
+     *  returning the first matching row or null on timeout. Used by the
+     *  peek-and-continue typing loop in {@link #runPickSearchResult} to
+     *  decide whether the next char needs to be typed. */
+    private ResultRow peekForResultRow(String wantedName, long peekMs)
+            throws InterruptedException {
+        long deadline = System.currentTimeMillis() + peekMs;
+        while (System.currentTimeMillis() < deadline) {
+            ResultRow r = dispatcher.runOnClient(() -> findResultRowFor(wantedName));
+            if (r != null) return r;
+            SequenceSleep.sleep(client, 120L);
+        }
+        return null;
     }
 
     private record ResultRow(String matchedAction, Rectangle bounds) {}
@@ -630,23 +693,37 @@ public final class GeInteraction implements GeActions {
     private static final int SETUP_CHILD_ENTER_QUANTITY   = 7;
     private static final int SETUP_CHILD_ENTER_PRICE      = 12;
 
+    /** Max button clicks we'll dispatch before falling back to typing.
+     *  Calibrated against the user's "58 should not be 13 fast clicks"
+     *  feedback (2026-05-02): any greedy decomposition that exceeds this
+     *  many presses is botlike no matter the cadence, so we type instead.
+     *  At ≤ 6 clicks the total wall-time (40-70ms within-run + one or two
+     *  300-800ms switches) stays well under the typing path's prompt-open
+     *  + per-key 180-380ms cost. */
+    private static final int MAX_BUTTON_CLICKS = 6;
+
     @Override
     public boolean setQuantity(int qty) {
-        // Per buy-flow-recipe.json step 8-9: click GeOffers.SETUP[7]
-        // ("Enter quantity"), MESLAYERMODE flips 0->7, type the digits,
-        // press Enter, GE_NEWOFFER_QUANTITY commits to the typed value.
+        // Three paths, decided by reading GE_NEWOFFER_QUANTITY first:
+        //   (a) current == target → no-op (avoid reopening the prompt
+        //       just to retype the same value).
+        //   (b) target > current AND greedy +100/+10/+1 decomposition
+        //       fits in MAX_BUTTON_CLICKS → click-step via the +N
+        //       buttons. The OSRS GE quantity row has NO minus buttons
+        //       (you cannot go below 1), so going down always falls
+        //       through to (c).
+        //   (c) anything else → click "Enter quantity" + type digits +
+        //       Enter (the original path).
         //
-        // The click and the type used to be two separate dispatches. The
-        // second was dropped by the busy guard (the click hadn't finished
-        // when the type queued), and the chatbox prompt was left stuck
-        // waiting for input. Bundle both into one RUN_TASK so the worker
-        // runs them in sequence while holding busy throughout.
+        // The whole flow runs as a single RUN_TASK so the dispatcher's
+        // busy flag stays held across the click/type/multi-click — no
+        // risk of a follow-up dispatch being dropped while the prior is
+        // mid-flight (the regression that prompted bundling in the first
+        // place).
         ActionRequest req = ActionRequest.builder()
             .kind(ActionRequest.Kind.RUN_TASK)
             .channel(ActionRequest.Channel.KEYBOARD)
-            .task(() -> runClickSetupChildThenType(
-                SETUP_CHILD_ENTER_QUANTITY, "Enter quantity",
-                Integer.toString(qty)))
+            .task(() -> runSetQuantity(qty))
             .taskName("GE_SET_QUANTITY(" + qty + ")")
             .build();
         log.info("setQuantity: queueing GE_SET_QUANTITY qty={}", qty);
@@ -656,21 +733,247 @@ public final class GeInteraction implements GeActions {
 
     @Override
     public boolean setPrice(int priceEach) {
-        // Per buy-flow-recipe.json step 5-6: click GeOffers.SETUP[12]
-        // ("Enter price"), then type digits and Enter. Click and type are
-        // bundled into one RUN_TASK to prevent the busy guard from
-        // dropping the type half — see setQuantity above.
+        // Mirror of setQuantity. Price has BOTH +1 and -1 buttons, so
+        // the button path covers up/down. Per user 2026-05-02 we
+        // deliberately ignore the +5%/-5% percentage buttons — they're
+        // imprecise and useless for ≤ MAX_BUTTON_CLICKS deltas.
         ActionRequest req = ActionRequest.builder()
             .kind(ActionRequest.Kind.RUN_TASK)
             .channel(ActionRequest.Channel.KEYBOARD)
-            .task(() -> runClickSetupChildThenType(
-                SETUP_CHILD_ENTER_PRICE, "Enter price",
-                Integer.toString(priceEach)))
+            .task(() -> runSetPrice(priceEach))
             .taskName("GE_SET_PRICE(" + priceEach + ")")
             .build();
         log.info("setPrice: queueing GE_SET_PRICE price={}", priceEach);
         dispatcher.dispatch(req);
         return true;
+    }
+
+    /** Worker-thread implementation of the setQuantity flow. Public so
+     *  the dispatcher can call back via the {@code RUN_TASK} payload. */
+    public void runSetQuantity(int target) throws InterruptedException {
+        if (target <= 0) return;
+        Integer current = dispatcher.runOnClient(() ->
+            client.getVarbitValue(VarbitID.GE_NEWOFFER_QUANTITY));
+        if (current != null && current == target) {
+            log.info("setQuantity: already at qty={}, skipping", target);
+            return;
+        }
+        int cur = current == null ? 0 : current;
+        int diff = target - cur;
+        // Going up and within the click budget? Use the +N buttons.
+        // Greedy decomposition: highest-value preset first; whatever the
+        // SETUP widget actually exposes (+100, +10, +1, and +1000 on
+        // newer revisions) is what we'll use. Buttons not in the live
+        // tree are silently dropped from the plan.
+        if (diff > 0) {
+            Map<String, Rectangle> qtyButtons = dispatcher.runOnClient(() ->
+                resolveSetupButtons("+1000", "+100", "+10", "+1"));
+            List<ButtonClick> plan = planAdditiveClicks(diff, qtyButtons,
+                new String[]{"+1000", "+100", "+10", "+1"});
+            if (plan != null && plan.size() <= MAX_BUTTON_CLICKS && !plan.isEmpty()) {
+                log.info("setQuantity: button-stepping diff={} via {} clicks: {}",
+                    diff, plan.size(), summarize(plan));
+                runHumanizedClickPlan(plan);
+                return;
+            }
+        }
+        // Fallback: open the "Enter quantity" prompt and type the value.
+        log.info("setQuantity: typing qty={} (current={}, diff={})",
+            target, cur, diff);
+        runClickSetupChildThenType(SETUP_CHILD_ENTER_QUANTITY,
+            "Enter quantity", Integer.toString(target));
+    }
+
+    /** Worker-thread implementation of the setPrice flow. Public so the
+     *  dispatcher can call back via the {@code RUN_TASK} payload. */
+    public void runSetPrice(int target) throws InterruptedException {
+        if (target <= 0) return;
+        Integer current = dispatcher.runOnClient(() ->
+            client.getVarbitValue(VarbitID.GE_NEWOFFER_PRICE));
+        if (current != null && current == target) {
+            log.info("setPrice: already at price={}, skipping", target);
+            return;
+        }
+        int cur = current == null ? 0 : current;
+        int diff = target - cur;
+        // Price has +1 AND -1 (no +10/+100). Button path covers a small
+        // ± delta in either direction; otherwise type.
+        if (cur > 0 && Math.abs(diff) <= MAX_BUTTON_CLICKS) {
+            String verb = diff > 0 ? "+1" : "-1";
+            Map<String, Rectangle> priceButtons = dispatcher.runOnClient(() ->
+                resolveSetupButtons(verb));
+            Rectangle b = priceButtons == null ? null : priceButtons.get(verb);
+            if (b != null) {
+                int presses = Math.abs(diff);
+                List<ButtonClick> plan = new ArrayList<>(presses);
+                for (int i = 0; i < presses; i++) plan.add(new ButtonClick(verb, b));
+                log.info("setPrice: button-stepping diff={} via {} '{}' clicks",
+                    diff, presses, verb);
+                runHumanizedClickPlan(plan);
+                return;
+            }
+        }
+        log.info("setPrice: typing price={} (current={}, diff={})",
+            target, cur, diff);
+        runClickSetupChildThenType(SETUP_CHILD_ENTER_PRICE,
+            "Enter price", Integer.toString(target));
+    }
+
+    /** A single planned button press: which verb (for logging + cadence-
+     *  group identity) and where to click. */
+    private record ButtonClick(String verb, Rectangle bounds) {}
+
+    /** Walk the dynamic + static + nested children of {@code GeOffers.SETUP}
+     *  and return a map from each requested verb to its visible bounds.
+     *  Verbs not found are simply absent from the result map (caller checks
+     *  with {@code .get}). Match is case-insensitive and uses
+     *  {@link VerbMatcher#normalise} so colour tags and whitespace don't
+     *  cause misses. Must run on the client thread. */
+    private Map<String, Rectangle> resolveSetupButtons(String... wantedVerbs) {
+        Map<String, Rectangle> out = new LinkedHashMap<>();
+        if (wantedVerbs == null || wantedVerbs.length == 0) return out;
+        Widget setup = client.getWidget(InterfaceID.GeOffers.SETUP);
+        if (setup == null || setup.isHidden()) return out;
+        // Pre-normalise all wanted verbs once.
+        String[] wantedNorm = new String[wantedVerbs.length];
+        for (int i = 0; i < wantedVerbs.length; i++) {
+            wantedNorm[i] = VerbMatcher.normalise(wantedVerbs[i]);
+        }
+        Deque<Widget> stack = new ArrayDeque<>();
+        stack.push(setup);
+        while (!stack.isEmpty() && out.size() < wantedVerbs.length) {
+            Widget w = stack.pop();
+            if (w == null || w.isHidden()) continue;
+            String[] actions = w.getActions();
+            if (actions != null) {
+                for (String a : actions) {
+                    if (a == null || a.isEmpty()) continue;
+                    String an = VerbMatcher.normalise(a);
+                    for (int i = 0; i < wantedVerbs.length; i++) {
+                        if (out.containsKey(wantedVerbs[i])) continue;
+                        if (an.equals(wantedNorm[i])) {
+                            Rectangle b = w.getBounds();
+                            if (b != null && !b.isEmpty()) {
+                                out.put(wantedVerbs[i], b);
+                            }
+                        }
+                    }
+                }
+            }
+            pushAll(stack, w.getDynamicChildren());
+            pushAll(stack, w.getStaticChildren());
+            pushAll(stack, w.getNestedChildren());
+        }
+        return out;
+    }
+
+    /** Greedy additive decomposition of {@code remaining} into the given
+     *  preset values (must be positive integers parsed from the verb,
+     *  e.g. "+1000" → 1000), using only verbs whose bounds are present
+     *  in {@code buttons}. Verbs are tried in the order given, so callers
+     *  pass them highest-value first.
+     *
+     *  <p>Returns null if no presets are usable. Returns an empty list
+     *  iff {@code remaining == 0} (caller should treat as no-op). */
+    private static List<ButtonClick> planAdditiveClicks(int remaining,
+                                                        Map<String, Rectangle> buttons,
+                                                        String[] verbsHighFirst) {
+        if (remaining <= 0) return null;
+        if (buttons == null || buttons.isEmpty()) return null;
+        List<ButtonClick> plan = new ArrayList<>();
+        for (String verb : verbsHighFirst) {
+            Rectangle b = buttons.get(verb);
+            if (b == null) continue;
+            int step = parsePresetVerb(verb);
+            if (step <= 0) continue;
+            while (remaining >= step) {
+                plan.add(new ButtonClick(verb, b));
+                remaining -= step;
+            }
+            if (remaining == 0) break;
+        }
+        if (remaining != 0) {
+            // Couldn't fully decompose with the buttons we have; let the
+            // caller fall through to typing.
+            return null;
+        }
+        return plan;
+    }
+
+    private static int parsePresetVerb(String verb) {
+        if (verb == null || verb.isEmpty()) return 0;
+        try {
+            return Integer.parseInt(verb.startsWith("+") ? verb.substring(1) : verb);
+        } catch (NumberFormatException nfe) {
+            return 0;
+        }
+    }
+
+    private static String summarize(List<ButtonClick> plan) {
+        Map<String, Integer> counts = new LinkedHashMap<>();
+        for (ButtonClick bc : plan) counts.merge(bc.verb, 1, Integer::sum);
+        return counts.toString();
+    }
+
+    /** Execute a plan of button clicks with humanized cadence calibrated
+     *  to "active player wanting to buy" — fast but not tournament-fast,
+     *  no fatigue slowdown:
+     *  <ul>
+     *    <li>Pick ONE base interval per "run" of identical-verb clicks
+     *        in {@code [40, 70]} ms. Each click within the run jitters
+     *        ±5 ms around that base — one finger keeping a single
+     *        rhythm.</li>
+     *    <li>BETWEEN runs of different verbs, sleep
+     *        {@code [200, 450]} ms (one pick) — saccade + cursor move
+     *        to the adjacent SETUP button + click. Was 300-800ms; that
+     *        modeled a contemplative player rereading the UI, not an
+     *        engaged one.</li>
+     *    <li>For the LAST {@code 2 + rng(6)} clicks of the plan,
+     *        override to {@code [120, 280]} ms — a small "I'm done"
+     *        hesitation, not a fatigue slowdown. Was 200-600ms.</li>
+     *    <li>If the tail zone overlaps a cross-verb boundary, take
+     *        {@code max(crossVerbPick, tailPick)} so the tail rule
+     *        always fires AND the gap never feels faster than mid-
+     *        plan within-run clicks.</li>
+     *  </ul>
+     */
+    private void runHumanizedClickPlan(List<ButtonClick> plan) throws InterruptedException {
+        if (plan == null || plan.isEmpty()) return;
+        ThreadLocalRandom rng = ThreadLocalRandom.current();
+        int slowdownCount = 2 + rng.nextInt(6);              // 2..7 final tail clicks
+        int slowdownStart = Math.max(0, plan.size() - slowdownCount);
+
+        String currentVerb = null;
+        long currentBase = 0L;
+        for (int i = 0; i < plan.size(); i++) {
+            ButtonClick bc = plan.get(i);
+            boolean newRun = !bc.verb.equals(currentVerb);
+            if (newRun) {
+                currentVerb = bc.verb;
+                currentBase = 40L + rng.nextInt(31);         // 40-70ms
+            }
+            dispatcher.boundsClickOnWorker(bc.bounds, null);
+            if (i == plan.size() - 1) break;                 // no trailing sleep
+
+            ButtonClick next = plan.get(i + 1);
+            boolean nextNewRun = !next.verb.equals(currentVerb);
+            boolean inTail = (i + 1) >= slowdownStart;
+
+            long sleep;
+            if (nextNewRun && inTail) {
+                long crossVerb = 200L + rng.nextLong(251);   // 200-450ms
+                long tail      = 120L + rng.nextLong(161);   // 120-280ms
+                sleep = Math.max(crossVerb, tail);
+            } else if (nextNewRun) {
+                sleep = 200L + rng.nextLong(251);            // 200-450ms cross-verb
+            } else if (inTail) {
+                sleep = 120L + rng.nextLong(161);            // 120-280ms tail
+            } else {
+                long jitter = rng.nextLong(11) - 5L;         // ±5ms around the run's base
+                sleep = Math.max(20L, currentBase + jitter);
+            }
+            SequenceSleep.sleep(client, sleep);
+        }
     }
 
     /** Worker-thread implementation of the setQuantity / setPrice flow.

@@ -127,7 +127,10 @@ public final class ChickenCombatLoop
      *  600ms cadence — covers a brief loading-screen flicker but bails fast
      *  if the user started the loop on the title screen. */
     private static final int NOT_READY_GRACE_TICKS = 3;
-    private static final String ALREADY_FIGHTING_MESSAGE = "Someone else is fighting that.";
+    /** Short memory for a chicken another player claimed, so we don't bounce
+     *  right back into the same "already fighting" target. */
+    private static final long CLAIMED_NPC_COOLDOWN_MS = 5_000L;
+    private static final String ALREADY_FIGHTING_MESSAGE = "someone else is fighting that";
 
     private final CombatDispatcher dispatcher;
     private final Client client;
@@ -168,6 +171,8 @@ public final class ChickenCombatLoop
     private int notReadyTicks = 0;
     private volatile boolean registeredOnEventBus = false;
     private final AtomicBoolean serverRejectedAttack = new AtomicBoolean(false);
+    private final AtomicInteger claimedNpcCooldownIndex = new AtomicInteger(-1);
+    private volatile long claimedNpcCooldownUntilMs = 0;
 
     /** Convenience: wrap the humanized dispatcher and use the default
      *  selector + visibility filter (LOS / canvas / viewport / open menu)
@@ -239,6 +244,7 @@ public final class ChickenCombatLoop
         target.set(null);
         killCount.set(0);
         serverRejectedAttack.set(false);
+        clearClaimedNpcCooldown();
         if (eventBus != null && !registeredOnEventBus)
         {
             eventBus.register(this);
@@ -395,7 +401,8 @@ public final class ChickenCombatLoop
         // so we don't crash the worker the moment we're near a real chicken.
         NPC pick = onClient(() -> {
             WorldView wv = client.getTopLevelWorldView();
-            NPC p = selector.pick(snap.npcs, snap.self, snap.playerPos, -1, wv, visibility);
+            NPC p = selector.pick(snap.npcs, snap.self, snap.playerPos,
+                activeClaimedNpcCooldownIndex(), wv, visibility);
             if (p == null && justEnteredSelecting)
             {
                 justEnteredSelecting = false;
@@ -431,6 +438,32 @@ public final class ChickenCombatLoop
             setState(State.SELECTING);
             return;
         }
+        EngagePreflight preflight = onClientOrDefault(() -> preflightEngage(ct),
+            EngagePreflight.TARGET_GONE);
+        if (preflight == EngagePreflight.ALREADY_OURS)
+        {
+            setStatus("in combat with " + ct.npcName() + " #" + ct.npcIndex());
+            setState(State.IN_COMBAT);
+            return;
+        }
+        if (preflight == EngagePreflight.TAKEN_BY_OTHER)
+        {
+            log.info("chicken #{} claimed by another player before click — releasing lock",
+                ct.npcIndex());
+            rememberClaimedNpc(ct.npcIndex());
+            target.set(null);
+            setStatus("target already in combat — re-selecting");
+            setState(State.SELECTING);
+            return;
+        }
+        if (preflight == EngagePreflight.TARGET_GONE)
+        {
+            log.info("locked chicken #{} gone before click — releasing lock", ct.npcIndex());
+            target.set(null);
+            setStatus("target vanished");
+            setState(State.SELECTING);
+            return;
+        }
         serverRejectedAttack.set(false);
         ActionRequest req = ActionRequest.builder()
             .kind(ActionRequest.Kind.CLICK_NPC)
@@ -449,6 +482,7 @@ public final class ChickenCombatLoop
         if (serverRejectedAttack.getAndSet(false))
         {
             log.info("server rejected attack on chicken #{} — releasing lock", ct.npcIndex());
+            rememberClaimedNpc(ct.npcIndex());
             target.set(null);
             setStatus("server rejected: already in combat");
             setState(State.SELECTING);
@@ -460,6 +494,7 @@ public final class ChickenCombatLoop
             // Click failed to reach the NPC (off-screen, dead between
             // selection and click, etc.). Drop the lock and re-select.
             log.info("engage dispatch failed: {}", err);
+            if (isAlreadyClaimedError(err)) rememberClaimedNpc(ct.npcIndex());
             target.set(null);
             setStatus("engage failed: " + err);
             setState(State.SELECTING);
@@ -478,6 +513,7 @@ public final class ChickenCombatLoop
             {
                 log.info("server rejected attack on chicken #{} during engage wait — releasing lock",
                     ct.npcIndex());
+                rememberClaimedNpc(ct.npcIndex());
                 target.set(null);
                 setStatus("server rejected: already in combat");
                 setState(State.SELECTING);
@@ -572,6 +608,7 @@ public final class ChickenCombatLoop
             // immediately, which is what a human would do.
             log.info("kill stolen on chicken #{} — releasing lock, re-selecting",
                 ct.npcIndex());
+            rememberClaimedNpc(ct.npcIndex());
             target.set(null);
             setStatus("kill stolen — re-selecting");
             setState(State.SELECTING);
@@ -737,6 +774,55 @@ public final class ChickenCombatLoop
         setState(State.SELECTING);
     }
 
+    private enum EngagePreflight
+    {
+        READY,
+        ALREADY_OURS,
+        TAKEN_BY_OTHER,
+        TARGET_GONE
+    }
+
+    private EngagePreflight preflightEngage(CombatTarget ct)
+    {
+        Player self = client.getLocalPlayer();
+        if (self == null) return EngagePreflight.TARGET_GONE;
+        NPC npc = findNpcByIndex(ct.npcIndex());
+        if (npc == null) return EngagePreflight.TARGET_GONE;
+        if (npc.getHealthRatio() == 0) return EngagePreflight.TARGET_GONE;
+        Actor selfInteracting = self.getInteracting();
+        if (selfInteracting == npc) return EngagePreflight.ALREADY_OURS;
+        Actor npcInteracting = npc.getInteracting();
+        if (npcInteracting == self) return EngagePreflight.ALREADY_OURS;
+        if (npcInteracting instanceof Player) return EngagePreflight.TAKEN_BY_OTHER;
+        return EngagePreflight.READY;
+    }
+
+    private void rememberClaimedNpc(int npcIndex)
+    {
+        claimedNpcCooldownIndex.set(npcIndex);
+        claimedNpcCooldownUntilMs = System.currentTimeMillis() + CLAIMED_NPC_COOLDOWN_MS;
+    }
+
+    private int activeClaimedNpcCooldownIndex()
+    {
+        int idx = claimedNpcCooldownIndex.get();
+        if (idx < 0) return -1;
+        if (System.currentTimeMillis() <= claimedNpcCooldownUntilMs) return idx;
+        clearClaimedNpcCooldown();
+        return -1;
+    }
+
+    private void clearClaimedNpcCooldown()
+    {
+        claimedNpcCooldownIndex.set(-1);
+        claimedNpcCooldownUntilMs = 0;
+    }
+
+    private static boolean isAlreadyClaimedError(String err)
+    {
+        return err != null && err.contains("already in combat with another player");
+    }
+
     /** Client-thread: read TileItems on {@code tile}, return the id of the
      *  oldest one that is owned by us AND in {@link #LOOT_ITEM_IDS}.
      *  Returns null if no matching item is currently on the tile. */
@@ -777,10 +863,13 @@ public final class ChickenCombatLoop
     @Subscribe
     public void onChatMessage(ChatMessage event)
     {
-        if (event == null || event.getType() != ChatMessageType.GAMEMESSAGE) return;
-        String msg = Text.removeTags(event.getMessage());
-        if (ALREADY_FIGHTING_MESSAGE.equals(msg))
+        if (event == null) return;
+        ChatMessageType type = event.getType();
+        if (type != ChatMessageType.GAMEMESSAGE && type != ChatMessageType.SPAM) return;
+        String msg = Text.standardize(event.getMessage());
+        if (msg.contains(ALREADY_FIGHTING_MESSAGE))
         {
+            log.info("server rejection chat seen: '{}'", msg);
             serverRejectedAttack.set(true);
         }
     }

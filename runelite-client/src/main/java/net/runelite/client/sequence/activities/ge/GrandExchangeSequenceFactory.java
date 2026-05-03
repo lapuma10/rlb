@@ -3,6 +3,8 @@ package net.runelite.client.sequence.activities.ge;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Set;
+import javax.annotation.Nullable;
+import net.runelite.api.Client;
 import net.runelite.api.coords.WorldArea;
 import net.runelite.api.gameval.InterfaceID;
 import net.runelite.client.sequence.Step;
@@ -69,6 +71,17 @@ public final class GrandExchangeSequenceFactory {
             BuyItemIntent intent,
             WorldArea geArea,
             GeActions ge) {
+        return buyCore(intent, geArea, ge, null);
+    }
+
+    /** Same as {@link #buyCore(BuyItemIntent, WorldArea, GeActions)} but
+     *  threads a {@link Client} into {@link CollectOfferStep} for item-name
+     *  log resolution. */
+    public static GrandExchangeSequencePlan buyCore(
+            BuyItemIntent intent,
+            WorldArea geArea,
+            GeActions ge,
+            @Nullable Client client) {
         if (intent == null) throw new IllegalArgumentException("intent must not be null");
         if (geArea == null) throw new IllegalArgumentException("geArea must not be null");
         if (ge == null)     throw new IllegalArgumentException("GeActions must not be null");
@@ -98,7 +111,7 @@ public final class GrandExchangeSequenceFactory {
             .then(new EnsureNoConflictingOfferStep(intent.itemId(), OfferSide.BUY))
             .then(createOffer)
             .then(new WaitForOfferStep(intent.waitPolicy()))
-            .then(new CollectOfferStep(ge));
+            .then(new CollectOfferStep(ge, client));
 
         List<Step> reactives = List.of(new EnsureNoBlockingInterfaceStep(GE_ROOTS));
         return new GrandExchangeSequencePlan(root, reactives);
@@ -113,6 +126,17 @@ public final class GrandExchangeSequenceFactory {
             SellItemIntent intent,
             WorldArea geArea,
             GeActions ge) {
+        return sellCore(intent, geArea, ge, null);
+    }
+
+    /** Same as {@link #sellCore(SellItemIntent, WorldArea, GeActions)} but
+     *  threads a {@link Client} into {@link CollectOfferStep} for item-name
+     *  log resolution. */
+    public static GrandExchangeSequencePlan sellCore(
+            SellItemIntent intent,
+            WorldArea geArea,
+            GeActions ge,
+            @Nullable Client client) {
         if (intent == null) throw new IllegalArgumentException("intent must not be null");
         if (geArea == null) throw new IllegalArgumentException("geArea must not be null");
         if (ge == null)     throw new IllegalArgumentException("GeActions must not be null");
@@ -134,7 +158,7 @@ public final class GrandExchangeSequenceFactory {
             .then(new EnsureNoConflictingOfferStep(intent.itemId(), OfferSide.SELL))
             .then(createOffer)
             .then(new WaitForOfferStep(intent.waitPolicy()))
-            .then(new CollectOfferStep(ge));
+            .then(new CollectOfferStep(ge, client));
 
         List<Step> reactives = List.of(new EnsureNoBlockingInterfaceStep(GE_ROOTS));
         return new GrandExchangeSequencePlan(root, reactives);
@@ -188,6 +212,18 @@ public final class GrandExchangeSequenceFactory {
             WorldArea geArea,
             BankActions bank,
             GeActions ge) {
+        return buyWithBankPrep(intent, geArea, bank, ge, null);
+    }
+
+    /** Same as {@link #buyWithBankPrep(BuyItemIntent, WorldArea, BankActions, GeActions)}
+     *  but threads a {@link Client} into {@link CollectOfferStep} for item-name
+     *  log resolution. */
+    public static GrandExchangeSequencePlan buyWithBankPrep(
+            BuyItemIntent intent,
+            WorldArea geArea,
+            BankActions bank,
+            GeActions ge,
+            @Nullable Client client) {
         if (intent == null) throw new IllegalArgumentException("intent must not be null");
         if (geArea == null) throw new IllegalArgumentException("geArea must not be null");
         if (bank == null)   throw new IllegalArgumentException("BankActions must not be null");
@@ -238,7 +274,7 @@ public final class GrandExchangeSequenceFactory {
             .then(new EnsureNoConflictingOfferStep(intent.itemId(), OfferSide.BUY))
             .then(createOffer)
             .then(new WaitForOfferStep(intent.waitPolicy()))
-            .then(new CollectOfferStep(ge));
+            .then(new CollectOfferStep(ge, client));
 
         // Reactive needs to allow BOTH bank and GE roots so it doesn't try to
         // dismiss whichever interface is open during the active sub-flow.
@@ -255,6 +291,18 @@ public final class GrandExchangeSequenceFactory {
             WorldArea geArea,
             BankActions bank,
             GeActions ge) {
+        return sellWithBankPrep(intent, geArea, bank, ge, null);
+    }
+
+    /** Same as {@link #sellWithBankPrep(SellItemIntent, WorldArea, BankActions, GeActions)}
+     *  but threads a {@link Client} into {@link CollectOfferStep} for item-name
+     *  log resolution. */
+    public static GrandExchangeSequencePlan sellWithBankPrep(
+            SellItemIntent intent,
+            WorldArea geArea,
+            BankActions bank,
+            GeActions ge,
+            @Nullable Client client) {
         if (intent == null) throw new IllegalArgumentException("intent must not be null");
         if (geArea == null) throw new IllegalArgumentException("geArea must not be null");
         if (bank == null)   throw new IllegalArgumentException("BankActions must not be null");
@@ -283,7 +331,7 @@ public final class GrandExchangeSequenceFactory {
             .then(new EnsureNoConflictingOfferStep(intent.itemId(), OfferSide.SELL))
             .then(createOffer)
             .then(new WaitForOfferStep(intent.waitPolicy()))
-            .then(new CollectOfferStep(ge));
+            .then(new CollectOfferStep(ge, client));
 
         List<Step> reactives = List.of(new EnsureNoBlockingInterfaceStep(GE_AND_BANK_ROOTS));
         return new GrandExchangeSequencePlan(root, reactives);

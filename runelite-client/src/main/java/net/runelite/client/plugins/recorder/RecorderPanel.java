@@ -215,7 +215,9 @@ public final class RecorderPanel extends PluginPanel
     private MiningLoop miningLoop;
     // Cooking section.
     private CookingScript cookingScript;
-    private final JButton cookStartBtn = new JButton("Start cooking");
+    private net.runelite.client.plugins.recorder.scripts.CookingScriptV2 cookingScriptV2;
+    private final JButton cookStartBtn = new JButton("Start V1");
+    private final JButton cookStartV2Btn = new JButton("Start V2 (human)");
     private final JButton cookStopBtn = new JButton("Stop");
     private final JComboBox<CookingLocation> cookLocationBox = new JComboBox<>();
     private final JComboBox<CookingFood.Entry> cookFoodBox = new JComboBox<>();
@@ -292,6 +294,7 @@ public final class RecorderPanel extends PluginPanel
         miningAddRockBtn.addActionListener(e -> onMiningAddRock());
         miningClearRocksBtn.addActionListener(e -> onMiningClearRocks());
         cookStartBtn.addActionListener(e -> onCookStart());
+        cookStartV2Btn.addActionListener(e -> onCookV2Start());
         cookStopBtn.addActionListener(e -> onCookStop());
         questStartBtn.addActionListener(e -> onQuestStart());
         questStopBtn.addActionListener(e -> onQuestStop());
@@ -1688,8 +1691,14 @@ public final class RecorderPanel extends PluginPanel
         // row's max height to its preferred height with unbounded width.
         JPanel locationRow = labelledRow("Location:", cookLocationBox);
         JPanel foodRow     = labelledRow("Food:",     cookFoodBox);
+        // Two start buttons (V1 + V2) share one Stop button. The Stop
+        // handler calls stop() on whichever is currently running.
+        JPanel startsRow = new JPanel(new java.awt.GridLayout(1, 2, 4, 0));
+        startsRow.add(cookStartBtn);
+        startsRow.add(cookStartV2Btn);
+        capHeight(startsRow);
         JPanel buttons     = new JPanel(new BorderLayout(4, 4));
-        buttons.add(cookStartBtn, BorderLayout.CENTER);
+        buttons.add(startsRow, BorderLayout.CENTER);
         buttons.add(cookStopBtn, BorderLayout.EAST);
         capHeight(buttons);
 
@@ -1843,6 +1852,14 @@ public final class RecorderPanel extends PluginPanel
         this.cookingScript = script;
     }
 
+    /** Wire the V2 cooking script. Same shape as
+     *  {@link #setCookingScript} — plugin constructs both, panel exposes
+     *  separate Start buttons but a shared Stop. */
+    public void setCookingScriptV2(net.runelite.client.plugins.recorder.scripts.CookingScriptV2 script)
+    {
+        this.cookingScriptV2 = script;
+    }
+
     /** Wire the GE Core script. RecorderPlugin constructs it after CookingScript
      *  and registers it on the eventBus for GameTick forwarding. The panel
      *  builds the GE Core tab on first wiring. {@code itemManager} powers the
@@ -1865,6 +1882,17 @@ public final class RecorderPanel extends PluginPanel
             cookStatusLabel.setText("Cooking: unavailable");
             return;
         }
+        // Mutual exclusion — refuse to start V1 if V2 is already running.
+        // (Same dispatcher / clicks would interleave and produce garbage.)
+        if (cookingScriptV2 != null
+            && cookingScriptV2.state()
+                != net.runelite.client.plugins.recorder.scripts.CookingScriptV2.State.IDLE
+            && cookingScriptV2.state()
+                != net.runelite.client.plugins.recorder.scripts.CookingScriptV2.State.ABORTED)
+        {
+            cookStatusLabel.setText("Cooking: V2 still running — Stop first");
+            return;
+        }
         CookingLocation loc = (CookingLocation) cookLocationBox.getSelectedItem();
         CookingFood.Entry food = (CookingFood.Entry) cookFoodBox.getSelectedItem();
         if (loc == null || food == null)
@@ -1875,28 +1903,96 @@ public final class RecorderPanel extends PluginPanel
         cookingScript.setLocation(loc);
         cookingScript.setRawFoodId(food.rawId);
         cookingScript.start();
-        cookStatusLabel.setText("Cooking: starting");
+        cookStatusLabel.setText("Cooking V1: starting");
+    }
+
+    private void onCookV2Start()
+    {
+        if (cookingScriptV2 == null)
+        {
+            cookStatusLabel.setText("Cooking V2: unavailable");
+            return;
+        }
+        if (cookingScript != null
+            && cookingScript.state() != CookingScript.State.IDLE
+            && cookingScript.state() != CookingScript.State.ABORTED)
+        {
+            cookStatusLabel.setText("Cooking: V1 still running — Stop first");
+            return;
+        }
+        CookingLocation loc = (CookingLocation) cookLocationBox.getSelectedItem();
+        CookingFood.Entry food = (CookingFood.Entry) cookFoodBox.getSelectedItem();
+        if (loc == null || food == null)
+        {
+            cookStatusLabel.setText("Cooking: pick location + food first");
+            return;
+        }
+        cookingScriptV2.setLocation(loc);
+        cookingScriptV2.setRawFoodId(food.rawId);
+        cookingScriptV2.start();
+        cookStatusLabel.setText("Cooking V2: starting");
     }
 
     private void onCookStop()
     {
-        if (cookingScript == null) return;
-        cookingScript.stop();
+        // Shared Stop — call stop() on both. Each is a no-op if not
+        // running, so calling both is safe and saves the panel having
+        // to track which version is live.
+        if (cookingScript != null) cookingScript.stop();
+        if (cookingScriptV2 != null) cookingScriptV2.stop();
         cookStatusLabel.setText("Cooking: stopping");
     }
 
     private void refreshCooking()
     {
-        if (cookingScript == null)
+        // Choose which script to display state for: prefer the one that
+        // isn't IDLE, falling back to V1 when both are idle.
+        boolean v1Live = cookingScript != null
+            && cookingScript.state() != CookingScript.State.IDLE
+            && cookingScript.state() != CookingScript.State.ABORTED;
+        boolean v2Live = cookingScriptV2 != null
+            && cookingScriptV2.state()
+                != net.runelite.client.plugins.recorder.scripts.CookingScriptV2.State.IDLE
+            && cookingScriptV2.state()
+                != net.runelite.client.plugins.recorder.scripts.CookingScriptV2.State.ABORTED;
+
+        if (v2Live)
+        {
+            cookStatusLabel.setText("Cooking V2: " + cookingScriptV2.state()
+                + " — " + cookingScriptV2.status());
+            cookCountsLabel.setText("Cooked: " + cookingScriptV2.cookedCount()
+                + "  Burnt: " + cookingScriptV2.burntCount());
+            return;
+        }
+        if (v1Live)
+        {
+            cookStatusLabel.setText("Cooking V1: " + cookingScript.state()
+                + " — " + cookingScript.status());
+            cookCountsLabel.setText("Cooked: " + cookingScript.cookedCount()
+                + "  Burnt: " + cookingScript.burntCount());
+            return;
+        }
+        if (cookingScript == null && cookingScriptV2 == null)
         {
             cookStatusLabel.setText("Cooking: unavailable");
             cookCountsLabel.setText("Cooked: 0  Burnt: 0");
             return;
         }
-        cookStatusLabel.setText("Cooking: " + cookingScript.state()
-            + " — " + cookingScript.status());
-        cookCountsLabel.setText("Cooked: " + cookingScript.cookedCount()
-            + "  Burnt: " + cookingScript.burntCount());
+        // Neither is live — show V1's idle state by default.
+        if (cookingScript != null)
+        {
+            cookStatusLabel.setText("Cooking V1: " + cookingScript.state()
+                + " — " + cookingScript.status());
+            cookCountsLabel.setText("Cooked: " + cookingScript.cookedCount()
+                + "  Burnt: " + cookingScript.burntCount());
+        }
+        else
+        {
+            cookStatusLabel.setText("Cooking V2: " + cookingScriptV2.state()
+                + " — " + cookingScriptV2.status());
+            cookCountsLabel.setText("Cooked: " + cookingScriptV2.cookedCount()
+                + "  Burnt: " + cookingScriptV2.burntCount());
+        }
     }
 
     private void updateButtons()

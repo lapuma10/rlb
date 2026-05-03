@@ -243,6 +243,170 @@ public final class BankInteraction implements BankActions
         tryClickBankBoothRandom();
     }
 
+    /** V2-style booth picker: weighted-random across all candidates instead
+     *  of short-circuiting on the adjacent one. {@code adjacencyBias} is the
+     *  probability mass given to the closest candidate (range 0..1); the
+     *  remaining mass is spread uniformly across the other candidates.
+     *  At {@code adjacencyBias=1.0} this collapses to the V1 behaviour
+     *  (always pick adjacent). At 0.5 the closest is picked half the
+     *  time, the other half a different booth gets clicked — different
+     *  tile, different camera angle, different click pixel.
+     *
+     *  <p>Returns true iff a click was dispatched. Mirrors
+     *  {@link #tryClickBankBoothRandom} in dispatch shape (CLICK_NPC for
+     *  bankers, CLICK_GAME_OBJECT for booths) so verb-pick + camera pan +
+     *  WindMouse cursor path are identical to V1. */
+    public boolean tryClickBankBoothVaried(double adjacencyBias) throws InterruptedException
+    {
+        java.util.List<BoothCandidate> all = onClient(this::collectBoothCandidates);
+        if (all == null || all.isEmpty())
+        {
+            log.warn("bank: no booth candidates within {} tiles (varied)", BOOTH_SEARCH_RADIUS);
+            return false;
+        }
+        BoothCandidate pick = pickWeightedRandom(all, adjacencyBias);
+
+        if (pick.npc != null)
+        {
+            Integer idx = onClient(() -> pick.npc.getIndex());
+            if (idx == null) return false;
+            log.info("bank: CLICK_NPC banker (varied dist={}, verb={}, npc index={})",
+                pick.distance, pick.actionText, idx);
+            dispatcher.dispatch(ActionRequest.builder()
+                .kind(ActionRequest.Kind.CLICK_NPC)
+                .channel(ActionRequest.Channel.MOUSE)
+                .npcIndex(idx)
+                .verb(pick.actionText)
+                .build());
+            return true;
+        }
+        WorldPoint tile = onClient(() -> pick.go.getWorldLocation());
+        if (tile == null)
+        {
+            log.warn("bank: varied booth pick has no world location");
+            return false;
+        }
+        log.info("bank: CLICK_GAME_OBJECT booth (varied dist={}, tile={}, verb={})",
+            pick.distance, tile, pick.actionText);
+        dispatcher.dispatch(ActionRequest.builder()
+            .kind(ActionRequest.Kind.CLICK_GAME_OBJECT)
+            .channel(ActionRequest.Channel.MOUSE)
+            .tile(tile)
+            .verb(pick.actionText)
+            .build());
+        return true;
+    }
+
+    /** Client-thread: collect ALL booth candidates within range, sorted by
+     *  Chebyshev distance ascending. Mirrors {@link #findBoothCandidate}'s
+     *  scan but does NOT short-circuit on adjacent — V2's weighted picker
+     *  needs the full list. */
+    private java.util.List<BoothCandidate> collectBoothCandidates()
+    {
+        WorldView wv = client.getTopLevelWorldView();
+        if (wv == null) return java.util.Collections.emptyList();
+        Player self = client.getLocalPlayer();
+        if (self == null) return java.util.Collections.emptyList();
+        WorldPoint here = self.getWorldLocation();
+        if (here == null) return java.util.Collections.emptyList();
+        int plane = here.getPlane();
+
+        java.util.List<BoothCandidate> out = new ArrayList<>();
+        for (NPC npc : wv.npcs())
+        {
+            if (npc == null) continue;
+            String name = npc.getName();
+            if (name == null) continue;
+            if (!name.equalsIgnoreCase("Banker")
+                && !name.equalsIgnoreCase("Bank booth")) continue;
+            WorldPoint loc = npc.getWorldLocation();
+            if (loc == null || loc.getPlane() != plane) continue;
+            NPCComposition def = npc.getComposition();
+            if (def == null) continue;
+            String[] actions = def.getActions();
+            if (actions == null) continue;
+            int slot = bankActionSlot(actions);
+            if (slot < 0) continue;
+            int cheb = Math.max(
+                Math.abs(loc.getX() - here.getX()),
+                Math.abs(loc.getY() - here.getY()));
+            if (cheb > BOOTH_SEARCH_RADIUS) continue;
+            out.add(new BoothCandidate(npc, slot, actions[slot], cheb));
+        }
+        Scene scene = wv.getScene();
+        if (scene != null)
+        {
+            Tile[][][] tiles = scene.getTiles();
+            if (tiles != null && plane >= 0 && plane < tiles.length)
+            {
+                Tile[][] planeTiles = tiles[plane];
+                int hereSx = here.getX() - wv.getBaseX();
+                int hereSy = here.getY() - wv.getBaseY();
+                int loSx = Math.max(0, hereSx - BOOTH_SEARCH_RADIUS);
+                int loSy = Math.max(0, hereSy - BOOTH_SEARCH_RADIUS);
+                int hiSx = Math.min(planeTiles.length - 1, hereSx + BOOTH_SEARCH_RADIUS);
+                int hiSy = Math.min(planeTiles[0].length - 1, hereSy + BOOTH_SEARCH_RADIUS);
+                for (int sx = loSx; sx <= hiSx; sx++)
+                {
+                    for (int sy = loSy; sy <= hiSy; sy++)
+                    {
+                        Tile t = planeTiles[sx][sy];
+                        if (t == null) continue;
+                        GameObject[] gos = t.getGameObjects();
+                        if (gos == null) continue;
+                        for (GameObject go : gos)
+                        {
+                            if (go == null) continue;
+                            ObjectComposition baseDef = client.getObjectDefinition(go.getId());
+                            if (baseDef == null) continue;
+                            ObjectComposition def = baseDef;
+                            if (baseDef.getImpostorIds() != null)
+                            {
+                                try
+                                {
+                                    ObjectComposition imp = baseDef.getImpostor();
+                                    if (imp != null) def = imp;
+                                }
+                                catch (Throwable ignored) { /* fall back */ }
+                            }
+                            String name = def.getName();
+                            String[] actions = def.getActions();
+                            if (actions == null) continue;
+                            int slot = bankActionSlot(actions);
+                            if (slot < 0) continue;
+                            if (name != null
+                                && !name.toLowerCase().contains("bank")) continue;
+                            WorldPoint loc = go.getWorldLocation();
+                            if (loc == null) continue;
+                            int cheb = Math.max(
+                                Math.abs(loc.getX() - here.getX()),
+                                Math.abs(loc.getY() - here.getY()));
+                            if (cheb > BOOTH_SEARCH_RADIUS) continue;
+                            out.add(new BoothCandidate(go, slot, actions[slot], cheb));
+                        }
+                    }
+                }
+            }
+        }
+        // Sort ascending by Chebyshev distance — picker uses index 0 as the
+        // "closest" mass.
+        out.sort((a, b) -> Integer.compare(a.distance, b.distance));
+        return out;
+    }
+
+    /** Pick one candidate. The closest gets {@code bias} probability; the
+     *  rest split (1-bias) uniformly. With a single candidate this just
+     *  returns it. */
+    private static BoothCandidate pickWeightedRandom(
+        java.util.List<BoothCandidate> sorted, double bias)
+    {
+        if (sorted.size() == 1) return sorted.get(0);
+        double clamped = Math.max(0.0, Math.min(1.0, bias));
+        if (Math.random() < clamped) return sorted.get(0);
+        int otherIdx = 1 + (int) (Math.random() * (sorted.size() - 1));
+        return sorted.get(otherIdx);
+    }
+
     /** Either an NPC banker or a GameObject bank booth, plus the slot
      *  whose action begins with "Bank". Used internally by the random-
      *  pick selector. */

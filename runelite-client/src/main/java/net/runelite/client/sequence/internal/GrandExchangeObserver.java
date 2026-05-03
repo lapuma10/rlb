@@ -85,6 +85,10 @@ public final class GrandExchangeObserver {
         // resolves against the hidden Inventory.ITEMS instead of the
         // overlaid GeOffersSide.ITEMS).
         int newOfferQuantity = client.getVarbitValue(VarbitID.GE_NEWOFFER_QUANTITY);
+        // GE_NEWOFFER_PRICE: current price-each in the offer-setup. Tracks
+        // both Enter-price submissions and live +1/-1 button clicks (verified
+        // 2026-05-02: -1 click flipped 74→73 in the same tick).
+        int newOfferPrice = client.getVarbitValue(VarbitID.GE_NEWOFFER_PRICE);
 
         // Members detection: cap usable slots to 3 for F2P. Worlds without
         // the MEMBERS flag are F2P; the locked slot widgets aren't clickable
@@ -117,7 +121,7 @@ public final class GrandExchangeObserver {
         }
 
         return new SnapshotGrandExchangeView(offersOpen, setupOpen, collectOpen,
-            searchPopulated, promptMode, newOfferType, newOfferQuantity,
+            searchPopulated, promptMode, newOfferType, newOfferQuantity, newOfferPrice,
             priceWarning, List.copyOf(slots), usableSlots, slotCanCreate);
     }
 
@@ -244,6 +248,7 @@ public final class GrandExchangeObserver {
         int chatboxPromptMode,
         int newOfferType,
         int newOfferQuantity,
+        int newOfferPrice,
         boolean priceWarningOpen,
         List<GrandExchangeOfferView> offers,
         int usableSlots,

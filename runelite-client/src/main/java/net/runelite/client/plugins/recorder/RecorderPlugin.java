@@ -288,6 +288,19 @@ public class RecorderPlugin extends Plugin
             client, clientThread, cookingDispatcher, cookingResolver, config, cookingInputOwnership);
         panel.setCookingScript(cookingScript);
 
+        // Cooking V2 — independent dispatcher + resolver so V1 and V2
+        // never share dispatch state. Panel enforces mutual exclusion at
+        // the Start-button level (only one runs at a time). V2 fixes
+        // the four bot-tells documented in CookingScriptV2 javadoc:
+        // random walk targets, varied log-pile pick, weighted-random
+        // booth pick, explicit fire-state clear on death.
+        HumanizedInputDispatcher cookingV2Dispatcher = new HumanizedInputDispatcher(client, clientThread);
+        TransportResolver cookingV2Resolver = new TransportResolver(client);
+        net.runelite.client.plugins.recorder.scripts.CookingScriptV2 cookingScriptV2 =
+            new net.runelite.client.plugins.recorder.scripts.CookingScriptV2(
+                client, clientThread, cookingV2Dispatcher, cookingV2Resolver);
+        panel.setCookingScriptV2(cookingScriptV2);
+
         // GE Core + Phase B bank-prep: independent dispatcher + InputOwnership
         // lease. The bank-prep variants withdraw coins / sell items from a GE
         // bank booth before placing the offer; we wire a BankInteraction

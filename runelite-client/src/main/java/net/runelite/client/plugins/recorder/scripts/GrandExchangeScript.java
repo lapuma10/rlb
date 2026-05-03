@@ -125,7 +125,7 @@ public final class GrandExchangeScript {
         if (intent == null) return false;
         BuyItemIntent capped = applyBuyLimitCap(intent);
         if (capped == null) return false;   // limit fully consumed — refused
-        return startPlan(GrandExchangeSequenceFactory.buyCore(capped, geArea, geActions),
+        return startPlan(GrandExchangeSequenceFactory.buyCore(capped, geArea, geActions, client),
             "buy " + capped.quantity() + "x " + capped.displayName() + " @ "
                 + ((net.runelite.client.sequence.activities.ge.PricePolicy.Exact)
                     capped.pricePolicy()).coinsEach());
@@ -133,7 +133,7 @@ public final class GrandExchangeScript {
 
     public boolean startSell(SellItemIntent intent) {
         if (intent == null) return false;
-        return startPlan(GrandExchangeSequenceFactory.sellCore(intent, geArea, geActions),
+        return startPlan(GrandExchangeSequenceFactory.sellCore(intent, geArea, geActions, client),
             "sell " + intent.quantity() + "x " + intent.displayName() + " @ "
                 + ((net.runelite.client.sequence.activities.ge.PricePolicy.Exact)
                     intent.pricePolicy()).coinsEach());
@@ -150,7 +150,7 @@ public final class GrandExchangeScript {
         }
         BuyItemIntent capped = applyBuyLimitCap(intent);
         if (capped == null) return false;
-        return startPlan(GrandExchangeSequenceFactory.buyWithBankPrep(capped, geArea, bankActions, geActions),
+        return startPlan(GrandExchangeSequenceFactory.buyWithBankPrep(capped, geArea, bankActions, geActions, client),
             "buy-with-prep " + capped.quantity() + "x " + capped.displayName() + " @ "
                 + ((net.runelite.client.sequence.activities.ge.PricePolicy.Exact)
                     capped.pricePolicy()).coinsEach());
@@ -164,7 +164,7 @@ public final class GrandExchangeScript {
             status.set("bank-prep unavailable: BankActions not wired");
             return false;
         }
-        return startPlan(GrandExchangeSequenceFactory.sellWithBankPrep(intent, geArea, bankActions, geActions),
+        return startPlan(GrandExchangeSequenceFactory.sellWithBankPrep(intent, geArea, bankActions, geActions, client),
             "sell-with-prep " + intent.quantity() + "x " + intent.displayName() + " @ "
                 + ((net.runelite.client.sequence.activities.ge.PricePolicy.Exact)
                     intent.pricePolicy()).coinsEach());

@@ -74,6 +74,15 @@ public interface GrandExchangeView {
      *  didn't reach the right widget. */
     int newOfferQuantity();
 
+    /** Raw {@code VarbitID.GE_NEWOFFER_PRICE} value — current price-each
+     *  set in the offer-setup interface. Defaults to the engine-provided
+     *  guide price when the offer-setup first opens, then tracks every
+     *  +1/-1 button click and Enter-price submission live. Used by
+     *  {@link net.runelite.client.sequence.activities.ge.GeInteraction#setPrice}
+     *  to skip work when the setup is already at the wanted price, and to
+     *  decide between button-stepping vs typing for small deltas. */
+    int newOfferPrice();
+
     /** True when the OSRS "Your offer is much higher / lower than the guide
      *  price. Are you sure you wish to place this offer?" warning popup is
      *  on screen. Detected via {@code Popupoverlay.UNIVERSE} visibility +
@@ -117,6 +126,7 @@ public interface GrandExchangeView {
         public int chatboxPromptMode()        { return 0; }
         public int newOfferType()             { return 0; }
         public int newOfferQuantity()         { return 0; }
+        public int newOfferPrice()            { return 0; }
         public boolean priceWarningOpen()     { return false; }
         public List<GrandExchangeOfferView> offers()              { return emptyOffers; }
         public OptionalInt firstEmptySlot()                       { return OptionalInt.of(0); }
