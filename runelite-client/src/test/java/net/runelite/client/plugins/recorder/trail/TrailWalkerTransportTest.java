@@ -137,7 +137,7 @@ public class TrailWalkerTransportTest
         playerPos.set(new WorldPoint(0, 0, 0));
         mockSceneWithGameObject(trans, 5678, "Climb-down");
         TrailPath path = bareTransport(trans, "Climb-down");
-        ObjectVisibility offCanvas = (tile, hull, self, reach) ->
+        ObjectVisibility offCanvas = (tile, hull, selfTile, reach) ->
             ObjectVisibility.Reason.OFF_CANVAS;
         TrailWalker w = new TrailWalker(client, clientThread, dispatcher, offCanvas);
         w.tick(path);
@@ -160,7 +160,7 @@ public class TrailWalkerTransportTest
         playerPos.set(new WorldPoint(0, 0, 0));
         mockSceneWithGameObject(trans, 5678, "Climb-down");
         TrailPath path = bareTransport(trans, "Climb-down");
-        ObjectVisibility hudHidden = (tile, hull, self, reach) ->
+        ObjectVisibility hudHidden = (tile, hull, selfTile, reach) ->
             ObjectVisibility.Reason.UNDER_HUD;
         TrailWalker w = new TrailWalker(client, clientThread, dispatcher, hudHidden);
         w.tick(path);

@@ -863,15 +863,19 @@ public final class TrailWalker
         if (!trustRecordedAdjacent)
         {
             // Standard v2 path: snapshot hull + reach, run visibility.
+            // Pass `pos` directly (already client-thread-read at top of
+            // tick) — never hand a live Player to the visibility check;
+            // it would call self.getWorldLocation() on the worker thread
+            // and trip RuneLite's client-thread assertion.
             TransportSnapshot snap = onClient(() -> snapshotTransport(t, leg.verb(), pos));
-            if (snap == null || snap.player == null)
+            if (snap == null)
             {
-                // Couldn't get player or scene state — treat as not-yet-resolvable.
+                // Couldn't get scene state — treat as not-yet-resolvable.
                 return Status.IN_PROGRESS;
             }
 
             ObjectVisibility.Reason reason = objectVisibility.whyHidden(
-                t, snap.hull, snap.player, snap.reach);
+                t, snap.hull, pos, snap.reach);
 
             if (reason != null)
             {
@@ -925,16 +929,18 @@ public final class TrailWalker
 
     /** Snapshot taken on the client thread before the visibility check.
      *  Bundles the resolved object's hull (or null if no object matched
-     *  the recorded verb), the live {@code Player}, and a fresh BFS
-     *  reachability map from the player's tile. */
+     *  the recorded verb) and a fresh BFS reachability map from the
+     *  player's tile. The player's WorldPoint is NOT included here —
+     *  callers already have it from {@code readPlayerTile()} and we
+     *  must not pass a live {@code Player} reference into a worker-
+     *  thread context (its accessors assert client thread). */
     private static final class TransportSnapshot
     {
         @Nullable final Shape hull;
-        @Nullable final Player player;
         @Nullable final ReachabilityMap reach;
-        TransportSnapshot(@Nullable Shape hull, @Nullable Player player, @Nullable ReachabilityMap reach)
+        TransportSnapshot(@Nullable Shape hull, @Nullable ReachabilityMap reach)
         {
-            this.hull = hull; this.player = player; this.reach = reach;
+            this.hull = hull; this.reach = reach;
         }
     }
 
@@ -945,8 +951,7 @@ public final class TrailWalker
     @Nullable
     private TransportSnapshot snapshotTransport(WorldPoint tile, String verb, WorldPoint playerPos)
     {
-        Player self = client == null ? null : client.getLocalPlayer();
-        if (self == null) return null;
+        if (client == null) return null;
 
         Shape hull = null;
         if (transportResolver != null)
@@ -970,7 +975,7 @@ public final class TrailWalker
 
         WorldView wv = client.getTopLevelWorldView();
         ReachabilityMap reach = wv == null ? null : Reachability.compute(wv, playerPos);
-        return new TransportSnapshot(hull, self, reach);
+        return new TransportSnapshot(hull, reach);
     }
 
     /** Issue a WALK toward the transport tile. Throttled by

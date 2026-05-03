@@ -6,7 +6,6 @@ import javax.annotation.Nullable;
 import lombok.extern.slf4j.Slf4j;
 import net.runelite.api.Client;
 import net.runelite.api.Menu;
-import net.runelite.api.Player;
 import net.runelite.api.coords.WorldPoint;
 import net.runelite.api.gameval.InterfaceID;
 import net.runelite.api.gameval.VarbitID;
@@ -74,26 +73,32 @@ public interface ObjectVisibility
     }
 
     /** Returns the first cull reason, or {@code null} if the object
-     *  is fully visible. {@code targetTile} is the recorded transport
-     *  tile; {@code objectHull} is the object's projected screen shape
-     *  (from {@code GameObject.getConvexHull()} or equivalent) — pass
-     *  {@code null} when the resolver couldn't fetch one. */
+     *  is fully visible. All inputs are pre-resolved snapshots — the
+     *  implementation never calls {@code getLocalPlayer().getWorldLocation()}
+     *  or any other client-thread-required accessor. Caller is
+     *  responsible for snapshotting on the client thread.
+     *
+     *  <p>Threading note: the v1 mistake was taking {@code Player self}
+     *  here and calling {@code self.getWorldLocation()} inside the
+     *  pipeline, which asserts under {@code -ea} when invoked from a
+     *  worker thread. v2 takes the player's already-resolved
+     *  {@code WorldPoint} so this method is safe from any thread. */
     @Nullable
     Reason whyHidden(WorldPoint targetTile,
                      @Nullable Shape objectHull,
-                     @Nullable Player self,
+                     @Nullable WorldPoint selfTile,
                      @Nullable ReachabilityMap reach);
 
     default boolean canSee(WorldPoint targetTile, @Nullable Shape objectHull,
-                           @Nullable Player self, @Nullable ReachabilityMap reach)
+                           @Nullable WorldPoint selfTile, @Nullable ReachabilityMap reach)
     {
-        return whyHidden(targetTile, objectHull, self, reach) == null;
+        return whyHidden(targetTile, objectHull, selfTile, reach) == null;
     }
 
     /** Test stub — every object passes. */
     static ObjectVisibility alwaysVisible()
     {
-        return (tile, hull, self, reach) -> null;
+        return (tile, hull, selfTile, reach) -> null;
     }
 
     /** Production checker bound to a live client. */
@@ -112,17 +117,15 @@ final class ClientObjectVisibility implements ObjectVisibility
 
     @Override
     public Reason whyHidden(WorldPoint targetTile, @Nullable Shape objectHull,
-                            @Nullable Player self, @Nullable ReachabilityMap reach)
+                            @Nullable WorldPoint selfTile, @Nullable ReachabilityMap reach)
     {
-        if (targetTile == null || self == null) return Reason.NULL_INPUT;
-        WorldPoint selfWp = self.getWorldLocation();
-        if (selfWp == null) return Reason.NULL_INPUT;
+        if (targetTile == null || selfTile == null) return Reason.NULL_INPUT;
 
         // 0. Plane match.
-        if (selfWp.getPlane() != targetTile.getPlane())
+        if (selfTile.getPlane() != targetTile.getPlane())
         {
             log.debug("cull obj at {} — plane mismatch (self {} vs tgt {})",
-                targetTile, selfWp.getPlane(), targetTile.getPlane());
+                targetTile, selfTile.getPlane(), targetTile.getPlane());
             return Reason.PLANE_MISMATCH;
         }
         // 1. Walking reachability — uses the same BFS snapshot the

@@ -5,7 +5,6 @@ import java.awt.Rectangle;
 import java.awt.Shape;
 import net.runelite.api.Client;
 import net.runelite.api.Menu;
-import net.runelite.api.Player;
 import net.runelite.api.coords.WorldPoint;
 import net.runelite.client.plugins.recorder.walker.Reachability;
 import net.runelite.client.plugins.recorder.walker.Reachability.ReachabilityMap;
@@ -23,15 +22,12 @@ public class ObjectVisibilityTest
     private static final WorldPoint TARGET_TILE = new WorldPoint(105, 100, 0);
 
     private Client client;
-    private Player player;
     private ObjectVisibility visibility;
 
     @Before
     public void setUp()
     {
         client = mock(Client.class);
-        player = mock(Player.class);
-        when(player.getWorldLocation()).thenReturn(PLAYER_TILE);
         // Default viewport: a 600x400 box at (10, 10).
         when(client.getViewportXOffset()).thenReturn(10);
         when(client.getViewportYOffset()).thenReturn(10);
@@ -60,14 +56,14 @@ public class ObjectVisibilityTest
     {
         ObjectVisibility stub = ObjectVisibility.alwaysVisible();
         assertNull(stub.whyHidden(TARGET_TILE, null, null, null));
-        assertNull(stub.whyHidden(TARGET_TILE, hullAt(0, 0), player, null));
+        assertNull(stub.whyHidden(TARGET_TILE, hullAt(0, 0), PLAYER_TILE, null));
     }
 
     @Test
     public void nullInputsReturnNullInput()
     {
         assertEquals(ObjectVisibility.Reason.NULL_INPUT,
-            visibility.whyHidden(null, hullAt(100, 100), player, null));
+            visibility.whyHidden(null, hullAt(100, 100), PLAYER_TILE, null));
         assertEquals(ObjectVisibility.Reason.NULL_INPUT,
             visibility.whyHidden(TARGET_TILE, hullAt(100, 100), null, null));
     }
@@ -77,7 +73,7 @@ public class ObjectVisibilityTest
     {
         WorldPoint differentPlane = new WorldPoint(105, 100, 1);
         assertEquals(ObjectVisibility.Reason.PLANE_MISMATCH,
-            visibility.whyHidden(differentPlane, hullAt(100, 100), player, null));
+            visibility.whyHidden(differentPlane, hullAt(100, 100), PLAYER_TILE, null));
     }
 
     @Test
@@ -87,7 +83,7 @@ public class ObjectVisibilityTest
         // (no visited tiles). The target tile is therefore unreachable.
         ReachabilityMap empty = Reachability.compute(null, PLAYER_TILE, -1);
         assertEquals(ObjectVisibility.Reason.NOT_REACHABLE,
-            visibility.whyHidden(TARGET_TILE, hullAt(100, 100), player, empty));
+            visibility.whyHidden(TARGET_TILE, hullAt(100, 100), PLAYER_TILE, empty));
     }
 
     @Test
@@ -96,14 +92,14 @@ public class ObjectVisibilityTest
         // null reach map = "can't validate, allow" — the rest of the
         // pipeline should still run and accept (visible hull inside
         // viewport, no menu/HUD).
-        assertNull(visibility.whyHidden(TARGET_TILE, hullAt(100, 100), player, null));
+        assertNull(visibility.whyHidden(TARGET_TILE, hullAt(100, 100), PLAYER_TILE, null));
     }
 
     @Test
     public void offCanvasWhenHullNull()
     {
         assertEquals(ObjectVisibility.Reason.OFF_CANVAS,
-            visibility.whyHidden(TARGET_TILE, null, player, null));
+            visibility.whyHidden(TARGET_TILE, null, PLAYER_TILE, null));
     }
 
     @Test
@@ -113,7 +109,7 @@ public class ObjectVisibilityTest
         // anything useful.
         Polygon empty = new Polygon();
         assertEquals(ObjectVisibility.Reason.OFF_CANVAS,
-            visibility.whyHidden(TARGET_TILE, empty, player, null));
+            visibility.whyHidden(TARGET_TILE, empty, PLAYER_TILE, null));
     }
 
     @Test
@@ -123,7 +119,7 @@ public class ObjectVisibilityTest
         // of and above the viewport.
         Shape farLeft = hullAt(5, 5);
         assertEquals(ObjectVisibility.Reason.OUTSIDE_VIEWPORT,
-            visibility.whyHidden(TARGET_TILE, farLeft, player, null));
+            visibility.whyHidden(TARGET_TILE, farLeft, PLAYER_TILE, null));
     }
 
     @Test
@@ -139,7 +135,7 @@ public class ObjectVisibilityTest
         when(menu.getMenuHeight()).thenReturn(150);
         when(client.getMenu()).thenReturn(menu);
         assertEquals(ObjectVisibility.Reason.UNDER_OPEN_MENU,
-            visibility.whyHidden(TARGET_TILE, hullAt(200, 200), player, null));
+            visibility.whyHidden(TARGET_TILE, hullAt(200, 200), PLAYER_TILE, null));
     }
 
     @Test
@@ -148,7 +144,7 @@ public class ObjectVisibilityTest
         // isMenuOpen=false → don't even consult the menu. Centroid
         // inside viewport → visible.
         when(client.isMenuOpen()).thenReturn(false);
-        assertNull(visibility.whyHidden(TARGET_TILE, hullAt(200, 200), player, null));
+        assertNull(visibility.whyHidden(TARGET_TILE, hullAt(200, 200), PLAYER_TILE, null));
     }
 
     @Test
@@ -157,7 +153,7 @@ public class ObjectVisibilityTest
         // Resized=false → fixed mode, viewport rect already excludes
         // chrome. HUD walk is a no-op.
         when(client.isResized()).thenReturn(false);
-        assertNull(visibility.whyHidden(TARGET_TILE, hullAt(200, 200), player, null));
+        assertNull(visibility.whyHidden(TARGET_TILE, hullAt(200, 200), PLAYER_TILE, null));
     }
 
     // — Reason classification —
@@ -184,7 +180,7 @@ public class ObjectVisibilityTest
     {
         // canSee is just a Boolean wrapper around whyHidden — pin
         // the equivalence so callers can rely on it.
-        assertTrue(visibility.canSee(TARGET_TILE, hullAt(200, 200), player, null));
-        assertFalse(visibility.canSee(TARGET_TILE, null, player, null));
+        assertTrue(visibility.canSee(TARGET_TILE, hullAt(200, 200), PLAYER_TILE, null));
+        assertFalse(visibility.canSee(TARGET_TILE, null, PLAYER_TILE, null));
     }
 }
