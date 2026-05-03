@@ -1,5 +1,7 @@
 package net.runelite.client.plugins.recorder.scripts;
 
+import java.util.EnumMap;
+import java.util.Map;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
@@ -10,7 +12,6 @@ import net.runelite.api.Client;
 import net.runelite.api.Item;
 import net.runelite.api.ItemContainer;
 import net.runelite.api.Player;
-import net.runelite.api.coords.WorldArea;
 import net.runelite.api.coords.WorldPoint;
 import net.runelite.api.gameval.InventoryID;
 import net.runelite.api.gameval.ItemID;
@@ -18,12 +19,10 @@ import net.runelite.client.callback.ClientThread;
 import net.runelite.client.plugins.recorder.combat.NpcSelector;
 import net.runelite.client.plugins.recorder.npc.NpcInteraction;
 import net.runelite.client.plugins.recorder.scene.SceneScanner;
-import net.runelite.client.plugins.recorder.trail.TrailPath;
+import net.runelite.client.plugins.recorder.trail.Route;
 import net.runelite.client.plugins.recorder.trail.TrailRegistry;
 import net.runelite.client.plugins.recorder.trail.TrailWalker;
 import net.runelite.client.plugins.recorder.transport.TransportResolver;
-import net.runelite.client.plugins.recorder.walker.PathSpec;
-import net.runelite.client.plugins.recorder.walker.UniversalWalker;
 import net.runelite.client.plugins.recorder.widget.SidebarTab;
 import net.runelite.client.plugins.recorder.widget.SidebarTabActions;
 import net.runelite.client.sequence.SequenceState;
@@ -67,56 +66,37 @@ import net.runelite.client.sequence.internal.ActionRequest;
 @Slf4j
 public final class CooksAssistantScript
 {
-    // ── World areas (plane 0) ───────────────────────────────────────
-    /** Cook's kitchen inside Lumbridge Castle (ground floor). */
-    static final WorldArea KITCHEN_AREA = new WorldArea(3204, 3209, 8, 7, 0);
-    /** Chicken pen south of Lumbridge castle. */
-    static final WorldArea CHICKEN_AREA = new WorldArea(3225, 3285, 16, 15, 0);
-    /** Fred's Farm — dairy cow pasture, north-west of chicken area. */
-    static final WorldArea COW_AREA     = new WorldArea(3185, 3278, 15, 13, 0);
-
-    // ── Walk paths ──────────────────────────────────────────────────
-    /**
-     * Kitchen → chicken pen (south-east of castle).
-     * Path runs south from the castle through the courtyard,
-     * then south-east to the chicken pen.
-     */
-    private static final PathSpec PATH_TO_EGG_AREA = PathSpec.builder("kitchen-to-eggs")
-        .walk("castle-south",  new WorldArea(3207, 3207, 18, 12, 0))
-        .walk("road-south",    new WorldArea(3217, 3219, 9, 22, 0))
-        .walk("pen-approach",  new WorldArea(3225, 3285, 16, 15, 0))
-        .build();
-
-    /**
-     * Anywhere near Lumbridge → Fred's Farm dairy cow area.
-     * The first waypoint is a large central area that covers paths
-     * from both the kitchen and the chicken pen.
-     */
-    private static final PathSpec PATH_TO_COW_AREA = PathSpec.builder("to-cow")
-        .walk("lumbridge-south", new WorldArea(3191, 3258, 44, 28, 0))
-        .walk("fred-farm",       new WorldArea(3185, 3278, 15, 13, 0))
-        .build();
-
-    /**
-     * Anywhere near Lumbridge → Cook's kitchen.
-     */
-    private static final PathSpec PATH_TO_COOK = PathSpec.builder("to-cook")
-        .walk("castle-gate",  new WorldArea(3216, 3213, 12, 9, 0))
-        .walk("kitchen",      new WorldArea(3204, 3209, 8, 7, 0))
-        .build();
-
     // ── NPC selectors ───────────────────────────────────────────────
     private static final NpcSelector COOK_SELECTOR      = new NpcSelector("Cook", 12);
     private static final NpcSelector DAIRY_COW_SELECTOR = new NpcSelector("Dairy cow", 10);
 
-    // ── Recorded trail names ────────────────────────────────────────
-    /** Lumbridge bank (plane 2) → GE area (plane 0). */
-    private static final String TRAIL_TO_GE        = "lumbridge_bank_to_ge_safe";
-    /** GE area (plane 0) → Lumbridge bank (plane 2). */
-    private static final String TRAIL_TO_LUMBRIDGE = "ge_to_lumbridge_bank_safe";
-    /** Lumbridge bank (plane 2) → chicken pen (plane 0). Used after GE return to
-     *  bring the player back to ground-floor Lumbridge before egg / milk / cook. */
-    private static final String TRAIL_BANK_TO_PEN  = "lumby-bank-to-pen";
+    // ── Route prefixes per walk state ───────────────────────────────
+    // The walker uses {@link Route#fromTrails} to scoop up every trail
+    // whose name starts with the prefix, so:
+    //   - dropping multiple variants in the trails dir (e.g.
+    //     `to-cook-via-bridge.json` + `to-cook-via-shortcut.json`)
+    //     gives the v2 walker random alternation for free, and
+    //   - the script aborts loudly with the missing prefix if no trail
+    //     matches — much better than the v1 PathSpec failure mode where
+    //     UniversalWalker silently spun BFS-bouncing-off-the-castle-wall.
+    //
+    // Existing user trails matching these prefixes (as of 2026-05-03):
+    //   lumbridge_bank_to_ge_safe        ✓ (+ ..._v2 → Route picks both)
+    //   ge_to_lumbridge_bank_safe        ✓
+    //   lumby-bank-to-pen                ✓
+    //   kitchen-to-pen                   ✗ — record one
+    //   to-cow                           ✗ — record one
+    //   to-cook                          ✗ — record one
+    private static final Map<State, String> ROUTE_PREFIX = new EnumMap<>(State.class);
+    static
+    {
+        ROUTE_PREFIX.put(State.WALK_TO_GE,             "lumbridge_bank_to_ge_safe");
+        ROUTE_PREFIX.put(State.WALK_BACK_TO_LUMBRIDGE, "ge_to_lumbridge_bank_safe");
+        ROUTE_PREFIX.put(State.WALK_BANK_TO_PEN,       "lumby-bank-to-pen");
+        ROUTE_PREFIX.put(State.WALK_TO_EGG_AREA,       "kitchen-to-pen");
+        ROUTE_PREFIX.put(State.WALK_TO_COW_AREA,       "to-cow");
+        ROUTE_PREFIX.put(State.WALK_TO_COOK,           "to-cook");
+    }
 
     // ── NPC verb strings ────────────────────────────────────────────
     private static final String VERB_TALK_TO = "Talk-to";
@@ -157,7 +137,6 @@ public final class CooksAssistantScript
     private final HumanizedInputDispatcher dispatcher;
     private final NpcInteraction npcInteraction;
     private final SceneScanner scene;
-    private final UniversalWalker walker;
     private final TrailWalker trailWalker;
     private final TrailRegistry trailRegistry;
     private final GrandExchangeScript geScript;
@@ -178,13 +157,19 @@ public final class CooksAssistantScript
     /** Consecutive STUCK/ERROR increments from the walker; reset on ARRIVED
      *  and on every state transition. */
     private int walkerStuckCount;
-    /** Active TrailPath for the current trail-walk state; null between states. */
-    private TrailPath currentTrailPath;
     /** True once GE startBuy has been called for pot of flour. */
     private boolean flourBuyStarted;
+    /** Lazy cache of compiled Routes per state. Built on first need by
+     *  {@link #routeFor}. Cleared on stop so a re-record + restart picks
+     *  up the new trail set. */
+    private final Map<State, Route> routeCache = new EnumMap<>(State.class);
 
     // ── Constructor ─────────────────────────────────────────────────
 
+    /** {@code resolver} is retained for source/binary compatibility with
+     *  prior callers but is no longer used internally — UniversalWalker
+     *  was dropped in favour of the v2 {@link TrailWalker} + {@link Route}
+     *  flow. Safe to pass {@code null}. */
     public CooksAssistantScript(Client client, ClientThread clientThread,
                                 HumanizedInputDispatcher dispatcher,
                                 TransportResolver resolver,
@@ -196,7 +181,6 @@ public final class CooksAssistantScript
         this.dispatcher     = dispatcher;
         this.npcInteraction = new NpcInteraction(client, clientThread, dispatcher);
         this.scene          = new SceneScanner(client);
-        this.walker         = new UniversalWalker(client, clientThread, dispatcher, resolver);
         this.trailWalker    = new TrailWalker(client, clientThread, dispatcher);
         this.trailRegistry  = trailRegistry;
         this.geScript       = geScript;
@@ -313,17 +297,18 @@ public final class CooksAssistantScript
                     SequenceSleep.sleep(client, TICK_MS);
                     continue;
                 }
-                switch (state.get())
+                State cur = state.get();
+                switch (cur)
                 {
-                    case WALK_TO_GE             -> tickTrailWalk(TRAIL_TO_GE, State.BUYING_FLOUR);
+                    case WALK_TO_GE             -> tickRouteWalk(cur, State.BUYING_FLOUR);
                     case BUYING_FLOUR           -> tickBuyFlour();
-                    case WALK_BACK_TO_LUMBRIDGE -> tickTrailWalk(TRAIL_TO_LUMBRIDGE, State.WALK_BANK_TO_PEN);
-                    case WALK_BANK_TO_PEN       -> tickTrailWalk(TRAIL_BANK_TO_PEN, null);
-                    case WALK_TO_EGG_AREA       -> tickWalk(PATH_TO_EGG_AREA, State.COLLECTING_EGG);
+                    case WALK_BACK_TO_LUMBRIDGE -> tickRouteWalk(cur, State.WALK_BANK_TO_PEN);
+                    case WALK_BANK_TO_PEN       -> tickRouteWalk(cur, null);
+                    case WALK_TO_EGG_AREA       -> tickRouteWalk(cur, State.COLLECTING_EGG);
                     case COLLECTING_EGG         -> tickCollectEgg();
-                    case WALK_TO_COW_AREA       -> tickWalk(PATH_TO_COW_AREA, State.COLLECTING_MILK);
+                    case WALK_TO_COW_AREA       -> tickRouteWalk(cur, State.COLLECTING_MILK);
                     case COLLECTING_MILK        -> tickCollectMilk();
-                    case WALK_TO_COOK           -> tickWalk(PATH_TO_COOK, State.TALKING_TO_COOK);
+                    case WALK_TO_COOK           -> tickRouteWalk(cur, State.TALKING_TO_COOK);
                     case TALKING_TO_COOK        -> tickTalkToCook();
                     case DONE, ABORTED, IDLE    -> running.set(false);
                 }
@@ -342,31 +327,64 @@ public final class CooksAssistantScript
 
     // ── State handlers ──────────────────────────────────────────────
 
-    private void tickTrailWalk(String trailName, State onArrival) throws InterruptedException
+    /** Drive a v2 {@link Route} via {@link TrailWalker#walkRoute}. The
+     *  Route is built lazily from {@link #routeCache} the first time
+     *  this state runs — so a missing trail aborts loudly with the
+     *  exact prefix to record, rather than silently looping. */
+    private void tickRouteWalk(State curState, State onArrival) throws InterruptedException
     {
-        if (currentTrailPath == null) currentTrailPath = planTrail(trailName);
-        if (currentTrailPath == null) return;
-        TrailWalker.Status st = trailWalker.tick(currentTrailPath);
-        status.set("trail[" + trailName + "]: " + st);
+        Route route = routeFor(curState);
+        if (route == null) return;   // routeFor already aborted with a clear reason
+        String prefix = ROUTE_PREFIX.get(curState);
+        TrailWalker.Status st = trailWalker.walkRoute(route);
+        status.set("route[" + prefix + "]: " + st);
         switch (st)
         {
             case ARRIVED ->
             {
-                trailWalker.reset();
-                currentTrailPath = null;
                 walkerStuckCount = 0;
                 setState(onArrival != null ? onArrival : nextStateForCurrentInventory());
             }
             case STUCK, ERROR ->
             {
                 walkerStuckCount++;
-                log.info("cooks-assistant: trail stuck #{} on '{}'", walkerStuckCount, trailName);
-                trailWalker.reset();
-                currentTrailPath = null;
+                log.info("cooks-assistant: route stuck #{} on '{}'", walkerStuckCount, prefix);
                 if (walkerStuckCount > WALKER_MAX_STUCK)
-                    abortWith("trail walker stuck " + walkerStuckCount + "× on " + trailName);
+                    abortWith("walker stuck " + walkerStuckCount + "× on '" + prefix + "'");
             }
             default -> {}
+        }
+    }
+
+    /** Build (and cache) a {@link Route} for {@code curState} by
+     *  globbing {@link #trailRegistry}. Returns {@code null} after
+     *  calling {@link #abortWith} when no trail matches the prefix —
+     *  the user needs to record one before this state can run. */
+    @javax.annotation.Nullable
+    private Route routeFor(State curState)
+    {
+        Route cached = routeCache.get(curState);
+        if (cached != null) return cached;
+        String prefix = ROUTE_PREFIX.get(curState);
+        if (prefix == null)
+        {
+            abortWith("internal: no route prefix mapped for state " + curState);
+            return null;
+        }
+        try
+        {
+            Route built = Route.fromTrails(trailRegistry.all(), prefix);
+            routeCache.put(curState, built);
+            log.info("cooks-assistant: route '{}' loaded with {} trail(s) for state {}",
+                prefix, built.entries().size(), curState);
+            return built;
+        }
+        catch (IllegalArgumentException e)
+        {
+            abortWith("no recorded trail starts with '" + prefix
+                + "' — record one (save as " + prefix + ".json under "
+                + "~/.runelite/recorder/trails/) and restart the script");
+            return null;
         }
     }
 
@@ -414,31 +432,6 @@ public final class CooksAssistantScript
         }
     }
 
-    /** Resolve a named trail to a {@link TrailPath} from the player's current
-     *  position. Calls {@link #abortWith} and returns null on any failure. */
-    private TrailPath planTrail(String trailName)
-    {
-        net.runelite.client.plugins.recorder.trail.Trail trail = trailRegistry.byName(trailName);
-        if (trail == null || trail.events().isEmpty())
-        {
-            abortWith("trail \"" + trailName + "\" missing — re-record it");
-            return null;
-        }
-        WorldPoint here = playerPos();
-        if (here == null) { status.set("no player"); return null; }
-        TrailPath full = TrailPath.fromTrail(trail);
-        int entry = full.findEntryLeg(here);
-        TrailPath path = full.subPath(entry);
-        if (path.isEmpty())
-        {
-            abortWith("trail \"" + trailName + "\" has no usable legs from " + here);
-            return null;
-        }
-        log.info("cooks-assistant: replay \"{}\" {} legs (entry {} of {}) from {}",
-            trailName, path.size(), entry, full.size(), here);
-        return path;
-    }
-
     /** Read inventory and return the next logical state after arriving back at
      *  Lumbridge (plane 0). Never returns {@link State#WALK_TO_GE} — flour is
      *  assumed present by the time this is called. */
@@ -475,32 +468,6 @@ public final class CooksAssistantScript
             return State.WALK_TO_COW_AREA;
         }
         return State.WALK_TO_COOK;
-    }
-
-    private void tickWalk(PathSpec spec, State onArrival) throws InterruptedException
-    {
-        UniversalWalker.Status st = walker.tick(spec);
-        status.set("walk[" + spec.name() + "]: " + st);
-        switch (st)
-        {
-            case ARRIVED ->
-            {
-                walker.reset();
-                walkerStuckCount = 0;
-                setState(onArrival);
-            }
-            case STUCK, ERROR ->
-            {
-                walkerStuckCount++;
-                log.info("cooks-assistant: walk stuck #{} on '{}'", walkerStuckCount, spec.name());
-                walker.reset();
-                if (walkerStuckCount > WALKER_MAX_STUCK)
-                {
-                    abortWith("walker stuck " + walkerStuckCount + "× on " + spec.name());
-                }
-            }
-            default -> {}
-        }
     }
 
     private void tickCollectEgg() throws InterruptedException
@@ -662,8 +629,9 @@ public final class CooksAssistantScript
         dialogueTaskDispatched = false;
         walkerStuckCount       = 0;
         flourBuyStarted        = false;
-        currentTrailPath       = null;
-        walker.reset();
+        // trailWalker.reset() clears its currentPath; the next walkRoute
+        // call rebuilds activeRoutePath from a fresh weighted pick, so
+        // we don't need to track route state at the script level.
         trailWalker.reset();
     }
 
