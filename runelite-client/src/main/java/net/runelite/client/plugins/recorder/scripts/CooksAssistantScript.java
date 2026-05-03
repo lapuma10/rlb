@@ -102,6 +102,24 @@ public final class CooksAssistantScript
     private static final String VERB_TALK_TO = "Talk-to";
     private static final String VERB_MILK    = "Milk";
 
+    // ── Cook dialogue options ───────────────────────────────────────
+    /** Strings the option-menu walker should pick when the Cook offers
+     *  a choice. First-match-wins, so list both the quest-start
+     *  ("Yes, I'll help.") and quest-hand-in ("Yes.") options.
+     *  Wiki-canonical wording for Cook's Assistant; if Jagex rephrases
+     *  one of these the dialogue stalls and the abort path will surface
+     *  the issue with the exact list we tried. */
+    private static final String[] COOK_DIALOGUE_OPTIONS = {
+        "Yes, I'll help.",
+        "Yes.",
+        "I'll help."
+    };
+
+    /** Hard cap on talk attempts. Two is the canonical maximum (start +
+     *  hand-in); anything beyond means the option-pick logic missed
+     *  and the cook never took the items. */
+    private static final int MAX_COOK_TALKS = 2;
+
     // ── Timing ──────────────────────────────────────────────────────
     private static final long TICK_MS           = 650;
     private static final long DISPATCH_PACE_MS  = 2_000;
@@ -154,6 +172,9 @@ public final class CooksAssistantScript
     private boolean cookClickDispatched;
     /** True once the RUN_TASK for completeDialogue() has been dispatched. */
     private boolean dialogueTaskDispatched;
+    /** Count of completed cook talk cycles — incremented after each
+     *  dialogue session ends. Capped at {@link #MAX_COOK_TALKS}. */
+    private int talkAttempts;
     /** Consecutive STUCK/ERROR increments from the walker; reset on ARRIVED
      *  and on every state transition. */
     private int walkerStuckCount;
@@ -598,11 +619,11 @@ public final class CooksAssistantScript
                 lastDispatchMs = 0;
                 return;
             }
-            status.set("cook: dialogue open — completing quest dialogue");
+            status.set("cook: dialogue open — completing quest dialogue (talk #" + (talkAttempts + 1) + ")");
             dispatcher.dispatch(ActionRequest.builder()
                 .kind(ActionRequest.Kind.RUN_TASK)
                 .channel(ActionRequest.Channel.MOUSE)
-                .task(() -> npcInteraction.completeDialogue())
+                .task(() -> npcInteraction.completeDialogue(COOK_DIALOGUE_OPTIONS))
                 .taskName("CooksAssistant.completeDialogue")
                 .build());
             dialogueTaskDispatched = true;
@@ -614,9 +635,37 @@ public final class CooksAssistantScript
             status.set("cook: dialogue in progress");
             return;
         }
-        log.info("cooks-assistant: Cook's Assistant complete!");
-        status.set("Cook's Assistant: COMPLETE");
-        setState(State.DONE);
+
+        // Dialogue task finished. The Cook only consumes ingredients on
+        // the *second* talk (first talk starts the quest, second hands
+        // them over). Inventory check is the truth source — items gone =
+        // quest complete; items still here = need another talk.
+        talkAttempts++;
+        boolean stillHasIngredients =
+            inventoryCount(ItemID.EGG)         > 0
+            || inventoryCount(ItemID.BUCKET_MILK) > 0
+            || inventoryCount(ItemID.POT_FLOUR)   > 0;
+
+        if (!stillHasIngredients)
+        {
+            log.info("cooks-assistant: ingredients consumed by Cook — quest complete!");
+            status.set("Cook's Assistant: COMPLETE");
+            setState(State.DONE);
+            return;
+        }
+
+        if (talkAttempts >= MAX_COOK_TALKS)
+        {
+            abortWith("talked to Cook " + talkAttempts
+                + "× but ingredients still in inventory — option strings may have drifted");
+            return;
+        }
+
+        log.info("cooks-assistant: ingredients still present after talk #{} — talking again", talkAttempts);
+        status.set("cook: talk " + talkAttempts + " done, items still here — talking again");
+        cookClickDispatched    = false;
+        dialogueTaskDispatched = false;
+        lastDispatchMs         = 0;
     }
 
     // ── Helpers ─────────────────────────────────────────────────────
@@ -629,6 +678,7 @@ public final class CooksAssistantScript
         dialogueTaskDispatched = false;
         walkerStuckCount       = 0;
         flourBuyStarted        = false;
+        talkAttempts           = 0;
         // trailWalker.reset() clears its currentPath; the next walkRoute
         // call rebuilds activeRoutePath from a fresh weighted pick, so
         // we don't need to track route state at the script level.
