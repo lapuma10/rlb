@@ -244,9 +244,17 @@ public final class RecorderPanel extends PluginPanel
     // Trails section — wired by RecorderPlugin via setTrailRecorder / setTrailRegistry.
     private TrailRecorder trailRecorder;
     private TrailRegistry trailRegistry;
-    private final JTextField trailNameField = new JTextField(14);
+    /** Editable combo: dropdown lists existing trails (for picking one to
+     *  display or stop-and-save into), but you can also type a new name
+     *  to start a fresh recording. {@link #refreshTrailNames()} repopulates
+     *  the dropdown items after registry load/save. */
+    private final JComboBox<String> trailNameCombo = new JComboBox<>();
     private final JButton trailRecordBtn = new JButton("Record trail");
     private final JButton trailStopSaveBtn = new JButton("Stop & save");
+    /** Pulls the selected/typed trail name from the combo, looks it up in
+     *  the registry, and publishes it to the overlay so you can eyeball
+     *  the route on the world map / minimap. */
+    private final JButton trailShowBtn = new JButton("Show on map");
     private final JTextField trailWalkToField = new JTextField(14);
     private final JButton trailWalkToBtn = new JButton("Walk to…");
     private final JLabel trailStatusLabel = new JLabel("Trails: idle");
@@ -1439,7 +1447,28 @@ public final class RecorderPanel extends PluginPanel
     public void setTrailRegistry(TrailRegistry reg)
     {
         this.trailRegistry = reg;
-        SwingUtilities.invokeLater(this::updateTrailButtons);
+        SwingUtilities.invokeLater(() -> {
+            refreshTrailNames();
+            updateTrailButtons();
+        });
+    }
+
+    /** Repopulate the trail-name dropdown from the registry, preserving
+     *  whatever the user had typed/selected. Called after registry load
+     *  + after each save so newly-recorded trails appear immediately. */
+    private void refreshTrailNames()
+    {
+        if (trailRegistry == null) return;
+        trailRegistry.load();   // pick up any disk changes
+        Object selected = trailNameCombo.getEditor().getItem();
+        trailNameCombo.removeAllItems();
+        trailRegistry.all().stream()
+            .map(net.runelite.client.plugins.recorder.trail.Trail::name)
+            .sorted()
+            .forEach(trailNameCombo::addItem);
+        // Restore the user's pending text/selection so re-render doesn't
+        // wipe a half-typed new name.
+        if (selected != null) trailNameCombo.getEditor().setItem(selected);
     }
 
     private void updateTrailButtons()
@@ -1449,7 +1478,8 @@ public final class RecorderPanel extends PluginPanel
         trailRecordBtn.setEnabled(ready && !recording);
         trailStopSaveBtn.setEnabled(ready && recording);
         trailWalkToBtn.setEnabled(ready && !recording);
-        trailNameField.setEnabled(ready && !recording);
+        trailShowBtn.setEnabled(ready && !recording);
+        trailNameCombo.setEnabled(ready && !recording);
         trailStatusLabel.setText("Trails: " + (recording
             ? "recording \"" + trailRecorder.currentName() + "\""
             : "idle"));
@@ -1461,10 +1491,16 @@ public final class RecorderPanel extends PluginPanel
         out.setLayout(new BoxLayout(out, BoxLayout.Y_AXIS));
         out.setBackground(ColorScheme.DARK_GRAY_COLOR);
         out.setBorder(BorderFactory.createTitledBorder("Trails"));
+        // Combo is editable so users can either pick an existing trail
+        // (to display or stop-and-save into) or type a brand-new name
+        // for a fresh recording.
+        trailNameCombo.setEditable(true);
+        trailNameCombo.setPrototypeDisplayValue("xxxxxxxxxxxxxxxxxxxxxx");
         JPanel row1 = new JPanel(new FlowLayout(FlowLayout.LEFT, 4, 4));
         row1.setBackground(ColorScheme.DARK_GRAY_COLOR);
         row1.add(new JLabel("Name:"));
-        row1.add(trailNameField);
+        row1.add(trailNameCombo);
+        row1.add(trailShowBtn);
         out.add(row1);
         JPanel row2 = new JPanel(new FlowLayout(FlowLayout.LEFT, 4, 4));
         row2.setBackground(ColorScheme.DARK_GRAY_COLOR);
@@ -1480,15 +1516,25 @@ public final class RecorderPanel extends PluginPanel
         out.add(trailStatusLabel);
         trailRecordBtn.addActionListener(e -> startTrailRecord());
         trailStopSaveBtn.addActionListener(e -> stopTrailAndSave());
+        trailShowBtn.addActionListener(e -> showSelectedTrail());
         trailWalkToBtn.addActionListener(e -> walkToTarget());
         updateTrailButtons();
         return out;
     }
 
+    /** Pull the currently-typed/selected name from the combo. Returns
+     *  empty string when nothing's there — callers handle as "name
+     *  required." */
+    private String currentTrailName()
+    {
+        Object sel = trailNameCombo.getEditor().getItem();
+        return sel == null ? "" : sel.toString().trim();
+    }
+
     private void startTrailRecord()
     {
         if (trailRecorder == null) return;
-        String name = trailNameField.getText().trim();
+        String name = currentTrailName();
         if (name.isEmpty())
         {
             trailStatusLabel.setText("Trails: name required");
@@ -1512,6 +1558,8 @@ public final class RecorderPanel extends PluginPanel
             trailRegistry.save(trail);
             trailStatusLabel.setText("Trails: saved \"" + trail.name() + "\" ("
                 + trail.events().size() + " events)");
+            refreshTrailNames();
+            trailNameCombo.getEditor().setItem(trail.name());
         }
         catch (Throwable t)
         {
@@ -1519,6 +1567,42 @@ public final class RecorderPanel extends PluginPanel
             log.warn("trail save failed", t);
         }
         updateTrailButtons();
+    }
+
+    /** Look up the trail named in the combo and publish it to the
+     *  {@link net.runelite.client.plugins.recorder.trail.TrailOverlay}
+     *  so the user can eyeball the recorded route on the world map +
+     *  minimap. Passing an empty / unknown name clears the overlay. */
+    private void showSelectedTrail()
+    {
+        if (trailRegistry == null) return;
+        String name = currentTrailName();
+        if (name.isEmpty())
+        {
+            net.runelite.client.plugins.recorder.trail.TrailOverlay
+                .publishActiveTrail(null);
+            trailStatusLabel.setText("Trails: overlay cleared");
+            return;
+        }
+        net.runelite.client.plugins.recorder.trail.Trail t =
+            trailRegistry.byName(name);
+        if (t == null)
+        {
+            // Maybe it was added on disk after the last load.
+            trailRegistry.load();
+            t = trailRegistry.byName(name);
+        }
+        if (t == null)
+        {
+            trailStatusLabel.setText("Trails: \"" + name + "\" not found "
+                + "(have: " + trailRegistry.all().size() + " total)");
+            return;
+        }
+        net.runelite.client.plugins.recorder.trail.TrailOverlay
+            .publishActiveTrail(
+                net.runelite.client.plugins.recorder.trail.TrailPath.fromTrail(t));
+        trailStatusLabel.setText("Trails: showing \"" + t.name()
+            + "\" (" + t.events().size() + " events)");
     }
 
     private void walkToTarget()

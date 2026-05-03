@@ -80,13 +80,13 @@ public final class CooksAssistantScript
     // Existing user trails matching these prefixes (as of 2026-05-03):
     //   lumbridge_bank_to_ge_safe        ✓ (+ ..._v2 → Route picks both)
     //   ge_to_lumbridge_bank_safe        ✓
-    //   lumby-bank-to-cook               ✗ — record one to enable WALK_TO_COOK
+    //   lumby_bank_to_cook               ✗ — record one to enable WALK_TO_COOK
     private static final Map<State, String> ROUTE_PREFIX = new EnumMap<>(State.class);
     static
     {
         ROUTE_PREFIX.put(State.WALK_TO_GE,             "lumbridge_bank_to_ge_safe");
         ROUTE_PREFIX.put(State.WALK_BACK_TO_LUMBRIDGE, "ge_to_lumbridge_bank_safe");
-        ROUTE_PREFIX.put(State.WALK_TO_COOK,           "lumby-bank-to-cook");
+        ROUTE_PREFIX.put(State.WALK_TO_COOK,           "lumby_bank_to_cook");
     }
 
     // ── NPC verb strings ────────────────────────────────────────────
