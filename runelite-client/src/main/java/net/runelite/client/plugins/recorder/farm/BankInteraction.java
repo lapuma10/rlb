@@ -277,6 +277,89 @@ public final class BankInteraction implements BankActions
         tryClickBankBoothRandom();
     }
 
+    /** Outcome of {@link #ensureBoothInClickRange}. Lets the caller
+     *  distinguish "nothing to do — go ahead and click" from "I just
+     *  dispatched a walk; wait for the player to arrive before
+     *  re-checking" so attempt counters / timeouts can stay accurate. */
+    public enum BoothPrep { ALREADY_VISIBLE, WALKED_CLOSER, NO_CANDIDATE }
+
+    /** Pre-flight before a booth click: pick the closest candidate, check
+     *  if its convex hull (or tile poly fallback) actually projects onto
+     *  the canvas. If not, dispatch a WALK toward the booth tile so the
+     *  next tick has a chance to find it on-canvas, and return
+     *  {@link BoothPrep#WALKED_CLOSER}. If the candidate is already
+     *  on-canvas, return {@link BoothPrep#ALREADY_VISIBLE}; the caller
+     *  should immediately call {@link #tryClickBankBoothRandom}.
+     *
+     *  <p>This solves the v1 silent-failure where a booth at dist=8 with
+     *  the model behind a wall would return null hull → "pixel
+     *  unresolvable" → click dropped. The dispatcher's gameObjectClick
+     *  already does a non-forced rotateCameraToward, but rotation alone
+     *  doesn't help if the model isn't being rendered at all. Walking
+     *  closer drops us inside the render LOD where the hull becomes
+     *  available.
+     *
+     *  <p>Safe to call from any worker thread — all client reads marshal
+     *  via {@link #onClient}. */
+    public BoothPrep ensureBoothInClickRange() throws InterruptedException
+    {
+        assertWorkerThread("ensureBoothInClickRange");
+        BoothCandidate pick = onClient(this::findBoothCandidate);
+        if (pick == null) return BoothPrep.NO_CANDIDATE;
+
+        Boolean visible = onClient(() -> isBoothPixelResolvable(pick));
+        if (Boolean.TRUE.equals(visible)) return BoothPrep.ALREADY_VISIBLE;
+
+        WorldPoint tile = onClient(() ->
+            pick.npc != null ? pick.npc.getWorldLocation() : pick.go.getWorldLocation());
+        if (tile == null) return BoothPrep.NO_CANDIDATE;
+
+        log.info("bank: booth at {} not on canvas (dist={}) — walking closer",
+            tile, pick.distance);
+        dispatcher.dispatch(ActionRequest.builder()
+            .kind(ActionRequest.Kind.WALK)
+            .channel(ActionRequest.Channel.MOUSE)
+            .tile(tile)
+            .build());
+        return BoothPrep.WALKED_CLOSER;
+    }
+
+    /** Client-thread: true iff the booth's model has a non-empty convex
+     *  hull on the canvas, OR (fallback) its tile poly has a non-empty
+     *  bounding box. Either signal is sufficient for the dispatcher's
+     *  hull/tile-poly resolution path to find a clickable pixel. */
+    private boolean isBoothPixelResolvable(BoothCandidate pick)
+    {
+        Shape hull = null;
+        if (pick.npc != null)
+        {
+            hull = pick.npc.getConvexHull();
+        }
+        else if (pick.go != null)
+        {
+            hull = pick.go.getConvexHull();
+        }
+        if (hull != null)
+        {
+            Rectangle bb = hull.getBounds();
+            if (bb != null && !bb.isEmpty()) return true;
+        }
+        // Fallback: tile poly. The dispatcher's TILE_POLY strategy uses
+        // this when HULL fails.
+        WorldPoint loc = pick.npc != null ? pick.npc.getWorldLocation()
+                                          : (pick.go != null ? pick.go.getWorldLocation() : null);
+        if (loc == null) return false;
+        WorldView wv = client.getTopLevelWorldView();
+        if (wv == null) return false;
+        net.runelite.api.coords.LocalPoint lp =
+            net.runelite.api.coords.LocalPoint.fromWorld(wv, loc);
+        if (lp == null) return false;
+        java.awt.Polygon poly = net.runelite.api.Perspective.getCanvasTilePoly(client, lp);
+        if (poly == null) return false;
+        Rectangle bb = poly.getBounds();
+        return bb != null && !bb.isEmpty();
+    }
+
     /** V2-style booth picker: weighted-random across all candidates instead
      *  of short-circuiting on the adjacent one. {@code adjacencyBias} is the
      *  probability mass given to the closest candidate (range 0..1); the

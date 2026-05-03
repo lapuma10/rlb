@@ -487,6 +487,24 @@ public final class CooksAssistantScript
                     return;
                 }
             }
+
+            // Pre-flight: if the closest booth's model isn't on canvas
+            // (occluded by a wall, beyond render LOD), dispatch a walk
+            // toward its tile so the next tick has a chance to find a
+            // resolvable pixel. WALKED_CLOSER doesn't count as a click
+            // attempt — booth wasn't actually clicked, just approached.
+            BankInteraction.BoothPrep prep = bank.ensureBoothInClickRange();
+            if (prep == BankInteraction.BoothPrep.NO_CANDIDATE)
+            {
+                abortWith("bank: no booth/banker in click range — start the script at the Lumbridge bank");
+                return;
+            }
+            if (prep == BankInteraction.BoothPrep.WALKED_CLOSER)
+            {
+                status.set("bank: walking closer to booth (off-canvas)");
+                return;
+            }
+
             boolean ok = bank.tryClickBankBoothRandom();
             if (!ok)
             {
