@@ -133,22 +133,56 @@ public final class BankInteraction implements BankActions
         }
     }
 
-    /** True if the bank-main widget is loaded and visible. */
+    /** True if the bank-main widget is loaded and visible. Thread-safe:
+     *  reads directly on the client thread, marshals through
+     *  {@link #onClient} when called from any worker. The latter is the
+     *  important path — both {@code client.getWidget()} and
+     *  {@code Widget.isHidden()} assert the client thread under
+     *  {@code -ea} and would crash a script that polled this from its
+     *  own tick loop. */
     public boolean isBankOpen()
     {
-        Widget w = client.getWidget(InterfaceID.Bankmain.UNIVERSE);
-        return w != null && !w.isHidden();
+        return readWidgetVisible(InterfaceID.Bankmain.UNIVERSE);
     }
 
     /** True if the Bank PIN keypad is up. The bot can't enter a PIN
      *  safely (keystroke pacing matters for that flow); callers should
      *  abort with a status when this is true rather than continue
      *  clicking the booth — repeated booth clicks during PIN entry can
-     *  lock the player out for 5 minutes. */
+     *  lock the player out for 5 minutes. Thread-safe via the same
+     *  branch as {@link #isBankOpen()}. */
     public boolean isBankPinUp()
     {
-        Widget w = client.getWidget(InterfaceID.BankpinKeypad.UNIVERSE);
-        return w != null && !w.isHidden();
+        return readWidgetVisible(InterfaceID.BankpinKeypad.UNIVERSE);
+    }
+
+    /** Shared helper for the two thread-safe widget-visibility checks
+     *  above. {@link Client#isClientThread()} lets us skip the latch
+     *  hop on the hot path (engine-step callers) while keeping the
+     *  off-thread path safe for worker-driven scripts. The catch
+     *  re-asserts interrupt state and returns {@code false} — losing a
+     *  poll is preferable to swallowing the interrupt or rethrowing
+     *  through public methods that historically didn't declare it. */
+    private boolean readWidgetVisible(int widgetId)
+    {
+        if (client.isClientThread())
+        {
+            Widget w = client.getWidget(widgetId);
+            return w != null && !w.isHidden();
+        }
+        try
+        {
+            Boolean b = onClient(() -> {
+                Widget w = client.getWidget(widgetId);
+                return w != null && !w.isHidden();
+            });
+            return Boolean.TRUE.equals(b);
+        }
+        catch (InterruptedException ie)
+        {
+            Thread.currentThread().interrupt();
+            return false;
+        }
     }
 
     /** Step 1 (legacy / simple variant): find a Banker / Bank booth NPC

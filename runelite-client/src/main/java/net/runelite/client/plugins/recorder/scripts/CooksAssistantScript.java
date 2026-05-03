@@ -126,6 +126,16 @@ public final class CooksAssistantScript
      *  and the cook never took the items. */
     private static final int MAX_COOK_TALKS = 2;
 
+    /** Grace window after a booth click before re-attempting. The bank
+     *  widget can take 1-3 seconds to render server-side; re-clicking
+     *  inside this window finds the booth in a different state and the
+     *  verb-pick fails. Also long enough to absorb a missed first click
+     *  without the bot looking impatient. */
+    private static final long BANK_OPEN_TIMEOUT_MS = 6_000;
+    /** After this many failed booth-click attempts (each timing out
+     *  without the bank window appearing), abort. */
+    private static final int  MAX_BOOTH_CLICK_ATTEMPTS = 4;
+
     // ── Timing ──────────────────────────────────────────────────────
     private static final long TICK_MS           = 650;
     private static final long DISPATCH_PACE_MS  = 2_000;
@@ -185,6 +195,18 @@ public final class CooksAssistantScript
      *  because the buy completed" vs "GE was IDLE because we haven't
      *  started yet." */
     private int currentBuyItemId;
+    /** Wall-clock of the last booth click. After a successful click
+     *  the bank widget can take 1-3 seconds to render (server tick +
+     *  network round-trip). DISPATCH_PACE_MS=2000 isn't enough — by
+     *  the time the next tick fires another click, the player has
+     *  walked closer to the booth and the menu no longer contains
+     *  "Bank". This timestamp gates re-clicks: stay patient until
+     *  {@link #BANK_OPEN_TIMEOUT_MS} has elapsed before re-attempting. */
+    private long lastBoothClickMs;
+    /** How many booth-click attempts have failed to open the bank
+     *  (timeout elapsed without the widget appearing). Capped at
+     *  {@link #MAX_BOOTH_CLICK_ATTEMPTS} then we abort. */
+    private int boothClickAttempts;
     /** Lazy cache of compiled Routes per state. Built on first need by
      *  {@link #routeFor}. Cleared on stop so a re-record + restart picks
      *  up the new trail set. */
@@ -424,12 +446,31 @@ public final class CooksAssistantScript
                 abortWith("bank: PIN keypad is up — enter your PIN manually then restart");
                 return;
             }
-            if (dispatcher.isBusy()) { status.set("bank: dispatcher busy"); return; }
             long now = System.currentTimeMillis();
-            if (now - lastDispatchMs < DISPATCH_PACE_MS)
+            // A click already went out — stay patient until the window
+            // either renders or our grace period times out. Re-clicking
+            // mid-render finds the booth in a stale-menu state and the
+            // verb-pick fails.
+            if (lastBoothClickMs > 0 && now - lastBoothClickMs < BANK_OPEN_TIMEOUT_MS)
             {
-                status.set("bank: pacing booth click");
+                status.set("bank: waiting for window (clicked "
+                    + (now - lastBoothClickMs) + "ms ago)");
                 return;
+            }
+            if (dispatcher.isBusy()) { status.set("bank: dispatcher busy"); return; }
+            if (lastBoothClickMs > 0)
+            {
+                // Grace window expired without bank opening — count as
+                // a failed attempt before re-clicking.
+                boothClickAttempts++;
+                log.info("cooks-assistant: bank booth click attempt {} timed out after {}ms",
+                    boothClickAttempts, BANK_OPEN_TIMEOUT_MS);
+                if (boothClickAttempts >= MAX_BOOTH_CLICK_ATTEMPTS)
+                {
+                    abortWith("bank: " + boothClickAttempts
+                        + " booth-click attempts failed to open the window");
+                    return;
+                }
             }
             boolean ok = bank.tryClickBankBoothRandom();
             if (!ok)
@@ -437,10 +478,15 @@ public final class CooksAssistantScript
                 abortWith("bank: no booth/banker in click range — start the script at the Lumbridge bank");
                 return;
             }
-            lastDispatchMs = now;
+            lastBoothClickMs = now;
+            lastDispatchMs   = now;
             status.set("bank: booth clicked, waiting for window");
             return;
         }
+        // Bank opened — clear the click guard so subsequent CHECK_BANK
+        // entries (after a setState reset) start fresh.
+        lastBoothClickMs   = 0;
+        boothClickAttempts = 0;
 
         // Phase 2: bank open, wait for the inventory container.
         if (!bank.bankReady())
@@ -680,6 +726,8 @@ public final class CooksAssistantScript
         dialogueTaskDispatched = false;
         walkerStuckCount       = 0;
         currentBuyItemId       = 0;
+        lastBoothClickMs       = 0;
+        boothClickAttempts     = 0;
         talkAttempts           = 0;
         // trailWalker.reset() clears its currentPath; the next walkRoute
         // call rebuilds activeRoutePath from a fresh weighted pick, so
