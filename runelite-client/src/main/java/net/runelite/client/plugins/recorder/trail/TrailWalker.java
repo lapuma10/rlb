@@ -7,6 +7,7 @@ import java.util.Optional;
 import java.util.Random;
 import java.util.concurrent.ThreadLocalRandom;
 import java.util.concurrent.atomic.AtomicReference;
+import java.util.function.BooleanSupplier;
 import java.util.function.Predicate;
 import javax.annotation.Nullable;
 import lombok.extern.slf4j.Slf4j;
@@ -302,6 +303,44 @@ public final class TrailWalker
             activeRoutePath = null;
         }
         return s;
+    }
+
+    /** {@link #walkRoute} with an arrival short-circuit. Checks
+     *  {@code shortCircuit} before delegating; if it returns {@code true}
+     *  this returns {@link Status#ARRIVED} immediately and resets the
+     *  active route trail so the next call (whether to {@link #walkRoute}
+     *  or {@link #walkRouteUntil}) picks a fresh trail — matching the
+     *  post-{@code ARRIVED} contract of {@link #walkRoute} itself.
+     *
+     *  <p>Use case: walk-to-X flows where "X is on canvas / interactable"
+     *  is a stronger arrival signal than the trail's recorded final
+     *  tile. Example: cooks-assistant walks toward the Lumbridge Cook,
+     *  but as soon as the cook's hull renders, it's better to hand off
+     *  to a click-NPC dispatch than to keep marching toward the
+     *  recorded end tile.
+     *
+     *  <p>The predicate runs on the calling thread (typically the
+     *  script's own worker). If it needs OSRS client state it must
+     *  marshal itself — there's no implicit hop. {@link BooleanSupplier}
+     *  cannot throw checked exceptions; predicates that need to await
+     *  a checked failure should encode it as {@code false} (and rely
+     *  on the next tick) or wrap with {@link RuntimeException}.
+     *
+     *  @param shortCircuit invoked once per call before the inner
+     *                     {@code walkRoute}. {@code true} → return
+     *                     {@link Status#ARRIVED}.
+     */
+    public Status walkRouteUntil(Route route, BooleanSupplier shortCircuit)
+        throws InterruptedException
+    {
+        if (shortCircuit != null && shortCircuit.getAsBoolean())
+        {
+            // Match walkRoute's post-ARRIVED reset so the next call
+            // re-picks a trail from the route.
+            activeRoutePath = null;
+            return Status.ARRIVED;
+        }
+        return walkRoute(route);
     }
 
     /** Most recently picked trail across all {@link #walkRoute} calls.

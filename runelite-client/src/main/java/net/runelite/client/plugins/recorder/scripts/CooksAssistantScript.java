@@ -451,59 +451,82 @@ public final class CooksAssistantScript
         }
     }
 
-    /** Walk-to-Cook with NPC short-circuit. Every tick: scan the loaded
-     *  scene for the Lumbridge Cook (by ID 4626 first, name "Cook" as
-     *  fallback). Three outcomes:
+    /** Walk-to-Cook with NPC short-circuit, driven via
+     *  {@link TrailWalker#walkRouteUntil}. The arrival predicate scans
+     *  the loaded scene for the Lumbridge Cook every tick; as soon as
+     *  his canvas-tile poly is present we cut the walk short and hand
+     *  off to {@link State#TALKING_TO_COOK}. The dispatcher's
+     *  {@link HumanizedInputDispatcher} npcClick rotates the camera,
+     *  re-resolves the hull at click time, and lets the OSRS server
+     *  pathfind us into talk-to range — we don't need to be on his
+     *  tile.
      *
-     *  <ul>
-     *    <li><b>Cook on canvas</b> — hand off to {@link State#TALKING_TO_COOK}
-     *        immediately. Don't keep walking — the dispatcher's
-     *        {@link HumanizedInputDispatcher} npcClick rotates the camera,
-     *        re-resolves the hull at click time, and lets the OSRS server
-     *        pathfind the player to the talk-to interaction range. We
-     *        don't need to be standing on his tile.</li>
-     *    <li><b>Cook on scene but offscreen</b> — fall through to walker
-     *        but log diagnostic. The walker advances along the trail
-     *        and the next tick's scan will catch on-canvas as soon as
-     *        the kitchen comes into viewport.</li>
-     *    <li><b>Cook not on scene</b> — keep walking; we haven't got
-     *        close enough yet for the scene to stream his chunk.</li>
-     *  </ul>
-     *
-     *  <p>Diagnostic log throttled to every {@link #COOK_VISIBILITY_LOG_PACE_MS}
-     *  to surface what NPCs the script actually sees when something
-     *  goes wrong, without spamming on every tick. */
+     *  <p>Diagnostic logging (which NPCs we see, why the cook didn't
+     *  match) runs from inside the predicate, throttled by
+     *  {@link #COOK_VISIBILITY_LOG_PACE_MS} so it surfaces during
+     *  failure investigation without spamming every tick. */
     private void tickWalkToCook() throws InterruptedException
     {
-        NpcScan scan = onClient(() -> npcInteraction.findOnScene(
-            COOK_SCENE_SCAN_RADIUS, new int[]{ COOK_NPC_ID }, "Cook"));
-        long now = System.currentTimeMillis();
-        if (scan != null && scan.found() && scan.onCanvas())
+        Route route = routeFor(State.WALK_TO_COOK);
+        if (route == null) return;
+        String prefix = ROUTE_PREFIX.get(State.WALK_TO_COOK);
+
+        TrailWalker.Status st = trailWalker.walkRouteUntil(route, () -> {
+            NpcScan scan = onClient(() -> npcInteraction.findOnScene(
+                COOK_SCENE_SCAN_RADIUS, new int[]{ COOK_NPC_ID }, "Cook"));
+            long now = System.currentTimeMillis();
+            boolean cookOnCanvas = scan != null && scan.found() && scan.onCanvas();
+            if (cookOnCanvas)
+            {
+                log.info("cooks-assistant: cook on canvas (idx={}, tile={}) — short-circuiting walker",
+                    scan.npcIndex(), scan.tile());
+                return true;
+            }
+            if (now - lastCookVisibilityLogMs > COOK_VISIBILITY_LOG_PACE_MS)
+            {
+                lastCookVisibilityLogMs = now;
+                logCookScan(scan);
+            }
+            return false;
+        });
+
+        status.set("route[" + prefix + "]: " + st);
+        switch (st)
         {
-            log.info("cooks-assistant: cook on canvas (idx={}, tile={}) — handing off to TALKING_TO_COOK",
-                scan.npcIndex(), scan.tile());
-            walkerStuckCount = 0;
-            setState(State.TALKING_TO_COOK);
-            return;
+            case ARRIVED ->
+            {
+                walkerStuckCount = 0;
+                setState(State.TALKING_TO_COOK);
+            }
+            case STUCK, ERROR ->
+            {
+                walkerStuckCount++;
+                log.info("cooks-assistant: route stuck #{} on '{}'", walkerStuckCount, prefix);
+                if (walkerStuckCount > WALKER_MAX_STUCK)
+                    abortWith("walker stuck " + walkerStuckCount + "× on '" + prefix + "'");
+            }
+            default -> {}
         }
-        if (now - lastCookVisibilityLogMs > COOK_VISIBILITY_LOG_PACE_MS)
+    }
+
+    /** Diagnostic dump for {@link #tickWalkToCook}'s short-circuit
+     *  predicate. Throttled by the caller — pulled out so the
+     *  walkRouteUntil predicate stays readable. */
+    private void logCookScan(NpcScan scan)
+    {
+        if (scan == null)
         {
-            lastCookVisibilityLogMs = now;
-            if (scan == null)
-            {
-                log.info("cooks-assistant: cook scan returned null (client-thread timeout?) — continuing walk");
-            }
-            else if (!scan.found())
-            {
-                log.info("cooks-assistant: cook not on scene yet — {}", scan.diagnostic());
-            }
-            else
-            {
-                log.info("cooks-assistant: cook on scene at {} but offscreen — walker will continue ({})",
-                    scan.tile(), scan.diagnostic());
-            }
+            log.info("cooks-assistant: cook scan returned null (client-thread timeout?) — continuing walk");
         }
-        tickRouteWalk(State.WALK_TO_COOK, State.TALKING_TO_COOK);
+        else if (!scan.found())
+        {
+            log.info("cooks-assistant: cook not on scene yet — {}", scan.diagnostic());
+        }
+        else
+        {
+            log.info("cooks-assistant: cook on scene at {} but offscreen — walker will continue ({})",
+                scan.tile(), scan.diagnostic());
+        }
     }
 
     /** Build (and cache) a {@link Route} for {@code curState} by
