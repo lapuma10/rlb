@@ -239,6 +239,30 @@ public final class GrandExchangeScript {
         return Optional.empty();
     }
 
+    /** Most recent {@code "CHECK FAILED <reason>"} record from the
+     *  telemetry ring buffer, formatted as
+     *  {@code "<stepName> CHECK FAILED <reason>"}, or {@code ""} when
+     *  none is present.
+     *
+     *  <p>Exists because {@link #status} can be racy on FAILED:
+     *  {@code onGameTick} only updates the status string on the next
+     *  game tick after the engine fails internally, so a caller polling
+     *  the script (e.g. CooksAssistantScript every 650 ms) can read a
+     *  stale {@code "running: ... STARTED"} string and never see the
+     *  real BlockReason. Walking the telemetry buffer captures the typed
+     *  failure even when the status caching missed it. */
+    public String lastFailedStepDescription() {
+        String result = "";
+        for (TelemetryRecord r : recentTelemetry()) {
+            if (r.event() == TelemetryRecord.Event.CHECK
+                && r.payload() != null
+                && r.payload().startsWith("FAILED")) {
+                result = r.stepName() + " " + r.event() + " " + r.payload();
+            }
+        }
+        return result;
+    }
+
     // ─── Plugin hookup ──────────────────────────────────────────────────
 
     /** Record buy-side fill increments into the per-account 4-hour

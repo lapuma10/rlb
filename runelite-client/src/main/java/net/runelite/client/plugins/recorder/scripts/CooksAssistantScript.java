@@ -620,7 +620,14 @@ public final class CooksAssistantScript
         }
         if (geSt == SequenceState.FAILED)
         {
-            abortWith("GE buy failed (item " + currentBuyItemId + "): " + geScript.status());
+            // geScript.status() is racy on FAILED — onGameTick only
+            // updates the cached status on the *next* game tick after
+            // the engine internally fails, so polling here can read a
+            // stale "running: ... STARTED". lastFailedStepDescription
+            // walks the telemetry buffer for the real CHECK FAILED line.
+            String detail = geScript.lastFailedStepDescription();
+            String reason = detail.isEmpty() ? geScript.status() : detail;
+            abortWith("GE buy failed (item " + currentBuyItemId + "): " + reason);
             return;
         }
 
