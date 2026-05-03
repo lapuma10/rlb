@@ -13,10 +13,10 @@ import static org.junit.Assert.*;
 
 /**
  * Tests for {@link WaitForBankReadyStep}.
- * 8d: 3 tests.
  * - ready arrives: succeeds
- * - bank closes mid-wait: fails with BankNotOpen (not timeout)
- * - never-ready: typed timeout BankNotReady fires before engine generic timeout
+ * - widget never opens (stale container from prior visit): waits up
+ *   to the typed timeout, then fails with BankNotOpen
+ * - widget opens but ready never arrives: typed timeout BankNotReady
  */
 public class WaitForBankReadyStepTest {
 
@@ -34,23 +34,54 @@ public class WaitForBankReadyStepTest {
         assertEquals(SequenceState.IDLE, harness.state());
     }
 
+    /** Regression: a fresh booth click hasn't yet rendered the bank
+     *  widget, but the BANK ItemContainer is sticky from a previous
+     *  visit (CooksAssistant withdraws → close, then GE bank-prep
+     *  re-opens). Old logic returned SUCCEEDED on tick 1 because
+     *  ready=true (stale container), and the next step then read
+     *  open=false and failed with BankNotOpen. New logic gates on
+     *  open() FIRST and only succeeds when the widget is actually up. */
     @Test
-    public void bankClosedMidWait_failsWithBankNotOpen() {
+    public void staleContainerWithoutOpenWidget_doesNotShortCircuit() {
         BankingEngineHarness harness = new BankingEngineHarness();
 
-        // Bank opens but then closes before ready
-        WorldSnapshot openSnap  = new BankSnapBuilder().tick(1).bankOpen(true).bankReady(false).build();
-        WorldSnapshot closedSnap = new BankSnapBuilder().tick(2).bankOpen(false).bankReady(false).build();
-        harness.queue(openSnap, openSnap, closedSnap, closedSnap);
+        // Container is sticky (ready=true) but widget hasn't rendered yet
+        // for the new session. Then the widget appears.
+        WorldSnapshot stuckClosed = new BankSnapBuilder().tick(1).bankOpen(false).bankReady(true).build();
+        WorldSnapshot openReady   = new BankSnapBuilder().tick(2).bankOpen(true).bankReady(true).build();
+        harness.queue(stuckClosed, stuckClosed, openReady, openReady);
+
+        harness.run(new WaitForBankReadyStep());
+        harness.advance(4);
+
+        // We should still succeed eventually (when the widget appears),
+        // not bail with BankNotOpen immediately on the stale-container tick.
+        assertEquals(SequenceState.IDLE, harness.state());
+    }
+
+    @Test
+    public void bankClosedMidWait_failsWithBankNotOpenAtTimeout() {
+        BankingEngineHarness harness = new BankingEngineHarness();
+
+        // Bank opens but then closes before ready, and never re-opens.
+        // New logic waits the full typed timeout (10 ticks) before
+        // failing — gives the widget a chance to come back, then
+        // surfaces the typed BankNotOpen reason.
+        WorldSnapshot openSnap   = new BankSnapBuilder().tick(1).bankOpen(true).bankReady(false).build();
+        List<WorldSnapshot> snaps = new ArrayList<>();
+        snaps.add(openSnap);
+        for (int i = 2; i <= 14; i++) {
+            snaps.add(new BankSnapBuilder().tick(i).bankOpen(false).bankReady(false).build());
+        }
+        harness.queue(snaps.toArray(new WorldSnapshot[0]));
 
         List<TelemetryRecord> records = new ArrayList<>();
         harness.telemetry().subscribe(records::add);
 
         harness.run(new WaitForBankReadyStep());
-        harness.advance(4);
+        harness.advance(13);
 
         assertEquals(SequenceState.FAILED, harness.state());
-        // Verify failure had BankNotOpen diagnostic (not timeout)
         boolean foundBankNotOpen = records.stream()
             .filter(r -> r.event() == TelemetryRecord.Event.RECOVERY || r.event() == TelemetryRecord.Event.FAILED)
             .anyMatch(r -> r.payload().contains("BankNotOpen") || r.payload().contains("Abort"));

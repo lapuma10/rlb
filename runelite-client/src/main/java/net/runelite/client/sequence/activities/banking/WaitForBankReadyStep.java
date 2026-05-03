@@ -35,15 +35,26 @@ public final class WaitForBankReadyStep implements Step {
     @Override
     public Completion check(WorldSnapshot s, Blackboard bb) {
         Blackboard step = bb.scope(BlackboardScope.STEP);
-
-        if (s.bank().ready()) return new Completion.Succeeded("bank ready");
-
-        if (!s.bank().open()) return Completion.failed(new BlockReason.BankNotOpen());
-
         int startTick = step.get(K_START_TICK).orElse(s.tick());
-        if (s.tick() - startTick >= timeoutTicks()) {
-            return Completion.failed(new BlockReason.BankNotReady());
+        boolean timedOut = s.tick() - startTick >= timeoutTicks();
+
+        // Require BOTH the bank widget to be visible AND the container
+        // to be populated. {@code ready()} is just {@code container != null},
+        // and the BANK ItemContainer is STICKY from the previous bank
+        // visit — once you've opened the bank in this session the
+        // container reference persists even after you close the widget.
+        // So a freshly-dispatched booth click that hasn't yet produced
+        // a visible widget would still see {@code ready()=true} and pass
+        // this gate immediately, only for the next step to read the
+        // widget, find it hidden, and fail with BankNotOpen. The widget
+        // check must come first.
+        if (!s.bank().open()) {
+            if (timedOut) return Completion.failed(new BlockReason.BankNotOpen());
+            return Completion.RUNNING;
         }
+        if (s.bank().ready()) return new Completion.Succeeded("bank open + ready");
+
+        if (timedOut) return Completion.failed(new BlockReason.BankNotReady());
         return Completion.RUNNING;
     }
 
