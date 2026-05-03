@@ -267,14 +267,41 @@ public final class BankInteraction implements BankActions
         return true;
     }
 
-    /** {@inheritDoc} — dispatches a booth click, discarding the boolean result.
-     *  Call {@link #tryClickBankBoothRandom()} directly when the boolean return
-     *  matters for fail-counting. */
+    /** {@inheritDoc}
+     *
+     *  <p>This is the {@link BankActions} entry point — invoked from
+     *  inside a {@code RUN_TASK} the dispatcher worker is already
+     *  executing (see {@code OpenBankStep}). We must NOT call
+     *  {@link #tryClickBankBoothRandom()} here, even though it does
+     *  almost the same thing — that path queues a CLICK_NPC /
+     *  CLICK_GAME_OBJECT through {@code dispatcher.dispatch}, which
+     *  self-drops because we already hold the dispatcher's busy flag.
+     *  Use the worker-callable {@code *OnWorker} variants instead. */
     @Override
     public void clickBankBoothRandom() throws InterruptedException
     {
         assertWorkerThread("clickBankBoothRandom");
-        tryClickBankBoothRandom();
+        BoothCandidate pick = onClient(this::findBoothCandidate);
+        if (pick == null)
+        {
+            log.warn("bank: clickBankBoothRandom — no candidate within {} tiles",
+                BOOTH_SEARCH_RADIUS);
+            return;
+        }
+        if (pick.npc != null)
+        {
+            Integer idx = onClient(() -> pick.npc.getIndex());
+            if (idx == null) return;
+            log.info("bank: CLICK_NPC banker (worker, index={}, verb={})",
+                idx, pick.actionText);
+            dispatcher.npcClickOnWorker(idx, pick.actionText);
+            return;
+        }
+        WorldPoint tile = onClient(() -> pick.go.getWorldLocation());
+        if (tile == null) return;
+        log.info("bank: CLICK_GAME_OBJECT booth (worker, tile={}, verb={})",
+            tile, pick.actionText);
+        dispatcher.gameObjectClickOnWorker(tile, pick.actionText);
     }
 
     /** Outcome of {@link #ensureBoothInClickRange}. Lets the caller

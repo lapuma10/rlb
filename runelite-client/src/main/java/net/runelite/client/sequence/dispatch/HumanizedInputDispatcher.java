@@ -1658,6 +1658,27 @@ public class HumanizedInputDispatcher implements InputDispatcher
         invSlotClick(slot, verb);
     }
 
+    /** Worker-callable wrapper around {@link #npcClick} — same rationale
+     *  as {@link #boundsClickOnWorker}. Use from inside a {@code RUN_TASK}
+     *  (e.g. a {@code BankActions.clickBankBoothRandom} body invoked by
+     *  the GE bank-prep flow) that needs to click an NPC mid-flow without
+     *  re-acquiring busy. Calling {@link #dispatch(ActionRequest)} from
+     *  inside the worker would self-drop because the dispatcher already
+     *  holds {@link #busy} on our behalf. */
+    public void npcClickOnWorker(int npcIndex, String verb) throws InterruptedException
+    {
+        npcClick(npcIndex, verb);
+    }
+
+    /** Worker-callable wrapper around {@link #gameObjectClick} — same
+     *  rationale as {@link #npcClickOnWorker}. Use for GameObject bank
+     *  booths inside a {@code RUN_TASK}. */
+    public void gameObjectClickOnWorker(WorldPoint tile, String verb)
+        throws InterruptedException
+    {
+        gameObjectClick(tile, verb);
+    }
+
     /** Click inside a pre-resolved canvas rectangle with optional verb match.
      *  Caller has already located the exact bounds (typically by walking a
      *  parent widget's children and reading {@code child.getBounds()} on the
