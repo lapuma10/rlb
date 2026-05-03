@@ -17,8 +17,8 @@ import net.runelite.api.gameval.InventoryID;
 import net.runelite.api.gameval.ItemID;
 import net.runelite.client.callback.ClientThread;
 import net.runelite.client.plugins.recorder.combat.NpcSelector;
+import net.runelite.client.plugins.recorder.farm.BankInteraction;
 import net.runelite.client.plugins.recorder.npc.NpcInteraction;
-import net.runelite.client.plugins.recorder.scene.SceneScanner;
 import net.runelite.client.plugins.recorder.trail.Route;
 import net.runelite.client.plugins.recorder.trail.TrailRegistry;
 import net.runelite.client.plugins.recorder.trail.TrailWalker;
@@ -36,26 +36,24 @@ import net.runelite.client.sequence.internal.ActionRequest;
 /**
  * One-shot quest script for Cook's Assistant.
  *
- * <p>Collects the three quest ingredients and then talks to the Lumbridge
- * Cook to complete the quest:
+ * <p>Acquires the three ingredients (pot of flour, egg, bucket of milk),
+ * walks to the Lumbridge Cook, and talks twice (start the quest then hand
+ * the ingredients in). The acquisition strategy is bank-first then GE:
+ *
  * <ol>
- *   <li><b>Egg</b> — picked up from the ground in the chicken pen south of
- *       Lumbridge.</li>
- *   <li><b>Bucket of milk</b> — player must have an empty bucket in
- *       inventory; the script walks to the dairy cow at Fred's Farm and
- *       uses the "Milk" option.</li>
- *   <li><b>Pot of flour</b> — must already be in the player's inventory;
- *       the script will not collect it automatically.</li>
+ *   <li>Inventory check. All three present → straight to Cook.</li>
+ *   <li>{@code CHECK_BANK} — open the Lumbridge bank, withdraw whatever
+ *       missing items the bank has, close the bank.</li>
+ *   <li>If anything is still missing after banking, {@code WALK_TO_GE}
+ *       → {@code BUYING} (sequential one-item buys for whatever's
+ *       missing) → {@code WALK_BACK_TO_LUMBRIDGE}.</li>
+ *   <li>{@code WALK_TO_COOK} → {@code TALKING_TO_COOK}.</li>
  * </ol>
  *
- * <p>Items already in inventory skip their collection phase.
- *
- * <p><b>Pre-conditions (checked in {@link #start()}):</b>
- * <ul>
- *   <li>{@link ItemID#POT_FLOUR Pot of flour} in inventory.</li>
- *   <li>{@link ItemID#BUCKET_MILK Bucket of milk} already in inventory,
- *       OR {@link ItemID#BUCKET_EMPTY empty bucket} for milking.</li>
- * </ul>
+ * <p>The script assumes the player starts at the Lumbridge bank — the
+ * {@code CHECK_BANK} handler aborts loudly if no booth/banker is in
+ * range so the failure mode is "tell me to start at the bank" instead
+ * of an infinite open-bank-loop.
  *
  * <p><b>Threading:</b> one daemon worker thread pumps the FSM at ~650 ms
  * per tick. All client-API reads are marshalled to the client thread via
@@ -67,40 +65,48 @@ import net.runelite.client.sequence.internal.ActionRequest;
 public final class CooksAssistantScript
 {
     // ── NPC selectors ───────────────────────────────────────────────
-    private static final NpcSelector COOK_SELECTOR      = new NpcSelector("Cook", 12);
-    private static final NpcSelector DAIRY_COW_SELECTOR = new NpcSelector("Dairy cow", 10);
+    private static final NpcSelector COOK_SELECTOR = new NpcSelector("Cook", 12);
 
     // ── Route prefixes per walk state ───────────────────────────────
     // The walker uses {@link Route#fromTrails} to scoop up every trail
     // whose name starts with the prefix, so:
     //   - dropping multiple variants in the trails dir (e.g.
-    //     `to-cook-via-bridge.json` + `to-cook-via-shortcut.json`)
-    //     gives the v2 walker random alternation for free, and
+    //     `lumby-bank-to-cook-via-bridge.json` +
+    //     `lumby-bank-to-cook-via-shortcut.json`) gives the v2 walker
+    //     random alternation for free, and
     //   - the script aborts loudly with the missing prefix if no trail
-    //     matches — much better than the v1 PathSpec failure mode where
-    //     UniversalWalker silently spun BFS-bouncing-off-the-castle-wall.
+    //     matches — much better than silently spinning a broken walker.
     //
     // Existing user trails matching these prefixes (as of 2026-05-03):
     //   lumbridge_bank_to_ge_safe        ✓ (+ ..._v2 → Route picks both)
     //   ge_to_lumbridge_bank_safe        ✓
-    //   lumby-bank-to-pen                ✓
-    //   kitchen-to-pen                   ✗ — record one
-    //   to-cow                           ✗ — record one
-    //   to-cook                          ✗ — record one
+    //   lumby-bank-to-cook               ✗ — record one to enable WALK_TO_COOK
     private static final Map<State, String> ROUTE_PREFIX = new EnumMap<>(State.class);
     static
     {
         ROUTE_PREFIX.put(State.WALK_TO_GE,             "lumbridge_bank_to_ge_safe");
         ROUTE_PREFIX.put(State.WALK_BACK_TO_LUMBRIDGE, "ge_to_lumbridge_bank_safe");
-        ROUTE_PREFIX.put(State.WALK_BANK_TO_PEN,       "lumby-bank-to-pen");
-        ROUTE_PREFIX.put(State.WALK_TO_EGG_AREA,       "kitchen-to-pen");
-        ROUTE_PREFIX.put(State.WALK_TO_COW_AREA,       "to-cow");
-        ROUTE_PREFIX.put(State.WALK_TO_COOK,           "to-cook");
+        ROUTE_PREFIX.put(State.WALK_TO_COOK,           "lumby-bank-to-cook");
     }
 
     // ── NPC verb strings ────────────────────────────────────────────
     private static final String VERB_TALK_TO = "Talk-to";
-    private static final String VERB_MILK    = "Milk";
+
+    // ── GE buy intents (one per ingredient) ─────────────────────────
+    /** Item-id → BuyItemIntent pre-baked. Prices are deliberately set
+     *  generous (500 gp) since flour/egg/milk are pennies on the GE
+     *  and we'd rather pay through the nose than fail an offer because
+     *  the price moved 30 gp. {@link OfferWaitPolicy#until(int)} = 100
+     *  means "wait until the offer is fully filled (100%)." */
+    private static final BuyItemIntent BUY_FLOUR = new BuyItemIntent(
+        ItemID.POT_FLOUR, "Pot of flour", 1,
+        new PricePolicy.Exact(500), OfferWaitPolicy.until(100));
+    private static final BuyItemIntent BUY_EGG = new BuyItemIntent(
+        ItemID.EGG, "Egg", 1,
+        new PricePolicy.Exact(500), OfferWaitPolicy.until(100));
+    private static final BuyItemIntent BUY_MILK = new BuyItemIntent(
+        ItemID.BUCKET_MILK, "Bucket of milk", 1,
+        new PricePolicy.Exact(500), OfferWaitPolicy.until(100));
 
     // ── Cook dialogue options ───────────────────────────────────────
     /** Strings the option-menu walker should pick when the Cook offers
@@ -135,15 +141,11 @@ public final class CooksAssistantScript
     public enum State
     {
         IDLE,
-        WALK_TO_GE,            // Lumbridge bank → GE via recorded trail
-        BUYING_FLOUR,          // GrandExchangeScript buying 1× pot of flour
-        WALK_BACK_TO_LUMBRIDGE,// GE → Lumbridge bank via recorded trail
-        WALK_BANK_TO_PEN,      // Lumbridge bank (p2) → chicken pen (p0) via trail
-        WALK_TO_EGG_AREA,
-        COLLECTING_EGG,
-        WALK_TO_COW_AREA,
-        COLLECTING_MILK,
-        WALK_TO_COOK,
+        CHECK_BANK,            // Open bank, withdraw missing ingredients, close
+        WALK_TO_GE,            // Lumbridge bank → GE (only if bank didn't supply everything)
+        BUYING,                // GE buy loop — one ingredient at a time
+        WALK_BACK_TO_LUMBRIDGE,// GE → Lumbridge bank
+        WALK_TO_COOK,          // Lumbridge bank (p2) → Cook (kitchen, p0)
         TALKING_TO_COOK,
         DONE,
         ABORTED
@@ -154,7 +156,7 @@ public final class CooksAssistantScript
     private final ClientThread clientThread;
     private final HumanizedInputDispatcher dispatcher;
     private final NpcInteraction npcInteraction;
-    private final SceneScanner scene;
+    private final BankInteraction bank;
     private final TrailWalker trailWalker;
     private final TrailRegistry trailRegistry;
     private final GrandExchangeScript geScript;
@@ -178,8 +180,11 @@ public final class CooksAssistantScript
     /** Consecutive STUCK/ERROR increments from the walker; reset on ARRIVED
      *  and on every state transition. */
     private int walkerStuckCount;
-    /** True once GE startBuy has been called for pot of flour. */
-    private boolean flourBuyStarted;
+    /** Item-id of the GE buy currently in flight, or 0 between buys.
+     *  Tracked at the script level so we can detect "GE went IDLE
+     *  because the buy completed" vs "GE was IDLE because we haven't
+     *  started yet." */
+    private int currentBuyItemId;
     /** Lazy cache of compiled Routes per state. Built on first need by
      *  {@link #routeFor}. Cleared on stop so a re-record + restart picks
      *  up the new trail set. */
@@ -201,7 +206,7 @@ public final class CooksAssistantScript
         this.clientThread   = clientThread;
         this.dispatcher     = dispatcher;
         this.npcInteraction = new NpcInteraction(client, clientThread, dispatcher);
-        this.scene          = new SceneScanner(client);
+        this.bank           = new BankInteraction(client, clientThread, dispatcher);
         this.trailWalker    = new TrailWalker(client, clientThread, dispatcher);
         this.trailRegistry  = trailRegistry;
         this.geScript       = geScript;
@@ -250,10 +255,33 @@ public final class CooksAssistantScript
 
     private State decideInitialState()
     {
-        // Single client-thread hop to read all four relevant item counts.
+        if (allIngredientsPresent())
+        {
+            status.set("quest: all ingredients in inventory — going to Cook");
+            log.info("cooks-assistant: all ingredients present — going straight to Cook");
+            return State.WALK_TO_COOK;
+        }
+        status.set("quest: ingredients missing — checking bank");
+        log.info("cooks-assistant: missing ingredient(s) — opening bank first, GE as fallback");
+        return State.CHECK_BANK;
+    }
+
+    /** True iff all three ingredients (flour + egg + milk) are in the
+     *  player's inventory. Single client-thread hop. */
+    private boolean allIngredientsPresent()
+    {
+        int[] inv = readIngredientCounts();
+        return inv[0] > 0 && inv[1] > 0 && inv[2] > 0;
+    }
+
+    /** Returns {@code [flour, egg, milk]} counts from the inventory.
+     *  Single client-thread hop — cheaper than three {@code inventoryCount}
+     *  calls. Treats null inventory as all zero. */
+    private int[] readIngredientCounts()
+    {
         int[] inv = onClient(() -> {
             ItemContainer c = client.getItemContainer(InventoryID.INV);
-            int flour = 0, egg = 0, milk = 0, bucket = 0;
+            int flour = 0, egg = 0, milk = 0;
             if (c != null)
             {
                 for (Item item : c.getItems())
@@ -261,40 +289,14 @@ public final class CooksAssistantScript
                     if (item == null) continue;
                     int id  = item.getId();
                     int qty = item.getQuantity();
-                    if      (id == ItemID.POT_FLOUR)    flour  += qty;
-                    else if (id == ItemID.EGG)          egg    += qty;
-                    else if (id == ItemID.BUCKET_MILK)  milk   += qty;
-                    else if (id == ItemID.BUCKET_EMPTY) bucket += qty;
+                    if      (id == ItemID.POT_FLOUR)   flour += qty;
+                    else if (id == ItemID.EGG)         egg   += qty;
+                    else if (id == ItemID.BUCKET_MILK) milk  += qty;
                 }
             }
-            return new int[]{flour, egg, milk, bucket};
+            return new int[]{flour, egg, milk};
         });
-        int flourCount  = inv != null ? inv[0] : 0;
-        int eggCount    = inv != null ? inv[1] : 0;
-        int milkCount   = inv != null ? inv[2] : 0;
-        int bucketCount = inv != null ? inv[3] : 0;
-
-        if (flourCount == 0)
-        {
-            status.set("quest: pot of flour missing — walking to GE to buy one");
-            log.info("cooks-assistant: no pot of flour — heading to GE");
-            return State.WALK_TO_GE;
-        }
-
-        boolean needMilk = milkCount == 0;
-
-        if (needMilk && bucketCount == 0)
-        {
-            status.set("quest: no empty bucket for milking — add one and restart");
-            log.warn("cooks-assistant: no empty bucket — aborting");
-            setState(State.ABORTED);
-            return State.ABORTED;
-        }
-
-        if (eggCount == 0)  { status.set("quest: collecting egg");  return State.WALK_TO_EGG_AREA; }
-        if (needMilk)       { status.set("quest: collecting milk"); return State.WALK_TO_COW_AREA; }
-        status.set("quest: all items found — going to Cook");
-        return State.WALK_TO_COOK;
+        return inv != null ? inv : new int[]{0, 0, 0};
     }
 
     // ── Tick loop ───────────────────────────────────────────────────
@@ -321,14 +323,10 @@ public final class CooksAssistantScript
                 State cur = state.get();
                 switch (cur)
                 {
-                    case WALK_TO_GE             -> tickRouteWalk(cur, State.BUYING_FLOUR);
-                    case BUYING_FLOUR           -> tickBuyFlour();
-                    case WALK_BACK_TO_LUMBRIDGE -> tickRouteWalk(cur, State.WALK_BANK_TO_PEN);
-                    case WALK_BANK_TO_PEN       -> tickRouteWalk(cur, null);
-                    case WALK_TO_EGG_AREA       -> tickRouteWalk(cur, State.COLLECTING_EGG);
-                    case COLLECTING_EGG         -> tickCollectEgg();
-                    case WALK_TO_COW_AREA       -> tickRouteWalk(cur, State.COLLECTING_MILK);
-                    case COLLECTING_MILK        -> tickCollectMilk();
+                    case CHECK_BANK             -> tickCheckBank();
+                    case WALK_TO_GE             -> tickRouteWalk(cur, State.BUYING);
+                    case BUYING                 -> tickBuying();
+                    case WALK_BACK_TO_LUMBRIDGE -> tickRouteWalk(cur, State.WALK_TO_COOK);
                     case WALK_TO_COOK           -> tickRouteWalk(cur, State.TALKING_TO_COOK);
                     case TALKING_TO_COOK        -> tickTalkToCook();
                     case DONE, ABORTED, IDLE    -> running.set(false);
@@ -364,7 +362,7 @@ public final class CooksAssistantScript
             case ARRIVED ->
             {
                 walkerStuckCount = 0;
-                setState(onArrival != null ? onArrival : nextStateForCurrentInventory());
+                setState(onArrival);
             }
             case STUCK, ERROR ->
             {
@@ -409,158 +407,162 @@ public final class CooksAssistantScript
         }
     }
 
-    private void tickBuyFlour() throws InterruptedException
+    /** Open the Lumbridge bank, withdraw any missing ingredients the
+     *  bank holds, close it, then transition. After this state runs:
+     *  - all 3 ingredients in inventory → WALK_TO_COOK
+     *  - still missing one or more  → WALK_TO_GE (then BUYING)
+     *
+     *  <p>Aborts if no banker/booth is in click range — assumption is
+     *  the player started at the Lumbridge bank. */
+    private void tickCheckBank() throws InterruptedException
     {
-        if (inventoryCount(ItemID.POT_FLOUR) > 0)
+        // Phase 1: open the bank if it isn't already.
+        if (!bank.isBankOpen())
         {
-            log.info("cooks-assistant: pot of flour acquired — returning to Lumbridge");
+            if (bank.isBankPinUp())
+            {
+                abortWith("bank: PIN keypad is up — enter your PIN manually then restart");
+                return;
+            }
+            if (dispatcher.isBusy()) { status.set("bank: dispatcher busy"); return; }
+            long now = System.currentTimeMillis();
+            if (now - lastDispatchMs < DISPATCH_PACE_MS)
+            {
+                status.set("bank: pacing booth click");
+                return;
+            }
+            boolean ok = bank.tryClickBankBoothRandom();
+            if (!ok)
+            {
+                abortWith("bank: no booth/banker in click range — start the script at the Lumbridge bank");
+                return;
+            }
+            lastDispatchMs = now;
+            status.set("bank: booth clicked, waiting for window");
+            return;
+        }
+
+        // Phase 2: bank open, wait for the inventory container.
+        if (!bank.bankReady())
+        {
+            status.set("bank: waiting for container to load");
+            return;
+        }
+
+        // Phase 3: withdraw the next missing-but-banked ingredient.
+        // One per tick keeps the loop responsive and lets the inventory
+        // settle before re-evaluating.
+        int[] inv = readIngredientCounts();
+        if (tryWithdrawIfMissing(inv[0], ItemID.POT_FLOUR,   "pot of flour")) return;
+        if (tryWithdrawIfMissing(inv[1], ItemID.EGG,         "egg"))           return;
+        if (tryWithdrawIfMissing(inv[2], ItemID.BUCKET_MILK, "bucket of milk")) return;
+
+        // Phase 4: nothing left to withdraw — close the bank.
+        if (bank.isBankOpen())
+        {
+            bank.closeBank();
+            status.set("bank: closed, evaluating inventory");
+            return;
+        }
+
+        // Phase 5: transition based on what we ended up with.
+        int[] post = readIngredientCounts();
+        boolean allPresent = post[0] > 0 && post[1] > 0 && post[2] > 0;
+        if (allPresent)
+        {
+            log.info("cooks-assistant: bank supplied all ingredients — going straight to Cook");
+            setState(State.WALK_TO_COOK);
+        }
+        else
+        {
+            log.info("cooks-assistant: bank missing flour={} egg={} milk={} — heading to GE",
+                post[0] == 0, post[1] == 0, post[2] == 0);
+            setState(State.WALK_TO_GE);
+        }
+    }
+
+    /** If {@code currentCount == 0} and the bank holds {@code itemId},
+     *  attempt one withdraw. Returns true iff a withdraw was attempted
+     *  (caller should return so the inventory settles before another
+     *  withdraw fires). */
+    private boolean tryWithdrawIfMissing(int currentCount, int itemId, String desc)
+        throws InterruptedException
+    {
+        if (currentCount > 0) return false;
+        if (!bank.bankContainsItem(itemId))
+        {
+            log.debug("bank: {} not in bank — skipping (will buy on GE)", desc);
+            return false;
+        }
+        boolean ok = bank.tryWithdrawOne(itemId);
+        log.info("cooks-assistant: bank withdraw {} → {}", desc, ok);
+        status.set("bank: withdrew " + desc);
+        return true;
+    }
+
+    /** Sequential GE buy loop. Each tick: re-read inventory; if all
+     *  three present → walk back. Otherwise wait for the in-flight
+     *  buy (if any) and then start the next missing ingredient.
+     *
+     *  <p>{@link #currentBuyItemId} disambiguates "GE went IDLE because
+     *  the buy completed" from "GE was IDLE because we haven't started
+     *  the next one yet" — without it, two consecutive IDLE polls
+     *  could fire the same buy twice. */
+    private void tickBuying() throws InterruptedException
+    {
+        int[] inv = readIngredientCounts();
+        boolean haveFlour = inv[0] > 0;
+        boolean haveEgg   = inv[1] > 0;
+        boolean haveMilk  = inv[2] > 0;
+
+        if (haveFlour && haveEgg && haveMilk)
+        {
+            log.info("cooks-assistant: GE supplied everything — heading back to Lumbridge");
+            currentBuyItemId = 0;
             setState(State.WALK_BACK_TO_LUMBRIDGE);
             return;
         }
+
         SequenceState geSt = geScript.state();
         if (geSt == SequenceState.RUNNING)
         {
-            status.set("GE: buying pot of flour…");
+            status.set("GE: buying item " + currentBuyItemId + "…");
             return;
         }
         if (geSt == SequenceState.FAILED)
         {
-            abortWith("GE buy failed: " + geScript.status());
+            abortWith("GE buy failed (item " + currentBuyItemId + "): " + geScript.status());
             return;
         }
-        // IDLE — start the buy on first call
-        if (!flourBuyStarted)
+
+        // GE is IDLE. If we had a buy in flight, it finished — clear
+        // the marker so we can start the next one (or, if the buy
+        // failed silently, the inventory check below will catch it
+        // when we loop and find that item still missing).
+        if (currentBuyItemId != 0)
         {
-            BuyItemIntent intent = new BuyItemIntent(
-                ItemID.POT_FLOUR, "Pot of flour", 1,
-                new PricePolicy.Exact(500),
-                OfferWaitPolicy.until(100));
-            boolean ok = geScript.startBuy(intent);
-            if (!ok) { abortWith("GE: failed to start buy for pot of flour"); return; }
-            flourBuyStarted = true;
-            status.set("GE: buy submitted for pot of flour");
-            return;
+            log.info("cooks-assistant: GE buy of {} returned IDLE; inventory now flour={} egg={} milk={}",
+                currentBuyItemId, haveFlour, haveEgg, haveMilk);
+            currentBuyItemId = 0;
         }
-        // Was started and GE is IDLE again — buy finished (or cancelled)
-        if (inventoryCount(ItemID.POT_FLOUR) == 0)
-        {
-            abortWith("GE finished but pot of flour not in inventory");
-        }
-        else
-        {
-            log.info("cooks-assistant: pot of flour bought");
-            setState(State.WALK_BACK_TO_LUMBRIDGE);
-        }
+
+        // Start the next missing-ingredient buy. First-match-wins.
+        if (!haveFlour) { startGeBuy(BUY_FLOUR); return; }
+        if (!haveEgg)   { startGeBuy(BUY_EGG);   return; }
+        if (!haveMilk)  { startGeBuy(BUY_MILK);  return; }
     }
 
-    /** Read inventory and return the next logical state after arriving back at
-     *  Lumbridge (plane 0). Never returns {@link State#WALK_TO_GE} — flour is
-     *  assumed present by the time this is called. */
-    private State nextStateForCurrentInventory() throws InterruptedException
+    private void startGeBuy(BuyItemIntent intent)
     {
-        int[] inv = onClient(() -> {
-            ItemContainer c = client.getItemContainer(InventoryID.INV);
-            int egg = 0, milk = 0, bucket = 0;
-            if (c != null)
-            {
-                for (Item item : c.getItems())
-                {
-                    if (item == null) continue;
-                    int id = item.getId(), qty = item.getQuantity();
-                    if      (id == ItemID.EGG)          egg    += qty;
-                    else if (id == ItemID.BUCKET_MILK)  milk   += qty;
-                    else if (id == ItemID.BUCKET_EMPTY) bucket += qty;
-                }
-            }
-            return new int[]{egg, milk, bucket};
-        });
-        int egg    = inv != null ? inv[0] : 0;
-        int milk   = inv != null ? inv[1] : 0;
-        int bucket = inv != null ? inv[2] : 0;
-        if (egg == 0) return State.WALK_TO_EGG_AREA;
-        if (milk == 0)
+        boolean ok = geScript.startBuy(intent);
+        if (!ok)
         {
-            if (bucket == 0)
-            {
-                log.warn("cooks-assistant: no empty bucket after GE return");
-                status.set("ABORTED: no empty bucket for milking");
-                return State.ABORTED;
-            }
-            return State.WALK_TO_COW_AREA;
-        }
-        return State.WALK_TO_COOK;
-    }
-
-    private void tickCollectEgg() throws InterruptedException
-    {
-        if (inventoryCount(ItemID.EGG) > 0)
-        {
-            log.info("cooks-assistant: egg collected");
-            if (inventoryCount(ItemID.BUCKET_MILK) == 0)
-                setState(State.WALK_TO_COW_AREA);
-            else
-                setState(State.WALK_TO_COOK);
+            abortWith("GE: failed to start buy for " + intent.displayName());
             return;
         }
-        if (dispatcher.isBusy()) { status.set("egg: dispatcher busy"); return; }
-
-        long now = System.currentTimeMillis();
-        if (now - lastDispatchMs < DISPATCH_PACE_MS) { status.set("egg: pacing"); return; }
-
-        SceneScanner.Match egg = onClient(() -> scene.findTileItemById(ItemID.EGG, 10));
-        if (egg == null)
-        {
-            status.set("egg: no egg on ground — waiting for spawn");
-            return;
-        }
-        status.set("egg: picking up at " + egg.tile);
-        dispatcher.dispatch(ActionRequest.builder()
-            .kind(ActionRequest.Kind.CLICK_GROUND_ITEM)
-            .channel(ActionRequest.Channel.MOUSE)
-            .tile(egg.tile)
-            .itemId(ItemID.EGG)
-            .build());
-        lastDispatchMs = now;
-    }
-
-    private void tickCollectMilk() throws InterruptedException
-    {
-        if (inventoryCount(ItemID.BUCKET_MILK) > 0)
-        {
-            log.info("cooks-assistant: milk collected");
-            setState(State.WALK_TO_COOK);
-            return;
-        }
-        if (inventoryCount(ItemID.BUCKET_EMPTY) == 0)
-        {
-            abortWith("empty bucket consumed — can't milk dairy cow");
-            return;
-        }
-        if (dispatcher.isBusy()) { status.set("milk: dispatcher busy"); return; }
-
-        long now = System.currentTimeMillis();
-        if (now - lastDispatchMs < DISPATCH_PACE_MS) { status.set("milk: pacing"); return; }
-
-        Integer cowIndex = onClient(() -> {
-            Player p = client.getLocalPlayer();
-            if (p == null) return null;
-            net.runelite.api.NPC cow = DAIRY_COW_SELECTOR.pick(
-                client.getTopLevelWorldView().npcs(), p, p.getWorldLocation());
-            return cow == null ? null : cow.getIndex();
-        });
-        if (cowIndex == null)
-        {
-            status.set("milk: no dairy cow in range — waiting");
-            return;
-        }
-        status.set("milk: clicking dairy cow (" + VERB_MILK + ")");
-        dispatcher.dispatch(ActionRequest.builder()
-            .kind(ActionRequest.Kind.CLICK_NPC)
-            .channel(ActionRequest.Channel.MOUSE)
-            .npcIndex(cowIndex)
-            .verb(VERB_MILK)
-            .build());
-        lastDispatchMs = now;
+        currentBuyItemId = intent.itemId();
+        status.set("GE: buy submitted for " + intent.displayName());
+        log.info("cooks-assistant: GE buy submitted for {}", intent.displayName());
     }
 
     private void tickTalkToCook() throws InterruptedException
@@ -677,7 +679,7 @@ public final class CooksAssistantScript
         cookClickDispatched    = false;
         dialogueTaskDispatched = false;
         walkerStuckCount       = 0;
-        flourBuyStarted        = false;
+        currentBuyItemId       = 0;
         talkAttempts           = 0;
         // trailWalker.reset() clears its currentPath; the next walkRoute
         // call rebuilds activeRoutePath from a fresh weighted pick, so
