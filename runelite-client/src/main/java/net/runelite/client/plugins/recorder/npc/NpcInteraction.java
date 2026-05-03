@@ -1,12 +1,18 @@
 package net.runelite.client.plugins.recorder.npc;
 
+import java.awt.Polygon;
 import java.awt.Rectangle;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.Supplier;
+import javax.annotation.Nullable;
 import lombok.extern.slf4j.Slf4j;
 import net.runelite.api.Client;
+import net.runelite.api.NPC;
+import net.runelite.api.NPCComposition;
+import net.runelite.api.Player;
+import net.runelite.api.coords.WorldPoint;
 import net.runelite.api.widgets.Widget;
 import net.runelite.api.gameval.InterfaceID;
 import net.runelite.client.callback.ClientThread;
@@ -37,6 +43,120 @@ public final class NpcInteraction
         this.client = client;
         this.clientThread = clientThread;
         this.dispatcher = dispatcher;
+    }
+
+    /**
+     * Locate an NPC on the loaded scene that matches one of {@code preferredIds}
+     * or, if no id matches, the {@code nameFallback} (markup stripped,
+     * case-insensitive).
+     *
+     * <p>Must run on the OSRS client thread — the scene iteration and
+     * {@link NPC#getCanvasTilePoly()} call assert client thread under
+     * {@code -ea}, and a stale-scene read mid-frame can produce
+     * inconsistent results. Caller is responsible for marshalling
+     * (typically via {@link ClientThread#invokeLater}). Throws
+     * {@link IllegalStateException} when called off-thread so silent
+     * misuse is impossible.
+     *
+     * <p>Match priority: first NPC whose {@code getId()} is in
+     * {@code preferredIds} wins (id is invariant against name markup
+     * and quest-completion id swaps); failing that, the first NPC whose
+     * composition name strips to {@code nameFallback} (case-insensitive)
+     * wins. Only NPCs on the same plane as the local player AND within
+     * {@code scanRadius} (Chebyshev) tiles are considered.
+     *
+     * <p>The returned {@link NpcScan#diagnostic} is always populated:
+     * on hit it includes {@code matched-by=id|name} and
+     * {@code hullPoly=present|null}; on miss it lists up to 8 nearby
+     * NPCs with id and Chebyshev distance — invaluable for grepping
+     * the log when a match doesn't fire.
+     *
+     * @param scanRadius   Chebyshev tile distance from local player.
+     * @param preferredIds NPC ids to prefer, in order. Pass {@code null}
+     *                     or empty if only matching by name.
+     * @param nameFallback NPC composition name to match (case-insensitive,
+     *                     markup stripped) when no id matches. Pass
+     *                     {@code null} to disable the name fallback.
+     */
+    public NpcScan findOnScene(int scanRadius, @Nullable int[] preferredIds,
+                               @Nullable String nameFallback)
+    {
+        if (client != null && !client.isClientThread())
+        {
+            throw new IllegalStateException(
+                "NpcInteraction.findOnScene called off the OSRS client thread — "
+                    + "marshal via ClientThread.invokeLater first. Scene iteration "
+                    + "and getCanvasTilePoly() assert client thread under -ea.");
+        }
+        Player self = client.getLocalPlayer();
+        if (self == null) return NpcScan.miss("no local player");
+        WorldPoint here = self.getWorldLocation();
+        if (here == null) return NpcScan.miss("no player tile");
+
+        NPC byId = null;
+        NPC byName = null;
+        StringBuilder nearby = new StringBuilder();
+        int count = 0;
+        for (NPC npc : client.getTopLevelWorldView().npcs())
+        {
+            if (npc == null) continue;
+            WorldPoint loc = npc.getWorldLocation();
+            if (loc == null) continue;
+            if (loc.getPlane() != here.getPlane()) continue;
+            int dist = chebyshev(loc, here);
+            if (dist > scanRadius) continue;
+
+            if (count++ < 8)
+            {
+                NPCComposition c = npc.getComposition();
+                String n = c == null ? npc.getName() : c.getName();
+                if (n == null) n = "?";
+                nearby.append(stripMarkup(n)).append("(id=").append(npc.getId())
+                    .append(",d=").append(dist).append(") ");
+            }
+
+            if (byId == null && preferredIds != null)
+            {
+                for (int wantedId : preferredIds)
+                {
+                    if (npc.getId() == wantedId) { byId = npc; break; }
+                }
+                if (byId != null) continue;
+            }
+            if (byName == null && nameFallback != null)
+            {
+                NPCComposition c = npc.getComposition();
+                String n = c == null ? npc.getName() : c.getName();
+                if (n != null && nameFallback.equalsIgnoreCase(stripMarkup(n)))
+                {
+                    byName = npc;
+                }
+            }
+        }
+
+        NPC hit = byId != null ? byId : byName;
+        if (hit == null)
+        {
+            String diag = "scanned " + count + " NPCs within "
+                + scanRadius + " tiles plane " + here.getPlane()
+                + ": " + (nearby.length() == 0 ? "(none)" : nearby.toString().trim());
+            return NpcScan.miss(diag);
+        }
+        Polygon poly = hit.getCanvasTilePoly();
+        boolean onCanvas = poly != null;
+        String matchedBy = (hit == byId) ? "id" : "name";
+        return new NpcScan(hit.getIndex(), hit.getWorldLocation(), onCanvas,
+            "matched-by=" + matchedBy + " hullPoly=" + (onCanvas ? "present" : "null"));
+    }
+
+    private static int chebyshev(WorldPoint a, WorldPoint b)
+    {
+        return Math.max(Math.abs(a.getX() - b.getX()), Math.abs(a.getY() - b.getY()));
+    }
+
+    private static String stripMarkup(String s)
+    {
+        return s == null ? "" : s.replaceAll("<[^>]+>", "").trim();
     }
 
     /**

@@ -15,10 +15,12 @@ import net.runelite.api.Player;
 import net.runelite.api.coords.WorldPoint;
 import net.runelite.api.gameval.InventoryID;
 import net.runelite.api.gameval.ItemID;
+import net.runelite.api.gameval.NpcID;
 import net.runelite.client.callback.ClientThread;
 import net.runelite.client.plugins.recorder.combat.NpcSelector;
 import net.runelite.client.plugins.recorder.farm.BankInteraction;
 import net.runelite.client.plugins.recorder.npc.NpcInteraction;
+import net.runelite.client.plugins.recorder.npc.NpcScan;
 import net.runelite.client.plugins.recorder.trail.Route;
 import net.runelite.client.plugins.recorder.trail.TrailRegistry;
 import net.runelite.client.plugins.recorder.trail.TrailWalker;
@@ -66,6 +68,24 @@ public final class CooksAssistantScript
 {
     // ── NPC selectors ───────────────────────────────────────────────
     private static final NpcSelector COOK_SELECTOR = new NpcSelector("Cook", 12);
+    /** Lumbridge Castle Kitchen Cook (Cook's Assistant quest giver).
+     *  ID match is the primary path because it's invariant against
+     *  name markup ("<col=ffff00>Cook") and any future name drift,
+     *  and disambiguates from other "Cook"-named NPCs that may share
+     *  the scene (none in Lumbridge but defence in depth). Name match
+     *  is the fallback. */
+    private static final int COOK_NPC_ID = NpcID.COOK;
+    /** Permissive scene-range scan radius for {@link #findCookOnScene}.
+     *  Selector range was 12 tiles (Chebyshev) which already covers
+     *  the kitchen, but the dispatcher does its own visibility/aim
+     *  pipeline once we hand off — so we just need "is the cook
+     *  somewhere in scene-streamed memory" here, not "is he within
+     *  combat range". 24 mirrors typical OSRS scene-load radius. */
+    private static final int COOK_SCENE_SCAN_RADIUS = 24;
+    /** Throttle for the per-tick "what NPCs do I see" diagnostic log
+     *  in {@link #tickWalkToCook}. Without this the worker thread
+     *  would spam the log at TICK_MS cadence. */
+    private static final long COOK_VISIBILITY_LOG_PACE_MS = 3_000;
 
     // ── Route prefixes per walk state ───────────────────────────────
     // The walker uses {@link Route#fromTrails} to scoop up every trail
@@ -109,16 +129,32 @@ public final class CooksAssistantScript
         new PricePolicy.Exact(500), OfferWaitPolicy.until(100));
 
     // ── Cook dialogue options ───────────────────────────────────────
-    /** Strings the option-menu walker should pick when the Cook offers
-     *  a choice. First-match-wins, so list both the quest-start
-     *  ("Yes, I'll help.") and quest-hand-in ("Yes.") options.
-     *  Wiki-canonical wording for Cook's Assistant; if Jagex rephrases
-     *  one of these the dialogue stalls and the abort path will surface
-     *  the issue with the exact list we tried. */
+    /** Option strings to pick during Cook's Assistant dialogue.
+     *  {@link NpcInteraction#completeDialogue} matches in display order,
+     *  not list order — i.e. for any visible option menu it picks the
+     *  FIRST visible child whose text matches ANY entry here. So listing
+     *  every menu we expect to encounter across both talks is safe and
+     *  the order in this array doesn't matter.
+     *
+     *  <p>Quest dialogue tree (verified vs OSRS wiki + working OSBot
+     *  reference):
+     *  <ol>
+     *    <li>First "Talk-to": Cook laments → menu — pick "What's wrong?".
+     *    <li>Cook explains he needs ingredients → menu — pick
+     *        "I'm always happy to help a cook in distress." (the other
+     *        options abort the quest start).
+     *    <li>Second "Talk-to" (with ingredients): Cook asks if we got
+     *        them → menu — pick "Actually, I know where to find this
+     *        stuff." (some clients show a literal "Yes." follow-up
+     *        confirmation; harmless to keep listed).
+     *  </ol>
+     *  If Jagex rephrases any of these, {@code completeDialogue} logs
+     *  a warn naming the wanted list — easy to update from the log. */
     private static final String[] COOK_DIALOGUE_OPTIONS = {
-        "Yes, I'll help.",
-        "Yes.",
-        "I'll help."
+        "What's wrong?",
+        "I'm always happy to help a cook in distress.",
+        "Actually, I know where to find this stuff.",
+        "Yes."
     };
 
     /** Hard cap on talk attempts. Two is the canonical maximum (start +
@@ -224,6 +260,9 @@ public final class CooksAssistantScript
      *  {@link #routeFor}. Cleared on stop so a re-record + restart picks
      *  up the new trail set. */
     private final Map<State, Route> routeCache = new EnumMap<>(State.class);
+    /** Wall-clock of the last cook-visibility diagnostic. Throttle for
+     *  {@link #tickWalkToCook}'s per-tick scan log. */
+    private long lastCookVisibilityLogMs;
 
     // ── Constructor ─────────────────────────────────────────────────
 
@@ -363,7 +402,7 @@ public final class CooksAssistantScript
                     case BUYING                 -> tickBuying();
                     case DEPOSIT_CASH_AT_GE     -> tickDepositCashAtGe();
                     case WALK_BACK_TO_LUMBRIDGE -> tickRouteWalk(cur, State.WALK_TO_COOK);
-                    case WALK_TO_COOK           -> tickRouteWalk(cur, State.TALKING_TO_COOK);
+                    case WALK_TO_COOK           -> tickWalkToCook();
                     case TALKING_TO_COOK        -> tickTalkToCook();
                     case DONE, ABORTED, IDLE    -> running.set(false);
                 }
@@ -409,6 +448,61 @@ public final class CooksAssistantScript
             }
             default -> {}
         }
+    }
+
+    /** Walk-to-Cook with NPC short-circuit. Every tick: scan the loaded
+     *  scene for the Lumbridge Cook (by ID 4626 first, name "Cook" as
+     *  fallback). Three outcomes:
+     *
+     *  <ul>
+     *    <li><b>Cook on canvas</b> — hand off to {@link State#TALKING_TO_COOK}
+     *        immediately. Don't keep walking — the dispatcher's
+     *        {@link HumanizedInputDispatcher} npcClick rotates the camera,
+     *        re-resolves the hull at click time, and lets the OSRS server
+     *        pathfind the player to the talk-to interaction range. We
+     *        don't need to be standing on his tile.</li>
+     *    <li><b>Cook on scene but offscreen</b> — fall through to walker
+     *        but log diagnostic. The walker advances along the trail
+     *        and the next tick's scan will catch on-canvas as soon as
+     *        the kitchen comes into viewport.</li>
+     *    <li><b>Cook not on scene</b> — keep walking; we haven't got
+     *        close enough yet for the scene to stream his chunk.</li>
+     *  </ul>
+     *
+     *  <p>Diagnostic log throttled to every {@link #COOK_VISIBILITY_LOG_PACE_MS}
+     *  to surface what NPCs the script actually sees when something
+     *  goes wrong, without spamming on every tick. */
+    private void tickWalkToCook() throws InterruptedException
+    {
+        NpcScan scan = onClient(() -> npcInteraction.findOnScene(
+            COOK_SCENE_SCAN_RADIUS, new int[]{ COOK_NPC_ID }, "Cook"));
+        long now = System.currentTimeMillis();
+        if (scan != null && scan.found() && scan.onCanvas())
+        {
+            log.info("cooks-assistant: cook on canvas (idx={}, tile={}) — handing off to TALKING_TO_COOK",
+                scan.npcIndex(), scan.tile());
+            walkerStuckCount = 0;
+            setState(State.TALKING_TO_COOK);
+            return;
+        }
+        if (now - lastCookVisibilityLogMs > COOK_VISIBILITY_LOG_PACE_MS)
+        {
+            lastCookVisibilityLogMs = now;
+            if (scan == null)
+            {
+                log.info("cooks-assistant: cook scan returned null (client-thread timeout?) — continuing walk");
+            }
+            else if (!scan.found())
+            {
+                log.info("cooks-assistant: cook not on scene yet — {}", scan.diagnostic());
+            }
+            else
+            {
+                log.info("cooks-assistant: cook on scene at {} but offscreen — walker will continue ({})",
+                    scan.tile(), scan.diagnostic());
+            }
+        }
+        tickRouteWalk(State.WALK_TO_COOK, State.TALKING_TO_COOK);
     }
 
     /** Build (and cache) a {@link Route} for {@code curState} by
@@ -782,24 +876,27 @@ public final class CooksAssistantScript
         if (!cookClickDispatched)
         {
             if (dispatcher.isBusy()) { status.set("cook: dispatcher busy"); return; }
-            Integer cookIndex = onClient(() -> {
-                Player p = client.getLocalPlayer();
-                if (p == null) return null;
-                net.runelite.api.NPC cook = COOK_SELECTOR.pick(
-                    client.getTopLevelWorldView().npcs(), p, p.getWorldLocation());
-                return cook == null ? null : cook.getIndex();
-            });
-            if (cookIndex == null)
+            NpcScan scan = onClient(() -> npcInteraction.findOnScene(
+                COOK_SCENE_SCAN_RADIUS, new int[]{ COOK_NPC_ID }, "Cook"));
+            if (scan == null || !scan.found())
             {
-                status.set("cook: Cook not visible — walking closer");
+                status.set("cook: Cook not on scene — walking closer");
+                log.info("cooks-assistant: cook not on scene during talk-attempt — bouncing to WALK_TO_COOK ({})",
+                    scan == null ? "scan-null" : scan.diagnostic());
                 setState(State.WALK_TO_COOK);
                 return;
             }
-            status.set("cook: clicking " + VERB_TALK_TO);
+            // Hull may be null this exact frame (camera mid-rotate, behind a
+            // wall) — let the dispatcher's npcClick re-resolve when it runs.
+            // It already rotates the camera + re-fetches the hull at click
+            // time, and bails with "not on screen" if it still can't see him.
+            status.set("cook: clicking " + VERB_TALK_TO + " (idx=" + scan.npcIndex() + ")");
+            log.info("cooks-assistant: dispatching CLICK_NPC Talk-to cook idx={} tile={}",
+                scan.npcIndex(), scan.tile());
             dispatcher.dispatch(ActionRequest.builder()
                 .kind(ActionRequest.Kind.CLICK_NPC)
                 .channel(ActionRequest.Channel.MOUSE)
-                .npcIndex(cookIndex)
+                .npcIndex(scan.npcIndex())
                 .verb(VERB_TALK_TO)
                 .build());
             cookClickDispatched = true;
