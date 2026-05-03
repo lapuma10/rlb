@@ -862,21 +862,34 @@ public final class TrailWalker
 
         if (!trustRecordedAdjacent)
         {
-            // Standard v2 path: snapshot hull + reach, run visibility.
+            // Standard v2 path: snapshot hull + reach + run visibility,
+            // ALL in one client-thread hop. {@code whyHidden} reads
+            // viewport, menu, varbits, HUD widgets — every one of those
+            // asserts the client thread under -ea. Splitting snapshot
+            // (on-client) from whyHidden (off-client, the bug we hit)
+            // would trip the assertion the moment a real visibility
+            // pipeline ran. Mirrors ChickenCombatLoop's selector.pick
+            // pattern that wraps the visibility call inside onClient.
             // Pass `pos` directly (already client-thread-read at top of
-            // tick) — never hand a live Player to the visibility check;
-            // it would call self.getWorldLocation() on the worker thread
-            // and trip RuneLite's client-thread assertion.
-            TransportSnapshot snap = onClient(() -> snapshotTransport(t, leg.verb(), pos));
-            if (snap == null)
+            // tick) — never hand a live Player to the visibility check.
+            // VisResult conveys both "snapshot was unresolvable" and
+            // "visible/why-hidden" outcomes back from a single client-thread
+            // hop. Returning a sentinel from {@code onClient} (which itself
+            // can return null on interrupt) would conflate three states;
+            // a tiny holder keeps each one explicit.
+            VisResult vr = onClient(() -> {
+                TransportSnapshot snap = snapshotTransport(t, leg.verb(), pos);
+                if (snap == null) return VisResult.UNRESOLVED;
+                ObjectVisibility.Reason r = objectVisibility.whyHidden(
+                    t, snap.hull, pos, snap.reach);
+                return r == null ? VisResult.VISIBLE : VisResult.hidden(r);
+            });
+            // onClient returned null = thread was interrupted; bail.
+            if (vr == null || vr == VisResult.UNRESOLVED)
             {
-                // Couldn't get scene state — treat as not-yet-resolvable.
                 return Status.IN_PROGRESS;
             }
-
-            ObjectVisibility.Reason reason = objectVisibility.whyHidden(
-                t, snap.hull, pos, snap.reach);
-
+            ObjectVisibility.Reason reason = vr.reason();
             if (reason != null)
             {
                 if (reason.fixableByRotation() && !rotatedThisLeg)
@@ -942,6 +955,23 @@ public final class TrailWalker
         {
             this.hull = hull; this.reach = reach;
         }
+    }
+
+    /** Three-way visibility outcome bundled into a single value so the
+     *  on-client hop in {@link #handleTransportLeg} can return all three
+     *  cases (unresolved / visible / hidden-with-reason) without
+     *  overloading null. The two non-hidden states are singletons; only
+     *  identity comparison is used (see {@code vr == UNRESOLVED}). */
+    private static final class VisResult
+    {
+        static final VisResult UNRESOLVED = new VisResult(null);
+        static final VisResult VISIBLE    = new VisResult(null);
+
+        @Nullable private final ObjectVisibility.Reason reason;
+
+        private VisResult(@Nullable ObjectVisibility.Reason r) { this.reason = r; }
+        static VisResult hidden(ObjectVisibility.Reason r) { return new VisResult(r); }
+        @Nullable ObjectVisibility.Reason reason() { return reason; }
     }
 
     /** Client-thread: resolve the transport object on {@code tile} and

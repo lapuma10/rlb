@@ -207,6 +207,15 @@ public final class CooksAssistantScript
      *  (timeout elapsed without the widget appearing). Capped at
      *  {@link #MAX_BOOTH_CLICK_ATTEMPTS} then we abort. */
     private int boothClickAttempts;
+    /** Latched true once {@link BankInteraction#closeBank} has been
+     *  dispatched for this CHECK_BANK session. Without this flag
+     *  Phase 4 closes the bank, Phase 5 never runs (we return), and
+     *  next tick Phase 1 sees a closed bank and re-opens it — an
+     *  infinite open/close loop. With it: Phase 1 stops opening
+     *  once we've decided withdrawals are done, and Phase 5 fires
+     *  on the next tick once {@code isBankOpen()} reflects the
+     *  close. Reset by {@link #setState}. */
+    private boolean bankSessionDone;
     /** Lazy cache of compiled Routes per state. Built on first need by
      *  {@link #routeFor}. Cleared on stop so a re-record + restart picks
      *  up the new trail set. */
@@ -438,8 +447,14 @@ public final class CooksAssistantScript
      *  the player started at the Lumbridge bank. */
     private void tickCheckBank() throws InterruptedException
     {
-        // Phase 1: open the bank if it isn't already.
-        if (!bank.isBankOpen())
+        boolean bankOpen = bank.isBankOpen();
+
+        // Phase 1: open the bank if it isn't already AND we haven't
+        // already finished our withdraw session this state-entry. The
+        // session-done flag is the loop firewall: once we've dispatched
+        // closeBank, this guard prevents the next tick from seeing a
+        // closed bank and re-opening it.
+        if (!bankOpen && !bankSessionDone)
         {
             if (bank.isBankPinUp())
             {
@@ -483,35 +498,40 @@ public final class CooksAssistantScript
             status.set("bank: booth clicked, waiting for window");
             return;
         }
-        // Bank opened — clear the click guard so subsequent CHECK_BANK
-        // entries (after a setState reset) start fresh.
-        lastBoothClickMs   = 0;
-        boothClickAttempts = 0;
 
-        // Phase 2: bank open, wait for the inventory container.
-        if (!bank.bankReady())
+        if (bankOpen)
         {
-            status.set("bank: waiting for container to load");
-            return;
-        }
+            // Bank opened — clear the click guard so subsequent CHECK_BANK
+            // entries (after a setState reset) start fresh.
+            lastBoothClickMs   = 0;
+            boothClickAttempts = 0;
 
-        // Phase 3: withdraw the next missing-but-banked ingredient.
-        // One per tick keeps the loop responsive and lets the inventory
-        // settle before re-evaluating.
-        int[] inv = readIngredientCounts();
-        if (tryWithdrawIfMissing(inv[0], ItemID.POT_FLOUR,   "pot of flour")) return;
-        if (tryWithdrawIfMissing(inv[1], ItemID.EGG,         "egg"))           return;
-        if (tryWithdrawIfMissing(inv[2], ItemID.BUCKET_MILK, "bucket of milk")) return;
+            // Phase 2: wait for the inventory container.
+            if (!bank.bankReady())
+            {
+                status.set("bank: waiting for container to load");
+                return;
+            }
 
-        // Phase 4: nothing left to withdraw — close the bank.
-        if (bank.isBankOpen())
-        {
+            // Phase 3: withdraw the next missing-but-banked ingredient.
+            // One per tick keeps the loop responsive and lets the inventory
+            // settle before re-evaluating.
+            int[] inv = readIngredientCounts();
+            if (tryWithdrawIfMissing(inv[0], ItemID.POT_FLOUR,   "pot of flour"))  return;
+            if (tryWithdrawIfMissing(inv[1], ItemID.EGG,         "egg"))            return;
+            if (tryWithdrawIfMissing(inv[2], ItemID.BUCKET_MILK, "bucket of milk")) return;
+
+            // Phase 4: nothing left to withdraw — close the bank and
+            // latch the session-done flag so Phase 1 won't re-open on
+            // the next tick.
             bank.closeBank();
+            bankSessionDone = true;
             status.set("bank: closed, evaluating inventory");
             return;
         }
 
-        // Phase 5: transition based on what we ended up with.
+        // Phase 5: bank is closed AND we've completed our withdraw
+        // session — transition based on what we ended up with.
         int[] post = readIngredientCounts();
         boolean allPresent = post[0] > 0 && post[1] > 0 && post[2] > 0;
         if (allPresent)
@@ -728,6 +748,7 @@ public final class CooksAssistantScript
         currentBuyItemId       = 0;
         lastBoothClickMs       = 0;
         boothClickAttempts     = 0;
+        bankSessionDone        = false;
         talkAttempts           = 0;
         // trailWalker.reset() clears its currentPath; the next walkRoute
         // call rebuilds activeRoutePath from a fresh weighted pick, so
