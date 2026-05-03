@@ -878,10 +878,19 @@ public final class TrailWalker
             // can return null on interrupt) would conflate three states;
             // a tiny holder keeps each one explicit.
             VisResult vr = onClient(() -> {
-                TransportSnapshot snap = snapshotTransport(t, leg.verb(), pos);
+                TransportSnapshot snap = snapshotTransport(t, leg.verb());
                 if (snap == null) return VisResult.UNRESOLVED;
+                // Pass null reach for transports — the destination tile
+                // of a stair / ladder / door is intentionally inside the
+                // model's collision block (you click *into* the
+                // transport, you don't walk onto it). Feeding it through
+                // the BFS reachability check would always return
+                // NOT_REACHABLE → walker walks closer → at dist=1 the
+                // dispatch falls back to a useless minimap click. The
+                // remaining canvas / viewport / menu / HUD checks are
+                // the right gate for "can we click this object".
                 ObjectVisibility.Reason r = objectVisibility.whyHidden(
-                    t, snap.hull, pos, snap.reach);
+                    t, snap.hull, pos, null);
                 return r == null ? VisResult.VISIBLE : VisResult.hidden(r);
             });
             // onClient returned null = thread was interrupted; bail.
@@ -947,14 +956,13 @@ public final class TrailWalker
      *  callers already have it from {@code readPlayerTile()} and we
      *  must not pass a live {@code Player} reference into a worker-
      *  thread context (its accessors assert client thread). */
+    /** Per-tick scene snapshot for a transport leg. Was previously
+     *  carrying a {@code ReachabilityMap} too, but we deliberately
+     *  drop it — see {@link #handleTransportLeg} for why. */
     private static final class TransportSnapshot
     {
         @Nullable final Shape hull;
-        @Nullable final ReachabilityMap reach;
-        TransportSnapshot(@Nullable Shape hull, @Nullable ReachabilityMap reach)
-        {
-            this.hull = hull; this.reach = reach;
-        }
+        TransportSnapshot(@Nullable Shape hull) { this.hull = hull; }
     }
 
     /** Three-way visibility outcome bundled into a single value so the
@@ -979,7 +987,7 @@ public final class TrailWalker
      *  each have their own {@code getConvexHull()} accessor; the {@code
      *  TransportResolver.Match} encodes which one matched. */
     @Nullable
-    private TransportSnapshot snapshotTransport(WorldPoint tile, String verb, WorldPoint playerPos)
+    private TransportSnapshot snapshotTransport(WorldPoint tile, String verb)
     {
         if (client == null) return null;
 
@@ -1002,10 +1010,7 @@ public final class TrailWalker
                 log.debug("trail-walker: snapshotTransport resolver threw", th);
             }
         }
-
-        WorldView wv = client.getTopLevelWorldView();
-        ReachabilityMap reach = wv == null ? null : Reachability.compute(wv, playerPos);
-        return new TransportSnapshot(hull, reach);
+        return new TransportSnapshot(hull);
     }
 
     /** Issue a WALK toward the transport tile. Throttled by
