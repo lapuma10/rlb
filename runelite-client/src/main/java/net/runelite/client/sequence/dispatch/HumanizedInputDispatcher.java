@@ -1903,7 +1903,7 @@ public class HumanizedInputDispatcher implements InputDispatcher
     public void gameObjectClickOnWorker(WorldPoint tile, String verb)
         throws InterruptedException
     {
-        gameObjectClick(tile, verb);
+        gameObjectClick(tile, verb, false);
     }
 
     /** Click inside a pre-resolved canvas rectangle with optional verb match.
