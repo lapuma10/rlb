@@ -12,6 +12,8 @@ import net.runelite.api.GrandExchangeOfferState;
 import net.runelite.api.coords.WorldArea;
 import net.runelite.api.events.GameTick;
 import net.runelite.api.events.GrandExchangeOfferChanged;
+import net.runelite.api.gameval.InterfaceID;
+import net.runelite.api.widgets.Widget;
 import net.runelite.client.callback.ClientThread;
 import net.runelite.client.eventbus.Subscribe;
 import net.runelite.client.sequence.SequenceManager;
@@ -29,6 +31,7 @@ import net.runelite.client.sequence.activities.ge.SellItemIntent;
 import net.runelite.client.sequence.affordance.DiagnosticReason;
 import net.runelite.client.sequence.dispatch.HumanizedInputDispatcher;
 import net.runelite.client.sequence.dispatch.InputOwnership;
+import net.runelite.client.sequence.dispatch.SequenceSleep;
 import net.runelite.client.sequence.internal.ClientObserver;
 import net.runelite.client.sequence.telemetry.RingBufferTelemetry;
 import net.runelite.client.sequence.telemetry.TelemetryRecord;
@@ -221,6 +224,66 @@ public final class GrandExchangeScript {
 
     public SequenceState state()                  { return geManager == null ? SequenceState.IDLE : geManager.state(); }
     public String status()                        { return status.get(); }
+
+    // ─── GE-widget close primitive ──────────────────────────────────────
+    //
+    // The GE buy/sell sequence plans (GrandExchangeSequenceFactory.buyCore,
+    // sellCore) end with CollectOfferStep — they intentionally do NOT close
+    // the main GE widget so back-to-back GE ops don't pay a wasteful
+    // close-then-reopen. The price: when a caller is done with a batch and
+    // moves on to a non-GE world interaction (banker right-click, NPC talk),
+    // the GE widget overlay is still rendered and occludes the world click.
+    //
+    // Symptom (logged 2026-05-04): PieDishScript spent 8.5 minutes
+    // right-clicking a banker after a buy batch — every right-click menu
+    // came back without "Bank" because the GE widget was still up.
+    //
+    // Callers invoke tryCloseGrandExchange() explicitly when they're done
+    // with a batch and the next step touches the world.
+
+    private static final long GE_CLOSE_TIMEOUT_MS = 1_500L;
+    private static final long GE_CLOSE_POLL_MS    = 80L;
+
+    /** True iff the GE main widget ({@link InterfaceID.GeOffers#UNIVERSE})
+     *  is currently rendered. Safe to call from any thread — the widget
+     *  read is marshalled onto the client thread via
+     *  {@link HumanizedInputDispatcher#runOnClient}. */
+    public boolean isGrandExchangeOpen() throws InterruptedException {
+        Boolean open = dispatcher.runOnClient(() -> {
+            Widget w = client.getWidget(InterfaceID.GeOffers.UNIVERSE);
+            return w != null && !w.isHidden();
+        });
+        return Boolean.TRUE.equals(open);
+    }
+
+    /** Verified close.  Returns {@code true} if the GE was already closed
+     *  OR closes within {@value #GE_CLOSE_TIMEOUT_MS} ms.  Returns
+     *  {@code false} if the {@code GeOffers.UNIVERSE} widget is still
+     *  visible after the deadline; caller is responsible for retrying.
+     *
+     *  <p>Single ESC tap then poll — does NOT multi-tap.  If a chatbox
+     *  prompt overlay is still up (rare; should be drained by the time
+     *  {@code CollectOfferStep} returns), the first ESC dismisses the
+     *  chatbox and this call returns {@code false}; the caller's next
+     *  retry then closes the GE itself.
+     *
+     *  <p>Safe to call from any worker thread; throws
+     *  {@link InterruptedException} on interrupt.  Must NOT be called
+     *  from the client thread — the internal {@link SequenceSleep} would
+     *  freeze the game world.  See CLAUDE.md threading section. */
+    public boolean tryCloseGrandExchange() throws InterruptedException {
+        if (!isGrandExchangeOpen()) return true;
+        geActions.closeGrandExchange();
+        long deadline = System.currentTimeMillis() + GE_CLOSE_TIMEOUT_MS;
+        while (System.currentTimeMillis() < deadline) {
+            SequenceSleep.sleep(client, GE_CLOSE_POLL_MS);
+            if (!isGrandExchangeOpen()) return true;
+        }
+        log.warn("ge: tryCloseGrandExchange timed out after {}ms — widget still visible",
+            GE_CLOSE_TIMEOUT_MS);
+        return false;
+    }
+
     public List<TelemetryRecord> recentTelemetry() {
         SequenceManager m = geManager;
         if (m == null) return List.of();

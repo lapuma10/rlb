@@ -724,6 +724,17 @@ public final class CooksAssistantScript
 
         if (haveFlour && haveEgg && haveMilk)
         {
+            // Close the GE widget before transitioning to the GE-bank flow —
+            // the buy plans (buyCore / buyWithBankPrep) intentionally don't
+            // close GE, and the next state's bank-booth click would stall
+            // behind the still-rendered GE overlay (PieDishScript hit this
+            // exact bug 2026-05-04 → 8.5 minute bank stall). Stay in this
+            // state on close-failure so the next tick retries.
+            if (!geScript.tryCloseGrandExchange())
+            {
+                log.warn("cooks-assistant: GE buys done but GE failed to close, retrying next tick");
+                return;
+            }
             log.info("cooks-assistant: GE supplied everything — depositing leftover coins");
             currentBuyItemId = 0;
             setState(State.DEPOSIT_CASH_AT_GE);

@@ -576,6 +576,18 @@ public final class PieDishScript
         boolean waterComplete = plannedBuyWaterQty == 0 || buyWaterDone;
         if (dishComplete && flourComplete && waterComplete)
         {
+            // Close the GE main widget before transitioning to CHECKING_BANK —
+            // the buy plan ends with CollectOfferStep and intentionally leaves
+            // the widget open. If we don't close it here, the next state's
+            // banker right-click sees a GE-overlay-occluded world and the
+            // menu comes back without "Bank" (logged 2026-05-04 → 8.5 minute
+            // bank stall). Stay in BUYING_SUPPLIES on a verified-close
+            // failure so next tick retries.
+            if (!geScript.tryCloseGrandExchange())
+            {
+                log.warn("pie-dish buying: GE failed to close, retrying next tick");
+                return;
+            }
             log.info("pie-dish buying: all planned buys submitted — re-checking bank");
             setState(State.CHECKING_BANK);
             return;
@@ -748,11 +760,13 @@ public final class PieDishScript
                 if (elapsed > SKILLMULTI_TIMEOUT_MS)
                 {
                     log.warn("pie-dish craft: Skillmulti did not open after {}ms — retrying clicks", elapsed);
-                    // ESC any stale right-click menu before re-dispatching the
-                    // use+target sequence — leftover menus block the cs2 that
-                    // would open the Skillmulti dialog (see CLAUDE.md memory:
-                    // "Stuck right-click menu freezes the OSRS client").
-                    dispatcher.tapKey(java.awt.event.KeyEvent.VK_ESCAPE);
+                    // Dismiss any stale right-click menu before re-dispatching
+                    // the use+target sequence — leftover menus block the cs2
+                    // that would open the Skillmulti dialog (CLAUDE.md §8).
+                    // dismissMenu() moves the cursor outside the menu first
+                    // (no side effect on the inventory tab), only falling
+                    // back to VK_ESCAPE if move-away can't close the menu.
+                    dispatcher.dismissMenu();
                     craftClicksDone  = false;
                     skillmultiWaitMs = 0;
                 }
@@ -1011,7 +1025,15 @@ public final class PieDishScript
             return;
         }
 
-        // GE sell complete — loop again.
+        // GE sell complete — close the GE widget (same reason as the buy
+        // path: CollectOfferStep doesn't close it) before looping back to
+        // CHECKING_BANK, otherwise the next bank trip stalls behind the
+        // GE overlay.
+        if (!geScript.tryCloseGrandExchange())
+        {
+            log.warn("pie-dish: sell cycle done but GE failed to close, retrying next tick");
+            return;
+        }
         log.info("pie-dish: sell cycle complete, starting new loop");
         setState(State.CHECKING_BANK);
     }
