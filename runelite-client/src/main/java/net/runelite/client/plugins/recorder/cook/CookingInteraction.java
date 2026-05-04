@@ -210,6 +210,84 @@ public final class CookingInteraction
             scanner.findTileItemByIdRandomNear(itemId, SEARCH_RADIUS, jitter)));
     }
 
+    /** Find any GameObject named {@code namePattern} (case-insensitive)
+     *  whose tile lies inside {@code area}. Returns the closest such
+     *  match to the player, or null. Used to spot a still-burning fire
+     *  anywhere in the cookArea before falling through to the "find
+     *  logs and light a new one" branch. */
+    public Match findHeatSourceInArea(
+        String namePattern, net.runelite.api.coords.WorldArea area)
+        throws InterruptedException
+    {
+        if (area == null) return findHeatSource(namePattern);
+        return onClient(() -> {
+            Player self = client.getLocalPlayer();
+            if (self == null) return null;
+            WorldPoint here = self.getWorldLocation();
+            if (here == null) return null;
+            WorldView wv = client.getTopLevelWorldView();
+            if (wv == null) return null;
+            net.runelite.api.Scene scene = wv.getScene();
+            if (scene == null) return null;
+            net.runelite.api.Tile[][][] tiles = scene.getTiles();
+            int plane = area.getPlane();
+            if (tiles == null || plane < 0 || plane >= tiles.length) return null;
+            net.runelite.api.Tile[][] planeTiles = tiles[plane];
+
+            Match best = null;
+            int bestDist = Integer.MAX_VALUE;
+            for (int wx = area.getX(); wx < area.getX() + area.getWidth(); wx++)
+            {
+                for (int wy = area.getY(); wy < area.getY() + area.getHeight(); wy++)
+                {
+                    int sx = wx - wv.getBaseX();
+                    int sy = wy - wv.getBaseY();
+                    if (sx < 0 || sy < 0
+                        || sx >= planeTiles.length
+                        || sy >= planeTiles[0].length) continue;
+                    net.runelite.api.Tile t = planeTiles[sx][sy];
+                    if (t == null) continue;
+                    GameObject[] gos = t.getGameObjects();
+                    if (gos == null) continue;
+                    for (GameObject go : gos)
+                    {
+                        if (go == null) continue;
+                        net.runelite.api.ObjectComposition def =
+                            client.getObjectDefinition(go.getId());
+                        if (def == null) continue;
+                        if (def.getImpostorIds() != null)
+                        {
+                            try
+                            {
+                                net.runelite.api.ObjectComposition imp = def.getImpostor();
+                                if (imp != null) def = imp;
+                            }
+                            catch (Throwable ignored) { /* base def */ }
+                        }
+                        String name = def.getName();
+                        if (name == null || !name.equalsIgnoreCase(namePattern)) continue;
+                        LocalPoint lp = go.getLocalLocation();
+                        if (lp == null) continue;
+                        WorldPoint wp = WorldPoint.fromLocal(client, lp);
+                        if (wp.getPlane() != plane) continue;
+                        if (wp.getX() < area.getX() || wp.getX() >= area.getX() + area.getWidth()
+                            || wp.getY() < area.getY() || wp.getY() >= area.getY() + area.getHeight())
+                            continue;
+                        int d = Math.max(
+                            Math.abs(wp.getX() - here.getX()),
+                            Math.abs(wp.getY() - here.getY()));
+                        if (d < bestDist)
+                        {
+                            bestDist = d;
+                            best = new Match(wp, go, null);
+                        }
+                    }
+                }
+            }
+            return best;
+        });
+    }
+
     /** Find a Fire game object whose composition name matches
      *  {@code namePattern} and whose tile equals {@code targetTile}.
      *  Used to verify the fire we just lit actually appeared — vs.
@@ -381,7 +459,7 @@ public final class CookingInteraction
         if (err != null)
         {
             log.info("cook: logs Light click failed — {}", err);
-            dispatcher.dismissOpenMenuByMovingAway();
+            dispatcher.dismissMenu();
             dispatcher.clearSelectedWidgetTargetMode();
             return false;
         }

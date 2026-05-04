@@ -56,14 +56,26 @@ public final class LogoutHelper
             return true;
         }
         // Step 2: open the side-panel tab.
-        // STONE10 is the logout-orb tab in both fixed (Toplevel) and
-        // resizable-modern (ToplevelOsm) layouts.
+        // STONE10 is the logout-orb tab. There are THREE layouts in OSRS:
+        //   - Toplevel        (fixed classic)
+        //   - ToplevelOsm     (resizable modern)
+        //   - ToplevelPreEoc  (resizable classic / pre-EoC)
+        // client.isResized() picks "resizable" but doesn't tell us which
+        // resizable variant is active, so probe all three and use the
+        // first visible one. Order matters only for log clarity — only
+        // one is rendered at a time.
         Integer tabWidgetId = onClient(() -> {
-            int wid = client.isResized()
-                ? InterfaceID.ToplevelOsm.STONE10
-                : InterfaceID.Toplevel.STONE10;
-            Widget w = client.getWidget(wid);
-            return (w != null && !w.isHidden()) ? wid : null;
+            int[] candidates = {
+                InterfaceID.Toplevel.STONE10,
+                InterfaceID.ToplevelOsm.STONE10,
+                InterfaceID.ToplevelPreEoc.STONE10,
+            };
+            for (int wid : candidates)
+            {
+                Widget w = client.getWidget(wid);
+                if (w != null && !w.isHidden()) return wid;
+            }
+            return null;
         });
         if (tabWidgetId != null)
         {

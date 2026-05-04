@@ -363,7 +363,34 @@ public final class CollectOfferStep implements Step {
         if (dispatcher != null && dispatcher.isBusy()) {
             return Completion.RUNNING;
         }
+
+        // Timeout check is hoisted ABOVE the strategy branches so
+        // COLLECT_ALL is also bounded — previously its early
+        // `return Completion.RUNNING` after re-dispatch bypassed the
+        // typed-failure path, and the engine's outer timeout
+        // (StepFrame.timedOut) doesn't catch it either because
+        // re-dispatching every REDISPATCH_COOLDOWN_TICKS keeps the
+        // dispatcher cycling busy → idle → busy and `lastBusyTick`
+        // never falls behind by `timeoutTicks()`. The result was an
+        // infinite loop on a persistent silent-miss; now the step
+        // surfaces GeCollectFailed and Recovery.Retry(2) re-rolls
+        // (which forces COLLECT_ALL via persisted baseline path).
         Strategy strategy = step.get(K_STRATEGY).orElse(null);
+        int startTick = step.get(K_START_TICK).orElse(s.tick());
+        if (s.tick() - startTick >= timeoutTicks()) {
+            // Click-missed timeout: slot still occupied. Reason fields are
+            // best-effort — observed delta is meaningless when collecting
+            // notes since `count(unnotedItemId)` won't move regardless.
+            int expectedItemId = step.get(K_EXPECTED_DELTA_ITEM_ID).orElse(-1);
+            int startCount = step.get(K_EXPECTED_DELTA_START).orElse(0);
+            int now = (expectedItemId > 0) ? s.inventory().count(expectedItemId) : 0;
+            log.warn("collect: FAILED to collect \"{}\" from slot {} after {} ticks — strategy={} expectedItemId={} unnotedDelta={} (delta is unreliable for noted collects)",
+                ItemNames.nameOrId(client, expectedItemId), slot, s.tick() - startTick,
+                strategy, expectedItemId, now - startCount);
+            return Completion.failed(new GeBlockReason.GeCollectFailed(
+                slot, expectedItemId, now - startCount));
+        }
+
         if (strategy == Strategy.COLLECT_ALL) {
             Integer lastDispatch = step.get(K_LAST_DISPATCH_TICK).orElse(null);
             if (lastDispatch == null
@@ -382,20 +409,6 @@ public final class CollectOfferStep implements Step {
             }
         }
 
-        int startTick = step.get(K_START_TICK).orElse(s.tick());
-        if (s.tick() - startTick >= timeoutTicks()) {
-            // Click-missed timeout: slot still occupied. Reason fields are
-            // best-effort — observed delta is meaningless when collecting
-            // notes since `count(unnotedItemId)` won't move regardless.
-            int expectedItemId = step.get(K_EXPECTED_DELTA_ITEM_ID).orElse(-1);
-            int startCount = step.get(K_EXPECTED_DELTA_START).orElse(0);
-            int now = (expectedItemId > 0) ? s.inventory().count(expectedItemId) : 0;
-            log.warn("collect: FAILED to collect \"{}\" from slot {} after {} ticks — strategy={} expectedItemId={} unnotedDelta={} (delta is unreliable for noted collects)",
-                ItemNames.nameOrId(client, expectedItemId), slot, s.tick() - startTick,
-                strategy, expectedItemId, now - startCount);
-            return Completion.failed(new GeBlockReason.GeCollectFailed(
-                slot, expectedItemId, now - startCount));
-        }
         return Completion.RUNNING;
     }
 

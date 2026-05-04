@@ -280,6 +280,63 @@ public class CollectOfferStepTest {
         assertTrue("expected GeCollectFailed (telemetry: " + h.recentTelemetry() + ")", found);
     }
 
+    /** Regression: COLLECT_ALL strategy's check() had an early
+     *  `return Completion.RUNNING` after re-dispatch that bypassed the
+     *  step's own timeout, and the engine's outer timeout
+     *  (StepFrame.timedOut) didn't catch it either because re-dispatching
+     *  every REDISPATCH_COOLDOWN_TICKS keeps `lastBusyTick` refreshing.
+     *  The result was an infinite loop on any persistent silent-miss
+     *  (observed live 2026-05-03 22:34 — pie-dish-maker spammed
+     *  COLLECT_ALL for 20s with the slot stuck COMPLETE).
+     *
+     *  <p>This test pins COLLECT_ALL, holds the slot COMPLETE forever,
+     *  and asserts GeCollectFailed surfaces — the same shape as the
+     *  PER_SLOT version above.
+     *
+     *  <p>Scope note: this test pins the STEP-LEVEL timeout that the fix
+     *  hoists above the strategy branches. The harness's
+     *  {@link RecordingGeActions} has no real dispatcher, so the
+     *  busy ↔ idle cycle that defeats {@code StepFrame.timedOut} in
+     *  production isn't reproduced here — exercising that pathology
+     *  end-to-end would need an integration harness with a real
+     *  {@code HumanizedInputDispatcher} cycling busy on each
+     *  {@code ge.collectAll()}. The step-level guard added by the fix
+     *  is sufficient on its own to prevent the infinite loop. */
+    @Test
+    public void slotNeverEmptiesFailsWithCollectFailedOnCollectAllStrategy() {
+        WorldSnapshot pre = new GeSnapBuilder().tick(0).geOpen(true)
+            .offer(2, OfferSide.BUY, OfferStatus.COMPLETE, 4151, 5, 5, 1_500_000)
+            .invItem(4151, 0)
+            .build();
+        List<WorldSnapshot> snaps = new ArrayList<>();
+        snaps.add(pre);
+        for (int t = 1; t < 60; t++) {
+            snaps.add(new GeSnapBuilder().tick(t).geOpen(true)
+                .offer(2, OfferSide.BUY, OfferStatus.COMPLETE, 4151, 5, 5, 1_500_000)
+                .invItem(4151, 0).build());
+        }
+        RecordingGeActions a = new RecordingGeActions();
+        GeEngineHarness h = new GeEngineHarness().queue(snaps);
+        h.run(new LinearSequence("collectWrap")
+            .then(new SlotWriter(2))
+            .then(new CollectOfferStep(a, ALWAYS_COLLECT_ALL)));
+        h.advance(60);
+
+        assertEquals(SequenceState.FAILED, h.state());
+        // Confirm we actually went through the COLLECT_ALL branch (not
+        // the PER_SLOT path), so the test pins what it claims to pin.
+        assertTrue("expected ge.collectAll() to have been dispatched at least once: " + a.calls(),
+            a.calls().contains("collectAll()"));
+        boolean found = false;
+        for (TelemetryRecord r : h.recentTelemetry()) {
+            if (r.payload() != null && r.payload().contains("GeCollectFailed")) {
+                found = true; break;
+            }
+        }
+        assertTrue("expected GeCollectFailed for COLLECT_ALL strategy (telemetry: "
+            + h.recentTelemetry() + ")", found);
+    }
+
     @Test
     public void geNotOpenOnStartFailsWithGeNotOpen() {
         WorldSnapshot s = new GeSnapBuilder().tick(0).geOpen(false).build();

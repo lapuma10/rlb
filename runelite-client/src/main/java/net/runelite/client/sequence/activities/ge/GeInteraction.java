@@ -202,19 +202,19 @@ public final class GeInteraction implements GeActions {
 
     @Override
     public void openOfferDetail(int slot) {
-        // Plain left-click on the slot container. "View offer" is the slot's
-        // default (entryId=1) when it holds an offer, so a left-click hits it
-        // directly. We deliberately do NOT route through clickWidgetVerb here:
-        // its right-click fallback fires VK_ESCAPE on verb-mismatch, which
-        // closes the GE entirely — exactly what we're trying to interact with.
-        // Better to silently miss a click and retry than to dismiss the GE
-        // out from under the next step.
+        // Verb-routed click on the slot container. "View offer" is the
+        // slot's default (entryId=1) when it holds an offer (click-inspector
+        // 2026-05-01). The dispatcher pre-checks the hover menu before
+        // clicking — catches silent misses where the slot's bounds might
+        // resolve to a stale rect or be partially overlaid. The verb-
+        // mismatch right-click fallback now uses dismissMenu() (move-away),
+        // so it no longer closes the GE.
         int containerId = slotIndexWidget(slot);
         if (containerId == 0) {
             log.warn("openOfferDetail: slot {} out of range 0..7", slot);
             return;
         }
-        clickWidget(containerId, "openOfferDetail(" + slot + ")");
+        clickWidgetVerb(containerId, "View offer", "openOfferDetail(" + slot + ")");
     }
 
     private static int slotIndexWidget(int slot) {
@@ -1017,6 +1017,14 @@ public final class GeInteraction implements GeActions {
 
     @Override
     public void confirmOffer() {
+        // Plain widgetClick — the SETUP_CONFIRM default verb is not
+        // documented in click-inspector reference memory, so passing a
+        // guessed verb to clickWidgetVerb risks a strict-equality
+        // mismatch (VerbMatcher uses normalized .equals, not substring)
+        // → the right-click fallback fires, dismissMenu() runs, and the
+        // offer is never placed. This path has no observed silent-miss
+        // in production. Switch to verb-routed only after capturing the
+        // exact actions[0] string with click-inspector.
         clickWidget(InterfaceID.GeOffers.SETUP_CONFIRM, "confirmOffer");
     }
 
@@ -1026,7 +1034,9 @@ public final class GeInteraction implements GeActions {
         // Popupoverlay.BUTTON_1 (0x01210008), so "No" is BUTTON_0 (0x01210007).
         // Both are dynamic children of Popupoverlay.UNIVERSE; CLICK_WIDGET
         // resolves their bounds afresh, so this works in fixed and resizable
-        // layouts alike.
+        // layouts alike. Plain widgetClick — verbs not captured in the
+        // reference memory, no observed silent-miss in production; same
+        // reasoning as confirmOffer above.
         int widgetId = accept
             ? InterfaceID.Popupoverlay.BUTTON_1
             : InterfaceID.Popupoverlay.BUTTON_0;
@@ -1044,8 +1054,10 @@ public final class GeInteraction implements GeActions {
         //   idx=3 — leftover coins. actions=[Collect, Bank, Examine].
         // Both children share the parent's packed widget id (dynamic
         // children of DETAILS_COLLECT), so we walk the children and
-        // click their tight bounds directly. GE detail clicks must stay
-        // on plain left-clicks only.
+        // click their tight bounds directly. We pass each child's
+        // captured actions[0] as the verb so the dispatcher pre-checks
+        // the hover-menu before clicking; the verb-mismatch fallback
+        // uses dismissMenu() (move-away), so it does not close the GE.
         //
         // Two clicks need to be sequenced — bundle into a RUN_TASK so the
         // dispatcher's busy flag stays held across both, mirroring the
@@ -1101,7 +1113,12 @@ public final class GeInteraction implements GeActions {
         for (CollectButton b : firstPass) {
             log.info("ge collect: slot={} itemId={}", slot, b.itemId);
             log.info("collect({}): click '{}' at {} (item={})", slot, b.verb, b.bounds, b.itemId);
-            dispatcher.boundsClickOnWorker(b.bounds, null);
+            // Pass the captured default verb (Collect-notes / Collect-items /
+            // Collect) so the dispatcher pre-checks the hover-menu before
+            // clicking. Catches silent misses where the bounds rect might
+            // resolve to a non-collect pixel. dismissMenu() (move-away) is
+            // safe in the GE detail view — no ESC side effects.
+            dispatcher.boundsClickOnWorker(b.bounds, b.verb);
             SequenceSleep.sleep(client, 180L + ThreadLocalRandom.current().nextInt(380));
         }
 
@@ -1125,7 +1142,7 @@ public final class GeInteraction implements GeActions {
                 if (clickedItemIds.contains(b.itemId)) continue;
                 log.info("ge collect: slot={} itemId={}", slot, b.itemId);
                 log.info("collect({}): late click '{}' at {} (item={})", slot, b.verb, b.bounds, b.itemId);
-                dispatcher.boundsClickOnWorker(b.bounds, null);
+                dispatcher.boundsClickOnWorker(b.bounds, b.verb);
                 clickedItemIds.add(b.itemId);
                 anyNew = true;
                 SequenceSleep.sleep(client, 180L + ThreadLocalRandom.current().nextInt(380));
@@ -1294,14 +1311,23 @@ public final class GeInteraction implements GeActions {
         // GeOffers.COLLECTALL toolbar button. Default verb captured from
         // click-inspector 2026-05-01: actions=['Collect to inventory',
         // 'Collect to bank'], entryId=1 → left-click = "Collect to inventory".
-        // Plain left-click — see openOfferDetail for why we avoid the
-        // verb-routed path here (its right-click fallback closes the GE on
-        // verb mismatch via VK_ESCAPE).
-        clickWidget(InterfaceID.GeOffers.COLLECTALL, "collectAll");
+        // Verb-routed: the dispatcher pre-checks that the engine's hover-menu
+        // actually shows "Collect to inventory" on top before clicking.
+        // Catches silent misses where the bounds click would land on a
+        // non-COLLECTALL pixel (e.g. Walk-here behind a stale rect, an
+        // overlay) — we'd repeatedly fire walks instead of draining the
+        // slot. The verb-mismatch right-click fallback now uses dismissMenu()
+        // (move-cursor-away), so a miss no longer closes the GE.
+        clickWidgetVerb(InterfaceID.GeOffers.COLLECTALL, "Collect to inventory", "collectAll");
     }
 
     @Override
     public void closeGrandExchange() {
+        // Intentional VK_ESCAPE — exempt from the dismissMenu() policy used
+        // by every other GE click site. ESC is OSRS's canonical "close the
+        // topmost interface" key, which is exactly what this method's job
+        // is. The other GE sites avoid it because closing the GE there
+        // would be an unwanted side effect; here it's the goal.
         try {
             dispatcher.tapKey(KeyEvent.VK_ESCAPE);
         } catch (InterruptedException ie) {

@@ -3,10 +3,12 @@ package net.runelite.client.plugins.recorder.scripts;
 import java.util.concurrent.ThreadLocalRandom;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.Supplier;
 import lombok.extern.slf4j.Slf4j;
 import net.runelite.api.Client;
+import net.runelite.api.GameState;
 import net.runelite.api.Player;
 import net.runelite.api.coords.WorldArea;
 import net.runelite.api.coords.WorldPoint;
@@ -125,8 +127,23 @@ public final class CookingScriptV2
         LIGHTING_FIRE,
         COOKING,
         WALK_TO_BANK,
+        LOGGING_OUT,
+        IDLE_AFK,
         ABORTED
     }
+
+    /** Logout strategy rolled once at script start. */
+    private enum LogoutMode { MANUAL, AFK }
+
+    /** OSRS server idle-kick is 5 minutes of zero input. Add a small
+     *  buffer so the AFK status countdown reaches zero before the actual
+     *  disconnect — avoids the visible "AFK: 0s — still logged in?"
+     *  flicker if the server's clock drifts by a tick. */
+    private static final long IDLE_KICK_MS = 305_000L;
+    /** Pace logout-button retries — the dispatcher takes ~600ms to issue
+     *  each click chain and the inner panel lags one tick behind the
+     *  side-tab open. */
+    private static final long LOGOUT_RETRY_MS = 1_200L;
 
     private final Client client;
     private final ClientThread clientThread;
@@ -135,6 +152,7 @@ public final class CookingScriptV2
     private final BankInteraction bank;
     private final CookingInteraction cook;
     private final SidebarTabActions sidebarTabs;
+    private final LogoutHelper logoutHelper;
 
     private final AtomicReference<CookingLocation> location = new AtomicReference<>();
     private final AtomicInteger rawFoodId = new AtomicInteger(0);
@@ -145,6 +163,17 @@ public final class CookingScriptV2
 
     private final AtomicInteger cookedCount = new AtomicInteger(0);
     private final AtomicInteger burntCount  = new AtomicInteger(0);
+
+    // Optional cook-duration cap. Zero (default) = run indefinitely. Set
+    // by the panel via setMaxDurationMs before start(); checked in
+    // tickCooking at the natural "raw == 0" break point so the current
+    // inventory is fully cooked before we wind down.
+    private final AtomicLong maxDurationMs = new AtomicLong(0L);
+    private long startedAtMs;
+    private long afkStartedAtMs;
+    private long lastLogoutAttemptMs;
+    private int afkPctRolled;
+    private LogoutMode logoutMode;
 
     // Per-trip cached PathSpecs — built fresh on each leg so the random
     // tile picked at leg-start is reused across subsequent walker.tick
@@ -196,10 +225,14 @@ public final class CookingScriptV2
         this.bank = new BankInteraction(client, clientThread, dispatcher);
         this.cook = new CookingInteraction(client, clientThread, dispatcher);
         this.sidebarTabs = new SidebarTabActions(client, clientThread, dispatcher);
+        this.logoutHelper = new LogoutHelper(client, clientThread, dispatcher);
     }
 
     public void setLocation(CookingLocation l) { location.set(l); }
     public void setRawFoodId(int id) { rawFoodId.set(id); }
+    /** Cap the cook session length. {@code <= 0} disables the cap.
+     *  Read once at start(); changing it mid-run has no effect. */
+    public void setMaxDurationMs(long ms) { maxDurationMs.set(Math.max(0, ms)); }
     public CookingLocation location() { return location.get(); }
     public int rawFoodId() { return rawFoodId.get(); }
     public State state() { return state.get(); }
@@ -228,6 +261,28 @@ public final class CookingScriptV2
             running.set(false);
             return;
         }
+        // Roll session-wide humanization parameters ONCE so the choice is
+        // committed up front and visible in the log: AFK pct uniform in
+        // [23, 46]; logout mode = AFK with that probability, else MANUAL.
+        ThreadLocalRandom rnd = ThreadLocalRandom.current();
+        afkPctRolled = rnd.nextInt(23, 47);
+        logoutMode = (rnd.nextDouble() * 100.0) < afkPctRolled
+            ? LogoutMode.AFK : LogoutMode.MANUAL;
+        startedAtMs = System.currentTimeMillis();
+        afkStartedAtMs = 0L;
+        lastLogoutAttemptMs = 0L;
+        long maxMs = maxDurationMs.get();
+        if (maxMs > 0)
+        {
+            log.info("cookV2: session cap {} ms; afkPct={}% mode={}",
+                maxMs, afkPctRolled, logoutMode);
+        }
+        else
+        {
+            log.info("cookV2: no session cap; afkPct={}% mode={} (unused)",
+                afkPctRolled, logoutMode);
+        }
+
         State decided = decideResume();
         log.info("cookV2: resume → {} ({})", decided, status.get());
         setState(decided);
@@ -292,6 +347,25 @@ public final class CookingScriptV2
 
             while (running.get() && !Thread.currentThread().isInterrupted())
             {
+                State current = state.get();
+                // LOGGING_OUT / IDLE_AFK run BEFORE the player-presence
+                // check: we expect player==null mid-disconnect and need
+                // those ticks to self-detect the logged-out state and
+                // clear running. Otherwise the loop would spin on the
+                // "waiting for player" branch forever.
+                if (current == State.LOGGING_OUT)
+                {
+                    tickLoggingOut();
+                    SequenceSleep.sleep(client, TICK_MS);
+                    continue;
+                }
+                if (current == State.IDLE_AFK)
+                {
+                    tickIdleAfk();
+                    SequenceSleep.sleep(client, TICK_MS);
+                    continue;
+                }
+
                 WorldPoint here = onClient(() -> {
                     Player p = client.getLocalPlayer();
                     return p == null ? null : p.getWorldLocation();
@@ -303,7 +377,7 @@ public final class CookingScriptV2
                     continue;
                 }
                 safeDismissLevelUp();
-                switch (state.get())
+                switch (current)
                 {
                     case BANKING:        tickBanking();      break;
                     case WALK_TO_COOK:   tickWalk(true);     break;
@@ -594,11 +668,55 @@ public final class CookingScriptV2
         }
     }
 
-    /** Lazily build (or return cached) per-trip bank-walk path. The
-     *  random target tile inside {@code bankArea} is chosen once at
-     *  trip start; reused across every walker.tick until ARRIVED or
-     *  STUCK clears the cache (each makes the next leg pick a fresh
-     *  tile). */
+    /** Build the per-trip cook-walk path by aiming AT a real fire (or, if
+     *  none, a real log pile) we can already see from where we are now,
+     *  rather than rolling a uniformly-random tile inside {@code cookArea}
+     *  and hoping the engine can route us onto it. The old roll often
+     *  picked a tile that was blocked by a fire/log/NPC; the walker
+     *  routed the player to an adjacent tile and the 1×1 ARRIVED check
+     *  never fired, so we'd burn 15–30s per trip on a STUCK timeout.
+     *
+     *  <p>Order of preference:
+     *  <ol>
+     *    <li>An existing Fire inside the cookArea — we can cook on it
+     *        directly and skip the firemaking dance.</li>
+     *    <li>The closest log pile inside the cookArea (jittered via
+     *        {@link CookingInteraction#findGroundLogsVaried} so the
+     *        humanization goal of "different camera angle each trip"
+     *        survives).</li>
+     *    <li>Fallback to the full cookArea — V1's behaviour, used only
+     *        if the scene scan hasn't loaded yet.</li>
+     *  </ol>
+     *
+     *  <p>The chosen tile is wrapped in a 3×3 arrival window (clamped to
+     *  stay roughly inside {@code cookArea}) so engine routing onto an
+     *  adjacent walkable tile still counts as ARRIVED. */
+    private PathSpec currentCookPath()
+    {
+        if (tripCookPath != null) return tripCookPath;
+        CookingLocation l = location.get();
+        WorldPoint target = pickCookTargetTile(l);
+        if (target == null)
+        {
+            tripCookPath = PathSpec.builder("v2-cook-area-" + System.currentTimeMillis())
+                .walk("v2-cook", l.cookArea())
+                .build();
+        }
+        else
+        {
+            WorldArea around = arrivalWindowAround(target);
+            tripCookPath = PathSpec.builder("v2-cook-target-" + System.currentTimeMillis())
+                .walk("v2-cook", around)
+                .build();
+        }
+        return tripCookPath;
+    }
+
+    /** Lazily build (or return cached) per-trip bank-walk path. Pick a
+     *  random tile inside {@code bankArea} for click-pixel variance;
+     *  wrap in a 3×3 arrival window so engine routing onto an adjacent
+     *  walkable tile still counts as ARRIVED. Cleared in setState /
+     *  on ARRIVED / on STUCK. */
     private PathSpec currentBankPath()
     {
         if (tripBankPath == null)
@@ -609,29 +727,51 @@ public final class CookingScriptV2
         return tripBankPath;
     }
 
-    private PathSpec currentCookPath()
+    /** Returns the tile of an existing Fire (preferred) or the closest
+     *  log pile inside {@code l.cookArea()}, or null if nothing visible.
+     *  All scans run on the client thread (CookingInteraction marshals
+     *  via onClient internally) and use SEARCH_RADIUS=12 around the
+     *  player — large enough to spot the cook spot from the bank. */
+    private WorldPoint pickCookTargetTile(CookingLocation l)
     {
-        if (tripCookPath == null)
+        WorldArea cookArea = l.cookArea();
+        try
         {
-            CookingLocation l = location.get();
-            tripCookPath = buildOneLegRandomTilePath(l.cookArea(), "v2-cook");
+            CookingInteraction.Match fire = cook.findHeatSource(l.heatSourceName());
+            if (fire != null && fire.tile != null && areaContains(cookArea, fire.tile))
+                return fire.tile;
+            CookingInteraction.Match logs = cook.findGroundLogsVaried(
+                l.groundLogsItemId(), LOG_JITTER_TILES);
+            if (logs != null && logs.tile != null && areaContains(cookArea, logs.tile))
+                return logs.tile;
         }
-        return tripCookPath;
+        catch (InterruptedException ie) { Thread.currentThread().interrupt(); }
+        catch (Throwable th) { log.warn("cookV2: pickCookTargetTile threw", th); }
+        return null;
+    }
+
+    /** Build a 3×3 area centred on {@code centre} on its plane. The
+     *  walker's ARRIVED check is "player's tile is inside this bbox" —
+     *  3×3 absorbs the engine routing around blocked tiles (fires, logs,
+     *  NPCs) without sending the player wandering. */
+    private static WorldArea arrivalWindowAround(WorldPoint centre)
+    {
+        return new WorldArea(centre.getX() - 1, centre.getY() - 1, 3, 3, centre.getPlane());
     }
 
     /** Pick a uniformly-random tile inside {@code area}; wrap it in a
-     *  1×1 sub-area; build a one-leg PathSpec targeting that sub-area.
-     *  ARRIVED fires when the player's tile equals the picked tile,
-     *  matching how V1's WALK_AREA arrival check behaves. */
+     *  3×3 arrival window so engine routing onto an adjacent walkable
+     *  tile still counts as ARRIVED (fixes the silent STUCK loop when
+     *  the random tile is blocked by an object/NPC). */
     private static PathSpec buildOneLegRandomTilePath(WorldArea area, String label)
     {
         ThreadLocalRandom r = ThreadLocalRandom.current();
         int dx = r.nextInt(Math.max(1, area.getWidth()));
         int dy = r.nextInt(Math.max(1, area.getHeight()));
         WorldPoint pick = new WorldPoint(area.getX() + dx, area.getY() + dy, area.getPlane());
-        WorldArea oneByOne = new WorldArea(pick.getX(), pick.getY(), 1, 1, area.getPlane());
+        WorldArea around = arrivalWindowAround(pick);
         return PathSpec.builder(label + "-" + System.currentTimeMillis())
-            .walk(label, oneByOne)
+            .walk(label, around)
             .build();
     }
 
@@ -689,6 +829,21 @@ public final class CookingScriptV2
         if (now < lightingBackoffUntilMs)
         {
             status.set("light: backoff (" + (lightingBackoffUntilMs - now) + "ms)");
+            return;
+        }
+
+        // Before doing anything tinderbox-related, check whether ANY fire
+        // is already burning inside the cookArea (left over from our last
+        // trip, or another player's). If so, just adopt it — relighting
+        // when there's already a live fire two tiles over was the "wtf
+        // it lit a far log instead of using the burning fire" bug.
+        CookingInteraction.Match liveFire = cook.findHeatSourceInArea(
+            l.heatSourceName(), l.cookArea());
+        if (liveFire != null && liveFire.tile != null)
+        {
+            log.info("cookV2: fire already burning at {} in cookArea — adopting", liveFire.tile);
+            litFireTile = liveFire.tile;
+            setState(State.COOKING);
             return;
         }
 
@@ -831,6 +986,28 @@ public final class CookingScriptV2
 
         if (raw == 0)
         {
+            // Natural break point — current inventory fully cooked. If
+            // the session cap has elapsed, wind down here instead of
+            // banking again. The mode (AFK / MANUAL) was rolled at
+            // start(); we just branch on it.
+            long cap = maxDurationMs.get();
+            if (cap > 0 && (now - startedAtMs) >= cap)
+            {
+                if (logoutMode == LogoutMode.AFK)
+                {
+                    log.info("cookV2: session cap reached after {}ms — going AFK ({}% rolled)",
+                        now - startedAtMs, afkPctRolled);
+                    afkStartedAtMs = now;
+                    setState(State.IDLE_AFK);
+                }
+                else
+                {
+                    log.info("cookV2: session cap reached after {}ms — manual logout ({}% AFK rolled, did not pick AFK)",
+                        now - startedAtMs, afkPctRolled);
+                    setState(State.LOGGING_OUT);
+                }
+                return;
+            }
             status.set("cook: out of raw food — back to bank");
             setState(State.WALK_TO_BANK);
             return;
@@ -997,6 +1174,66 @@ public final class CookingScriptV2
             return;
         }
         lastCookActionAtMs = System.currentTimeMillis();
+    }
+
+    // ────────────────────────────────────────────────────────────────
+    // LOGGING_OUT — manual click-logout via LogoutHelper
+    // IDLE_AFK   — sit idle until the OSRS server idle-kicks the player
+    // ────────────────────────────────────────────────────────────────
+
+    /** Issue logout clicks on a paced loop until the client reports a
+     *  non-LOGGED_IN game state, then stop the worker. {@link
+     *  LogoutHelper#tryLogout()} handles "open the side-tab first" vs.
+     *  "click the inner Logout panel" — we just retry it. */
+    private void tickLoggingOut() throws InterruptedException
+    {
+        GameState gs = onClient(client::getGameState);
+        if (gs != null && gs != GameState.LOGGED_IN)
+        {
+            log.info("cookV2: logged out (gameState={}) — stopping", gs);
+            status.set("logout: complete (" + gs + ")");
+            running.set(false);
+            return;
+        }
+        long now = System.currentTimeMillis();
+        if (lastLogoutAttemptMs > 0 && (now - lastLogoutAttemptMs) < LOGOUT_RETRY_MS)
+        {
+            status.set("logout: retrying in "
+                + (LOGOUT_RETRY_MS - (now - lastLogoutAttemptMs)) + "ms");
+            return;
+        }
+        if (dispatcher.isBusy())
+        {
+            status.set("logout: dispatcher busy");
+            return;
+        }
+        boolean dispatched = logoutHelper.tryLogout();
+        lastLogoutAttemptMs = now;
+        status.set(dispatched ? "logout: clicked" : "logout: panel not visible — retry");
+    }
+
+    /** Idle the worker — no clicks, no camera, no dispatcher activity.
+     *  The OSRS server idle-kicks the player after ~5 minutes of zero
+     *  input ({@link #IDLE_KICK_MS}); we just publish a status countdown
+     *  while waiting. Worker stops when the client transitions out of
+     *  LOGGED_IN. */
+    private void tickIdleAfk() throws InterruptedException
+    {
+        GameState gs = onClient(client::getGameState);
+        if (gs != null && gs != GameState.LOGGED_IN)
+        {
+            log.info("cookV2: AFK kicked (gameState={}) — stopping", gs);
+            status.set("afk: kicked (" + gs + ")");
+            running.set(false);
+            return;
+        }
+        long now = System.currentTimeMillis();
+        long elapsed = afkStartedAtMs == 0 ? 0 : now - afkStartedAtMs;
+        long remaining = Math.max(0, IDLE_KICK_MS - elapsed);
+        long mins = remaining / 60_000L;
+        long secs = (remaining % 60_000L) / 1_000L;
+        status.set("AFK: " + mins + "m " + secs + "s until kicked ("
+            + afkPctRolled + "% rolled)");
     }
 
     // ────────────────────────────────────────────────────────────────

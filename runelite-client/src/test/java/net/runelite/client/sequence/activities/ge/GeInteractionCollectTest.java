@@ -143,8 +143,8 @@ public class GeInteractionCollectTest {
 
         // Both buttons must be clicked, item before coins.
         org.mockito.InOrder order = inOrder(dispatcher);
-        order.verify(dispatcher).boundsClickOnWorker(ITEM_BOUNDS, null);
-        order.verify(dispatcher).boundsClickOnWorker(COINS_BOUNDS, null);
+        order.verify(dispatcher).boundsClickOnWorker(ITEM_BOUNDS, "Collect-notes");
+        order.verify(dispatcher).boundsClickOnWorker(COINS_BOUNDS, "Collect");
     }
 
     /**
@@ -180,8 +180,8 @@ public class GeInteractionCollectTest {
         GeInteraction ge = new GeInteraction(client, null, dispatcher);
         ge.runCollectFromDetail(0);
 
-        verify(dispatcher).boundsClickOnWorker(ITEM_BOUNDS, null);
-        verify(dispatcher).boundsClickOnWorker(COINS_BOUNDS, null);
+        verify(dispatcher).boundsClickOnWorker(ITEM_BOUNDS, "Collect-notes");
+        verify(dispatcher).boundsClickOnWorker(COINS_BOUNDS, "Collect");
         // INDEX_0 (View offer) must NOT be clicked before both buttons are collected —
         // the GE CS2 hides INDEX_0 while GE_SELECTEDSLOT > 0 (detail view open).
         // Here both buttons exist in DETAILS_COLLECT before any click, so the
@@ -234,8 +234,8 @@ public class GeInteractionCollectTest {
         ge.runCollectFromDetail(0);
 
         org.mockito.InOrder order = inOrder(dispatcher);
-        order.verify(dispatcher).boundsClickOnWorker(ITEM_BOUNDS, null);
-        order.verify(dispatcher).boundsClickOnWorker(COINS_BOUNDS, null);
+        order.verify(dispatcher).boundsClickOnWorker(ITEM_BOUNDS, "Collect-notes");
+        order.verify(dispatcher).boundsClickOnWorker(COINS_BOUNDS, "Collect");
     }
 
     /**

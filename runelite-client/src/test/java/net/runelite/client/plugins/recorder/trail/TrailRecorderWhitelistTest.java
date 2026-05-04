@@ -28,6 +28,14 @@ public class TrailRecorderWhitelistTest
     }
 
     @Test
+    public void whitelistContainsSpiralStaircaseShortcuts()
+    {
+        assertTrue(TrailRecorder.isTransportVerb("Bottom-floor"));
+        assertTrue(TrailRecorder.isTransportVerb("Top-floor"));
+        assertTrue(TrailRecorder.isTransportVerb("Ground-floor"));
+    }
+
+    @Test
     public void whitelistRejectsCommonNonTransportVerbs()
     {
         assertFalse(TrailRecorder.isTransportVerb("Walk here"));

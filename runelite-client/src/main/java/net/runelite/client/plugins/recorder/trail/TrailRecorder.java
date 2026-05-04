@@ -31,10 +31,18 @@ import net.runelite.client.eventbus.Subscribe;
 @RequiredArgsConstructor(onConstructor_ = {@javax.inject.Inject})
 public final class TrailRecorder
 {
-    /** The verbs that mark a region-transition click. Mirror of the spec. */
+    /** The verbs that mark a region-transition click. Mirror of the spec.
+     *
+     *  <p>"Bottom-floor" / "Top-floor" / "Ground-floor" are spiral-staircase
+     *  shortcuts (e.g. Lumbridge castle south staircase) that teleport
+     *  through the intermediate plane in one click. Without them in the
+     *  whitelist, a user picking "Bottom-floor" instead of plain "Climb-down"
+     *  silently records a plane jump with NO transport event and the walker
+     *  has nothing to click — see lumby_bank_to_cook regression of 2026-05-03. */
     public static final Set<String> TRANSPORT_VERBS = Set.of(
         "Open", "Close",
         "Climb-up", "Climb-down", "Climb", "Climb-over",
+        "Bottom-floor", "Top-floor", "Ground-floor",
         "Cross", "Pass",
         "Squeeze-through", "Squeeze-past",
         "Jump",

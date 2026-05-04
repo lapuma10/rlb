@@ -48,6 +48,8 @@ public final class CollectAllCompletedOffersStep implements Step {
         BlackboardKey.of("collectAll.phase", Phase.class);
     private static final BlackboardKey<Integer> K_LAST_DISPATCH_TICK =
         BlackboardKey.of("collectAll.lastDispatchTick", Integer.class);
+    private static final BlackboardKey<Integer> K_START_TICK =
+        BlackboardKey.of("collectAll.startTick", Integer.class);
 
     /** Default coin flip — 63% returns true (use COLLECTALL toolbar). The
      *  remainder uses the per-slot detail-view dance. Tuned per user
@@ -103,6 +105,7 @@ public final class CollectAllCompletedOffersStep implements Step {
 
         Strategy strategy = useCollectAll.getAsBoolean() ? Strategy.COLLECT_ALL : Strategy.PER_SLOT;
         step.put(K_STRATEGY, strategy);
+        step.put(K_START_TICK, s.tick());
 
         if (strategy == Strategy.COLLECT_ALL) {
             // One click drains every completed offer.
@@ -162,6 +165,21 @@ public final class CollectAllCompletedOffersStep implements Step {
         if (firstCompleteSlot(s.grandExchange()) < 0) {
             return new Completion.Succeeded("all completed offers collected");
         }
+
+        // Step-level timeout — same shape as CollectOfferStep.check(). The
+        // engine's outer StepFrame.timedOut doesn't catch a stuck COLLECT_ALL
+        // because re-dispatching every REDISPATCH_COOLDOWN_TICKS keeps
+        // `lastBusyTick` refreshing, so accumulated idle never reaches
+        // `timeoutTicks()`. Without this check a persistent silent-miss
+        // turns into an infinite loop on a step that pre-flights every GE
+        // session (CLAUDE.md §8 — bot freeze).
+        Integer startTick = step.get(K_START_TICK).orElse(null);
+        if (startTick != null && s.tick() - startTick >= timeoutTicks()) {
+            return Completion.failed(new GeBlockReason.GeOfferRejected(
+                "collect-all-completed: did not drain within "
+                    + timeoutTicks() + " ticks"));
+        }
+
         if (step.get(K_STRATEGY).orElse(null) == Strategy.COLLECT_ALL) {
             Integer lastDispatch = step.get(K_LAST_DISPATCH_TICK).orElse(null);
             if (lastDispatch == null

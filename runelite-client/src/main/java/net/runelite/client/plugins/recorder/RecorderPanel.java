@@ -221,6 +221,10 @@ public final class RecorderPanel extends PluginPanel
     private final JButton cookStopBtn = new JButton("Stop");
     private final JComboBox<CookingLocation> cookLocationBox = new JComboBox<>();
     private final JComboBox<CookingFood.Entry> cookFoodBox = new JComboBox<>();
+    // V2-only session cap. 0/0 = no cap. Read by onCookV2Start; mid-run
+    // edits have no effect (script reads at start()).
+    private final JTextField cookV2MaxHoursField = new JTextField("0", 3);
+    private final JTextField cookV2MaxMinutesField = new JTextField("0", 3);
     private final JLabel cookStatusLabel = new JLabel("Cooking: idle");
     private final JLabel cookCountsLabel = new JLabel("Cooked: 0  Burnt: 0");
     // Cook's Assistant quest script.
@@ -1775,6 +1779,15 @@ public final class RecorderPanel extends PluginPanel
         // row's max height to its preferred height with unbounded width.
         JPanel locationRow = labelledRow("Location:", cookLocationBox);
         JPanel foodRow     = labelledRow("Food:",     cookFoodBox);
+        // V2 max-duration row: hr + min text fields. 0/0 = no cap. Empty
+        // body labels keep "h" / "m" inline with the fields.
+        JPanel v2DurationFields = new JPanel(new java.awt.FlowLayout(
+            java.awt.FlowLayout.LEFT, 4, 0));
+        v2DurationFields.add(cookV2MaxHoursField);
+        v2DurationFields.add(new JLabel("h"));
+        v2DurationFields.add(cookV2MaxMinutesField);
+        v2DurationFields.add(new JLabel("m"));
+        JPanel v2DurationRow = labelledRow("V2 max time:", v2DurationFields);
         // Two start buttons (V1 + V2) share one Stop button. The Stop
         // handler calls stop() on whichever is currently running.
         JPanel startsRow = new JPanel(new java.awt.GridLayout(1, 2, 4, 0));
@@ -1788,6 +1801,7 @@ public final class RecorderPanel extends PluginPanel
 
         p.add(locationRow);
         p.add(foodRow);
+        p.add(v2DurationRow);
         p.add(buttons);
         p.add(cookStatusLabel);
         p.add(cookCountsLabel);
@@ -2013,8 +2027,33 @@ public final class RecorderPanel extends PluginPanel
         }
         cookingScriptV2.setLocation(loc);
         cookingScriptV2.setRawFoodId(food.rawId);
+        long durationMs = parseDurationMs(cookV2MaxHoursField, cookV2MaxMinutesField);
+        cookingScriptV2.setMaxDurationMs(durationMs);
         cookingScriptV2.start();
-        cookStatusLabel.setText("Cooking V2: starting");
+        cookStatusLabel.setText(durationMs > 0
+            ? "Cooking V2: starting (cap " + (durationMs / 60_000L) + "m)"
+            : "Cooking V2: starting (no cap)");
+    }
+
+    /** Parse hour + minute text fields into a millisecond cap. Empty /
+     *  invalid / negative values are treated as 0; total 0 disables the
+     *  cap on the script side. */
+    private static long parseDurationMs(JTextField hours, JTextField minutes)
+    {
+        long h = parseNonNegativeInt(hours.getText());
+        long m = parseNonNegativeInt(minutes.getText());
+        return (h * 3_600_000L) + (m * 60_000L);
+    }
+
+    private static long parseNonNegativeInt(String s)
+    {
+        if (s == null) return 0;
+        try
+        {
+            int v = Integer.parseInt(s.trim());
+            return Math.max(0, v);
+        }
+        catch (NumberFormatException nfe) { return 0; }
     }
 
     private void onCookStop()

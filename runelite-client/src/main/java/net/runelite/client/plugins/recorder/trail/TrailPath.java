@@ -217,6 +217,7 @@ public final class TrailPath
     {
         if (option == null) return false;
         String lo = option.toLowerCase();
-        return lo.contains("climb") || lo.contains("teleport");
+        return lo.contains("climb") || lo.contains("teleport")
+            || lo.contains("-floor");
     }
 }

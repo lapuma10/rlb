@@ -9,9 +9,12 @@ import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.Supplier;
 import lombok.extern.slf4j.Slf4j;
 import net.runelite.api.Client;
+import net.runelite.api.Item;
+import net.runelite.api.ItemContainer;
 import net.runelite.api.Player;
 import net.runelite.api.coords.WorldArea;
 import net.runelite.api.coords.WorldPoint;
+import net.runelite.api.gameval.InventoryID;
 import net.runelite.api.gameval.ItemID;
 import net.runelite.client.callback.ClientThread;
 import net.runelite.client.plugins.recorder.RecorderConfig;
@@ -244,6 +247,13 @@ public final class CookingScript
     /** The randomised wall-clock time at which we will actually press Space
      *  to dismiss the currently-visible level-up popup. */
     private long levelUpDismissAfterMs;
+    /** One-shot guard for the first-start inventory cleanup. Reset in
+     *  {@link #start()}. On the first bank visit of a session: if the
+     *  inventory contains anything other than raw food we're cooking
+     *  (and the tinderbox when FIRE_FROM_LOGS), we click the deposit-all
+     *  orb to start with a clean inventory before withdrawing. Once
+     *  cleared, the steady-state per-item cooked/burnt deposit takes over. */
+    private final AtomicBoolean firstStartCleanupDone = new AtomicBoolean(false);
 
     /** Max retries on a banking sub-step (booth click / deposit /
      *  withdraw / close) before aborting. 3 tries covers transient
@@ -318,6 +328,10 @@ public final class CookingScript
             running.set(false);
             return;
         }
+        // Reset one-shot first-start cleanup guard so the first banking
+        // visit of this session decides whether to deposit-all the
+        // inventory before the normal withdraw loop runs.
+        firstStartCleanupDone.set(false);
         State decided = decideResume();
         log.info("cook: resume → {} ({})", decided, status.get());
         setState(decided);
@@ -555,6 +569,46 @@ public final class CookingScript
         {
             tallyCookedBurnt();
             tallyDoneThisVisit = true;
+        }
+
+        // First-start inventory cleanup. The steady-state loop deposits
+        // cooked/burnt food per-item (preserving tinderbox + unrelated
+        // items across the cook → bank cycle), but on the FIRST bank
+        // visit of a session the player may be carrying anything —
+        // leftovers from another script, quest items, half a stack of
+        // logs, etc. Behaviour matches the user request:
+        //   * inventory holds ONLY raw food we're cooking (and the
+        //     tinderbox when FIRE_FROM_LOGS): skip deposit, fall through
+        //     to the normal withdraw / close path so partial inventories
+        //     get topped up;
+        //   * anything else: click the deposit-all orb so the next tick
+        //     enters the withdraw phase with an empty inventory.
+        // Bank container readiness is already gated above.
+        if (!firstStartCleanupDone.get())
+        {
+            if (inventoryHasJunkForCooking(l))
+            {
+                status.set("bank: first-start — depositing all (clearing junk)");
+                if (bank.depositAllInventory())
+                {
+                    lastBankActionAtMs = now;
+                    lastInventoryChangeAtMs = now;
+                    bankFailCount = 0;
+                    firstStartCleanupDone.set(true);
+                }
+                else
+                {
+                    bankFailCount++;
+                    if (bankFailCount > BANK_MAX_FAIL)
+                    {
+                        abortWithBankClosed("first-start deposit-all failed "
+                            + BANK_MAX_FAIL + "× — aborting");
+                        return;
+                    }
+                }
+                return;
+            }
+            firstStartCleanupDone.set(true);
         }
 
         // Per-item deposit, not the deposit-everything orb: tinderbox
@@ -1521,6 +1575,32 @@ public final class CookingScript
         try { return cook.inventoryAmount(id); }
         catch (InterruptedException ie) { Thread.currentThread().interrupt(); return 0; }
         catch (Throwable th) { return 0; }
+    }
+
+    /** True iff the inventory contains any item that isn't (a) the raw
+     *  food we're cooking or (b) the tinderbox (only when the location
+     *  is FIRE_FROM_LOGS — for RANGE locations the tinderbox is junk).
+     *  Used by the one-shot first-start cleanup in
+     *  {@link #tickBankingLegacy()}. */
+    private boolean inventoryHasJunkForCooking(CookingLocation l)
+    {
+        int rawId = rawFoodId.get();
+        boolean wantTinderbox = l.kind() == CookingLocation.SourceKind.FIRE_FROM_LOGS;
+        Boolean junk = onClient(() -> {
+            ItemContainer inv = client.getItemContainer(InventoryID.INV);
+            if (inv == null) return Boolean.FALSE;
+            for (Item item : inv.getItems())
+            {
+                if (item == null) continue;
+                int id = item.getId();
+                if (id <= 0) continue;
+                if (id == rawId) continue;
+                if (wantTinderbox && id == ItemID.TINDERBOX) continue;
+                return Boolean.TRUE;
+            }
+            return Boolean.FALSE;
+        });
+        return Boolean.TRUE.equals(junk);
     }
 
     private boolean playerInArea(WorldArea area)
