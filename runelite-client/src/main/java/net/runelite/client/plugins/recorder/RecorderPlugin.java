@@ -40,7 +40,6 @@ import net.runelite.client.plugins.recorder.annotator.AnnotatorHudOverlay;
 import net.runelite.client.plugins.recorder.annotator.AreaSelector;
 import net.runelite.client.plugins.recorder.scripts.ChickenFarmV2Script;
 import net.runelite.client.plugins.recorder.scripts.CooksAssistantScript;
-import net.runelite.client.plugins.recorder.scripts.CookingScript;
 import net.runelite.client.plugins.recorder.scripts.GrandExchangeScript;
 import net.runelite.client.plugins.recorder.scripts.PieDishScript;
 import net.runelite.client.sequence.dispatch.InputOwnership;
@@ -277,29 +276,28 @@ public class RecorderPlugin extends Plugin
         panel.setMiningLoop(miningLoop);
 
         // Cooking script — independent dispatcher + transport resolver.
-        // The script is location- and food-agnostic; the panel feeds it
-        // a CookingLocation + raw food item id and starts.
-        // InputOwnership is shared across the banking sub-paths so the
-        // sequence engine and the legacy banking path don't clash.
-        HumanizedInputDispatcher cookingDispatcher = new HumanizedInputDispatcher(client, clientThread);
-        TransportResolver cookingResolver = new TransportResolver(client);
-        InputOwnership cookingInputOwnership = new InputOwnership();
-        CookingScript cookingScript = new CookingScript(
-            client, clientThread, cookingDispatcher, cookingResolver, config, cookingInputOwnership);
-        panel.setCookingScript(cookingScript);
-
-        // Cooking V2 — independent dispatcher + resolver so V1 and V2
-        // never share dispatch state. Panel enforces mutual exclusion at
-        // the Start-button level (only one runs at a time). V2 fixes
-        // the four bot-tells documented in CookingScriptV2 javadoc:
-        // random walk targets, varied log-pile pick, weighted-random
-        // booth pick, explicit fire-state clear on death.
+        // Cooking V2 — independent dispatcher + resolver. Panel
+        // enforces mutual exclusion at the Start-button level (only one
+        // cooking script runs at a time). V2 fixes the four bot-tells
+        // documented in CookingScriptV2 javadoc.
         HumanizedInputDispatcher cookingV2Dispatcher = new HumanizedInputDispatcher(client, clientThread);
         TransportResolver cookingV2Resolver = new TransportResolver(client);
         net.runelite.client.plugins.recorder.scripts.CookingScriptV2 cookingScriptV2 =
             new net.runelite.client.plugins.recorder.scripts.CookingScriptV2(
                 client, clientThread, cookingV2Dispatcher, cookingV2Resolver);
         panel.setCookingScriptV2(cookingScriptV2);
+
+        // Cooking V3 — independent dispatcher + resolver (same shape as
+        // V2). V3 dispatches the bank-booth click as live-tracked
+        // (ActionRequest.liveTracked=true) so the dispatcher re-projects
+        // the booth's hull during cursor motion instead of binding to
+        // a stale T0 pixel — see CookingScriptV3 javadoc.
+        HumanizedInputDispatcher cookingV3Dispatcher = new HumanizedInputDispatcher(client, clientThread);
+        TransportResolver cookingV3Resolver = new TransportResolver(client);
+        net.runelite.client.plugins.recorder.scripts.CookingScriptV3 cookingScriptV3 =
+            new net.runelite.client.plugins.recorder.scripts.CookingScriptV3(
+                client, clientThread, cookingV3Dispatcher, cookingV3Resolver);
+        panel.setCookingScriptV3(cookingScriptV3);
 
         // GE Core + Phase B bank-prep: independent dispatcher + InputOwnership
         // lease. The bank-prep variants withdraw coins / sell items from a GE

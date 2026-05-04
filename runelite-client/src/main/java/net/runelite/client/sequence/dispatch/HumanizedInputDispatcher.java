@@ -49,6 +49,7 @@ import net.runelite.client.sequence.InputMode;
 import net.runelite.client.sequence.internal.ActionRequest;
 import java.awt.Polygon;
 import java.awt.Rectangle;
+import java.awt.Shape;
 import java.awt.event.MouseEvent;
 import java.util.Random;
 import java.util.concurrent.CompletableFuture;
@@ -360,7 +361,7 @@ public class HumanizedInputDispatcher implements InputDispatcher
             case WALK, CLICK_TILE -> walkClick(req.getTile());
             case CLICK_NPC -> npcClick(req.getNpcIndex(),
                 req.getVerb() == null || req.getVerb().isBlank() ? "Attack" : req.getVerb());
-            case CLICK_GAME_OBJECT -> gameObjectClick(req.getTile(), req.getVerb());
+            case CLICK_GAME_OBJECT -> gameObjectClick(req.getTile(), req.getVerb(), req.isLiveTracked());
             case CLICK_GROUND_ITEM -> groundItemClick(req.getTile(), req.getItemId(), req.getVerb());
             case CLICK_WIDGET -> {
                 String verb = req.getVerb();
@@ -971,7 +972,7 @@ public class HumanizedInputDispatcher implements InputDispatcher
      *  right-clicks to open the context menu, finds the matching entry, and
      *  left-clicks that entry's row — exactly like a human would.
      */
-    private void gameObjectClick(WorldPoint tile, String verb) throws InterruptedException
+    private void gameObjectClick(WorldPoint tile, String verb, boolean liveTracked) throws InterruptedException
     {
         if (tile == null) { lastError.set("null tile for gameObjectClick"); return; }
         if (verb == null || verb.isBlank())
@@ -988,6 +989,12 @@ public class HumanizedInputDispatcher implements InputDispatcher
         }
         // Camera rotation toward the tile keeps the object visible.
         rotateCameraToward(tile);
+
+        if (liveTracked && match.gameObject() != null)
+        {
+            tryGameObjectAttemptTracked(match, tile, verb);
+            return;
+        }
 
         // Try the convex-hull pixel first (matches the visible model
         // body — works for most objects). If the hover doesn't produce
@@ -1013,6 +1020,191 @@ public class HumanizedInputDispatcher implements InputDispatcher
         }
         log.info("gameObjectClick {} verb='{}' — TILE_POLY miss, giving up",
             tile, verb);
+    }
+
+    /** Live-tracked GameObject click — see {@link ActionRequest#isLiveTracked()}.
+     *
+     *  <p>The cursor moves to the model's hull along a humanized wind
+     *  path, but the path is regenerated mid-flight if the booth's hull
+     *  centroid drifts more than a small threshold while the camera
+     *  follows the still-walking player. After motion settles, one
+     *  short corrective hop pulls the cursor back inside the live hull
+     *  if it ended up outside. Verb mismatch aborts with no right-click
+     *  fallback — the previous fallback is what produced the
+     *  "Walk here Sademedicus" / "Withdraw-1 Burnt pizza" misclick logs.
+     *
+     *  <p>Wobble is preserved: the wind path itself is humanized, and
+     *  each re-aim picks a slightly different point inside the hull (we
+     *  call {@link PixelResolver#resolveGameObject} which samples a
+     *  humanized point inside the hull). A real player's eye doesn't
+     *  pixel-perfect track either — they re-aim a few times along the
+     *  way and accept that the click lands on a slightly different
+     *  spot of the model each trip. */
+    private boolean tryGameObjectAttemptTracked(TransportResolver.Match match,
+                                                WorldPoint tile, String verb)
+        throws InterruptedException
+    {
+        // Tunables — kept conservative to avoid jitter on small camera
+        // tweaks. See plan in commit message / CookingScriptV3 javadoc.
+        final int reaimThresholdPx = 22;
+        final int reaimThresholdSq = reaimThresholdPx * reaimThresholdPx;
+        final long reaimMinSegmentMs = 80L;
+        final long reaimMaxSegmentMs = 160L;
+        final int maxReaims = 3;
+
+        // Initial aim: humanized point inside the live hull, plus its
+        // bbox centroid as a stable "where is the booth now" signal.
+        Point initial = onClient(() ->
+            resolver.resolveGameObject(match.gameObject(),
+                PixelResolver.GameObjectStrategy.HULL));
+        Point lastCentroid = onClient(() -> hullCentroid(match.gameObject()));
+        if (initial == null || lastCentroid == null)
+        {
+            lastError.set("tracked: hull off-canvas at " + tile);
+            log.info("gameObjectClick tracked {} verb='{}' — hull off-canvas at start",
+                tile, verb);
+            return false;
+        }
+        log.info("gameObjectClick tracked → world {} initial pixel ({},{}) verb='{}' "
+                + "(matched '{}', id={})",
+            tile, initial.getX(), initial.getY(), verb,
+            match.matchedVerb(), match.matchedObjectId());
+
+        Point target = initial;
+        int reaims = 0;
+        // Iterative wind-path motion. Between samples we periodically
+        // peek the live centroid; if it has drifted past threshold,
+        // regenerate the remainder of the path toward a fresh hull
+        // sample. Up to maxReaims regenerations per click.
+        while (true)
+        {
+            int sx = input.cursorX() < 0 ? client.getCanvas().getWidth() / 2 : input.cursorX();
+            int sy = input.cursorY() < 0 ? client.getCanvas().getHeight() / 2 : input.cursorY();
+            var path = wind.path(sx, sy, target.getX(), target.getY());
+            long segStart = System.currentTimeMillis();
+            long segBudget = reaimMinSegmentMs
+                + rng.nextInt((int) (reaimMaxSegmentMs - reaimMinSegmentMs + 1));
+            boolean reaimed = false;
+            for (var s : path)
+            {
+                input.mouseMove(s.x(), s.y());
+                SequenceSleep.sleep(client, s.dtMs());
+                if (reaims >= maxReaims) continue;
+                if (System.currentTimeMillis() - segStart < segBudget) continue;
+                Point liveCentroid = onClient(() -> hullCentroid(match.gameObject()));
+                if (liveCentroid == null)
+                {
+                    lastError.set("tracked: hull went off-canvas mid-flight at " + tile);
+                    log.info("gameObjectClick tracked {} verb='{}' — hull off-canvas mid-flight",
+                        tile, verb);
+                    return false;
+                }
+                int dx = liveCentroid.getX() - lastCentroid.getX();
+                int dy = liveCentroid.getY() - lastCentroid.getY();
+                if (dx * dx + dy * dy > reaimThresholdSq)
+                {
+                    Point fresh = onClient(() ->
+                        resolver.resolveGameObject(match.gameObject(),
+                            PixelResolver.GameObjectStrategy.HULL));
+                    if (fresh == null)
+                    {
+                        lastError.set("tracked: hull unresolvable mid-flight at " + tile);
+                        return false;
+                    }
+                    reaims++;
+                    log.info("gameObjectClick tracked {} verb='{}' — re-aim {} drift~{}px → ({},{})",
+                        tile, verb, reaims,
+                        (int) Math.sqrt(dx * dx + dy * dy),
+                        fresh.getX(), fresh.getY());
+                    target = fresh;
+                    lastCentroid = liveCentroid;
+                    reaimed = true;
+                    break;
+                }
+                // Drift below threshold — keep the current target, but
+                // reset the budget so we'll check again later in the path.
+                segStart = System.currentTimeMillis();
+                segBudget = reaimMinSegmentMs
+                    + rng.nextInt((int) (reaimMaxSegmentMs - reaimMinSegmentMs + 1));
+            }
+            if (!reaimed) break;
+        }
+
+        // Last-mile correction: if cursor ended outside the live hull,
+        // do ONE short humanized corrective hop into a fresh hull
+        // sample. Humans do this — overshoot a bit, then nudge back.
+        Boolean inside = onClient(() ->
+            pointInsideHull(match.gameObject(), input.cursorX(), input.cursorY()));
+        if (Boolean.FALSE.equals(inside))
+        {
+            Point correction = onClient(() ->
+                resolver.resolveGameObject(match.gameObject(),
+                    PixelResolver.GameObjectStrategy.HULL));
+            if (correction == null)
+            {
+                lastError.set("tracked: hull off-canvas at last-mile " + tile);
+                log.info("gameObjectClick tracked {} verb='{}' — last-mile hull off-canvas",
+                    tile, verb);
+                return false;
+            }
+            log.info("gameObjectClick tracked {} verb='{}' — last-mile correction → ({},{})",
+                tile, verb, correction.getX(), correction.getY());
+            int sx = input.cursorX() < 0 ? correction.getX() : input.cursorX();
+            int sy = input.cursorY() < 0 ? correction.getY() : input.cursorY();
+            for (var s : wind.path(sx, sy, correction.getX(), correction.getY()))
+            {
+                input.mouseMove(s.x(), s.y());
+                SequenceSleep.sleep(client, s.dtMs());
+            }
+        }
+
+        // Settle ~2 frames so the engine populates the hover menu, then
+        // verify. No right-click fallback — if verb isn't on top after
+        // tracking + correction, the cursor is somehow still off-target
+        // (occluding player, hull popped off-canvas, etc.); abort and
+        // let the script's next tick start fresh.
+        SequenceSleep.sleep(client, 60);
+        boolean isTop = onClient(() -> isTopMenuVerb(verb));
+        if (isTop)
+        {
+            log.info("gameObjectClick tracked {} verb='{}' — verb is left-click default, single click",
+                tile, verb);
+            clickPress(MouseEvent.BUTTON1);
+            return true;
+        }
+        String topLbl = onClient(this::topMenuLabel);
+        lastError.set("tracked: verb '" + verb + "' not at top of menu (top='"
+            + topLbl + "') — aborted, no right-click fallback");
+        log.info("gameObjectClick tracked {} verb='{}' — verb not on top after re-aim "
+                + "(top='{}') — aborting (next tick re-aims fresh)",
+            tile, verb, topLbl);
+        return false;
+    }
+
+    /** Client-thread: bounding-box centroid of {@code obj}'s convex
+     *  hull. Returns null if the hull is unavailable (model not
+     *  rendered / off-canvas). Used as a stable "where is the booth
+     *  now" signal — much less noisy than the random-sampled point
+     *  used as the actual click target. */
+    private static Point hullCentroid(GameObject obj)
+    {
+        Shape hull = obj.getConvexHull();
+        if (hull == null) return null;
+        Rectangle bb = hull.getBounds();
+        if (bb == null || bb.width <= 0 || bb.height <= 0) return null;
+        return new Point(bb.x + bb.width / 2, bb.y + bb.height / 2);
+    }
+
+    /** Client-thread: true iff (x,y) lies inside {@code obj}'s convex
+     *  hull. Used at the last-mile correction step — if cursor drifted
+     *  off the hull during motion, do a corrective hop. Returns true
+     *  for null hulls (treat as "good enough"; we'd rather click than
+     *  spin re-aiming a model that's between renders). */
+    private static boolean pointInsideHull(GameObject obj, int x, int y)
+    {
+        Shape hull = obj.getConvexHull();
+        if (hull == null) return true;
+        return hull.contains(x, y);
     }
 
     /** One resolve+hover+click attempt for a GameObject under the

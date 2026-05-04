@@ -43,7 +43,7 @@ import net.runelite.client.sequence.dispatch.SequenceSleep;
  * dispatches. Walker stuck / dispatcher errors / missing pickaxe in bank
  * all surface a status message and abort cleanly without leaking the bank
  * widget open. This mirrors the cooking script's banking robustness
- * (see {@code CookingScript.tickBanking}).
+ * (see {@code CookingScriptV2#tickBanking} / {@code CookingScriptV3#tickBanking}).
  *
  * <p>The strategy is location-agnostic — paths and the bank area are
  * injected at construction. Callers ({@code RecorderPlugin}) are free

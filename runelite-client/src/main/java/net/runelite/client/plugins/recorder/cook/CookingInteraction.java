@@ -158,8 +158,8 @@ public final class CookingInteraction
     // ────────────────────────────────────────────────────────────────
 
     /** Result of a scene scan. Alias for {@link SceneScanner.Match} —
-     *  kept here so existing callers (CookingScript) don't have to
-     *  switch import paths. New code should reach for
+     *  kept here so existing callers (CookingScriptV2 / CookingScriptV3)
+     *  don't have to switch import paths. New code should reach for
      *  {@link SceneScanner.Match} directly. */
     public static final class Match
     {

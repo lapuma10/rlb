@@ -41,7 +41,6 @@ import net.runelite.client.plugins.recorder.farm.RouteWalker;
 import net.runelite.client.plugins.recorder.mining.MiningLoop;
 import net.runelite.client.plugins.recorder.scripts.ChickenFarmV2Script;
 import net.runelite.client.plugins.recorder.scripts.CooksAssistantScript;
-import net.runelite.client.plugins.recorder.scripts.CookingScript;
 import net.runelite.client.plugins.recorder.scripts.GrandExchangeScript;
 import net.runelite.client.plugins.recorder.scripts.GrandExchangeTab;
 import net.runelite.client.plugins.recorder.scripts.LumbridgeBankPenScript;
@@ -214,17 +213,19 @@ public final class RecorderPanel extends PluginPanel
     private final JLabel miningRockCountLabel = new JLabel("Rocks: 0");
     private MiningLoop miningLoop;
     // Cooking section.
-    private CookingScript cookingScript;
     private net.runelite.client.plugins.recorder.scripts.CookingScriptV2 cookingScriptV2;
-    private final JButton cookStartBtn = new JButton("Start V1");
+    private net.runelite.client.plugins.recorder.scripts.CookingScriptV3 cookingScriptV3;
     private final JButton cookStartV2Btn = new JButton("Start V2 (human)");
+    private final JButton cookStartV3Btn = new JButton("Start V3 (tracked)");
     private final JButton cookStopBtn = new JButton("Stop");
     private final JComboBox<CookingLocation> cookLocationBox = new JComboBox<>();
     private final JComboBox<CookingFood.Entry> cookFoodBox = new JComboBox<>();
-    // V2-only session cap. 0/0 = no cap. Read by onCookV2Start; mid-run
-    // edits have no effect (script reads at start()).
+    // Per-version session caps. 0/0 = no cap. Read by the matching
+    // onCook*Start; mid-run edits have no effect (script reads at start()).
     private final JTextField cookV2MaxHoursField = new JTextField("0", 3);
     private final JTextField cookV2MaxMinutesField = new JTextField("0", 3);
+    private final JTextField cookV3MaxHoursField = new JTextField("0", 3);
+    private final JTextField cookV3MaxMinutesField = new JTextField("0", 3);
     private final JLabel cookStatusLabel = new JLabel("Cooking: idle");
     private final JLabel cookCountsLabel = new JLabel("Cooked: 0  Burnt: 0");
     // Cook's Assistant quest script.
@@ -305,8 +306,8 @@ public final class RecorderPanel extends PluginPanel
         miningStopBtn.addActionListener(e -> onMiningStop());
         miningAddRockBtn.addActionListener(e -> onMiningAddRock());
         miningClearRocksBtn.addActionListener(e -> onMiningClearRocks());
-        cookStartBtn.addActionListener(e -> onCookStart());
         cookStartV2Btn.addActionListener(e -> onCookV2Start());
+        cookStartV3Btn.addActionListener(e -> onCookV3Start());
         cookStopBtn.addActionListener(e -> onCookStop());
         questStartBtn.addActionListener(e -> onQuestStart());
         questStopBtn.addActionListener(e -> onQuestStop());
@@ -1779,8 +1780,8 @@ public final class RecorderPanel extends PluginPanel
         // row's max height to its preferred height with unbounded width.
         JPanel locationRow = labelledRow("Location:", cookLocationBox);
         JPanel foodRow     = labelledRow("Food:",     cookFoodBox);
-        // V2 max-duration row: hr + min text fields. 0/0 = no cap. Empty
-        // body labels keep "h" / "m" inline with the fields.
+        // Per-version max-duration rows: hr + min text fields. 0/0 = no
+        // cap. Empty body labels keep "h" / "m" inline with the fields.
         JPanel v2DurationFields = new JPanel(new java.awt.FlowLayout(
             java.awt.FlowLayout.LEFT, 4, 0));
         v2DurationFields.add(cookV2MaxHoursField);
@@ -1788,11 +1789,18 @@ public final class RecorderPanel extends PluginPanel
         v2DurationFields.add(cookV2MaxMinutesField);
         v2DurationFields.add(new JLabel("m"));
         JPanel v2DurationRow = labelledRow("V2 max time:", v2DurationFields);
-        // Two start buttons (V1 + V2) share one Stop button. The Stop
+        JPanel v3DurationFields = new JPanel(new java.awt.FlowLayout(
+            java.awt.FlowLayout.LEFT, 4, 0));
+        v3DurationFields.add(cookV3MaxHoursField);
+        v3DurationFields.add(new JLabel("h"));
+        v3DurationFields.add(cookV3MaxMinutesField);
+        v3DurationFields.add(new JLabel("m"));
+        JPanel v3DurationRow = labelledRow("V3 max time:", v3DurationFields);
+        // Two start buttons (V2 + V3) share one Stop button. The Stop
         // handler calls stop() on whichever is currently running.
         JPanel startsRow = new JPanel(new java.awt.GridLayout(1, 2, 4, 0));
-        startsRow.add(cookStartBtn);
         startsRow.add(cookStartV2Btn);
+        startsRow.add(cookStartV3Btn);
         capHeight(startsRow);
         JPanel buttons     = new JPanel(new BorderLayout(4, 4));
         buttons.add(startsRow, BorderLayout.CENTER);
@@ -1802,6 +1810,7 @@ public final class RecorderPanel extends PluginPanel
         p.add(locationRow);
         p.add(foodRow);
         p.add(v2DurationRow);
+        p.add(v3DurationRow);
         p.add(buttons);
         p.add(cookStatusLabel);
         p.add(cookCountsLabel);
@@ -1943,25 +1952,26 @@ public final class RecorderPanel extends PluginPanel
             + " — " + pieDishScript.status());
     }
 
-    /** Wire the cooking script. The plugin constructs the script in
-     *  startUp and hands it here; the panel only owns the UI surface. */
-    public void setCookingScript(CookingScript script)
-    {
-        this.cookingScript = script;
-    }
-
-    /** Wire the V2 cooking script. Same shape as
-     *  {@link #setCookingScript} — plugin constructs both, panel exposes
-     *  separate Start buttons but a shared Stop. */
+    /** Wire the V2 cooking script. The plugin constructs the script in
+     *  startUp and hands it here; the panel only owns the UI surface.
+     *  Two start buttons (V2 + V3) share a Stop button. */
     public void setCookingScriptV2(net.runelite.client.plugins.recorder.scripts.CookingScriptV2 script)
     {
         this.cookingScriptV2 = script;
     }
 
-    /** Wire the GE Core script. RecorderPlugin constructs it after CookingScript
-     *  and registers it on the eventBus for GameTick forwarding. The panel
-     *  builds the GE Core tab on first wiring. {@code itemManager} powers the
-     *  name → id lookup when the user types an item name. */
+    /** Wire the V3 cooking script (live-tracked booth click). Same
+     *  shape as {@link #setCookingScriptV2}. */
+    public void setCookingScriptV3(net.runelite.client.plugins.recorder.scripts.CookingScriptV3 script)
+    {
+        this.cookingScriptV3 = script;
+    }
+
+    /** Wire the GE Core script. RecorderPlugin constructs it after the
+     *  cooking scripts and registers it on the eventBus for GameTick
+     *  forwarding. The panel builds the GE Core tab on first wiring.
+     *  {@code itemManager} powers the name → id lookup when the user
+     *  types an item name. */
     public void setGrandExchangeScript(GrandExchangeScript script,
                                        net.runelite.client.game.ItemManager itemManager)
     {
@@ -1973,37 +1983,6 @@ public final class RecorderPanel extends PluginPanel
         }
     }
 
-    private void onCookStart()
-    {
-        if (cookingScript == null)
-        {
-            cookStatusLabel.setText("Cooking: unavailable");
-            return;
-        }
-        // Mutual exclusion — refuse to start V1 if V2 is already running.
-        // (Same dispatcher / clicks would interleave and produce garbage.)
-        if (cookingScriptV2 != null
-            && cookingScriptV2.state()
-                != net.runelite.client.plugins.recorder.scripts.CookingScriptV2.State.IDLE
-            && cookingScriptV2.state()
-                != net.runelite.client.plugins.recorder.scripts.CookingScriptV2.State.ABORTED)
-        {
-            cookStatusLabel.setText("Cooking: V2 still running — Stop first");
-            return;
-        }
-        CookingLocation loc = (CookingLocation) cookLocationBox.getSelectedItem();
-        CookingFood.Entry food = (CookingFood.Entry) cookFoodBox.getSelectedItem();
-        if (loc == null || food == null)
-        {
-            cookStatusLabel.setText("Cooking: pick location + food first");
-            return;
-        }
-        cookingScript.setLocation(loc);
-        cookingScript.setRawFoodId(food.rawId);
-        cookingScript.start();
-        cookStatusLabel.setText("Cooking V1: starting");
-    }
-
     private void onCookV2Start()
     {
         if (cookingScriptV2 == null)
@@ -2011,11 +1990,16 @@ public final class RecorderPanel extends PluginPanel
             cookStatusLabel.setText("Cooking V2: unavailable");
             return;
         }
-        if (cookingScript != null
-            && cookingScript.state() != CookingScript.State.IDLE
-            && cookingScript.state() != CookingScript.State.ABORTED)
+        // Mutual exclusion — refuse to start V2 if V3 is already running.
+        // Each version has its own dispatcher; running both at once would
+        // interleave clicks and produce garbage.
+        if (cookingScriptV3 != null
+            && cookingScriptV3.state()
+                != net.runelite.client.plugins.recorder.scripts.CookingScriptV3.State.IDLE
+            && cookingScriptV3.state()
+                != net.runelite.client.plugins.recorder.scripts.CookingScriptV3.State.ABORTED)
         {
-            cookStatusLabel.setText("Cooking: V1 still running — Stop first");
+            cookStatusLabel.setText("Cooking: V3 still running — Stop first");
             return;
         }
         CookingLocation loc = (CookingLocation) cookLocationBox.getSelectedItem();
@@ -2033,6 +2017,39 @@ public final class RecorderPanel extends PluginPanel
         cookStatusLabel.setText(durationMs > 0
             ? "Cooking V2: starting (cap " + (durationMs / 60_000L) + "m)"
             : "Cooking V2: starting (no cap)");
+    }
+
+    private void onCookV3Start()
+    {
+        if (cookingScriptV3 == null)
+        {
+            cookStatusLabel.setText("Cooking V3: unavailable");
+            return;
+        }
+        if (cookingScriptV2 != null
+            && cookingScriptV2.state()
+                != net.runelite.client.plugins.recorder.scripts.CookingScriptV2.State.IDLE
+            && cookingScriptV2.state()
+                != net.runelite.client.plugins.recorder.scripts.CookingScriptV2.State.ABORTED)
+        {
+            cookStatusLabel.setText("Cooking: V2 still running — Stop first");
+            return;
+        }
+        CookingLocation loc = (CookingLocation) cookLocationBox.getSelectedItem();
+        CookingFood.Entry food = (CookingFood.Entry) cookFoodBox.getSelectedItem();
+        if (loc == null || food == null)
+        {
+            cookStatusLabel.setText("Cooking: pick location + food first");
+            return;
+        }
+        cookingScriptV3.setLocation(loc);
+        cookingScriptV3.setRawFoodId(food.rawId);
+        long durationMs = parseDurationMs(cookV3MaxHoursField, cookV3MaxMinutesField);
+        cookingScriptV3.setMaxDurationMs(durationMs);
+        cookingScriptV3.start();
+        cookStatusLabel.setText(durationMs > 0
+            ? "Cooking V3: starting (cap " + (durationMs / 60_000L) + "m)"
+            : "Cooking V3: starting (no cap)");
     }
 
     /** Parse hour + minute text fields into a millisecond cap. Empty /
@@ -2061,24 +2078,34 @@ public final class RecorderPanel extends PluginPanel
         // Shared Stop — call stop() on both. Each is a no-op if not
         // running, so calling both is safe and saves the panel having
         // to track which version is live.
-        if (cookingScript != null) cookingScript.stop();
         if (cookingScriptV2 != null) cookingScriptV2.stop();
+        if (cookingScriptV3 != null) cookingScriptV3.stop();
         cookStatusLabel.setText("Cooking: stopping");
     }
 
     private void refreshCooking()
     {
         // Choose which script to display state for: prefer the one that
-        // isn't IDLE, falling back to V1 when both are idle.
-        boolean v1Live = cookingScript != null
-            && cookingScript.state() != CookingScript.State.IDLE
-            && cookingScript.state() != CookingScript.State.ABORTED;
+        // isn't IDLE, falling back to V3 when both are idle.
         boolean v2Live = cookingScriptV2 != null
             && cookingScriptV2.state()
                 != net.runelite.client.plugins.recorder.scripts.CookingScriptV2.State.IDLE
             && cookingScriptV2.state()
                 != net.runelite.client.plugins.recorder.scripts.CookingScriptV2.State.ABORTED;
+        boolean v3Live = cookingScriptV3 != null
+            && cookingScriptV3.state()
+                != net.runelite.client.plugins.recorder.scripts.CookingScriptV3.State.IDLE
+            && cookingScriptV3.state()
+                != net.runelite.client.plugins.recorder.scripts.CookingScriptV3.State.ABORTED;
 
+        if (v3Live)
+        {
+            cookStatusLabel.setText("Cooking V3: " + cookingScriptV3.state()
+                + " — " + cookingScriptV3.status());
+            cookCountsLabel.setText("Cooked: " + cookingScriptV3.cookedCount()
+                + "  Burnt: " + cookingScriptV3.burntCount());
+            return;
+        }
         if (v2Live)
         {
             cookStatusLabel.setText("Cooking V2: " + cookingScriptV2.state()
@@ -2087,27 +2114,19 @@ public final class RecorderPanel extends PluginPanel
                 + "  Burnt: " + cookingScriptV2.burntCount());
             return;
         }
-        if (v1Live)
-        {
-            cookStatusLabel.setText("Cooking V1: " + cookingScript.state()
-                + " — " + cookingScript.status());
-            cookCountsLabel.setText("Cooked: " + cookingScript.cookedCount()
-                + "  Burnt: " + cookingScript.burntCount());
-            return;
-        }
-        if (cookingScript == null && cookingScriptV2 == null)
+        if (cookingScriptV2 == null && cookingScriptV3 == null)
         {
             cookStatusLabel.setText("Cooking: unavailable");
             cookCountsLabel.setText("Cooked: 0  Burnt: 0");
             return;
         }
-        // Neither is live — show V1's idle state by default.
-        if (cookingScript != null)
+        // Neither is live — show V3's idle state by default (the new path).
+        if (cookingScriptV3 != null)
         {
-            cookStatusLabel.setText("Cooking V1: " + cookingScript.state()
-                + " — " + cookingScript.status());
-            cookCountsLabel.setText("Cooked: " + cookingScript.cookedCount()
-                + "  Burnt: " + cookingScript.burntCount());
+            cookStatusLabel.setText("Cooking V3: " + cookingScriptV3.state()
+                + " — " + cookingScriptV3.status());
+            cookCountsLabel.setText("Cooked: " + cookingScriptV3.cookedCount()
+                + "  Burnt: " + cookingScriptV3.burntCount());
         }
         else
         {

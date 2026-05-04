@@ -104,4 +104,22 @@ public class ActionRequest {
      *  logs to identify which task is running, since the {@link #task}
      *  itself is opaque. e.g. {@code "BANK_WITHDRAW_X(995,2684)"}. */
     @Nullable String taskName;
+    /** Opt-in tracked-click mode for moving-camera world targets
+     *  ({@link Kind#CLICK_GAME_OBJECT} today; NPC / ground-item later).
+     *
+     *  <p>When {@code true}, the dispatcher commits to the world reference
+     *  ({@code tile + verb} → live {@code GameObject}) instead of binding
+     *  to the pixel resolved at request-time. During humanized cursor
+     *  motion the dispatcher re-projects the model's hull on a cadence
+     *  and bends the remaining wind path toward the live target — like a
+     *  human re-aiming as the camera follows the player. After motion
+     *  settles, one last humanized correction nudges the cursor into the
+     *  live hull if it drifted off. Verb mismatch aborts cleanly (no
+     *  right-click fallback on the stale pixel — that is what was
+     *  clicking through to other players' menus and Walk-here tiles).
+     *
+     *  <p>Defaults to {@code false} — preserves V2 / legacy behavior
+     *  byte-for-byte. V3 banking opts in via
+     *  {@code BankInteraction#tryClickBankBoothVariedTracked}. */
+    boolean liveTracked;
 }

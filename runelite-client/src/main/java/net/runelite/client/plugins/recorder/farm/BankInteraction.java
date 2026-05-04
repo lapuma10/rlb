@@ -441,6 +441,62 @@ public final class BankInteraction implements BankActions
         return true;
     }
 
+    /** V3 booth picker: same weighted-random as
+     *  {@link #tryClickBankBoothVaried} but dispatches the
+     *  CLICK_GAME_OBJECT with {@code liveTracked = true}. The dispatcher
+     *  re-projects the booth's hull mid-flight so the cursor tracks the
+     *  model as the camera follows the still-walking player, instead of
+     *  binding to a stale T0 pixel and clicking through to whoever
+     *  walked under the cursor.
+     *
+     *  <p>NPC bankers still use the legacy CLICK_NPC path — tracking is
+     *  scoped to game-object clicks first per the V3 plan. NPC banker
+     *  tracking is a follow-up.
+     *
+     *  <p>Existing {@link #tryClickBankBoothVaried} is unchanged so V2
+     *  consumers keep their behavior. */
+    public boolean tryClickBankBoothVariedTracked(double adjacencyBias) throws InterruptedException
+    {
+        java.util.List<BoothCandidate> all = onClient(this::collectBoothCandidates);
+        if (all == null || all.isEmpty())
+        {
+            log.warn("bank: no booth candidates within {} tiles (varied/tracked)", BOOTH_SEARCH_RADIUS);
+            return false;
+        }
+        BoothCandidate pick = pickWeightedRandom(all, adjacencyBias);
+
+        if (pick.npc != null)
+        {
+            Integer idx = onClient(() -> pick.npc.getIndex());
+            if (idx == null) return false;
+            log.info("bank: CLICK_NPC banker (varied/tracked dist={}, verb={}, npc index={})",
+                pick.distance, pick.actionText, idx);
+            dispatcher.dispatch(ActionRequest.builder()
+                .kind(ActionRequest.Kind.CLICK_NPC)
+                .channel(ActionRequest.Channel.MOUSE)
+                .npcIndex(idx)
+                .verb(pick.actionText)
+                .build());
+            return true;
+        }
+        WorldPoint tile = onClient(() -> pick.go.getWorldLocation());
+        if (tile == null)
+        {
+            log.warn("bank: varied/tracked booth pick has no world location");
+            return false;
+        }
+        log.info("bank: CLICK_GAME_OBJECT booth (varied/tracked dist={}, tile={}, verb={})",
+            pick.distance, tile, pick.actionText);
+        dispatcher.dispatch(ActionRequest.builder()
+            .kind(ActionRequest.Kind.CLICK_GAME_OBJECT)
+            .channel(ActionRequest.Channel.MOUSE)
+            .tile(tile)
+            .verb(pick.actionText)
+            .liveTracked(true)
+            .build());
+        return true;
+    }
+
     /** Client-thread: collect ALL booth candidates within range, sorted by
      *  Chebyshev distance ascending. Mirrors {@link #findBoothCandidate}'s
      *  scan but does NOT short-circuit on adjacent — V2's weighted picker
