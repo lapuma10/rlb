@@ -58,25 +58,35 @@ public boolean isGrandExchangeOpen();
 public boolean tryCloseGrandExchange() throws InterruptedException;
 ```
 
-The 1500 ms default mirrors `BankInteraction.tryCloseBank`.
+The 1500 ms timeout is generous slack for the close animation — about
+2–3 server ticks at 600 ms each. (Note: `BankInteraction.tryCloseBank`
+is fire-and-forget with no poll loop, so this primitive is genuinely
+new shape, not a copy.)
 
 ## Implementation sketch
 
 `isGrandExchangeOpen()`:
-- Marshal a one-shot read to the client thread:
+- Marshal a synchronous read to the client thread via
+  `dispatcher.runOnClient(Supplier<T>)` (HumanizedInputDispatcher.java
+  line 2308 — exists exactly for "peer classes in this package can
+  read scene state without rolling their own ClientThread plumbing"):
   `Widget w = client.getWidget(InterfaceID.GeOffers.UNIVERSE);
    return w != null && !w.isHidden();`
 - `InterfaceID.GeOffers.UNIVERSE` is the same constant `GE_ROOTS`
   already references in `GrandExchangeSequenceFactory` — no new
   widget ID.
+- Reuse `dispatcher.runOnClient` rather than rolling a new `onClient`
+  helper into `GrandExchangeScript` — it's already synchronous and
+  throws `InterruptedException`.
 
 `tryCloseGrandExchange()`:
 1. If `!isGrandExchangeOpen()` → return `true` immediately.
 2. Call `geActions.closeGrandExchange()` (existing — single
    `dispatcher.tapKey(VK_ESCAPE)`).
-3. Poll `isGrandExchangeOpen()` every ~80 ms via
+3. Poll `isGrandExchangeOpen()` every 80 ms via
    `SequenceSleep.sleep(client, 80)` until it returns `false` or
-   1500 ms have elapsed.
+   1500 ms have elapsed. (Cadence isn't load-bearing — 80 ms gives
+   ~7 polls within one 600 ms server tick.)
 4. Return final result.
 
 ## Caller changes
