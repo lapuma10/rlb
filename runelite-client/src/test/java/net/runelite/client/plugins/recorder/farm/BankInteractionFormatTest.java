@@ -97,6 +97,22 @@ public class BankInteractionFormatTest
     }
 
     @Test
+    public void roundUpForFastTyping_nearMaxValue_doesNotOverflow()
+    {
+        // Without the guard, qty + (1000 - remainder) would silently
+        // wrap to a negative int. The guard returns qty unchanged when
+        // there's no headroom for a 1000-byte round-up.
+        assertEquals(Integer.MAX_VALUE,
+            BankInteraction.roundUpForFastTyping(Integer.MAX_VALUE));
+        assertEquals(Integer.MAX_VALUE - 500,
+            BankInteraction.roundUpForFastTyping(Integer.MAX_VALUE - 500));
+        // Just inside the safe zone: still rounds up.
+        int safe = Integer.MAX_VALUE - 1500;     // remainder 147
+        assertEquals(safe + (1000 - safe % 1000),
+            BankInteraction.roundUpForFastTyping(safe));
+    }
+
+    @Test
     public void roundUpAndFormat_compose()
     {
         // The two helpers are designed to compose: roundUp then format

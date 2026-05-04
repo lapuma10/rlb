@@ -81,10 +81,33 @@ if (!withdrawWithVerb(itemId, "Withdraw-X")) return false;
 return dispatcher.typeChatboxAndEnter(formatChatboxQty(qty), 3500L);
 ```
 
-Verb format confirmed by user observation: OSRS renders the cached-Y
-entry as `"Withdraw-51000"` (full digits, no `K` abbreviation), so
-`"Withdraw-" + qty` matches via `VerbMatcher.matches` (which is
-normalized-exact, case + whitespace + hyphen tolerant).
+Verb format confirmed by user-supplied screenshot of a Pot of flour
+slot menu (cached Y = 9):
+
+```
+Withdraw-1 Pot of flour
+Withdraw-5 Pot of flour
+Withdraw-10 Pot of flour
+Withdraw-9 Pot of flour          ← cached Y, full digits
+Withdraw-X Pot of flour
+Withdraw-All Pot of flour
+Withdraw-All-but-1 Pot of flour
+```
+
+OSRS parses chatbox input to integer before caching, so typing
+`"51k"` produces a cached Y of `51000` (not the literal `"51K"`) —
+which means our `"Withdraw-" + qty` candidate matches regardless of
+whether the typed input was `"51000"` or `"51k"`. The Phase 2b round-
+up + Phase 1 verb-scan compose as designed.
+
+`MenuEntry.getOption()` returns just the verb (`"Withdraw-9"`); the
+`" Pot of flour"` suffix is the entry's `target` and is rendered
+separately. `VerbMatcher.matches("Withdraw-9", "Withdraw-9")` is
+normalized-exact and matches cleanly.
+
+Same menu structure for noted vs unnoted withdraws (varbit
+`BANK_WITHDRAWNOTES` only changes what arrives in inventory, not the
+menu entries), so `tryWithdrawAsNoteX` benefits from Phase 1 too.
 
 ## Phase 2a — format-on-type in `withdrawXClickChain` (universal)
 

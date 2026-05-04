@@ -1051,6 +1051,12 @@ public final class BankInteraction implements BankActions
         {
             return true;
         }
+        // Cache-miss: caller's qty doesn't match the slot's cached Y or
+        // any fixed verb. Logged so production-log audits can measure
+        // Phase 1 hit-rate over time. The chatbox path below sets the
+        // cached Y to qty, so the next call with the same qty WILL hit.
+        log.info("bank: verb-scan miss for itemId={} qty={} — falling back to chatbox",
+            itemId, qty);
 
         // Fallback: chatbox path.  formatChatboxQty collapses clean
         // multiples to "Nk"/"Nm" so 51000 types as 3 chars instead of
@@ -1161,6 +1167,10 @@ public final class BankInteraction implements BankActions
     public static int roundUpForFastTyping(int qty)
     {
         if (qty < 10_000) return qty;
+        // Overflow guard — qty within 1000 of MAX_VALUE would silently
+        // wrap to negative on the round-up. Unreachable for OSRS coin
+        // amounts but cheap belt-and-braces.
+        if (qty > Integer.MAX_VALUE - 1000) return qty;
         // Round up to next 1000-boundary; already-clean values pass
         // through unchanged.
         int remainder = qty % 1000;
