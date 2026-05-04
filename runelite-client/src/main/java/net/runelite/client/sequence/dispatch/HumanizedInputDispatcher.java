@@ -696,8 +696,7 @@ public class HumanizedInputDispatcher implements InputDispatcher
         {
             lastError.set("npc already in combat with another player " + npcIndex);
             log.info("npc {} became claimed before menu click — refusing attack", npcIndex);
-            try { tapKey(java.awt.event.KeyEvent.VK_ESCAPE); }
-            catch (InterruptedException ie) { Thread.currentThread().interrupt(); throw ie; }
+            dismissMenu();
             SequenceSleep.sleep(client, 120);
             return;
         }
@@ -710,8 +709,7 @@ public class HumanizedInputDispatcher implements InputDispatcher
         {
             lastError.set("npc already in combat with another player " + npcIndex);
             log.info("npc {} became claimed before menu left-click — refusing attack", npcIndex);
-            try { tapKey(java.awt.event.KeyEvent.VK_ESCAPE); }
-            catch (InterruptedException ie) { Thread.currentThread().interrupt(); throw ie; }
+            dismissMenu();
             SequenceSleep.sleep(client, 120);
             return;
         }
@@ -894,7 +892,7 @@ public class HumanizedInputDispatcher implements InputDispatcher
         {
             lastError.set("menu missing '" + v + "' on item " + itemId + " at " + tile);
             log.info("right-click menu did not contain '{}' for item {} at {}", v, itemId, tile);
-            dismissOpenMenuByMovingAway();
+            dismissMenu();
             clearSelectedWidgetTargetMode();
             return;
         }
@@ -1083,8 +1081,7 @@ public class HumanizedInputDispatcher implements InputDispatcher
             + strategy + ")");
         log.info("right-click menu did not contain verb '{}' (strategy={}, top='{}', {})",
             verb, strategy, topLbl, menuDump);
-        try { tapKey(java.awt.event.KeyEvent.VK_ESCAPE); }
-        catch (InterruptedException ie) { Thread.currentThread().interrupt(); throw ie; }
+        dismissMenu();
         // Let the right-click menu actually close before the next hover.
         SequenceSleep.sleep(client, 120);
         return false;
@@ -1258,8 +1255,7 @@ public class HumanizedInputDispatcher implements InputDispatcher
         if (!ok)
         {
             lastError.set("inv slot " + slot + " menu open but verb '" + verb + "' not present");
-            try { tapKey(java.awt.event.KeyEvent.VK_ESCAPE); }
-            catch (InterruptedException ie) { Thread.currentThread().interrupt(); }
+            dismissMenu();
         }
     }
 
@@ -1394,7 +1390,7 @@ public class HumanizedInputDispatcher implements InputDispatcher
                 + want);
             log.info("boundsClickVerifiedAction: menu missing wanted={} (top='{}', menu={})",
                 want, topLbl, dump);
-            dismissOpenMenuByMovingAway();
+            dismissMenu();
             clearSelectedWidgetTargetMode();
             return false;
         }
@@ -1462,7 +1458,7 @@ public class HumanizedInputDispatcher implements InputDispatcher
                 + verb + "' target~" + java.util.Arrays.toString(targetFragments));
             log.info("invSlotClickVerifiedOnWorker: menu missing slot={} verb='{}' fragments={} ({})",
                 slot, verb, java.util.Arrays.toString(targetFragments), dump);
-            dismissOpenMenuByMovingAway();
+            dismissMenu();
             clearSelectedWidgetTargetMode();
             return false;
         }
@@ -1475,33 +1471,81 @@ public class HumanizedInputDispatcher implements InputDispatcher
         return true;
     }
 
-    /** Press Escape only when the current hover proves an item is selected
-     *  for use-mode. This avoids the old blind-Escape path that could close
-     *  the inventory/sidebar after a dropped dispatch or non-use mismatch. */
-    public boolean cancelUseModeIfActiveOnCurrentHover() throws InterruptedException
+    /** Cancel use-mode (a selected inventory item / spell target) by
+     *  re-clicking the source widget — same as a real player cancelling:
+     *  click the highlighted item again to toggle it off.
+     *
+     *  <p>Detects use-mode via {@link Client#getSelectedWidget()} (the
+     *  engine's canonical source — non-null means an item is selected).
+     *  Fetches its bounds on the client thread, picks a humanized pixel
+     *  inside, and dispatches a left-click on the same widget; OSRS
+     *  toggles off the selection.
+     *
+     *  <p>{@code VK_ESCAPE} is NOT used here — it just closes the
+     *  inventory / sidebar tab while the engine's selected-widget state
+     *  stays set, so the next click would still be interpreted as
+     *  use-on-target. {@link #clearSelectedWidgetTargetMode()} is the
+     *  fast engine-state-only equivalent for tight recovery loops where
+     *  humanization isn't required.
+     *
+     *  @return true if use-mode was active and the cancel click was
+     *          dispatched; false if no item was selected. */
+    public boolean cancelUseModeIfActive() throws InterruptedException
     {
-        SequenceSleep.sleep(client, 40);
-        Boolean active = onClient(() -> {
-            try
-            {
-                MenuEntry[] entries = client.getMenu() == null ? null
-                    : client.getMenu().getMenuEntries();
-                if (entries == null || entries.length == 0) return false;
-                return menuEntryLooksLikeUseMode(entries[entries.length - 1]);
-            }
-            catch (Throwable th) { return false; }
+        Rectangle bounds = onClient(() -> {
+            Widget sel = client.getSelectedWidget();
+            if (sel == null) return null;
+            Rectangle b = sel.getBounds();
+            return (b == null || b.isEmpty()) ? null : b;
         });
-        if (!Boolean.TRUE.equals(active)) return false;
-        tapKey(java.awt.event.KeyEvent.VK_ESCAPE);
-        SequenceSleep.sleep(client, 80);
+        if (bounds == null) return false;
+
+        int marginX = Math.max(1, bounds.width / 8);
+        int marginY = Math.max(1, bounds.height / 8);
+        int x = bounds.x + marginX
+            + rng.nextInt(Math.max(1, bounds.width - 2 * marginX));
+        int y = bounds.y + marginY
+            + rng.nextInt(Math.max(1, bounds.height - 2 * marginY));
+        moveCursorTo(x, y);
+        SequenceSleep.sleep(client, 40 + rng.nextInt(60));
+        clickPress(MouseEvent.BUTTON1);
         return true;
     }
 
-    /** Close an open right-click menu by moving the cursor just outside its
-     *  bounds, instead of pressing Escape. Used on recovery paths where
-     *  Escape can have unwanted side effects such as closing the inventory
-     *  sidebar. Returns true if the menu is gone afterwards. */
-    public boolean dismissOpenMenuByMovingAway() throws InterruptedException
+    /** Dismiss any open right-click context menu safely.
+     *
+     *  <p>Single entry point — every menu-miss recovery path in this
+     *  dispatcher (and any external caller) should use this rather than
+     *  tap {@code VK_ESCAPE} directly.
+     *
+     *  <p>Strategy: move the cursor a few dozen pixels outside the menu's
+     *  bounding rect. The OSRS engine auto-dismisses the context menu as
+     *  soon as the cursor leaves it, and unlike {@code VK_ESCAPE} this
+     *  has no side effects on open interfaces (Grand Exchange, bank,
+     *  shop, prayer book, …) — ESC is overloaded as "close topmost
+     *  interface" and would close those out from under the next step.
+     *
+     *  <p>If move-away fails (rare — menu geometry unreadable, or the
+     *  engine ignored the cursor move) we fall back to {@code VK_ESCAPE}
+     *  so we never leave a stuck menu blocking the OSRS game thread.
+     *  A stuck context menu halts cs2 scripts, NPC ticks, and queued
+     *  click effects (CLAUDE.md §8). The ESC fallback may close an open
+     *  interface as a side effect, but that's strictly preferable to a
+     *  frozen client.
+     *
+     *  @return true if the menu is gone afterwards. */
+    public boolean dismissMenu() throws InterruptedException
+    {
+        if (dismissMenuByMovingAway()) return true;
+        log.info("dismissMenu: move-away did not close menu — falling back to VK_ESCAPE");
+        tapKey(java.awt.event.KeyEvent.VK_ESCAPE);
+        return Boolean.TRUE.equals(onClient(() -> !client.isMenuOpen()));
+    }
+
+    /** Move-away primitive — see {@link #dismissMenu()} for the public
+     *  entry point. Kept private so callers always get the ESC fallback
+     *  guarantee. */
+    private boolean dismissMenuByMovingAway() throws InterruptedException
     {
         Boolean open = onClient(client::isMenuOpen);
         if (!Boolean.TRUE.equals(open)) return true;
@@ -1617,15 +1661,6 @@ public class HumanizedInputDispatcher implements InputDispatcher
         return !stripped.contains("->");
     }
 
-    private static boolean menuEntryLooksLikeUseMode(MenuEntry entry)
-    {
-        if (entry == null || !VerbMatcher.matches("Use", entry.getOption()))
-            return false;
-        String target = entry.getTarget();
-        String stripped = (target == null ? "" : target.replaceAll("<[^>]+>", ""));
-        return stripped.contains("->");
-    }
-
     /** Worker-callable wrapper around {@link #typeChatboxInternal} — same
      *  rationale as {@link #boundsClickOnWorker}. */
     public boolean typeChatboxOnWorker(String text, long awaitMs,
@@ -1724,15 +1759,13 @@ public class HumanizedInputDispatcher implements InputDispatcher
         {
             lastError.set("boundsClick: menu open but verb '" + verb + "' not present");
             // CRITICAL: a stuck right-click menu blocks ALL OSRS gameplay
-            // (cs2 scripts, NPC movement, the queued click's effects) until
-            // the user dismisses it. We dismiss with Escape so the engine
-            // can continue processing — without this the entire client
-            // appears "throttled" until the dispatcher gives up and stops
-            // querying. Symptomatic failure: chatbox prompt never opens
-            // after a BUY click, then opens after our timeout fires.
+            // (cs2 scripts, NPC movement, the queued click's effects)
+            // until dismissed. Without this call the entire client appears
+            // "throttled" until the dispatcher gives up. Symptomatic
+            // failure: chatbox prompt never opens after a BUY click, then
+            // opens after our timeout fires.
             log.warn("boundsClick: dismissing stuck right-click menu (verb '{}' not in entries)", verb);
-            try { tapKey(java.awt.event.KeyEvent.VK_ESCAPE); }
-            catch (InterruptedException ie) { Thread.currentThread().interrupt(); }
+            dismissMenu();
         }
     }
 
@@ -1765,8 +1798,7 @@ public class HumanizedInputDispatcher implements InputDispatcher
         if (!ok)
         {
             lastError.set("widget " + widgetId + " menu open but verb '" + verb + "' not present");
-            try { tapKey(java.awt.event.KeyEvent.VK_ESCAPE); }
-            catch (InterruptedException ie) { Thread.currentThread().interrupt(); }
+            dismissMenu();
         }
     }
 
@@ -1954,9 +1986,80 @@ public class HumanizedInputDispatcher implements InputDispatcher
         if (!ok)
         {
             lastError.set("right-click menu did not contain verb '" + verb + "'");
-            try { tapKey(java.awt.event.KeyEvent.VK_ESCAPE); }
-            catch (InterruptedException ie) { Thread.currentThread().interrupt(); }
+            dismissMenu();
         }
+    }
+
+    /** Right-click at (x,y), then pick the first menu entry whose verb
+     *  matches ANY candidate, iterated in priority order.  Returns the
+     *  matched verb on success, or {@code null} if none matched (in
+     *  which case the menu is dismissed and {@link #lastErrorMessage}
+     *  is set).
+     *
+     *  <p>Same humanization shape as {@link #rightClickAndPickMenu} —
+     *  including the left-click shortcut when a candidate is the slot's
+     *  default action.  Verb match goes through
+     *  {@link VerbMatcher#matches} so case / whitespace / hyphens are
+     *  tolerant.
+     *
+     *  <p>Use when multiple verbs would satisfy the caller (e.g.
+     *  {@code Withdraw-9} matches the slot's cached {@code Y} or the
+     *  fixed {@code Withdraw-9} entry interchangeably). */
+    public String rightClickAndPickFirstMatching(int x, int y,
+                                                  java.util.List<String> verbs)
+        throws InterruptedException
+    {
+        if (verbs == null || verbs.isEmpty())
+        {
+            lastError.set("rightClickAndPickFirstMatching: empty candidates");
+            return null;
+        }
+        moveCursorTo(x, y);
+        SequenceSleep.sleep(client, 60);
+        // Left-click shortcut: if any candidate is the slot's default
+        // (top-of-menu) action, just left-click — same fast path as
+        // rightClickAndPickMenu.  Iterate in priority order so the
+        // returned verb matches the candidate that actually fired.
+        String topMatch = onClient(() -> {
+            for (String v : verbs)
+            {
+                if (v != null && !v.isBlank() && isTopMenuVerb(v)) return v;
+            }
+            return null;
+        });
+        if (topMatch != null)
+        {
+            clickPress(MouseEvent.BUTTON1);
+            return topMatch;
+        }
+        clickPress(MouseEvent.BUTTON3);
+        SequenceSleep.sleep(client, 120);
+        // Probe verbs in priority order: first one that appears in the
+        // open menu wins.  findMenuRow takes a predicate so each verb
+        // is one O(entries) scan; verb count in practice is 1–2.
+        String[] matched = new String[1];
+        MenuRow row = onClient(() -> {
+            for (String v : verbs)
+            {
+                if (v == null || v.isBlank()) continue;
+                MenuRow r = findMenuRow(v);
+                if (r != null) { matched[0] = v; return r; }
+            }
+            return null;
+        });
+        if (row == null)
+        {
+            lastError.set("right-click menu did not contain any of " + verbs);
+            dismissMenu();
+            return null;
+        }
+        moveCursorTo(row.x, row.y);
+        SequenceSleep.sleep(client, 40 + rng.nextInt(60));
+        input.mousePress(MouseEvent.BUTTON1);
+        SequenceSleep.sleep(client, 40 + rng.nextInt(40));
+        input.mouseRelease(MouseEvent.BUTTON1);
+        SequenceSleep.sleep(client, 80 + rng.nextInt(180));
+        return matched[0];
     }
 
     /** Type a single printable character with a humanized hold time. The

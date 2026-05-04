@@ -1021,24 +1021,150 @@ public final class BankInteraction implements BankActions
         return withdrawXAndVerify(itemId, qty, itemId);
     }
 
-    /** Click chain only — right-click the slot, pick "Withdraw-X", type
-     *  digits, press Enter. Returns {@code true} iff the chatbox prompt
-     *  opened and was typed into. NOT verified against inventory; the
-     *  caller in {@link #withdrawXAndVerify} does the verify poll. */
+    /** Click chain only — try the cached "Withdraw-Y" verb first, fall
+     *  back to the chatbox path. Returns {@code true} iff a withdraw
+     *  was dispatched (verb-pick OR chatbox typed). NOT verified
+     *  against inventory; the caller in {@link #withdrawXAndVerify}
+     *  does the verify poll.
+     *
+     *  <p>The right-click menu on a bank slot includes a literal
+     *  {@code Withdraw-N} entry for every fixed verb (1, 5, 10) AND a
+     *  dynamic {@code Withdraw-Y} where {@code Y} is the last value
+     *  anyone typed at the bank (cache persists across slots and
+     *  across bank close/reopen). If our requested {@code qty} matches
+     *  any of those, we pick the entry directly — one click, no
+     *  chatbox.  Otherwise we fall through to the existing
+     *  {@code Withdraw-X} chatbox path.
+     *
+     *  <p>{@code Withdraw-All} is intentionally NOT a candidate here:
+     *  callers already partition stack-vs-qty and route All-sized
+     *  withdraws to {@link #tryWithdrawAll} (PieDishScript:915, 940 —
+     *  {@code bankAmt <= need ? tryWithdrawAll : tryWithdrawX}). */
     private boolean withdrawXClickChain(int itemId, int qty) throws InterruptedException
     {
+        // Phase 1: verb-scan.  Single candidate matches both the cached
+        // last-Y and the fixed Withdraw-1/5/10 forms.  Verb format
+        // confirmed against the live menu: OSRS renders the cached-Y
+        // entry as "Withdraw-51000" (full digits, no K abbreviation).
+        if (withdrawWithFirstMatching(itemId,
+                java.util.List.of("Withdraw-" + qty)))
+        {
+            return true;
+        }
+
+        // Fallback: chatbox path.  formatChatboxQty collapses clean
+        // multiples to "Nk"/"Nm" so 51000 types as 3 chars instead of
+        // 5; non-clean qtys pass through unchanged.
         boolean picked = withdrawWithVerb(itemId, "Withdraw-X");
         if (!picked) return false;
         // Withdraw-X opens a chatbox numeric prompt. Use the dispatcher's
         // shared helper that gates on VarClientID.MESLAYERMODE — widget
         // visibility on Chatbox.MES_LAYER lies for these prompts (the
         // hidden chain reports false even when the dialog is on screen).
-        if (!dispatcher.typeChatboxAndEnter(Integer.toString(qty), 3500L))
+        String typed = formatChatboxQty(qty);
+        if (!dispatcher.typeChatboxAndEnter(typed, 3500L))
         {
-            log.warn("bank: withdraw-X chatbox prompt did not appear within 3.5s — aborting type");
+            log.warn("bank: withdraw-X chatbox prompt did not appear within 3.5s — aborting type (typed=\"{}\")", typed);
             return false;
         }
         return true;
+    }
+
+    /** Sibling of {@link #withdrawWithVerb} that picks the first menu
+     *  entry whose verb matches ANY candidate (priority order). Same
+     *  scroll-and-find loop, dispatches
+     *  {@link HumanizedInputDispatcher#rightClickAndPickFirstMatching}
+     *  instead of {@code rightClickAndPickMenu}. Returns true iff a
+     *  candidate was found and clicked.
+     *
+     *  <p>Used by {@link #withdrawXClickChain} for the verb-scan
+     *  fast path (cached {@code Withdraw-Y} / fixed {@code Withdraw-1/5/10}
+     *  hit). Returns false on no-match (caller falls back to the
+     *  chatbox flow) or on item-not-in-bank / scroll-find timeout. */
+    private boolean withdrawWithFirstMatching(int itemId, java.util.List<String> verbs)
+        throws InterruptedException
+    {
+        long deadline = System.currentTimeMillis() + 10_000L;
+        int safety = 30;
+        while (safety-- > 0 && System.currentTimeMillis() < deadline)
+        {
+            ScrollOrBounds sb = onClient(() -> resolveBankSlotInfo(itemId));
+            if (sb == null) return false;
+            if (sb.bounds != null)
+            {
+                int cx = sb.bounds.x + sb.bounds.width / 2;
+                int cy = sb.bounds.y + sb.bounds.height / 2;
+                String matched = dispatcher.rightClickAndPickFirstMatching(cx, cy, verbs);
+                if (matched != null)
+                {
+                    log.info("bank: verb-scan hit '{}' itemId={} at bounds={}",
+                        matched, itemId, sb.bounds);
+                    return true;
+                }
+                // No candidate verb in the menu — caller falls back.
+                return false;
+            }
+            int notches = Math.max(1, Math.min(3, sb.scrollNotches));
+            log.info("bank: verb-scan scroll burst toward itemId={} (dir={}, notches={})",
+                itemId, sb.scrollDirection, notches);
+            dispatcher.wheelScroll(sb.scrollX, sb.scrollY,
+                sb.scrollDirection, notches);
+            SequenceSleep.sleep(client, 150L + (long) (Math.random() * 250L));
+        }
+        log.warn("bank: verb-scan scroll-to-find timed out for itemId={}", itemId);
+        return false;
+    }
+
+    /** Format {@code qty} for the bank/GE chatbox numeric prompt.
+     *  OSRS parses "Nk" as N×1000 and "Nm" as N×1_000_000, so clean
+     *  multiples save typing without overshooting:
+     *  <pre>
+     *    51000   → "51k"     (3 chars vs 5)
+     *    1000000 → "1m"      (2 chars vs 7)
+     *    1003000 → "1003k"   (5 chars vs 7)
+     *    50432   → "50432"   (no clean factor — plain digits)
+     *    0       → "0"
+     *  </pre>
+     *  Pure formatter — no rounding.  See {@link #roundUpForFastTyping}
+     *  for the caller-opt-in rounding helper.
+     *
+     *  <p>Prefer "m" over "k" for cleaner million-multiples (rendering
+     *  parity with how players naturally type).  Negative qty isn't
+     *  meaningful for withdraws; we still return the literal so callers
+     *  see a real (failed) typed string in logs rather than mangled
+     *  output. */
+    static String formatChatboxQty(int qty)
+    {
+        if (qty >= 1_000_000 && qty % 1_000_000 == 0) return (qty / 1_000_000) + "m";
+        if (qty >= 1_000     && qty % 1_000     == 0) return (qty / 1_000)     + "k";
+        return Integer.toString(qty);
+    }
+
+    /** Round {@code qty} UP to the smallest 1000-boundary so
+     *  {@link #formatChatboxQty} can collapse it to "Nk".  Returns
+     *  {@code qty} unchanged for {@code qty < 10_000} — the overshoot
+     *  ratio isn't worth a couple of characters at small magnitudes.
+     *
+     *  <p>Examples:
+     *  <pre>
+     *    50432   → 51000     (typed as "51k", +1.1% overshoot)
+     *    1002213 → 1003000   (typed as "1003k", +0.08% overshoot)
+     *    9999    → 9999      (under threshold)
+     *    51000   → 51000     (already clean)
+     *    447     → 447       (under threshold)
+     *  </pre>
+     *
+     *  <p>Caller is responsible for using this only where a small
+     *  overshoot is harmless (coins, not item batches — withdrawing
+     *  1000 jugs of water when the recipe needs 9 would obviously
+     *  break inventory math). */
+    public static int roundUpForFastTyping(int qty)
+    {
+        if (qty < 10_000) return qty;
+        // Round up to next 1000-boundary; already-clean values pass
+        // through unchanged.
+        int remainder = qty % 1000;
+        return remainder == 0 ? qty : qty + (1000 - remainder);
     }
 
     /** Click chain + inventory poll for Withdraw-X / Withdraw-as-note-X.

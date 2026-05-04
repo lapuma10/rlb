@@ -413,8 +413,16 @@ public final class PieDishScript
                 }
                 else
                 {
-                    log.info("pie-dish: withdraw {} coins (bank={})", plannedBuyCost, bankCoins);
-                    ok = bank.tryWithdrawX(COINS, plannedBuyCost);
+                    // Round up to nearest 1000 so the chatbox typing collapses
+                    // to "Nk" (e.g. 50432 → 51000 typed as "51k", 3 chars vs 5).
+                    // Overshoot is harmless for coins — extra coins land in the
+                    // same stack-slot. Bonus: the rounded value becomes the
+                    // bank's cached Withdraw-Y, so the next equivalent cycle
+                    // hits the verb-scan one-click path.
+                    int withdrawAmt = BankInteraction.roundUpForFastTyping(plannedBuyCost);
+                    log.info("pie-dish: withdraw {} coins (bank={}, planned={})",
+                        withdrawAmt, bankCoins, plannedBuyCost);
+                    ok = bank.tryWithdrawX(COINS, withdrawAmt);
                 }
                 if (!ok)
                 {
