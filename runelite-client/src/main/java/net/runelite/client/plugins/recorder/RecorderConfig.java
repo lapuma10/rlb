@@ -244,4 +244,18 @@ public interface RecorderConfig extends Config
 	{
 		return false;
 	}
+
+	@ConfigItem(
+		keyName = "useWorldMemoryPlanner",
+		name = "Use WorldMemory planner (experimental)",
+		description = "When on, scripts that opt in (currently CookingScriptV3) "
+			+ "use the WorldMemory planner to pick interact tiles instead of "
+			+ "their hardcoded arrival-area path. Default off.",
+		section = experimentalSection,
+		position = 1
+	)
+	default boolean useWorldMemoryPlanner()
+	{
+		return false;
+	}
 }
