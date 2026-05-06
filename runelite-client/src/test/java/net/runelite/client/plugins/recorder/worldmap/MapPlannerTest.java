@@ -5,6 +5,7 @@ import net.runelite.api.coords.WorldPoint;
 import net.runelite.client.plugins.recorder.walker.PathSpec;
 import org.junit.Test;
 import static org.junit.Assert.*;
+import static org.junit.Assert.assertNotEquals;
 
 public class MapPlannerTest
 {
@@ -65,5 +66,29 @@ public class MapPlannerTest
         var wp = spec.get().waypoints().get(0);
         assertEquals(1, wp.area().getWidth());
         assertEquals(1, wp.area().getHeight());
+    }
+
+    @Test
+    public void lumbridgeKitchenWallFixture_picksLosValidTile() throws Exception
+    {
+        RegionChunkSnapshot snap = MapStoreIO.readFixture("lumbridge-kitchen-wall.json");
+        assertNotNull("fixture not found on classpath", snap);
+        assertFalse("fixture loaded empty — resource missing?", snap.tiles().isEmpty());
+
+        MapStore store = new MapStore(new WorldMemoryConfig());
+        store.installSnapshotForTest(snap.regionId(), snap);
+
+        MapPlanner planner = new MapPlanner(store, new WorldMemoryConfig());
+        WorldPoint player = new WorldPoint(3208, 3215, 0);   // approach from south
+        WorldPoint cookTarget = new WorldPoint(3211, 3214, 0);
+
+        Optional<WorldPoint> stand = planner.findInteractTile(player, cookTarget, 2, true);
+
+        assertTrue("planner must find a valid stand tile", stand.isPresent());
+        assertTrue("chosen tile must have LOS to cookTarget",
+            Bresenham.hasLineOfSight(snap, stand.get(), cookTarget));
+        // (3210, 3214, 0) is the closest-by-Chebyshev tile to the west but is
+        // a wall (BLOCK_MOVEMENT_FULL | BLOCK_LINE_OF_SIGHT_FULL) — must be rejected.
+        assertNotEquals(new WorldPoint(3210, 3214, 0), stand.get());
     }
 }

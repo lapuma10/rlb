@@ -1,0 +1,38 @@
+{
+  "schema": 1,
+  "regionId": 0,
+  "gameRevision": 238,
+  "lastScrapedAt": 1714960000000,
+  "tiles": [
+    {"x": 0, "y": 0, "plane": 0, "movement": 0, "los": 0},
+    {"x": 1, "y": 0, "plane": 0, "movement": 0, "los": 0},
+    {"x": 2, "y": 0, "plane": 0, "movement": 0, "los": 0},
+    {"x": 3, "y": 0, "plane": 0, "movement": 0, "los": 0},
+    {"x": 4, "y": 0, "plane": 0, "movement": 0, "los": 0},
+
+    {"x": 0, "y": 1, "plane": 0, "movement": 0, "los": 0},
+    {"x": 1, "y": 1, "plane": 0, "movement": 0, "los": 0},
+    {"x": 2, "y": 1, "plane": 0, "movement": 0, "los": 0},
+    {"x": 3, "y": 1, "plane": 0, "movement": 0, "los": 0},
+    {"x": 4, "y": 1, "plane": 0, "movement": 0, "los": 0},
+
+    {"x": 0, "y": 2, "plane": 0, "movement": 0, "los": 0},
+    {"x": 1, "y": 2, "plane": 0, "movement": 0, "los": 0},
+    {"x": 2, "y": 2, "plane": 0, "movement": 131072, "los": 0},
+    {"x": 3, "y": 2, "plane": 0, "movement": 0, "los": 0},
+    {"x": 4, "y": 2, "plane": 0, "movement": 0, "los": 0},
+
+    {"x": 0, "y": 3, "plane": 0, "movement": 0, "los": 0},
+    {"x": 1, "y": 3, "plane": 0, "movement": 0, "los": 0},
+    {"x": 2, "y": 3, "plane": 0, "movement": 0, "los": 0},
+    {"x": 3, "y": 3, "plane": 0, "movement": 0, "los": 0},
+    {"x": 4, "y": 3, "plane": 0, "movement": 0, "los": 0},
+
+    {"x": 0, "y": 4, "plane": 0, "movement": 0, "los": 0},
+    {"x": 1, "y": 4, "plane": 0, "movement": 0, "los": 0},
+    {"x": 2, "y": 4, "plane": 0, "movement": 0, "los": 0},
+    {"x": 3, "y": 4, "plane": 0, "movement": 0, "los": 0},
+    {"x": 4, "y": 4, "plane": 0, "movement": 0, "los": 0}
+  ],
+  "objects": []
+}
