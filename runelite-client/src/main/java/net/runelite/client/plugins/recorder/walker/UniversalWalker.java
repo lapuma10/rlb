@@ -55,11 +55,9 @@ import net.runelite.client.sequence.internal.ActionRequest;
  * {@link HumanizedInputDispatcher} which has its own internal serialiser.
  */
 @Slf4j
-public final class UniversalWalker
+public final class UniversalWalker implements Walker
 {
-    public enum Status { IN_PROGRESS, ARRIVED, STUCK, ERROR }
-
-    public enum InternalState { IDLE, WALKING, AT_TRANSPORT, CROSSING, ARRIVED, STUCK }
+    // Enums removed — moved to Walker interface.
 
     /** BFS depth used per tick. 16 is enough for in-canvas walks; the BFS
      *  short-circuits at depth so this is a constant cost ~256-tile cap. */
@@ -108,7 +106,7 @@ public final class UniversalWalker
     // Per-spec mutable state. Reset whenever the spec identity changes.
     private PathSpec currentSpec;
     private int stepIdx;
-    private InternalState state;
+    private Walker.InternalState state;
     private WorldPoint lastSeenPosition;
     private long lastMovementMs;
     private long lastClickMs;
@@ -150,7 +148,7 @@ public final class UniversalWalker
     {
         currentSpec = null;
         stepIdx = 0;
-        state = InternalState.IDLE;
+        state = Walker.InternalState.IDLE;
         lastSeenPosition = null;
         lastMovementMs = System.currentTimeMillis();
         lastClickMs = 0;
@@ -161,7 +159,7 @@ public final class UniversalWalker
         lastTransportClicked = null;
     }
 
-    public InternalState state() { return state; }
+    public Walker.InternalState state() { return state; }
     public int currentStepIndex() { return stepIdx; }
     @Nullable public PathSpec currentSpec() { return currentSpec; }
 
@@ -177,9 +175,9 @@ public final class UniversalWalker
      * }
      * }</pre>
      */
-    public Status tick(PathSpec spec) throws InterruptedException
+    public Walker.Status tick(PathSpec spec) throws InterruptedException
     {
-        if (spec == null || spec.size() == 0) return Status.ARRIVED;
+        if (spec == null || spec.size() == 0) return Walker.Status.ARRIVED;
         if (currentSpec != spec)
         {
             // Either this is the first call or the caller swapped specs —
@@ -188,19 +186,19 @@ public final class UniversalWalker
             // fresh state machine, which is what we want.
             reset();
             currentSpec = spec;
-            state = InternalState.WALKING;
+            state = Walker.InternalState.WALKING;
         }
         if (stepIdx >= spec.size())
         {
-            state = InternalState.ARRIVED;
-            return Status.ARRIVED;
+            state = Walker.InternalState.ARRIVED;
+            return Walker.Status.ARRIVED;
         }
 
         Snapshot snap = readSnapshot();
         if (snap == null || snap.position == null)
         {
             // Logged-out / scene not loaded — let the outer loop retry.
-            return Status.IN_PROGRESS;
+            return Walker.Status.IN_PROGRESS;
         }
 
         long now = System.currentTimeMillis();
@@ -238,8 +236,8 @@ public final class UniversalWalker
         }
         if (stepIdx >= spec.size())
         {
-            state = InternalState.ARRIVED;
-            return Status.ARRIVED;
+            state = Walker.InternalState.ARRIVED;
+            return Walker.Status.ARRIVED;
         }
 
         Waypoint active = spec.waypoints().get(stepIdx);
@@ -252,12 +250,12 @@ public final class UniversalWalker
         {
             st = handleWalk(active, snap, now);
         }
-        if (st == Status.IN_PROGRESS && now - lastMovementMs > STUCK_AFTER_MS)
+        if (st == Walker.Status.IN_PROGRESS && now - lastMovementMs > STUCK_AFTER_MS)
         {
             log.warn("walker: STUCK — no movement for {}ms at step {} ({})",
                 now - lastMovementMs, stepIdx, describe(active));
-            state = InternalState.STUCK;
-            return Status.STUCK;
+            state = Walker.InternalState.STUCK;
+            return Walker.Status.STUCK;
         }
         return st;
     }
@@ -543,24 +541,24 @@ public final class UniversalWalker
         return false;
     }
 
-    private Status handleWalk(Waypoint active, Snapshot snap, long now)
+    private Walker.Status handleWalk(Waypoint active, Snapshot snap, long now)
         throws InterruptedException
     {
-        state = InternalState.WALKING;
+        state = Walker.InternalState.WALKING;
         WorldArea area = active.area();
         if (area == null)
         {
             log.warn("walker: WALK step {} has no area", stepIdx);
-            return Status.ERROR;
+            return Walker.Status.ERROR;
         }
         if (snap.reach == null)
         {
-            return Status.IN_PROGRESS;
+            return Walker.Status.IN_PROGRESS;
         }
         if (arrived(active, snap.position))
         {
             // We're already in the area — caller will advance next tick.
-            return Status.IN_PROGRESS;
+            return Walker.Status.IN_PROGRESS;
         }
 
         // Picker reads Perspective.localToCanvas / localToMinimap, both of
@@ -594,7 +592,7 @@ public final class UniversalWalker
                 // and re-BFS next tick.
                 log.debug("walker: walk step {} — no reachable projection yet, "
                     + "waiting for player to advance", stepIdx);
-                return Status.IN_PROGRESS;
+                return Walker.Status.IN_PROGRESS;
             }
         }
         if (shouldClick(now))
@@ -620,18 +618,18 @@ public final class UniversalWalker
             lastClickMs = now;
             lastClickStepIdx = stepIdx;
         }
-        return Status.IN_PROGRESS;
+        return Walker.Status.IN_PROGRESS;
     }
 
-    private Status handleTransport(Waypoint active, Snapshot snap, long now)
+    private Walker.Status handleTransport(Waypoint active, Snapshot snap, long now)
         throws InterruptedException
     {
-        state = InternalState.AT_TRANSPORT;
+        state = Walker.InternalState.AT_TRANSPORT;
         WorldPoint t = active.tile();
         if (t == null)
         {
             log.warn("walker: TRANSPORT step {} has no tile", stepIdx);
-            return Status.ERROR;
+            return Walker.Status.ERROR;
         }
 
         // First: are we close enough to interact? If not, walk toward the
@@ -650,16 +648,16 @@ public final class UniversalWalker
                 // another transport — caller's PathSpec is malformed.
                 log.warn("walker: TRANSPORT step {} on plane {} but player on plane {}",
                     stepIdx, t.getPlane(), snap.position.getPlane());
-                return Status.ERROR;
+                return Walker.Status.ERROR;
             }
-            if (snap.reach == null) return Status.IN_PROGRESS;
+            if (snap.reach == null) return Walker.Status.IN_PROGRESS;
             // pickTowards reads Perspective.localTo*, requires client thread.
             StepClickPicker.ClickTarget pick = clientCall(() ->
                 picker.pickTowards(snap.reach, t));
             if (pick == null)
             {
                 log.debug("walker: transport step {} — can't reach tile {} yet", stepIdx, t);
-                return Status.IN_PROGRESS;
+                return Walker.Status.IN_PROGRESS;
             }
             if (shouldClick(now))
             {
@@ -681,14 +679,14 @@ public final class UniversalWalker
                 lastClickMs = now;
                 lastClickStepIdx = stepIdx;
             }
-            return Status.IN_PROGRESS;
+            return Walker.Status.IN_PROGRESS;
         }
 
         // Adjacent — interact (with throttle).
         if (now - lastInteractMs < INTERACT_THROTTLE_MS)
         {
             // Wait for the previous interaction to settle before re-issuing.
-            return Status.IN_PROGRESS;
+            return Walker.Status.IN_PROGRESS;
         }
         // Wait for the player to STOP animating before clicking the verb.
         // V1's rule: never invoke a stairs/gate menu while the player is
@@ -703,7 +701,7 @@ public final class UniversalWalker
         });
         if (settled == null || !settled)
         {
-            return Status.IN_PROGRESS;
+            return Walker.Status.IN_PROGRESS;
         }
         ClickPair pair = clientCall(() -> {
             TransportResolver.Match m = resolver.findTransport(t, active.verb());
@@ -726,7 +724,7 @@ public final class UniversalWalker
             if (b == null) return ClickPair.missing();
             return ClickPair.click(b, m);
         });
-        if (pair == null) return Status.IN_PROGRESS;
+        if (pair == null) return Walker.Status.IN_PROGRESS;
         if (pair.alreadyOpen)
         {
             log.info("walker: transport step {} {} already open — walking through",
@@ -736,12 +734,12 @@ public final class UniversalWalker
             lastInteractMs = now;
             lastTransportClicked = active;
             lastClickedTransportIdx = stepIdx;
-            return Status.IN_PROGRESS;
+            return Walker.Status.IN_PROGRESS;
         }
         if (pair.missing)
         {
             log.debug("walker: transport at {} verb '{}' not found yet", t, active.verb());
-            return Status.IN_PROGRESS;
+            return Walker.Status.IN_PROGRESS;
         }
         // Dispatch via CLICK_GAME_OBJECT — the dispatcher's pixel
         // resolver samples a point INSIDE the convex hull (not just the
@@ -762,8 +760,8 @@ public final class UniversalWalker
         lastClickedTransportIdx = stepIdx;
         lastClickMs = now;
         lastTransportClicked = active;
-        state = InternalState.CROSSING;
-        return Status.IN_PROGRESS;
+        state = Walker.InternalState.CROSSING;
+        return Walker.Status.IN_PROGRESS;
     }
 
     /** A click target derived from the resolver match, or a sentinel that
