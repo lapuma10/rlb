@@ -254,9 +254,9 @@ public final class MapStoreIO
      *  {@code /worldmap/fixtures/<resourceName>}. Used by Phase 5 fixture tests.
      *  Returns an empty snapshot (regionId=0) on failure — the test should
      *  assert non-empty to catch missing resources. */
-    public RegionChunkSnapshot readFixture(String resourceName)
+    public static RegionChunkSnapshot readFixture(String resourceName)
     {
-        try (InputStream is = getClass().getResourceAsStream(
+        try (InputStream is = MapStoreIO.class.getResourceAsStream(
                 "/worldmap/fixtures/" + resourceName))
         {
             if (is == null)

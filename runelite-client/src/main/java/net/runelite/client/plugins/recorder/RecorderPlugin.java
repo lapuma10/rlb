@@ -322,7 +322,8 @@ public class RecorderPlugin extends Plugin
         TransportResolver cookingV3Resolver = new TransportResolver(client);
         net.runelite.client.plugins.recorder.scripts.CookingScriptV3 cookingScriptV3 =
             new net.runelite.client.plugins.recorder.scripts.CookingScriptV3(
-                client, clientThread, cookingV3Dispatcher, cookingV3Resolver);
+                client, clientThread, cookingV3Dispatcher, cookingV3Resolver,
+                this, config);
         panel.setCookingScriptV3(cookingScriptV3);
 
         // GE Core + Phase B bank-prep: independent dispatcher + InputOwnership

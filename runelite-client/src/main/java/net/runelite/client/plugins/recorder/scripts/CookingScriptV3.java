@@ -1,5 +1,6 @@
 package net.runelite.client.plugins.recorder.scripts;
 
+import java.util.Optional;
 import java.util.concurrent.ThreadLocalRandom;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
@@ -14,6 +15,8 @@ import net.runelite.api.coords.WorldArea;
 import net.runelite.api.coords.WorldPoint;
 import net.runelite.api.gameval.ItemID;
 import net.runelite.client.callback.ClientThread;
+import net.runelite.client.plugins.recorder.RecorderConfig;
+import net.runelite.client.plugins.recorder.RecorderPlugin;
 import net.runelite.client.plugins.recorder.cook.CookingFood;
 import net.runelite.client.plugins.recorder.cook.CookingInteraction;
 import net.runelite.client.plugins.recorder.cook.CookingLocation;
@@ -137,6 +140,8 @@ public final class CookingScriptV3
     private final CookingInteraction cook;
     private final SidebarTabActions sidebarTabs;
     private final LogoutHelper logoutHelper;
+    private final RecorderPlugin plugin;
+    private final RecorderConfig config;
 
     private final AtomicReference<CookingLocation> location = new AtomicReference<>();
     private final AtomicInteger rawFoodId = new AtomicInteger(0);
@@ -189,7 +194,9 @@ public final class CookingScriptV3
 
     public CookingScriptV3(Client client, ClientThread clientThread,
                            HumanizedInputDispatcher dispatcher,
-                           TransportResolver resolver)
+                           TransportResolver resolver,
+                           RecorderPlugin plugin,
+                           RecorderConfig config)
     {
         this.client = client;
         this.clientThread = clientThread;
@@ -199,6 +206,8 @@ public final class CookingScriptV3
         this.cook = new CookingInteraction(client, clientThread, dispatcher);
         this.sidebarTabs = new SidebarTabActions(client, clientThread, dispatcher);
         this.logoutHelper = new LogoutHelper(client, clientThread, dispatcher);
+        this.plugin = plugin;
+        this.config = config;
     }
 
     public void setLocation(CookingLocation l) { location.set(l); }
@@ -634,14 +643,49 @@ public final class CookingScriptV3
         if (tripCookPath != null) return tripCookPath;
         CookingLocation l = location.get();
         WorldPoint target = pickCookTargetTile(l);
+
         if (target == null)
         {
+            // Unchanged: walk to full cookArea (legacy behavior when target unknown).
             tripCookPath = PathSpec.builder("v3-cook-area-" + System.currentTimeMillis())
                 .walk("v3-cook", l.cookArea())
                 .build();
         }
+        else if (config.useWorldMemoryPlanner())
+        {
+            WorldPoint playerPos = onClient(() -> {
+                Player p = client.getLocalPlayer();
+                return p == null ? null : p.getWorldLocation();
+            });
+            if (playerPos == null)
+            {
+                // Player position read failed (logged out / scene unloaded).
+                // Fall back to wide cookArea so the script doesn't hang.
+                tripCookPath = PathSpec.builder("v3-cook-area-" + System.currentTimeMillis())
+                    .walk("v3-cook", l.cookArea())
+                    .build();
+                return tripCookPath;
+            }
+            Optional<PathSpec> spec = plugin.mapPlanner().planToInteractTile(
+                playerPos, target,
+                /* maxDistance */ 2,
+                /* requireLineOfSight */ true,
+                /* pathName */ "v3-cook-wm-" + System.currentTimeMillis());
+            if (spec.isPresent())
+            {
+                tripCookPath = spec.get();
+            }
+            else
+            {
+                // Wide cookArea fallback (NOT the buggy 3×3).
+                tripCookPath = PathSpec.builder("v3-cook-area-" + System.currentTimeMillis())
+                    .walk("v3-cook", l.cookArea())
+                    .build();
+            }
+        }
         else
         {
+            // Toggle off — preserve the existing 3×3 path exactly.
             WorldArea around = arrivalWindowAround(target);
             tripCookPath = PathSpec.builder("v3-cook-target-" + System.currentTimeMillis())
                 .walk("v3-cook", around)
