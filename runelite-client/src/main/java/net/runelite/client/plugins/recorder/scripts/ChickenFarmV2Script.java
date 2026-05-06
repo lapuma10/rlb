@@ -18,6 +18,7 @@ import net.runelite.client.plugins.recorder.farm.InventoryUtil;
 import net.runelite.client.plugins.recorder.transport.TransportResolver;
 import net.runelite.client.plugins.recorder.walker.PathSpec;
 import net.runelite.client.plugins.recorder.walker.UniversalWalker;
+import net.runelite.client.plugins.recorder.walker.Walker;
 import net.runelite.client.sequence.dispatch.HumanizedInputDispatcher;
 import net.runelite.client.sequence.dispatch.SequenceSleep;
 
@@ -146,7 +147,7 @@ public final class ChickenFarmV2Script
     private final ClientThread clientThread;
     private final HumanizedInputDispatcher dispatcher;
 
-    private final UniversalWalker walker;
+    private final Walker walker;
     private final BankInteraction bank;
     private final ChickenCombatLoop combat;
 
@@ -260,7 +261,7 @@ public final class ChickenFarmV2Script
      *  walking phase starts fresh. */
     private void tickWalk(PathSpec spec, State onArrived) throws InterruptedException
     {
-        UniversalWalker.Status st = walker.tick(spec);
+        Walker.Status st = walker.tick(spec);
         status.set("walk: " + spec.name() + " (" + st + ")");
         switch (st)
         {

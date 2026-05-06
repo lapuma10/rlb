@@ -15,6 +15,7 @@ import net.runelite.client.plugins.recorder.farm.InventoryUtil;
 import net.runelite.client.plugins.recorder.transport.TransportResolver;
 import net.runelite.client.plugins.recorder.walker.PathSpec;
 import net.runelite.client.plugins.recorder.walker.UniversalWalker;
+import net.runelite.client.plugins.recorder.walker.Walker;
 import net.runelite.client.sequence.dispatch.HumanizedInputDispatcher;
 import net.runelite.client.sequence.dispatch.SequenceSleep;
 
@@ -70,7 +71,7 @@ public final class BankDepositStrategy implements BankingStrategy
      *  widget opens. */
     public static final long BANK_LOAD_GRACE_MS = 1500L;
 
-    private final UniversalWalker walker;
+    private final Walker walker;
     private final BankInteraction bank;
     private final HumanizedInputDispatcher dispatcher;
     private final Client client;
@@ -166,7 +167,7 @@ public final class BankDepositStrategy implements BankingStrategy
                 return false;
             }
             if (Thread.currentThread().isInterrupted()) throw new InterruptedException("stop");
-            UniversalWalker.Status st = walker.tick(spec);
+            Walker.Status st = walker.tick(spec);
             switch (st)
             {
                 case ARRIVED:

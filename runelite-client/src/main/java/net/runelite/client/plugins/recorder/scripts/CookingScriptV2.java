@@ -21,6 +21,7 @@ import net.runelite.client.plugins.recorder.farm.BankInteraction;
 import net.runelite.client.plugins.recorder.transport.TransportResolver;
 import net.runelite.client.plugins.recorder.walker.PathSpec;
 import net.runelite.client.plugins.recorder.walker.UniversalWalker;
+import net.runelite.client.plugins.recorder.walker.Walker;
 import net.runelite.client.plugins.recorder.widget.SidebarTab;
 import net.runelite.client.plugins.recorder.widget.SidebarTabActions;
 import net.runelite.client.sequence.dispatch.HumanizedInputDispatcher;
@@ -148,7 +149,7 @@ public final class CookingScriptV2
     private final Client client;
     private final ClientThread clientThread;
     private final HumanizedInputDispatcher dispatcher;
-    private final UniversalWalker walker;
+    private final Walker walker;
     private final BankInteraction bank;
     private final CookingInteraction cook;
     private final SidebarTabActions sidebarTabs;
@@ -410,16 +411,16 @@ public final class CookingScriptV2
         CookingLocation l = location.get();
         if (!playerInArea(l.bankArea()))
         {
-            UniversalWalker.Status s = walker.tick(currentBankPath());
+            Walker.Status s = walker.tick(currentBankPath());
             status.set("bank: walking to bank (" + s + ")");
-            if (s == UniversalWalker.Status.ARRIVED)
+            if (s == Walker.Status.ARRIVED)
             {
                 walker.reset();
                 walkerStuckCount = 0;
                 tripBankPath = null;   // arrived — next leg picks a fresh tile
             }
-            else if (s == UniversalWalker.Status.STUCK
-                  || s == UniversalWalker.Status.ERROR)
+            else if (s == Walker.Status.STUCK
+                  || s == Walker.Status.ERROR)
             {
                 walkerStuckCount++;
                 log.info("cookV2 bank: walker {} (count={})", s, walkerStuckCount);
@@ -624,7 +625,7 @@ public final class CookingScriptV2
     private void tickWalk(boolean toCook) throws InterruptedException
     {
         PathSpec spec = toCook ? currentCookPath() : currentBankPath();
-        UniversalWalker.Status st = walker.tick(spec);
+        Walker.Status st = walker.tick(spec);
         status.set((toCook ? "→ cook" : "→ bank") + ": " + st);
         switch (st)
         {
