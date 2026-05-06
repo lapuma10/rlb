@@ -28,6 +28,7 @@ import lombok.extern.slf4j.Slf4j;
 import net.runelite.api.Client;
 import net.runelite.api.coords.WorldPoint;
 import net.runelite.client.callback.ClientThread;
+import net.runelite.client.config.ConfigManager;
 import net.runelite.client.plugins.recorder.annotator.AnnotatorHudOverlay;
 import net.runelite.client.plugins.recorder.annotator.AreaSelector;
 import net.runelite.client.plugins.recorder.annotator.RoutesTab;
@@ -159,6 +160,8 @@ public final class RecorderPanel extends PluginPanel
     private net.runelite.client.plugins.recorder.inspector.ClickInspector clickInspector;
     private final javax.swing.JCheckBox clickInspectorCb =
         new javax.swing.JCheckBox("Click Inspector");
+    private final javax.swing.JCheckBox worldMemoryPlannerCb =
+        new javax.swing.JCheckBox("WorldMemory planner (experimental)");
     private Timer refreshTimer;
     private final JButton chickenStartBtn = new JButton("Start chicken loop");
     private final JButton chickenStopBtn = new JButton("Stop");
@@ -238,6 +241,23 @@ public final class RecorderPanel extends PluginPanel
     private final JButton pieDishStartBtn  = new JButton("Start");
     private final JButton pieDishStopBtn   = new JButton("Stop");
     private final JLabel  pieDishStatusLabel = new JLabel("Pie Dish: idle");
+    // Pizza script.
+    private net.runelite.client.plugins.recorder.scripts.PizzaScript pizzaScript;
+    private final JButton pizzaStartBtn  = new JButton("Start");
+    private final JButton pizzaStopBtn   = new JButton("Stop");
+    // Per-loop enable toggles. Default = all selected, matching the
+    // script defaults; user unchecks to skip a loop.  Read live by
+    // PizzaScript.tickDecide on each bank trip.
+    private final javax.swing.JCheckBox pizzaTomatoBox =
+        new javax.swing.JCheckBox("Add tomato (loop 1)", true);
+    private final javax.swing.JCheckBox pizzaCheeseBox =
+        new javax.swing.JCheckBox("Add cheese (loop 2)", true);
+    private final javax.swing.JCheckBox pizzaCookBox =
+        new javax.swing.JCheckBox("Cook pizza (loop 3)", true);
+    private final javax.swing.JCheckBox pizzaAnchoviesBox =
+        new javax.swing.JCheckBox("Add anchovies (loop 4)", true);
+    private final JLabel  pizzaStatusLabel = new JLabel("Pizza: idle");
+    private final JLabel  pizzaCountsLabel = new JLabel("Made: 0");
     // GE Core (Phase A): wired by RecorderPlugin via setGrandExchangeScript.
     private GrandExchangeTab grandExchangeTab;
     private final JTabbedPane tabs = new JTabbedPane();
@@ -284,15 +304,16 @@ public final class RecorderPanel extends PluginPanel
 
         add(buildStatusHeader(), BorderLayout.NORTH);
 
-        tabs.addTab("Routes", new JScrollPane(buildRoutesTab()));
-        tabs.addTab("Combat", new JScrollPane(buildCombatTab()));
-        tabs.addTab("Chicken farm", new JScrollPane(buildChickenFarmTab()));
-        tabs.addTab("Record", new JScrollPane(buildRecordTab()));
-        tabs.addTab("Mining", new JScrollPane(buildMiningTab()));
-        tabs.addTab("Cooking", new JScrollPane(buildCookingTab()));
-        tabs.addTab("Cook's Quest", new JScrollPane(buildCooksQuestTab()));
-        tabs.addTab("Pie Dish", new JScrollPane(buildPieDishTab()));
-        tabs.addTab("Login",  new JScrollPane(buildLoginTab()));
+        tabs.addTab("Routes", tabScroll(buildRoutesTab()));
+        tabs.addTab("Combat", tabScroll(buildCombatTab()));
+        tabs.addTab("Chicken farm", tabScroll(buildChickenFarmTab()));
+        tabs.addTab("Record", tabScroll(buildRecordTab()));
+        tabs.addTab("Mining", tabScroll(buildMiningTab()));
+        tabs.addTab("Cooking", tabScroll(buildCookingTab()));
+        tabs.addTab("Cook's Quest", tabScroll(buildCooksQuestTab()));
+        tabs.addTab("Pie Dish", tabScroll(buildPieDishTab()));
+        tabs.addTab("Pizza", tabScroll(buildPizzaTab()));
+        tabs.addTab("Login",  tabScroll(buildLoginTab()));
         add(tabs, BorderLayout.CENTER);
 
         recordBtn.addActionListener(this::onRecordToggle);
@@ -343,6 +364,9 @@ public final class RecorderPanel extends PluginPanel
                 clickInspector.setEnabled(clickInspectorCb.isSelected());
             }
         });
+        p.add(worldMemoryPlannerCb);
+        // Action listener wired by setWorldMemoryPlannerConfig() once the
+        // plugin has injected config + configManager.
         return p;
     }
 
@@ -351,6 +375,20 @@ public final class RecorderPanel extends PluginPanel
         net.runelite.client.plugins.recorder.inspector.ClickInspector ci)
     {
         this.clickInspector = ci;
+    }
+
+    /**
+     * Wire the WorldMemory planner checkbox to the RuneLite config system.
+     * Called by RecorderPlugin after both config and configManager are available.
+     * Reads the current config value so the checkbox reflects the persisted state,
+     * then registers an action listener that writes back on toggle.
+     */
+    public void setWorldMemoryPlannerConfig(RecorderConfig cfg, ConfigManager cm)
+    {
+        worldMemoryPlannerCb.setSelected(cfg.useWorldMemoryPlanner());
+        worldMemoryPlannerCb.addActionListener(e ->
+            cm.setConfiguration("recorder", "useWorldMemoryPlanner",
+                worldMemoryPlannerCb.isSelected()));
     }
 
     // ------------------------------------------------------------------
@@ -1840,19 +1878,37 @@ public final class RecorderPanel extends PluginPanel
         c.setMaximumSize(new Dimension(Integer.MAX_VALUE, pref.height));
     }
 
+    /** Tab scroll wrapper. Keeps default horizontal-scroll policy
+     *  (AS_NEEDED) — some tabs have wide overlay tables that legitimately
+     *  need horizontal scroll. Per-tab content that should wrap instead
+     *  must use HTML width hints on its labels, not blanket-disable the
+     *  scrollbar here. */
+    private static JScrollPane tabScroll(JComponent inner)
+    {
+        JScrollPane sp = new JScrollPane(inner);
+        sp.setBorder(null);
+        return sp;
+    }
+
     private JPanel buildCooksQuestTab()
     {
         JPanel p = new JPanel();
         p.setLayout(new BoxLayout(p, BoxLayout.Y_AXIS));
         p.setBorder(BorderFactory.createTitledBorder("Cook's Assistant Quest"));
 
-        JPanel buttons = new JPanel(new BorderLayout(4, 4));
-        buttons.add(questStartBtn, BorderLayout.CENTER);
-        buttons.add(questStopBtn, BorderLayout.EAST);
+        JPanel buttons = new JPanel(new java.awt.GridLayout(1, 2, 4, 0));
+        buttons.add(questStartBtn);
+        buttons.add(questStopBtn);
         capHeight(buttons);
 
-        p.add(new JLabel("<html><small>Pre-conditions: pot of flour in inv;<br>"
-            + "bucket of milk OR empty bucket in inv.</small></html>"));
+        JLabel desc = new JLabel("<html>Pre-conditions: pot of flour in inv;<br>"
+            + "bucket of milk OR empty bucket in inv.</html>");
+        desc.setAlignmentX(Component.LEFT_ALIGNMENT);
+        buttons.setAlignmentX(Component.LEFT_ALIGNMENT);
+        questStatusLabel.setAlignmentX(Component.LEFT_ALIGNMENT);
+        capHeight(questStatusLabel);
+
+        p.add(desc);
         p.add(Box.createVerticalStrut(4));
         p.add(buttons);
         p.add(questStatusLabel);
@@ -1900,14 +1956,21 @@ public final class RecorderPanel extends PluginPanel
         p.setLayout(new BoxLayout(p, BoxLayout.Y_AXIS));
         p.setBorder(BorderFactory.createTitledBorder("Pie Dish Crafter"));
 
-        JPanel buttons = new JPanel(new BorderLayout(4, 4));
-        buttons.add(pieDishStartBtn, BorderLayout.CENTER);
-        buttons.add(pieDishStopBtn, BorderLayout.EAST);
+        JPanel buttons = new JPanel(new java.awt.GridLayout(1, 2, 4, 0));
+        buttons.add(pieDishStartBtn);
+        buttons.add(pieDishStopBtn);
         capHeight(buttons);
 
-        p.add(new JLabel("<html><small>Buys pie dishes, flour &amp; water at GE,<br>"
+        JLabel desc = new JLabel("<html>Buys pie dishes, flour &amp; water at GE,<br>"
             + "crafts pastry dough + pie shells, then sells.<br>"
-            + "Start near GE (Varrock).</small></html>"));
+            + "Start near GE (Varrock).</html>");
+
+        desc.setAlignmentX(Component.LEFT_ALIGNMENT);
+        buttons.setAlignmentX(Component.LEFT_ALIGNMENT);
+        pieDishStatusLabel.setAlignmentX(Component.LEFT_ALIGNMENT);
+        capHeight(pieDishStatusLabel);
+
+        p.add(desc);
         p.add(Box.createVerticalStrut(4));
         p.add(buttons);
         p.add(pieDishStatusLabel);
@@ -1950,6 +2013,158 @@ public final class RecorderPanel extends PluginPanel
         }
         pieDishStatusLabel.setText(pieDishScript.state()
             + " — " + pieDishScript.status());
+    }
+
+    private JPanel buildPizzaTab()
+    {
+        JPanel p = new JPanel();
+        p.setLayout(new BoxLayout(p, BoxLayout.Y_AXIS));
+        p.setBorder(BorderFactory.createTitledBorder("Pizza maker (Lumbridge)"));
+
+        // GridLayout(1,2) gives Start + Stop equal width, matching the
+        // Cooking tab. Plain BorderLayout(CENTER, EAST) starves Start
+        // when the panel is narrow.
+        JPanel buttons = new JPanel(new java.awt.GridLayout(1, 2, 4, 0));
+        buttons.add(pizzaStartBtn);
+        buttons.add(pizzaStopBtn);
+        capHeight(buttons);
+
+        JLabel desc = new JLabel("<html>"
+            + "Bank tomatoes, pizza bases, cheese.<br>"
+            + "Combines them into uncooked pizzas,<br>"
+            + "cooks at the Lumbridge range.<br>"
+            + "Start at Lumbridge bank.</html>");
+
+        // BoxLayout Y_AXIS positions each child by its alignmentX, which
+        // defaults to CENTER (0.5). Short components (checkbox, status,
+        // counts) end up indented from the left edge — visually wasted
+        // space. Pin every child to LEFT_ALIGNMENT.
+        desc.setAlignmentX(Component.LEFT_ALIGNMENT);
+        pizzaTomatoBox.setAlignmentX(Component.LEFT_ALIGNMENT);
+        pizzaCheeseBox.setAlignmentX(Component.LEFT_ALIGNMENT);
+        pizzaCookBox.setAlignmentX(Component.LEFT_ALIGNMENT);
+        pizzaAnchoviesBox.setAlignmentX(Component.LEFT_ALIGNMENT);
+        buttons.setAlignmentX(Component.LEFT_ALIGNMENT);
+        pizzaStatusLabel.setAlignmentX(Component.LEFT_ALIGNMENT);
+        pizzaCountsLabel.setAlignmentX(Component.LEFT_ALIGNMENT);
+        // Pin label heights so BoxLayout doesn't stretch them vertically.
+        capHeight(pizzaTomatoBox);
+        capHeight(pizzaCheeseBox);
+        capHeight(pizzaCookBox);
+        capHeight(pizzaAnchoviesBox);
+        capHeight(pizzaStatusLabel);
+        capHeight(pizzaCountsLabel);
+
+        p.add(desc);
+        p.add(Box.createVerticalStrut(4));
+        p.add(pizzaTomatoBox);
+        p.add(pizzaCheeseBox);
+        p.add(pizzaCookBox);
+        p.add(pizzaAnchoviesBox);
+        p.add(buttons);
+        p.add(pizzaStatusLabel);
+        p.add(pizzaCountsLabel);
+        p.add(Box.createVerticalGlue());
+
+        pizzaStartBtn.addActionListener(e -> onPizzaStart());
+        pizzaStopBtn.addActionListener(e -> onPizzaStop());
+        // Live-push every checkbox flip to the script — script reads
+        // these in tickDecide so the change takes effect at the next
+        // bank trip without restart.
+        pizzaTomatoBox.addActionListener(e -> {
+            if (pizzaScript != null) pizzaScript.setAddTomato(pizzaTomatoBox.isSelected());
+        });
+        pizzaCheeseBox.addActionListener(e -> {
+            if (pizzaScript != null) pizzaScript.setAddCheese(pizzaCheeseBox.isSelected());
+        });
+        pizzaCookBox.addActionListener(e -> {
+            if (pizzaScript != null) pizzaScript.setCookPizza(pizzaCookBox.isSelected());
+        });
+        pizzaAnchoviesBox.addActionListener(e -> {
+            if (pizzaScript != null) pizzaScript.setAddAnchovies(pizzaAnchoviesBox.isSelected());
+        });
+        return p;
+    }
+
+    public void setPizzaScript(net.runelite.client.plugins.recorder.scripts.PizzaScript script)
+    {
+        this.pizzaScript = script;
+        if (script != null)
+        {
+            script.setAddTomato(pizzaTomatoBox.isSelected());
+            script.setAddCheese(pizzaCheeseBox.isSelected());
+            script.setCookPizza(pizzaCookBox.isSelected());
+            script.setAddAnchovies(pizzaAnchoviesBox.isSelected());
+        }
+    }
+
+    private void onPizzaStart()
+    {
+        if (pizzaScript == null)
+        {
+            pizzaStatusLabel.setText("Pizza: unavailable");
+            return;
+        }
+        // Mutual exclusion with the cooking V2/V3 scripts — they all
+        // click the same character, so two running at once interleaves
+        // input and produces garbage. Same guard pattern Cooking V2
+        // uses against V3.
+        if (cookingScriptV3 != null
+            && cookingScriptV3.state()
+                != net.runelite.client.plugins.recorder.scripts.CookingScriptV3.State.IDLE
+            && cookingScriptV3.state()
+                != net.runelite.client.plugins.recorder.scripts.CookingScriptV3.State.ABORTED)
+        {
+            pizzaStatusLabel.setText("Pizza: Cooking V3 still running — Stop first");
+            return;
+        }
+        if (cookingScriptV2 != null
+            && cookingScriptV2.state()
+                != net.runelite.client.plugins.recorder.scripts.CookingScriptV2.State.IDLE
+            && cookingScriptV2.state()
+                != net.runelite.client.plugins.recorder.scripts.CookingScriptV2.State.ABORTED)
+        {
+            pizzaStatusLabel.setText("Pizza: Cooking V2 still running — Stop first");
+            return;
+        }
+        pizzaScript.setAddTomato(pizzaTomatoBox.isSelected());
+        pizzaScript.setAddCheese(pizzaCheeseBox.isSelected());
+        pizzaScript.setCookPizza(pizzaCookBox.isSelected());
+        pizzaScript.setAddAnchovies(pizzaAnchoviesBox.isSelected());
+        pizzaScript.start();
+        StringBuilder flags = new StringBuilder();
+        if (pizzaTomatoBox.isSelected())    flags.append("T");
+        if (pizzaCheeseBox.isSelected())    flags.append("C");
+        if (pizzaCookBox.isSelected())      flags.append("K");
+        if (pizzaAnchoviesBox.isSelected()) flags.append("A");
+        pizzaStatusLabel.setText("Pizza: starting (loops: "
+            + (flags.length() == 0 ? "none" : flags.toString()) + ")");
+    }
+
+    private void onPizzaStop()
+    {
+        if (pizzaScript == null) return;
+        pizzaScript.stop();
+        pizzaStatusLabel.setText("Pizza: stopping");
+    }
+
+    private void refreshPizza()
+    {
+        if (pizzaScript == null)
+        {
+            pizzaStatusLabel.setText("Pizza: unavailable");
+            pizzaCountsLabel.setText("Made: 0");
+            return;
+        }
+        pizzaStatusLabel.setText(pizzaScript.state()
+            + " — " + pizzaScript.status());
+        pizzaCountsLabel.setText("<html>Made — "
+            + "Unfinished: <b>" + pizzaScript.incompleteMade() + "</b> | "
+            + "Uncooked: <b>" + pizzaScript.uncookedMade() + "</b> | "
+            + "Plain: <b>" + pizzaScript.plainMade() + "</b> | "
+            + "Anchovy: <b>" + pizzaScript.anchovyMade() + "</b> | "
+            + "Burnt: <b>" + pizzaScript.burntMade() + "</b>"
+            + "</html>");
     }
 
     /** Wire the V2 cooking script. The plugin constructs the script in
@@ -2621,6 +2836,7 @@ public final class RecorderPanel extends PluginPanel
         refreshCooking();
         refreshCooksQuest();
         refreshPieDish();
+        refreshPizza();
     }
 
     /** Mirror the bare chicken combat loop's state into the panel labels.

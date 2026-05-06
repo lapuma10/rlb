@@ -370,6 +370,7 @@ public class RecorderPlugin extends Plugin
         clickInspector = new net.runelite.client.plugins.recorder.inspector.ClickInspector(
             client, eventBus);
         panel.setClickInspector(clickInspector);
+        panel.setWorldMemoryPlannerConfig(config, configManager);
 
         // WorldMemory subsystem — passive scraper + planner. Scrapers run on
         // the client thread (via @Subscribe onGameTick); the planner is called
