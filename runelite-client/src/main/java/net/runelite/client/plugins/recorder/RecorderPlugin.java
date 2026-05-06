@@ -26,23 +26,38 @@ package net.runelite.client.plugins.recorder;
 
 import com.google.inject.Provides;
 import javax.inject.Inject;
+import java.io.File;
 import lombok.extern.slf4j.Slf4j;
 import net.runelite.api.Client;
+import net.runelite.api.Player;
+import net.runelite.api.WorldView;
+import net.runelite.api.events.GameTick;
+import net.runelite.client.RuneLite;
 import net.runelite.client.callback.ClientThread;
 import net.runelite.client.config.ConfigManager;
 import net.runelite.client.eventbus.EventBus;
+import net.runelite.client.eventbus.Subscribe;
 import net.runelite.client.game.ItemManager;
 import net.runelite.client.input.KeyManager;
 import net.runelite.client.input.MouseManager;
 import net.runelite.client.plugins.Plugin;
 import net.runelite.client.plugins.PluginDescriptor;
+import net.runelite.client.plugins.recorder.worldmap.EntityIndex;
+import net.runelite.client.plugins.recorder.worldmap.EntityScraper;
+import net.runelite.client.plugins.recorder.worldmap.EntitySighting;
+import net.runelite.client.plugins.recorder.worldmap.FlushDaemon;
+import net.runelite.client.plugins.recorder.worldmap.MapPlanner;
+import net.runelite.client.plugins.recorder.worldmap.MapStore;
+import net.runelite.client.plugins.recorder.worldmap.MapStoreIO;
+import net.runelite.client.plugins.recorder.worldmap.SceneScraper;
+import net.runelite.client.plugins.recorder.worldmap.WorldMemoryConfig;
 import net.runelite.client.plugins.recorder.annotator.AnnotatorHudOverlay;
 import net.runelite.client.plugins.recorder.annotator.AreaSelector;
 import net.runelite.client.plugins.recorder.scripts.ChickenFarmV2Script;
 import net.runelite.client.plugins.recorder.scripts.CooksAssistantScript;
 import net.runelite.client.plugins.recorder.scripts.GrandExchangeScript;
 import net.runelite.client.plugins.recorder.scripts.PieDishScript;
-import net.runelite.client.sequence.dispatch.InputOwnership;
+import net.runelite.client.plugins.recorder.scripts.PizzaScript;
 import net.runelite.api.coords.WorldArea;
 import net.runelite.client.plugins.recorder.scripts.LumbridgeBankPenScript;
 import net.runelite.client.plugins.recorder.trail.TrailRecorder;
@@ -129,8 +144,19 @@ public class RecorderPlugin extends Plugin
     private AnnotatorHudOverlay hudOverlay;
     private CooksAssistantScript cooksAssistantScript;
     private PieDishScript pieDishScript;
+    private PizzaScript pizzaScript;
     private AreaSelector areaSelector;
     private net.runelite.client.plugins.recorder.inspector.ClickInspector clickInspector;
+
+    // WorldMemory subsystem — passive tile/entity scrapers + planner.
+    private MapStore worldMapStore;
+    private EntityIndex worldEntityIndex;
+    private SceneScraper sceneScraper;
+    private EntityScraper entityScraper;
+    private MapPlanner mapPlanner;
+    private WorldMemoryConfig wmConfig;
+    private FlushDaemon flushDaemon;
+    private int tickCounter;
 
     @Provides
     RecorderConfig provideConfig(ConfigManager cm)
@@ -331,11 +357,68 @@ public class RecorderPlugin extends Plugin
         pieDishScript = new PieDishScript(client, clientThread, pieDispatcher, grandExchangeScript);
         panel.setPieDishScript(pieDishScript);
 
+        // Pizza script — three batched bank↔bank loops (combine inputs)
+        // plus one bank → kitchen-range round trip to cook the uncooked
+        // pizzas. Independent dispatcher so it never collides with the
+        // other scripts on the dispatcher busy flag.
+        HumanizedInputDispatcher pizzaDispatcher = new HumanizedInputDispatcher(client, clientThread);
+        pizzaScript = new PizzaScript(client, clientThread, pizzaDispatcher, trailRegistry);
+        panel.setPizzaScript(pizzaScript);
+
         // Click inspector — toggleable diagnostic. Subscribes itself to the
         // EventBus only when enabled; safe to leave off by default.
         clickInspector = new net.runelite.client.plugins.recorder.inspector.ClickInspector(
             client, eventBus);
         panel.setClickInspector(clickInspector);
+
+        // WorldMemory subsystem — passive scraper + planner. Scrapers run on
+        // the client thread (via @Subscribe onGameTick); the planner is called
+        // from worker threads (cooking scripts etc.).
+        wmConfig = new WorldMemoryConfig();
+        worldMapStore = new MapStore(wmConfig);
+        worldEntityIndex = new EntityIndex();
+        sceneScraper = new SceneScraper(client, worldMapStore, worldEntityIndex, wmConfig);
+        entityScraper = new EntityScraper();
+        mapPlanner = new MapPlanner(worldMapStore, wmConfig);
+
+        // Bootstrap: load any persisted chunks for the player's current region
+        // + 8 neighbours so the planner has data immediately on a warm run
+        // (otherwise the planner returns empty for the first scrape cycle
+        // even when JSON exists from a prior session). Done off the client
+        // thread to avoid blocking startup.
+        File worldmapRoot = new File(RuneLite.RUNELITE_DIR, "recorder/worldmap");
+        Thread bootstrapThread = new Thread(() -> {
+            Player self = client.getLocalPlayer();
+            if (self == null || self.getWorldLocation() == null) return;
+            int rx = self.getWorldLocation().getX() >> 6;
+            int ry = self.getWorldLocation().getY() >> 6;
+            for (int dx = -1; dx <= 1; dx++)
+            {
+                for (int dy = -1; dy <= 1; dy++)
+                {
+                    int regionId = ((rx + dx) << 8) | ((ry + dy) & 0xff);
+                    worldMapStore.loadFromDisk(worldmapRoot, regionId);
+                }
+            }
+            // Entity sightings — for nearestNpc/Object queries.
+            for (int dx = -1; dx <= 1; dx++)
+            {
+                for (int dy = -1; dy <= 1; dy++)
+                {
+                    int regionId = ((rx + dx) << 8) | ((ry + dy) & 0xff);
+                    for (EntitySighting s : MapStoreIO.readEntities(worldmapRoot, regionId))
+                    {
+                        worldEntityIndex.recordNpcSighting(s.id, s.name, s.lastTile, s.lastSeenAt);
+                    }
+                }
+            }
+        }, "worldmap-bootstrap");
+        bootstrapThread.setDaemon(true);
+        bootstrapThread.start();
+
+        flushDaemon = new FlushDaemon(worldMapStore, worldEntityIndex,
+            worldmapRoot, wmConfig.flushEverySeconds * 1000L);
+        flushDaemon.start();
 
         BufferedImage icon = ImageUtil.loadImageResource(getClass(), "/util/reset.png");
         navButton = NavigationButton.builder()
@@ -394,6 +477,7 @@ public class RecorderPlugin extends Plugin
         if (miningLoop != null) miningLoop.stop();
         if (cooksAssistantScript != null) { cooksAssistantScript.stop(); cooksAssistantScript = null; }
         if (pieDishScript != null) { pieDishScript.stop(); pieDishScript = null; }
+        if (pizzaScript != null) { pizzaScript.stop(); pizzaScript = null; }
         if (hudOverlay != null) overlayManager.remove(hudOverlay);
         if (areaSelector != null && areaSelector.isActive()) areaSelector.cancel();
         if (debugOverlay != null) overlayManager.remove(debugOverlay);
@@ -434,5 +518,40 @@ public class RecorderPlugin extends Plugin
         eventCapture = null; manager = null; hotkeys = null;
         chickenLoop = null;
         miningLoop = null;
+        if (flushDaemon != null)
+        {
+            flushDaemon.stop();
+            flushDaemon.flushOnce();   // persist in-memory data before exit
+            flushDaemon = null;
+        }
+        worldMapStore = null;
+        worldEntityIndex = null;
+        sceneScraper = null;
+        entityScraper = null;
+        mapPlanner = null;
+        wmConfig = null;
+        tickCounter = 0;
     }
+
+    @Subscribe
+    public void onGameTick(GameTick e)
+    {
+        if (wmConfig == null) return;
+        if (++tickCounter % wmConfig.scrapeEveryNTicks != 0) return;
+        long now = System.currentTimeMillis();
+        WorldView wv = client.getTopLevelWorldView();
+        if (wv == null) return;
+        if (wv.getScene() != null && wv.getScene().isInstance()) return;
+        long start = System.nanoTime();
+        sceneScraper.scan(wv, now);
+        if (System.nanoTime() - start > wmConfig.scrapeBudgetNanos)
+        {
+            log.debug("worldmap: scene scrape exceeded budget; skipping entities this tick");
+            return;
+        }
+        entityScraper.scanNpcs(wv, now, worldEntityIndex);
+    }
+
+    /** Public accessor for scripts (e.g. CookingScriptV3). */
+    public MapPlanner mapPlanner() { return mapPlanner; }
 }
