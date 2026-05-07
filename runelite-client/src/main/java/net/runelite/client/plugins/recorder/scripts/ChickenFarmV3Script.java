@@ -41,8 +41,8 @@ import net.runelite.client.sequence.internal.ActionRequest;
 @Slf4j
 public final class ChickenFarmV3Script
 {
-    public static final String OUTBOUND_TRAIL_NAME = "lumby-bank-to-pen";
-    public static final String RETURN_TRAIL_NAME   = "pen-to-lumby-bank";
+    public static final String OUTBOUND_TRAIL_NAME = "lumby_bank_to_pen";
+    public static final String RETURN_TRAIL_NAME   = "pen_to_lumby_bank";
 
     /** Bank stand area — used for "are we at the bank?" check and as the
      *  RETURN destination. Mirrors V2/V1's BANK_AREA. */

@@ -49,6 +49,7 @@ RUN dpkg --add-architecture i386 \
        libgl1 \
        libxext6 libxrender1 libxtst6 libxi6 libxrandr2 \
        fontconfig fonts-dejavu \
+       x11-utils \
        ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 

@@ -100,10 +100,22 @@ fi
 # with VNC_PASSWORD for shared/exposed setups.
 VNC_PORT="${VNC_PORT:-5900}"
 VNC_PASSWORD="${VNC_PASSWORD:-rlb}"
+
+# Clean up any stale X server lock from a previous unclean shutdown
+# (`docker restart` doesn't always give Xvfb time to remove its lock).
+rm -f /tmp/.X*-lock /tmp/.X11-unix/X* 2>/dev/null
+
 x11vnc -storepasswd "$VNC_PASSWORD" /tmp/.vncpasswd >/dev/null
 Xvfb :99 -screen 0 1280x800x24 &
-x11vnc -display :99 -rfbauth /tmp/.vncpasswd -forever -shared -rfbport "$VNC_PORT" -quiet &
-sleep 1
+# Wait for Xvfb to actually be listening before x11vnc tries to connect.
+# Without this, x11vnc races and dies silently when :99 isn't up yet.
+for i in 1 2 3 4 5 6 7 8 9 10; do
+  if xdpyinfo -display :99 >/dev/null 2>&1; then break; fi
+  sleep 0.3
+done
+x11vnc -display :99 -rfbauth /tmp/.vncpasswd -forever -shared -rfbport "$VNC_PORT" \
+  -bg -o /tmp/x11vnc.log \
+  -threads -noxdamage -ncache 0 -nocursorshape -nocursorpos >/dev/null
 echo "[entrypoint] VNC on $VNC_PORT (password: $VNC_PASSWORD)"
 
 # ---- 5. AccountLauncher ----

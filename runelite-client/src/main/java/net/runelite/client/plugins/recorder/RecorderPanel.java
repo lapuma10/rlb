@@ -2144,6 +2144,7 @@ public final class RecorderPanel extends PluginPanel
         pizzaScript.setAddCheese(pizzaCheeseBox.isSelected());
         pizzaScript.setCookPizza(pizzaCookBox.isSelected());
         pizzaScript.setAddAnchovies(pizzaAnchoviesBox.isSelected());
+        pizzaScript.setAfkBreaksEnabled(pizzaBreaksBox.isSelected());
         pizzaScript.start();
         StringBuilder flags = new StringBuilder();
         if (pizzaTomatoBox.isSelected())    flags.append("T");
@@ -2167,10 +2168,12 @@ public final class RecorderPanel extends PluginPanel
         {
             pizzaStatusLabel.setText("Pizza: unavailable");
             pizzaCountsLabel.setText("Made: 0");
+            pizzaBreakLabel.setText("breaks: idle");
             return;
         }
         pizzaStatusLabel.setText(pizzaScript.state()
             + " — " + pizzaScript.status());
+        pizzaBreakLabel.setText(pizzaScript.breakStatus());
         pizzaCountsLabel.setText("<html>Made — "
             + "Unfinished: <b>" + pizzaScript.incompleteMade() + "</b> | "
             + "Uncooked: <b>" + pizzaScript.uncookedMade() + "</b> | "
