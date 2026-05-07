@@ -92,7 +92,7 @@ public class InvalidationClassifierTest
     {
         InvalidationClassifier c = new InvalidationClassifier();
         InvalidationClassifier.FailureClass cls = c.classify(unknown(TILE));
-        assertEquals(InvalidationClassifier.FailureClass.UNKNOWN, cls);
+        assertEquals(InvalidationClassifier.FailureClass.UNKNOWN_FAILURE, cls);
         assertEquals(1, c.failureCount(TILE));
         assertFalse("one unknown failure does not blacklist", c.isBlacklisted(TILE));
     }
@@ -141,6 +141,6 @@ public class InvalidationClassifierTest
         InvalidationClassifier c = new InvalidationClassifier();
         InvalidationClassifier.FailureClass cls = c.classify(null);
         assertNotNull(cls);
-        assertEquals(InvalidationClassifier.FailureClass.UNKNOWN, cls);
+        assertEquals(InvalidationClassifier.FailureClass.UNKNOWN_FAILURE, cls);
     }
 }

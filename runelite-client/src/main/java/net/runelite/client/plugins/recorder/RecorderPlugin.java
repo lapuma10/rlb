@@ -544,9 +544,16 @@ public class RecorderPlugin extends Plugin
         net.runelite.client.plugins.recorder.nav.v2.V2Executor.Env env
             = new net.runelite.client.plugins.recorder.nav.v2.V2ExecutorEnv(
                 client, clientThread, dispatcher, filter, minimap, worldMapStore);
+        net.runelite.client.plugins.recorder.nav.v2.V2Executor.Toggles toggles
+            = new net.runelite.client.plugins.recorder.nav.v2.V2Executor.Toggles()
+        {
+            @Override public boolean variableDistance() { return config.enableV2VariableDistance(); }
+            @Override public boolean minimapModality() { return config.enableV2MinimapModality(); }
+            @Override public boolean catchupClicks() { return config.enableV2CatchupClicks(); }
+        };
         net.runelite.client.plugins.recorder.nav.v2.V2Executor executor
             = new net.runelite.client.plugins.recorder.nav.v2.V2Executor(
-                env, picker, classifier, new java.util.Random());
+                env, picker, classifier, new java.util.Random(), toggles);
         return new net.runelite.client.plugins.recorder.nav.v2.V2Navigator(
             planner, executor, () -> playerLocOnClientThread(), worldEntityIndex);
     }

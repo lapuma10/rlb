@@ -97,6 +97,8 @@ public class V2EntityNavigationTest
         assertEquals("missing entity sighting → FAILED", NavStatus.FAILED, s);
         assertEquals("planner must NOT be invoked when entity not resolvable",
             0, planner.plannedTo.size());
+        assertEquals("FailureReason must be ENTITY_NOT_FOUND",
+            V2Navigator.FailureReason.ENTITY_NOT_FOUND, nav.lastFailureReason());
     }
 
     @Test
@@ -145,6 +147,7 @@ public class V2EntityNavigationTest
 
         NavStatus s = nav.tick(NavRequest.toEntity("Cook", EntityKind.NPC, BehaviorMode.VARIED));
         assertEquals(NavStatus.FAILED, s);
+        assertEquals(V2Navigator.FailureReason.ENTITY_NOT_FOUND, nav.lastFailureReason());
     }
 
     @Test

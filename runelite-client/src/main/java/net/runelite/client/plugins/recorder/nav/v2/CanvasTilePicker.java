@@ -42,6 +42,18 @@ public final class CanvasTilePicker
     public WorldPoint pickNext(V2Path path, WorldPoint player,
                                Predicate<WorldPoint> filter, Random rng)
     {
+        return pickNext(path, player, filter, rng, true);
+    }
+
+    /** Phase-13 toggle variant: when {@code variableDistance} is false,
+     *  the picker only considers the short bucket — always closest
+     *  walkable forward tile. Used when the user disables variable click
+     *  distance via {@code RecorderConfig.enableV2VariableDistance} to
+     *  isolate modality-specific failures. */
+    public WorldPoint pickNext(V2Path path, WorldPoint player,
+                               Predicate<WorldPoint> filter, Random rng,
+                               boolean variableDistance)
+    {
         if (path == null || path.isEmpty()) return null;
         if (player == null || filter == null || rng == null) return null;
 
@@ -54,6 +66,14 @@ public final class CanvasTilePicker
         // want strictly forward of it.
         int forwardCount = walkTiles.size() - playerIdx - 1;
         if (forwardCount <= 0) return null;
+
+        if (!variableDistance)
+        {
+            // Short-bucket-only path: always pick the nearest valid forward
+            // tile. The filter still applies — entity contamination rules
+            // are independent of the bucket choice.
+            return pickInBucket(walkTiles, playerIdx, 0, filter, rng);
+        }
 
         // Try the buckets in weighted-random order, then fall through
         // to any forward tile if every bucket is empty post-filter.

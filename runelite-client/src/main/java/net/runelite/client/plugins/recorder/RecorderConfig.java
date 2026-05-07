@@ -318,6 +318,60 @@ public interface RecorderConfig extends Config
 		return false;
 	}
 
+	/** Phase-13 sub-step toggles. Each click-improvement modality has
+	 *  its own kill switch so a regression in one (minimap, catch-up,
+	 *  variable distance) can be turned off without flipping
+	 *  {@link #navigatorMode} all the way back to V1_ONLY. Defaults
+	 *  reflect the spec's "round-1 active" set: variable distance ON,
+	 *  minimap ON, catch-up ON. Worldmap and run-toggle are explicitly
+	 *  out of round-1 scope so they have no flag (they're not wired). */
+	@ConfigItem(
+		keyName = "enableV2VariableDistance",
+		name = "V2 variable click distance",
+		description = "When on (default), V2 picks canvas tiles from short / "
+			+ "mid / long buckets along the planned path. When off, V2 always "
+			+ "picks the nearest forward path tile (short bucket). Off makes "
+			+ "the bot's clicks shorter and more frequent — useful when "
+			+ "diagnosing modality-specific failures.",
+		section = experimentalSection,
+		position = 4
+	)
+	default boolean enableV2VariableDistance()
+	{
+		return true;
+	}
+
+	@ConfigItem(
+		keyName = "enableV2MinimapModality",
+		name = "V2 minimap modality",
+		description = "When on (default), V2 falls back to minimap clicks when "
+			+ "every canvas candidate fails the empty-tile filter (busy area / "
+			+ "ground items everywhere). When off, V2 stays on canvas — "
+			+ "exhausted candidates fail the leg so the navigator replans. "
+			+ "Disable to isolate canvas-only behavior during seed-pass diagnosis.",
+		section = experimentalSection,
+		position = 5
+	)
+	default boolean enableV2MinimapModality()
+	{
+		return true;
+	}
+
+	@ConfigItem(
+		keyName = "enableV2CatchupClicks",
+		name = "V2 catch-up clicks",
+		description = "When on (default), V2 may re-click a stalled tile up to "
+			+ "twice before failing the leg. When off, the executor fails on "
+			+ "the first STALL_TICKS-of-no-progress event so the navigator "
+			+ "replans — useful when catch-up is masking a real pathing bug.",
+		section = experimentalSection,
+		position = 6
+	)
+	default boolean enableV2CatchupClicks()
+	{
+		return true;
+	}
+
 	@ConfigSection(
 		name = "WorldMap overlay (V2 inspect)",
 		description = "Minimap debug overlay for the V2 navigator's world memory: walkable tiles, transport endpoints, the active planned route, and (toggleable) blocked tiles, stale edges, entity sightings.",

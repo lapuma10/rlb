@@ -60,6 +60,28 @@ public final class V2Navigator implements Navigator
     {
     }
 
+    /** Tagged reason attached to a {@link NavStatus#FAILED} return.
+     *  Set by the most recent {@link #tick} that failed, cleared on the
+     *  next successful resolution. Surfaces to the panel + log so the
+     *  morning live-test workflow knows whether a missing-entity
+     *  failure differs from a missing-route failure. */
+    public enum FailureReason
+    {
+        /** Phase-16: request named an entity but {@link EntityIndex} had
+         *  no matching sighting (or no EntityIndex was wired). */
+        ENTITY_NOT_FOUND,
+        /** Planner returned an empty path — see the no-route log line
+         *  for the planner's diagnostic. */
+        NO_ROUTE,
+        /** Executor reported FAILED — see {@link V2Executor#lastFailureReason}
+         *  for the specific reason. */
+        EXECUTOR_FAILED,
+        /** Player location unknown (logged out / scene unloaded). */
+        NO_PLAYER_LOC,
+        /** Request shape unsupported (no point, no entity). */
+        BAD_REQUEST
+    }
+
     private static final String NAME = "worldmap-v2";
 
     private final PlannerHook planner;
@@ -71,6 +93,7 @@ public final class V2Navigator implements Navigator
 
     @Nullable private WorldPoint activeTarget;
     @Nullable private V2Path activePath;
+    @Nullable private FailureReason lastFailureReason;
 
     public V2Navigator(V2Planner planner, V2Executor executor, PlayerLocSupplier playerLoc)
     {
@@ -119,12 +142,17 @@ public final class V2Navigator implements Navigator
         };
     }
 
+    /** Tagged reason for the most recent FAILED transition. {@code null}
+     *  while RUNNING / ARRIVED / IDLE or after {@link #cancel}. */
+    @Nullable public FailureReason lastFailureReason() { return lastFailureReason; }
+
     @Override
     public NavStatus tick(NavRequest request) throws InterruptedException
     {
         if (request == null)
         {
             log.debug("worldmap-v2: null request — V2 requires a target");
+            lastFailureReason = FailureReason.BAD_REQUEST;
             return NavStatus.FAILED;
         }
         WorldPoint target = resolveTarget(request);
@@ -139,25 +167,31 @@ public final class V2Navigator implements Navigator
             if (here == null)
             {
                 log.warn("worldmap-v2: no player location, cannot plan");
+                lastFailureReason = FailureReason.NO_PLAYER_LOC;
                 return NavStatus.FAILED;
             }
             V2Path path = planner.plan(here, target, request.mode());
             if (path == null || path.isEmpty())
             {
-                log.warn("worldmap-v2: planner returned no route from {} to {} — {}",
+                log.warn("worldmap-v2: NO_ROUTE from {} to {} — {}",
                     here, target, diagnoseSafely(here, target));
                 activeTarget = null;
                 activePath = null;
                 executor.cancel();
+                lastFailureReason = FailureReason.NO_ROUTE;
                 return NavStatus.FAILED;
             }
-            log.info("worldmap-v2: plan {} → {} legs={} cost={}",
-                here, target, path.legs().size(), path.totalCost());
+            log.info("worldmap-v2: plan {} → {} legs={} cost={} routeId={}",
+                here, target, path.legs().size(), path.totalCost(), path.routeId());
             activeTarget = target;
             activePath = path;
+            lastFailureReason = null;
             executor.setPath(path);
         }
-        return mapStatus(executor.tick());
+        NavStatus s = mapStatus(executor.tick());
+        if (s == NavStatus.FAILED) lastFailureReason = FailureReason.EXECUTOR_FAILED;
+        else if (s == NavStatus.ARRIVED) lastFailureReason = null;
+        return s;
     }
 
     private String diagnoseSafely(WorldPoint from, WorldPoint to)
@@ -180,10 +214,13 @@ public final class V2Navigator implements Navigator
         // Entity-targeted — Phase 16.
         if (request.entity() != null)
         {
-            return resolveEntity(request.entity());
+            WorldPoint resolved = resolveEntity(request.entity());
+            if (resolved == null) lastFailureReason = FailureReason.ENTITY_NOT_FOUND;
+            return resolved;
         }
 
         log.debug("worldmap-v2: request has no point and no entity — V2 cannot satisfy");
+        lastFailureReason = FailureReason.BAD_REQUEST;
         return null;
     }
 
@@ -247,6 +284,7 @@ public final class V2Navigator implements Navigator
     {
         activeTarget = null;
         activePath = null;
+        lastFailureReason = null;
         executor.cancel();
     }
 

@@ -48,7 +48,11 @@ public final class InvalidationClassifier
         STATIC_COLLISION_MISMATCH,
         DYNAMIC_BLOCKER,
         TRANSPORT_STATE_MISMATCH,
-        UNKNOWN
+        /** Tag matches the spec's "UNKNOWN_FAILURE" exactly — used when
+         *  no higher-precedence rule fires. The per-tile counter still
+         *  increments so {@link #BLACKLIST_THRESHOLD} can promote
+         *  repeat offenders. */
+        UNKNOWN_FAILURE
     }
 
     /** Read-only observation packet describing a failed click. The
@@ -84,7 +88,7 @@ public final class InvalidationClassifier
 
     public FailureClass classify(FailureContext ctx)
     {
-        if (ctx == null) return FailureClass.UNKNOWN;
+        if (ctx == null) return FailureClass.UNKNOWN_FAILURE;
 
         FailureClass result;
         if (ctx.targetWasTransport() && !ctx.expectedVerbStillPresent())
@@ -110,7 +114,7 @@ public final class InvalidationClassifier
         }
         else
         {
-            result = FailureClass.UNKNOWN;
+            result = FailureClass.UNKNOWN_FAILURE;
         }
 
         int newCount = failureCounts.merge(ctx.clickedTile(), 1, Integer::sum);

@@ -60,9 +60,22 @@ public final class V2Executor
          *  plane, beyond the per-leg bound. Indicates a malformed
          *  route or planner bug. */
         CROSS_PLANE_CANDIDATES_EXHAUSTED,
-        /** Catch-all for round-1 FAILED paths whose specific reason
-         *  is logged inline (catch-up exhausted, click-reject bound,
-         *  stall classifier escalations, etc.). */
+        /** Spec HARD CONSTRAINT exhaust path: every canvas candidate
+         *  on the leg was rejected by the strict-walk gate
+         *  ({@code isLeftClickWalk} mismatch — overlapping tree /
+         *  ground item / NPC) up to {@link #MAX_CLICK_REJECTS_PER_LEG}.
+         *  The navigator should replan from a fresh world view. */
+        UNSAFE_CANVAS_CLICK_EXHAUSTED,
+        /** Stall classifier returned STATIC_COLLISION_MISMATCH or
+         *  TRANSPORT_STATE_MISMATCH — replanning is the right move,
+         *  retrying the same tile is a waste. */
+        STALL_CLASSIFIER_REPLAN,
+        /** Catch-up budget exhausted on a stalled leg
+         *  ({@link #MAX_CATCHUP_CLICKS_PER_LEG}). */
+        CATCHUP_EXHAUSTED,
+        /** Catch-all — kept for tests that don't care about the
+         *  precise enum case. New code paths should pick a more
+         *  specific value. */
         OTHER
     }
 
@@ -164,10 +177,25 @@ public final class V2Executor
      *  this fraction over {@link #FILTER_REJECT_WINDOW}. */
     private static final double MINIMAP_BIAS_THRESHOLD = 0.5;
 
+    /** Phase-13 click-improvement sub-step toggles. Each accessor is read
+     *  live (per-tick) so the panel switch takes effect on the next tick
+     *  without restarting the script. Defaults are "round-1 active" —
+     *  variable distance ON, minimap ON, catch-up ON. Tests inject a
+     *  static instance; production wires {@code RecorderConfig::...}. */
+    public interface Toggles
+    {
+        default boolean variableDistance() { return true; }
+        default boolean minimapModality() { return true; }
+        default boolean catchupClicks() { return true; }
+
+        Toggles ALL_ON = new Toggles() {};
+    }
+
     private final Env env;
     private final CanvasTilePicker canvasPicker;
     private final InvalidationClassifier classifier;
     private final Random rng;
+    private final Toggles toggles;
 
     @Nullable private V2Path path;
     private int legIdx;
@@ -187,10 +215,18 @@ public final class V2Executor
     public V2Executor(Env env, CanvasTilePicker canvasPicker,
                       InvalidationClassifier classifier, Random rng)
     {
+        this(env, canvasPicker, classifier, rng, Toggles.ALL_ON);
+    }
+
+    public V2Executor(Env env, CanvasTilePicker canvasPicker,
+                      InvalidationClassifier classifier, Random rng,
+                      Toggles toggles)
+    {
         this.env = env;
         this.canvasPicker = canvasPicker;
         this.classifier = classifier;
         this.rng = rng;
+        this.toggles = toggles == null ? Toggles.ALL_ON : toggles;
     }
 
     /** Start executing a new path. Clears all per-leg state and
@@ -318,9 +354,10 @@ public final class V2Executor
             ticksSinceProgress = 0;   // not a stall — the click never landed
             if (clickRejectsThisLeg >= MAX_CLICK_REJECTS_PER_LEG)
             {
-                log.warn("v2-executor: UNSAFE_CANVAS_CLICK — FAILED after {} consecutive rejections, all canvas candidates blacklisted; navigator should replan",
+                log.warn("v2-executor: UNSAFE_CANVAS_CLICK_EXHAUSTED — FAILED after {} consecutive rejections, all canvas candidates blacklisted; navigator should replan",
                     clickRejectsThisLeg);
                 status = Status.FAILED;
+                lastFailureReason = FailureReason.UNSAFE_CANVAS_CLICK_EXHAUSTED;
                 return status;
             }
             // Fall through into the same tick's pick path so we choose
@@ -365,7 +402,8 @@ public final class V2Executor
 
         if (modality == Modality.CANVAS)
         {
-            WorldPoint pick = canvasPicker.pickNext(path, here, this::canvasFilter, rng);
+            WorldPoint pick = canvasPicker.pickNext(path, here, this::canvasFilter, rng,
+                toggles.variableDistance());
             if (!acceptCandidate(pick, here, "canvas"))
             {
                 pick = null;
@@ -382,7 +420,17 @@ public final class V2Executor
                 }
                 return status;
             }
-            // Canvas exhausted: fall through to minimap this tick.
+            // Canvas exhausted: fall through to minimap this tick UNLESS
+            // the user disabled minimap modality (Phase-13 sub-step
+            // toggle). When minimap is off, the leg fails so the
+            // navigator can replan instead of looping with no candidate.
+            if (!toggles.minimapModality())
+            {
+                log.warn("v2-executor: canvas exhausted and minimap modality disabled — FAILED so navigator can replan");
+                status = Status.FAILED;
+                lastFailureReason = FailureReason.UNSAFE_CANVAS_CLICK_EXHAUSTED;
+                return status;
+            }
             modality = Modality.MINIMAP;
         }
 
@@ -475,12 +523,22 @@ public final class V2Executor
         {
             log.warn("v2-executor: {} requires a fresh plan — FAILED so navigator replans", fc);
             status = Status.FAILED;
+            lastFailureReason = FailureReason.STALL_CLASSIFIER_REPLAN;
             return true;
         }
 
         // DYNAMIC_BLOCKER / UNKNOWN: bounded catch-up. The classifier
         // already added a transient penalty for DYNAMIC_BLOCKER, so the
         // canvas filter will skip the tile on the next pick if needed.
+        // Catch-up is gated by Phase-13 toggle — when off, FAIL on
+        // first stall so the navigator replans instead of re-clicking.
+        if (!toggles.catchupClicks())
+        {
+            log.warn("v2-executor: stall + catch-up disabled — FAILED so navigator replans");
+            status = Status.FAILED;
+            lastFailureReason = FailureReason.CATCHUP_EXHAUSTED;
+            return true;
+        }
         if (catchupClicksThisLeg < MAX_CATCHUP_CLICKS_PER_LEG)
         {
             log.info("v2-executor: stall after {} ticks at {} — catch-up re-click on {} ({})",
@@ -498,6 +556,7 @@ public final class V2Executor
         log.warn("v2-executor: stall recovery exhausted after {} catch-up click(s) — FAILED",
             catchupClicksThisLeg);
         status = Status.FAILED;
+        lastFailureReason = FailureReason.CATCHUP_EXHAUSTED;
         return true;
     }
 
@@ -557,6 +616,10 @@ public final class V2Executor
 
     private Modality pickModality()
     {
+        // When minimap modality is disabled (Phase-13 toggle), always
+        // stay on canvas. The same-tick canvas-exhausted fall-through
+        // also respects this flag and FAILs the leg instead.
+        if (!toggles.minimapModality()) return Modality.CANVAS;
         if (recentRejectRate() >= MINIMAP_BIAS_THRESHOLD)
         {
             return Modality.MINIMAP;
