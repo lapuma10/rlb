@@ -79,6 +79,24 @@ public final class V2Executor
         boolean dispatchMinimap(WorldPoint tile);
         boolean dispatcherBusy();
         long nowMs();
+
+        /** Snapshot view: does {@link
+         *  net.runelite.client.plugins.recorder.worldmap.MapStore} think
+         *  the tile is walkable? Used by {@link InvalidationClassifier}
+         *  to detect static-collision mismatches. */
+        default boolean snapshotSaysWalkable(WorldPoint tile) { return true; }
+
+        /** Live view: do the engine's collision flags currently allow
+         *  walking onto the tile? Compared to {@link
+         *  #snapshotSaysWalkable} to classify static-vs-dynamic
+         *  failures. */
+        default boolean liveCollisionAllows(WorldPoint tile) { return true; }
+
+        /** Live view: NPC / player physically standing on the tile.
+         *  Distinct from {@link #isPlausiblyClean} which also rejects
+         *  decoration/door/ground-item — this is just the dynamic-
+         *  blocker channel. */
+        default boolean dynamicEntityOnTile(WorldPoint tile) { return false; }
     }
 
     /** Ticks of zero progress before treating the leg as stalled and
@@ -281,10 +299,32 @@ public final class V2Executor
             // Stall before any click — fall through to normal pick.
             return false;
         }
+
+        // Classify the failure so the recovery channel matches the
+        // root cause. STATIC_COLLISION_MISMATCH auto-blacklists the
+        // tile in the classifier; TRANSPORT_STATE_MISMATCH auto-marks
+        // the edge stale. Either way, retrying the same tile is a
+        // waste — replan instead.
+        InvalidationClassifier.FailureContext ctx = buildFailureContext(here);
+        InvalidationClassifier.FailureClass fc = classifier.classify(ctx);
+        log.info("v2-executor: stall classified {} for tile {} (player at {})",
+            fc, lastDispatchedTile, here);
+
+        if (fc == InvalidationClassifier.FailureClass.STATIC_COLLISION_MISMATCH
+            || fc == InvalidationClassifier.FailureClass.TRANSPORT_STATE_MISMATCH)
+        {
+            log.warn("v2-executor: {} requires a fresh plan — FAILED so navigator replans", fc);
+            status = Status.FAILED;
+            return true;
+        }
+
+        // DYNAMIC_BLOCKER / UNKNOWN: bounded catch-up. The classifier
+        // already added a transient penalty for DYNAMIC_BLOCKER, so the
+        // canvas filter will skip the tile on the next pick if needed.
         if (catchupClicksThisLeg < MAX_CATCHUP_CLICKS_PER_LEG)
         {
-            log.info("v2-executor: stall after {} ticks at {} — catch-up re-click on {}",
-                ticksSinceProgress, here, lastDispatchedTile);
+            log.info("v2-executor: stall after {} ticks at {} — catch-up re-click on {} ({})",
+                ticksSinceProgress, here, lastDispatchedTile, fc);
             boolean ok = lastDispatchWasMinimap
                 ? env.dispatchMinimap(lastDispatchedTile)
                 : env.dispatchWalk(lastDispatchedTile);
@@ -299,6 +339,60 @@ public final class V2Executor
             catchupClicksThisLeg);
         status = Status.FAILED;
         return true;
+    }
+
+    private InvalidationClassifier.FailureContext buildFailureContext(WorldPoint here)
+    {
+        WorldPoint tile = lastDispatchedTile;
+        // Detect transport-leg context. If the last dispatch was on a
+        // transport leg's approach tile, surface the edge so the
+        // classifier can flag it stale on verb-mismatch.
+        TransportLegInfo tli = transportLegFor(tile);
+        return new InvalidationClassifier.FailureContext(
+            tile, here, here,
+            env.snapshotSaysWalkable(tile),
+            env.liveCollisionAllows(tile),
+            env.dynamicEntityOnTile(tile),
+            tli != null,
+            tli == null ? null : tli.edge,
+            tli == null || tli.verbStillPresent);
+    }
+
+    private static final class TransportLegInfo
+    {
+        final net.runelite.client.plugins.recorder.worldmap.TransportEdge edge;
+        final boolean verbStillPresent;
+
+        TransportLegInfo(net.runelite.client.plugins.recorder.worldmap.TransportEdge e,
+                         boolean verbPresent)
+        {
+            this.edge = e;
+            this.verbStillPresent = verbPresent;
+        }
+    }
+
+    @Nullable
+    private TransportLegInfo transportLegFor(WorldPoint tile)
+    {
+        if (path == null || tile == null) return null;
+        for (V2Leg leg : path.legs())
+        {
+            if (leg instanceof V2Leg.Transport t)
+            {
+                if (tile.equals(t.edge().approachTile()) || tile.equals(t.edge().fromTile()))
+                {
+                    // Round-1: assume verb still present unless the
+                    // executor has another channel to tell. Phase 6.5
+                    // can wire a live-menu probe here when the engine
+                    // can resolve the object's actions on the click
+                    // tile. Conservative default: verb present →
+                    // classifier won't tag it TRANSPORT_STATE_MISMATCH
+                    // unless extended.
+                    return new TransportLegInfo(t.edge(), true);
+                }
+            }
+        }
+        return null;
     }
 
     private Modality pickModality()

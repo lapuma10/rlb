@@ -122,4 +122,14 @@ public class ActionRequest {
      *  byte-for-byte. V3 banking opts in via
      *  {@code BankInteraction#tryClickBankBoothVariedTracked}. */
     boolean liveTracked;
+    /** Strict-walk mode for {@link Kind#WALK}. When {@code true}, the
+     *  dispatcher requires the live menu at the resolved canvas pixel
+     *  to be a "Walk here" left-click (the engine's WALK / SET_HEADING
+     *  action). On failure, the dispatcher sets {@code lastError} and
+     *  returns WITHOUT the silent minimap fallback the legacy WALK
+     *  path takes. Used by V2's executor to honor the spec's HARD
+     *  CONSTRAINT — every canvas click must resolve to "Walk here" or
+     *  the executor picks a different tile (not a different modality).
+     *  Default {@code false} preserves V1 / legacy behavior. */
+    boolean strictWalk;
 }

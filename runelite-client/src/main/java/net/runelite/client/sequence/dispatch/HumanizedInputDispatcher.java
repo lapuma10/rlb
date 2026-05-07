@@ -358,7 +358,7 @@ public class HumanizedInputDispatcher implements InputDispatcher
     {
         switch (req.getKind())
         {
-            case WALK, CLICK_TILE -> walkClick(req.getTile());
+            case WALK, CLICK_TILE -> walkClick(req.getTile(), req.getKind() == ActionRequest.Kind.WALK && req.isStrictWalk());
             case CLICK_NPC -> npcClick(req.getNpcIndex(),
                 req.getVerb() == null || req.getVerb().isBlank() ? "Attack" : req.getVerb());
             case CLICK_GAME_OBJECT -> gameObjectClick(req.getTile(), req.getVerb(), req.isLiveTracked());
@@ -410,8 +410,13 @@ public class HumanizedInputDispatcher implements InputDispatcher
      *  asserts on it for {@code Perspective.localToCanvas},
      *  {@code getCanvasTilePoly}, etc.). Cursor moves and click presses run
      *  on the worker thread because they sleep between samples.
+     *
+     *  <p>{@code strict} disables the silent minimap fallback when
+     *  {@code isLeftClickWalk} reports a non-walk top verb. The caller
+     *  (V2's executor) requires a different-tile pick instead of a
+     *  modality switch, per the spec's HARD CONSTRAINT.
      */
-    private void walkClick(WorldPoint target) throws InterruptedException
+    private void walkClick(WorldPoint target, boolean strict) throws InterruptedException
     {
         if (target == null) { lastError.set("null target"); return; }
         // Skip if we're already standing on the target tile — clicking your
@@ -461,6 +466,13 @@ public class HumanizedInputDispatcher implements InputDispatcher
         {
             String top = onClient(this::topMenuLabel);
             String dump = onClient(this::fullMenuDump);
+            if (strict)
+            {
+                lastError.set("strict-walk: menu was '" + top + "' — caller must pick a different tile");
+                log.info("strict walk at ({},{}) — top='{}' not WALK; aborting (no minimap fallback). {}",
+                    pixel.getX(), pixel.getY(), top, dump);
+                return;
+            }
             log.info("hover at ({},{}) resolved to '{}' (not WALK) — minimap fallback. {}",
                 pixel.getX(), pixel.getY(), top, dump);
             Point mm = onClient(() -> resolver.resolveMinimapOnly(target));

@@ -24,6 +24,8 @@ public class V2ExecutorTest
         long now;
         final Set<WorldPoint> uncleanTiles = new HashSet<>();
         final Set<WorldPoint> minimapBlocked = new HashSet<>();
+        final Set<WorldPoint> staticBlocked = new HashSet<>();    // snapshot=walkable, live=blocked
+        final Set<WorldPoint> dynamicEntities = new HashSet<>();  // NPC standing on tile
         final List<WorldPoint> walkDispatches = new ArrayList<>();
         final List<WorldPoint> minimapDispatches = new ArrayList<>();
 
@@ -46,6 +48,10 @@ public class V2ExecutorTest
         }
         @Override public boolean dispatcherBusy() { return busy; }
         @Override public long nowMs() { return now; }
+
+        @Override public boolean snapshotSaysWalkable(WorldPoint t) { return true; }
+        @Override public boolean liveCollisionAllows(WorldPoint t) { return !staticBlocked.contains(t); }
+        @Override public boolean dynamicEntityOnTile(WorldPoint t) { return dynamicEntities.contains(t); }
     }
 
     private static V2Path eastPath(int n)
@@ -239,6 +245,62 @@ public class V2ExecutorTest
         x.setRunMode(V2Executor.RunMode.OFF);
         x.setRunMode(V2Executor.RunMode.UNCHANGED);
         x.setRunMode(null);   // tolerated
+    }
+
+    @Test
+    public void tick_stalledWithStaticCollisionMismatch_failsImmediately()
+    {
+        // Snapshot says walkable, live collision flags say blocked → classifier
+        // returns STATIC_COLLISION_MISMATCH. Executor must FAIL so navigator
+        // replans with a fresh route, NOT spin on catch-up clicks.
+        FakeEnv env = new FakeEnv();
+        env.player = new WorldPoint(3208, 3217, 0);
+        V2Executor x = newExecutor(env);
+        V2Path p = eastPath(20);
+        x.setPath(p);
+
+        // Initial dispatch — pick a tile and dispatch to it.
+        x.tick();
+        assertTrue(env.walkDispatches.size() >= 1);
+        WorldPoint clicked = env.walkDispatches.get(0);
+        // Mark the clicked tile as live-collision-blocked AFTER dispatch
+        // so the classify call sees the mismatch.
+        env.staticBlocked.add(clicked);
+
+        // Stall ticks — player static, dispatcher idle.
+        for (int i = 0; i < V2Executor.STALL_TICKS + 1; i++)
+        {
+            env.busy = false;
+            x.tick();
+        }
+        assertEquals("static collision mismatch must FAIL — replan, don't retry",
+            V2Executor.Status.FAILED, x.status());
+    }
+
+    @Test
+    public void tick_stalledWithDynamicBlocker_catchUpUsedFirst()
+    {
+        FakeEnv env = new FakeEnv();
+        env.player = new WorldPoint(3208, 3217, 0);
+        V2Executor x = newExecutor(env);
+        V2Path p = eastPath(20);
+        x.setPath(p);
+        x.tick();
+        WorldPoint clicked = env.walkDispatches.get(0);
+        // Dynamic blocker — the live collision IS fine, but an entity
+        // is standing there.
+        env.dynamicEntities.add(clicked);
+
+        // First stall pass — should issue a catch-up.
+        for (int i = 0; i < V2Executor.STALL_TICKS + 1; i++)
+        {
+            env.busy = false;
+            x.tick();
+        }
+        assertTrue("dynamic blocker should trigger a catch-up click, not immediate FAIL",
+            env.walkDispatches.size() >= 2);
+        assertEquals("status remains RUNNING during dynamic-blocker recovery",
+            V2Executor.Status.RUNNING, x.status());
     }
 
     @Test
