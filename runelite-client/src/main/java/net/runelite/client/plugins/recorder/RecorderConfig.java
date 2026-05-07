@@ -292,6 +292,32 @@ public interface RecorderConfig extends Config
 		return NavigatorMode.V1_ONLY;
 	}
 
+	/** Phase-11 toggle for V2's top-K alternation + edge-cost noise.
+	 *  OFF (default): V2 always returns the deterministic shortest path
+	 *  from a single A* run — stable, predictable, easier to debug.
+	 *  ON: V2 runs the spec's selection algorithm (top-K with edge-reuse
+	 *  penalties, recent-route memory, 30 % noisy A* fallback).
+	 *
+	 *  <p>Spec Phase 11 acceptance: "with variation OFF, V2 still
+	 *  completes bank↔pen; with variation ON, both north and south
+	 *  routes are selected when both exist." Off by default per the
+	 *  rollout — Phase 11 lives behind this flag so a regression in
+	 *  alternation can be killed by flipping it. */
+	@ConfigItem(
+		keyName = "enableV2RouteVariation",
+		name = "V2 route variation",
+		description = "When on, V2 alternates between known routes via top-K + "
+			+ "edge-reuse penalties + recent-route memory. When off (default), "
+			+ "V2 always returns the deterministic shortest path. Off by default "
+			+ "so reliability regressions can be killed by flipping the flag.",
+		section = experimentalSection,
+		position = 3
+	)
+	default boolean enableV2RouteVariation()
+	{
+		return false;
+	}
+
 	@ConfigSection(
 		name = "WorldMap overlay (V2 inspect)",
 		description = "Minimap debug overlay for the V2 navigator's world memory: walkable tiles, transport endpoints, the active planned route, and (toggleable) blocked tiles, stale edges, entity sightings.",
