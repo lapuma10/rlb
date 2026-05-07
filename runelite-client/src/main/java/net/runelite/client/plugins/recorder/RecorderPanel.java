@@ -162,6 +162,8 @@ public final class RecorderPanel extends PluginPanel
         new javax.swing.JCheckBox("Click Inspector");
     private final javax.swing.JCheckBox worldMemoryPlannerCb =
         new javax.swing.JCheckBox("WorldMemory planner (experimental)");
+    private final JComboBox<RecorderConfig.NavigatorImpl> navigatorImplCombo =
+        new JComboBox<>(RecorderConfig.NavigatorImpl.values());
     private Timer refreshTimer;
     private final JButton chickenStartBtn = new JButton("Start chicken loop");
     private final JButton chickenStopBtn = new JButton("Stop");
@@ -370,6 +372,18 @@ public final class RecorderPanel extends PluginPanel
         p.add(worldMemoryPlannerCb);
         // Action listener wired by setWorldMemoryPlannerConfig() once the
         // plugin has injected config + configManager.
+
+        // Navigator V1/V2 selector — single switch site for which
+        // Navigator implementation scripts use. Wired by
+        // setNavigatorImplConfig() at plugin startup.
+        JPanel navRow = new JPanel(new BorderLayout(4, 0));
+        navRow.setBackground(p.getBackground());
+        navRow.add(new JLabel("Navigator:"), BorderLayout.WEST);
+        navRow.add(navigatorImplCombo, BorderLayout.CENTER);
+        navRow.setMaximumSize(new java.awt.Dimension(
+            Integer.MAX_VALUE,
+            navigatorImplCombo.getPreferredSize().height));
+        p.add(navRow);
         return p;
     }
 
@@ -392,6 +406,25 @@ public final class RecorderPanel extends PluginPanel
         worldMemoryPlannerCb.addActionListener(e ->
             cm.setConfiguration("recorder", "useWorldMemoryPlanner",
                 worldMemoryPlannerCb.isSelected()));
+    }
+
+    /** Wire the Navigator-implementation dropdown to the config. Called
+     *  by the plugin once {@link RecorderConfig} and {@link ConfigManager}
+     *  are available. The combo reflects the persisted value at startup
+     *  and writes back on user selection. */
+    public void setNavigatorImplConfig(RecorderConfig cfg, ConfigManager cm)
+    {
+        RecorderConfig.NavigatorImpl current = cfg.navigatorImpl();
+        if (current == null) current = RecorderConfig.NavigatorImpl.TRAIL_V1;
+        navigatorImplCombo.setSelectedItem(current);
+        navigatorImplCombo.addActionListener(e ->
+        {
+            Object sel = navigatorImplCombo.getSelectedItem();
+            if (sel instanceof RecorderConfig.NavigatorImpl impl)
+            {
+                cm.setConfiguration("recorder", "navigatorImpl", impl);
+            }
+        });
     }
 
     // ------------------------------------------------------------------

@@ -372,6 +372,7 @@ public class RecorderPlugin extends Plugin
             client, eventBus);
         panel.setClickInspector(clickInspector);
         panel.setWorldMemoryPlannerConfig(config, configManager);
+        panel.setNavigatorImplConfig(config, configManager);
 
         // WorldMemory subsystem — passive scraper + planner. Scrapers run on
         // the client thread (via @Subscribe onGameTick); the planner is called
