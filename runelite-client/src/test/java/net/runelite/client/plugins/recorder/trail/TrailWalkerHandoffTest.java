@@ -3,6 +3,8 @@ package net.runelite.client.plugins.recorder.trail;
 import java.util.List;
 import java.util.concurrent.atomic.AtomicReference;
 import net.runelite.api.Client;
+import net.runelite.api.CollisionData;
+import net.runelite.api.CollisionDataFlag;
 import net.runelite.api.GameObject;
 import net.runelite.api.ObjectComposition;
 import net.runelite.api.Player;
@@ -185,6 +187,110 @@ public class TrailWalkerHandoffTest
         ArgumentCaptor<ActionRequest> cap = ArgumentCaptor.forClass(ActionRequest.class);
         verify(dispatcher, atLeastOnce()).dispatch(cap.capture());
         assertEquals(ActionRequest.Kind.WALK, cap.getValue().getKind());
+    }
+
+    /** As {@link #mockSceneWithGameObject} but also wires up a collision-flag
+     *  grid on the WorldView so {@link Reachability} BFS sees the same world
+     *  the player would. {@code wallFlags} is a list of (x, y) world tiles
+     *  to stamp BLOCK_MOVEMENT_FULL on; everything else is walkable. */
+    private void mockSceneWithGameObjectAndWalls(WorldPoint worldTile, int objectId,
+                                                 String verb, List<WorldPoint> wallFlags)
+    {
+        WorldView wv = mock(WorldView.class);
+        Scene scene = mock(Scene.class);
+        when(client.getTopLevelWorldView()).thenReturn(wv);
+        when(wv.getScene()).thenReturn(scene);
+        when(wv.getBaseX()).thenReturn(0);
+        when(wv.getBaseY()).thenReturn(0);
+        when(wv.getSizeX()).thenReturn(104);
+        when(wv.getSizeY()).thenReturn(104);
+        Tile[][][] tiles = new Tile[4][104][104];
+        Tile tile = mock(Tile.class);
+        GameObject go = mock(GameObject.class);
+        when(go.getId()).thenReturn(objectId);
+        when(tile.getWallObject()).thenReturn(null);
+        when(tile.getGameObjects()).thenReturn(new GameObject[]{go});
+        when(tile.getDecorativeObject()).thenReturn(null);
+        when(tile.getGroundObject()).thenReturn(null);
+        tiles[worldTile.getPlane()][worldTile.getX()][worldTile.getY()] = tile;
+        when(scene.getTiles()).thenReturn(tiles);
+
+        ObjectComposition comp = mock(ObjectComposition.class);
+        when(comp.getActions()).thenReturn(new String[]{verb, null, null, null, null});
+        when(comp.getImpostorIds()).thenReturn(null);
+        when(client.getObjectDefinition(objectId)).thenReturn(comp);
+
+        int[][] flags = new int[104][104];
+        for (WorldPoint w : wallFlags)
+        {
+            flags[w.getX()][w.getY()] |= CollisionDataFlag.BLOCK_MOVEMENT_FULL;
+        }
+        CollisionData cd = mock(CollisionData.class);
+        when(cd.getFlags()).thenReturn(flags);
+        when(wv.getCollisionMaps()).thenReturn(new CollisionData[]{cd, null, null, null});
+    }
+
+    @Test
+    public void handoffDefersWhenBfsPathRunsAroundWall() throws InterruptedException
+    {
+        // Reproduces the pen→bank Lumbridge-castle bug: player is at chebyshev
+        // 4 from the staircase, but a long wall sits between them. The
+        // recorded WALK leg threads a doorway off-screen of this fixture; if
+        // the handoff fires here, the walker abandons the entry path and
+        // dispatches a WALK to the staircase tile, which the engine then
+        // routes around the wall.  BFS sees the wall and forces the walker
+        // to keep walking the WALK leg's tiles.
+        WorldPoint stairs = new WorldPoint(8, 10, 0);
+        // 21-tile vertical wall at x=10, blocking every path between the
+        // player at x=12 and the stairs at x=8 within BFS depth 16.
+        java.util.List<WorldPoint> wall = new java.util.ArrayList<>();
+        for (int y = 0; y <= 25; y++) wall.add(new WorldPoint(10, y, 0));
+        mockSceneWithGameObjectAndWalls(stairs, 56230, "Climb-up", wall);
+
+        playerPos.set(new WorldPoint(12, 10, 0));
+        // WALK leg's last tile is the recorded standing tile next to the
+        // staircase — 4 tiles west, on the OTHER side of the wall.
+        TrailPath path = new TrailPath(List.of(
+            new Leg.Walk(List.of(
+                new WorldPoint(12, 10, 0),
+                new WorldPoint(11, 10, 0),
+                new WorldPoint(9, 10, 0))),
+            new Leg.Transport(stairs, "Climb-up", 56230, "GameObject", 36, 61,
+                new WorldPoint(9, 10, 0)),
+            new Leg.Walk(List.of(new WorldPoint(8, 10, 1)))));
+
+        TrailWalker w = new TrailWalker(client, clientThread, dispatcher,
+            ObjectVisibility.alwaysVisible());
+        w.setOnCanvasProbeForTest(tile -> true);
+        w.tick(path);
+        assertEquals("handoff must defer — BFS path detours around the wall",
+            0, w.currentLegIndex());
+    }
+
+    @Test
+    public void handoffFiresWhenBfsPathIsClear() throws InterruptedException
+    {
+        // Same fixture but no wall — BFS should agree with chebyshev and the
+        // existing handoff behavior must be preserved.
+        WorldPoint stairs = new WorldPoint(5, 6, 0);
+        mockSceneWithGameObjectAndWalls(stairs, 56230, "Climb-up", java.util.List.of());
+
+        playerPos.set(new WorldPoint(5, 3, 0));
+        TrailPath path = new TrailPath(List.of(
+            new Leg.Walk(List.of(
+                new WorldPoint(5, 3, 0),
+                new WorldPoint(5, 4, 0),
+                new WorldPoint(5, 5, 0))),
+            new Leg.Transport(stairs, "Climb-up", 56230, "GameObject", 36, 61,
+                new WorldPoint(5, 5, 0)),
+            new Leg.Walk(List.of(new WorldPoint(5, 6, 1)))));
+
+        TrailWalker w = new TrailWalker(client, clientThread, dispatcher,
+            ObjectVisibility.alwaysVisible());
+        w.setOnCanvasProbeForTest(tile -> true);
+        w.tick(path);
+        assertEquals("BFS clear of walls — handoff should fire as before",
+            1, w.currentLegIndex());
     }
 
     @Test

@@ -858,6 +858,39 @@ public final class TrailWalker
             return false;
         }
 
+        // Chebyshev distance lies through walls. A player 13 tiles east of a
+        // staircase that's behind the castle's east wall is "close" by
+        // chebyshev but 20+ hops away by the only walkable route (the recorded
+        // entry doorway). If we hand off here, the walker abandons the WALK
+        // leg's remaining entry-path tiles and dispatches a WALK to the
+        // transport's standing tile — the OSRS pathfinder then routes the
+        // player around the building. Reachability BFS sees the same walls
+        // the engine does; defer when the path is too long to be a tail-end
+        // micro-walk.
+        ReachabilityMap reach = onClient(() -> {
+            WorldView wv = client == null ? null : client.getTopLevelWorldView();
+            if (wv == null) return null;
+            return Reachability.compute(wv, pos);
+        });
+        if (reach != null && reach.size() > 0)
+        {
+            WorldPoint reference = tr.approachTile() != null
+                ? tr.approachTile() : tr.tile();
+            int bfs = reach.distance(reference);
+            // +2 absorbs cardinal/diagonal slack and one-tile geometry
+            // around walkable models. A gap larger than that means the
+            // engine has to route around something the recording walked
+            // through.
+            int bfsCap = TRANSPORT_DIRECT_CLICK_TILES + 2;
+            if (bfs < 0 || bfs > bfsCap)
+            {
+                log.debug("trail-walker: handoff deferred — BFS to {} = {} "
+                    + "(chebyshev to transport={}, cap={}); wall-detour suspected",
+                    reference, bfs, dist, bfsCap);
+                return false;
+            }
+        }
+
         log.info("trail-walker: handoff WALK leg {} → TRANSPORT leg {} "
             + "(verb='{}' tile={} dist={}) — skipping tail-end micro-walks",
             legIdx, legIdx + 1, tr.verb(), tr.tile(), dist);
