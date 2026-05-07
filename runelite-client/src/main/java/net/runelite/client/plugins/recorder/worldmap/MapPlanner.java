@@ -4,6 +4,7 @@ import java.util.HashSet;
 import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
+import lombok.extern.slf4j.Slf4j;
 import net.runelite.api.coords.WorldArea;
 import net.runelite.api.coords.WorldPoint;
 import net.runelite.client.plugins.recorder.walker.PathSpec;
@@ -11,6 +12,7 @@ import net.runelite.client.plugins.recorder.walker.PathSpec;
 /** WorldMemory's planner — turns "stand near target T with LOS" into a
  *  PathSpec the existing UniversalWalker can execute. Runs on a worker
  *  thread; never touches live Client/Scene/WorldView. */
+@Slf4j
 public final class MapPlanner
 {
     private final MapStore store;
@@ -27,18 +29,31 @@ public final class MapPlanner
         int maxDistance, boolean requireLineOfSight)
     {
         if (player == null || target == null) return Optional.empty();
-        if (player.getPlane() != target.getPlane()) return Optional.empty();   // v1: same-plane only
+        if (player.getPlane() != target.getPlane())
+        {
+            log.debug("[mapplanner] reject: cross-plane player={} target={}", player, target);
+            return Optional.empty();
+        }
         int regionId = RegionIds.regionIdFor(target.getX(), target.getY());
         RegionChunkSnapshot snap = store.snapshotFor(regionId);
-        if (snap == null) return Optional.empty();
+        if (snap == null)
+        {
+            log.debug("[mapplanner] reject: no snapshot for target region {} (player={} target={})",
+                regionId, player, target);
+            return Optional.empty();
+        }
         if (RegionIds.regionIdFor(player.getX(), player.getY()) != regionId)
         {
-            return Optional.empty();   // v1: same-region only
+            log.debug("[mapplanner] reject: cross-region player={} target={} (regions {}↔{})",
+                player, target, RegionIds.regionIdFor(player.getX(), player.getY()), regionId);
+            return Optional.empty();
         }
 
-        // Phase 1: enumerate candidates.
+        // Phase 1: enumerate candidates with rejection counters.
         Set<WorldPoint> candidates = new HashSet<>();
         int plane = target.getPlane();
+        int rejectedNotStandable = 0;
+        int rejectedNoLos = 0;
         for (int dx = -maxDistance; dx <= maxDistance; dx++)
         {
             for (int dy = -maxDistance; dy <= maxDistance; dy++)
@@ -46,12 +61,21 @@ public final class MapPlanner
                 if (dx == 0 && dy == 0) continue;        // can't stand on target
                 int x = target.getX() + dx, y = target.getY() + dy;
                 WorldPoint c = new WorldPoint(x, y, plane);
-                if (!snap.isStandableLocal(x, y, plane)) continue;
-                if (requireLineOfSight && !Bresenham.hasLineOfSight(snap, c, target)) continue;
+                if (!snap.isStandableLocal(x, y, plane)) { rejectedNotStandable++; continue; }
+                if (requireLineOfSight && !Bresenham.hasLineOfSight(snap, c, target))
+                {
+                    rejectedNoLos++;
+                    continue;
+                }
                 candidates.add(c);
             }
         }
-        if (candidates.isEmpty()) return Optional.empty();
+        if (candidates.isEmpty())
+        {
+            log.debug("[mapplanner] no candidates: target={} R={} reqLOS={} rejectNotStandable={} rejectNoLOS={}",
+                target, maxDistance, requireLineOfSight, rejectedNotStandable, rejectedNoLos);
+            return Optional.empty();
+        }
 
         // Phase 2: single Dijkstra, all candidates as goals.
         Map<WorldPoint, Integer> dist = MapAStar.dijkstraToAny(
@@ -60,15 +84,26 @@ public final class MapPlanner
         // Phase 3: rank, pick best.
         WorldPoint best = null;
         double bestScore = Double.POSITIVE_INFINITY;
+        int bestPath = -1;
+        int rejectedUnreachable = 0;
         for (WorldPoint c : candidates)
         {
             int d = dist.getOrDefault(c, -1);
-            if (d < 0) continue;     // unreachable within caps
+            if (d < 0) { rejectedUnreachable++; continue; }     // unreachable within caps
             double score = config.rankWeightPathLength * d
                 + config.rankWeightChebyshevToTarget * chebyshev(c, target);
-            if (score < bestScore) { bestScore = score; best = c; }
+            if (score < bestScore) { bestScore = score; best = c; bestPath = d; }
         }
-        return Optional.ofNullable(best);
+        if (best == null)
+        {
+            log.debug("[mapplanner] all candidates unreachable: target={} candidates={} rejectUnreachable={}",
+                target, candidates.size(), rejectedUnreachable);
+            return Optional.empty();
+        }
+        log.debug("[mapplanner] picked: player={} target={} stand={} pathLen={} candidates={} (rejNotStandable={} rejNoLOS={} rejUnreachable={})",
+            player, target, best, bestPath, candidates.size(),
+            rejectedNotStandable, rejectedNoLos, rejectedUnreachable);
+        return Optional.of(best);
     }
 
     public Optional<PathSpec> planWithin(WorldPoint player, WorldPoint goal)

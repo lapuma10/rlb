@@ -149,12 +149,21 @@ public final class SceneScraper
         }
 
         // Step 7: publish all region builders (only reached if budget was OK).
+        int totalTiles = 0, totalObjects = 0;
         for (Map.Entry<Integer, RegionChunkBuilder> entry : builders.entrySet())
         {
             RegionChunkBuilder b = entry.getValue();
             b.lastScrapedAt = now;
             b.gameRevision = client.getRevision();
+            totalTiles += b.tiles.size();
+            totalObjects += b.objects.size();
             mapStore.publish(entry.getKey(), b);
+        }
+        long elapsedNs = System.nanoTime() - startNs;
+        if (log.isDebugEnabled() && !builders.isEmpty())
+        {
+            log.debug("[worldmap] scrape regions={} tiles={} objects={} durationMs={}",
+                builders.size(), totalTiles, totalObjects, elapsedNs / 1_000_000);
         }
     }
 

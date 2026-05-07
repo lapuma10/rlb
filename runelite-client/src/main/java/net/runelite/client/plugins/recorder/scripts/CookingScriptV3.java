@@ -650,6 +650,7 @@ public final class CookingScriptV3
             tripCookPath = PathSpec.builder("v3-cook-area-" + System.currentTimeMillis())
                 .walk("v3-cook", l.cookArea())
                 .build();
+            log.info("cookV3 path: target=null (no fire/logs/range yet) → wide cookArea");
         }
         else if (config.useWorldMemoryPlanner())
         {
@@ -664,6 +665,7 @@ public final class CookingScriptV3
                 tripCookPath = PathSpec.builder("v3-cook-area-" + System.currentTimeMillis())
                     .walk("v3-cook", l.cookArea())
                     .build();
+                log.warn("cookV3 path: WM toggle ON but player position read failed → wide cookArea fallback");
                 return tripCookPath;
             }
             Optional<PathSpec> spec = plugin.mapPlanner().planToInteractTile(
@@ -674,6 +676,8 @@ public final class CookingScriptV3
             if (spec.isPresent())
             {
                 tripCookPath = spec.get();
+                log.info("cookV3 path: WM toggle ON player={} target={} → planner picked stand tile",
+                    playerPos, target);
             }
             else
             {
@@ -681,6 +685,8 @@ public final class CookingScriptV3
                 tripCookPath = PathSpec.builder("v3-cook-area-" + System.currentTimeMillis())
                     .walk("v3-cook", l.cookArea())
                     .build();
+                log.info("cookV3 path: WM toggle ON player={} target={} → planner returned empty, "
+                    + "fallback to wide cookArea (region not scraped yet?)", playerPos, target);
             }
         }
         else
@@ -690,6 +696,7 @@ public final class CookingScriptV3
             tripCookPath = PathSpec.builder("v3-cook-target-" + System.currentTimeMillis())
                 .walk("v3-cook", around)
                 .build();
+            log.debug("cookV3 path: WM toggle OFF target={} → legacy 3×3 arrival window", target);
         }
         return tripCookPath;
     }
