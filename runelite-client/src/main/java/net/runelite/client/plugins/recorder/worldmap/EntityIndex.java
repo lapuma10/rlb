@@ -77,9 +77,16 @@ public final class EntityIndex
     {
         List<Long> keys = byName.get(name);
         if (keys == null) return List.of();
+        // byName tracks every record() call, including repeat sightings of
+        // the same (kind,id) — dedupe via a Set so the caller sees one
+        // entry per concrete entity. Without this, two recordNpcSighting
+        // calls for the same Cook would surface as two list entries even
+        // though byKey has a single in-place-updated record.
+        java.util.Set<Long> seen = new java.util.HashSet<>();
         List<EntitySighting> out = new ArrayList<>();
         for (Long k : keys)
         {
+            if (!seen.add(k)) continue;
             EntitySighting s = byKey.get(k);
             if (s != null && s.kind == kind) out.add(s);
         }
