@@ -101,6 +101,28 @@ public final class EntityIndex
         return out;
     }
 
+    /** All object sightings in {@code regionId}. Mirror of {@link #npcsInRegion}
+     *  for the OBJECT kind — used by the inspection dumper. */
+    public List<EntitySighting> objectsInRegion(int regionId)
+    {
+        List<Long> keys = byRegion.get(regionId);
+        if (keys == null) return List.of();
+        List<EntitySighting> out = new ArrayList<>();
+        for (Long k : keys)
+        {
+            EntitySighting s = byKey.get(k);
+            if (s != null && s.kind == EntitySighting.Kind.OBJECT) out.add(s);
+        }
+        return out;
+    }
+
+    /** All region IDs with at least one recorded sighting. Snapshot, safe to
+     *  iterate without holding a lock — the underlying map is concurrent. */
+    public java.util.Set<Integer> knownRegionIds()
+    {
+        return new java.util.HashSet<>(byRegion.keySet());
+    }
+
     /** Atomically take and clear the dirty-region set for entities. */
     public java.util.Set<Integer> takeDirtyRegionIds()
     {
