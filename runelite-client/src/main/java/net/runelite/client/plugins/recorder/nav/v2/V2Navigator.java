@@ -1,13 +1,17 @@
 package net.runelite.client.plugins.recorder.nav.v2;
 
+import java.util.Optional;
 import java.util.function.Supplier;
 import javax.annotation.Nullable;
 import lombok.extern.slf4j.Slf4j;
 import net.runelite.api.coords.WorldPoint;
 import net.runelite.client.plugins.recorder.nav.BehaviorMode;
+import net.runelite.client.plugins.recorder.nav.EntityKind;
 import net.runelite.client.plugins.recorder.nav.NavRequest;
 import net.runelite.client.plugins.recorder.nav.NavStatus;
 import net.runelite.client.plugins.recorder.nav.Navigator;
+import net.runelite.client.plugins.recorder.worldmap.EntityIndex;
+import net.runelite.client.plugins.recorder.worldmap.EntitySighting;
 
 /** V2 implementation of {@link Navigator}. Plans the route once per
  *  destination via {@link V2Planner}, then drives clicks tick by tick
@@ -61,13 +65,22 @@ public final class V2Navigator implements Navigator
     private final PlannerHook planner;
     private final ExecutorHook executor;
     private final PlayerLocSupplier playerLoc;
+    /** Phase-16 entity resolution. Optional — when null, entity-targeted
+     *  requests fail with ENTITY_NOT_FOUND. */
+    @Nullable private final EntityIndex entityIndex;
 
     @Nullable private WorldPoint activeTarget;
     @Nullable private V2Path activePath;
 
     public V2Navigator(V2Planner planner, V2Executor executor, PlayerLocSupplier playerLoc)
     {
-        this(plannerHookFor(planner), hookFor(executor), playerLoc);
+        this(plannerHookFor(planner), hookFor(executor), playerLoc, null);
+    }
+
+    public V2Navigator(V2Planner planner, V2Executor executor, PlayerLocSupplier playerLoc,
+                       @Nullable EntityIndex entityIndex)
+    {
+        this(plannerHookFor(planner), hookFor(executor), playerLoc, entityIndex);
     }
 
     private static PlannerHook plannerHookFor(V2Planner planner)
@@ -83,9 +96,16 @@ public final class V2Navigator implements Navigator
 
     V2Navigator(PlannerHook planner, ExecutorHook executor, PlayerLocSupplier playerLoc)
     {
+        this(planner, executor, playerLoc, null);
+    }
+
+    V2Navigator(PlannerHook planner, ExecutorHook executor, PlayerLocSupplier playerLoc,
+                @Nullable EntityIndex entityIndex)
+    {
         this.planner = planner;
         this.executor = executor;
         this.playerLoc = playerLoc;
+        this.entityIndex = entityIndex;
     }
 
     private static ExecutorHook hookFor(V2Executor executor)
@@ -102,12 +122,16 @@ public final class V2Navigator implements Navigator
     @Override
     public NavStatus tick(NavRequest request) throws InterruptedException
     {
-        if (request == null || request.to() == null)
+        if (request == null)
         {
-            log.debug("worldmap-v2: request has no destination point — V2 requires (x,y,plane)");
+            log.debug("worldmap-v2: null request — V2 requires a target");
             return NavStatus.FAILED;
         }
-        WorldPoint target = request.to();
+        WorldPoint target = resolveTarget(request);
+        if (target == null)
+        {
+            return NavStatus.FAILED;
+        }
         if (!target.equals(activeTarget))
         {
             // New (or first) destination — replan.
@@ -140,6 +164,70 @@ public final class V2Navigator implements Navigator
     {
         try { return planner.diagnose(from, to); }
         catch (Throwable th) { return "(diagnostic threw: " + th.getMessage() + ")"; }
+    }
+
+    /** Resolve the request's target tile. Point and trail-with-point
+     *  requests reuse {@code request.to()}; entity-targeted requests
+     *  go through {@link EntityIndex} to find the nearest known
+     *  sighting. Returns {@code null} (caller treats as FAILED) when
+     *  resolution is impossible. */
+    @Nullable
+    private WorldPoint resolveTarget(NavRequest request)
+    {
+        // Direct point — preferred path.
+        if (request.to() != null) return request.to();
+
+        // Entity-targeted — Phase 16.
+        if (request.entity() != null)
+        {
+            return resolveEntity(request.entity());
+        }
+
+        log.debug("worldmap-v2: request has no point and no entity — V2 cannot satisfy");
+        return null;
+    }
+
+    @Nullable
+    private WorldPoint resolveEntity(NavRequest.EntityRef ref)
+    {
+        if (entityIndex == null)
+        {
+            log.warn("worldmap-v2: ENTITY_NOT_FOUND — no EntityIndex wired, cannot resolve {}",
+                ref);
+            return null;
+        }
+        WorldPoint here = playerLoc.get();
+        if (here == null)
+        {
+            log.warn("worldmap-v2: cannot resolve entity — player location unknown");
+            return null;
+        }
+        Optional<EntitySighting> nearest;
+        if (ref.kind() == EntityKind.NPC)
+        {
+            nearest = entityIndex.nearestNpc(ref.name(), here);
+        }
+        else if (ref.kind() == EntityKind.OBJECT)
+        {
+            nearest = entityIndex.nearestObject(ref.name(), here);
+        }
+        else
+        {
+            // AREA reserved — round-1 not supported.
+            log.warn("worldmap-v2: ENTITY_NOT_FOUND — kind {} not implemented in round 1",
+                ref.kind());
+            return null;
+        }
+        if (nearest.isEmpty())
+        {
+            log.info("worldmap-v2: ENTITY_NOT_FOUND for name=\"{}\" kind={} from {} — "
+                + "no sightings in EntityIndex", ref.name(), ref.kind(), here);
+            return null;
+        }
+        WorldPoint t = nearest.get().lastTile;
+        log.info("worldmap-v2: resolved entity name=\"{}\" kind={} → {} (via nearest sighting)",
+            ref.name(), ref.kind(), t);
+        return t;
     }
 
     private NavStatus mapStatus(V2Executor.Status s)
