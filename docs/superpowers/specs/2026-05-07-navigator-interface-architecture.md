@@ -180,10 +180,25 @@ are called out as "implementation determines."
 V2 captures **everything via live observation**. No reading of trail
 JSONs at runtime, no dependency on V1's file format.
 
-- **Collision + objects + NPCs:** today's `SceneScraper` already does
-  this. V2 keeps it.
-- **Entity sightings** persist alongside region snapshots under
-  `~/.runelite/recorder/worldmap/entities/<id>.json`.
+- **Collision + static / interactive objects:** today's
+  `SceneScraper` already populates `regions/<id>.json` with this.
+  V2 keeps it. Tile collision flags + GameObject records (id,
+  position, action verbs) are the source of truth for the planner's
+  walk graph.
+- **Entity sightings (NPCs + object/entity lookup records)** persist
+  separately under `~/.runelite/recorder/worldmap/entities/<id>.json`.
+  This is the single source of truth for `EntityIndex` and entity
+  inspection dumps. **NPCs are NOT duplicated into `regions/`**, even
+  if a tile happened to have an NPC standing on it at scrape time —
+  that ephemeral occupancy is not part of the static map.
+
+Source-of-truth rule (LOCKED so dumps and lookups don't drift):
+
+```
+regions/<id>.json   collision + static / interactive objects (planner walk graph)
+entities/<id>.json  NPC sightings + entity lookup records (entity index)
+inspect/...         may combine both into one report — read-only consumer of the two above
+```
 - **Transport edges:** new component `TransportObserver` (in
   `worldmap/`) subscribes to `MenuOptionClicked` in parallel to
   TrailRecorder. Same source event TrailRecorder uses, just a
