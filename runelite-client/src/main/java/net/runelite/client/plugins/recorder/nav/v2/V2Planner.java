@@ -38,23 +38,82 @@ public final class V2Planner
     private final TopKRouter topK;
     private final RouteHistory history;
     private final Random rng;
+    @javax.annotation.Nullable private final MapStore mapStore;
+    @javax.annotation.Nullable private final TransportIndex transports;
 
     public V2Planner(MapStore mapStore, TransportIndex transports,
                      WorldMemoryConfig wmConfig, RouteHistory history)
     {
         this(new MultiRegionAStar(mapStore, transports, wmConfig),
             new TopKRouter(new MultiRegionAStar(mapStore, transports, wmConfig), history),
-            history, new Random());
+            history, new Random(), mapStore, transports);
     }
 
     /** Test ctor — caller injects a deterministic Random for reproducible
      *  selection traces. */
     V2Planner(MultiRegionAStar planner, TopKRouter topK, RouteHistory history, Random rng)
     {
+        this(planner, topK, history, rng, null, null);
+    }
+
+    private V2Planner(MultiRegionAStar planner, TopKRouter topK, RouteHistory history,
+                      Random rng, @javax.annotation.Nullable MapStore mapStore,
+                      @javax.annotation.Nullable TransportIndex transports)
+    {
         this.planner = planner;
         this.topK = topK;
         this.history = history;
         this.rng = rng;
+        this.mapStore = mapStore;
+        this.transports = transports;
+    }
+
+    /** Diagnostic snapshot for a no-route case: which side has data,
+     *  how many transport edges are known overall + outgoing from
+     *  {@code from}'s tile, and whether the from/to tile entries exist
+     *  in MapStore at all. Call ONLY when {@link #plan} returned EMPTY
+     *  — surfaces the actual reason (NO_DATA at A, NO_DATA at B,
+     *  no transport connecting planes, or NO_PATH despite both having
+     *  data). */
+    public String diagnose(WorldPoint from, WorldPoint to)
+    {
+        if (mapStore == null || transports == null)
+        {
+            return "(diagnose unavailable — V2Planner constructed without store refs)";
+        }
+        StringBuilder sb = new StringBuilder();
+        sb.append("from=").append(describe(from));
+        sb.append(" to=").append(describe(to));
+        sb.append(" transports{total=").append(transports.size());
+        if (from != null)
+        {
+            sb.append(" outgoingFromHere=").append(transports.getOutgoing(from).size());
+        }
+        if (from != null && to != null && from.getPlane() != to.getPlane())
+        {
+            int crossPlane = 0;
+            for (var e : transports.getAll())
+            {
+                if (e.fromTile().getPlane() == from.getPlane()
+                    && e.toTile().getPlane() == to.getPlane()) crossPlane++;
+            }
+            sb.append(" crossPlane=").append(crossPlane);
+        }
+        sb.append("}");
+        return sb.toString();
+    }
+
+    private String describe(WorldPoint p)
+    {
+        if (p == null) return "null";
+        if (mapStore == null) return p.toString() + "(no-store)";
+        var snap = mapStore.snapshotFor(net.runelite.client.plugins.recorder.worldmap
+            .RegionIds.regionIdFor(p.getX(), p.getY()));
+        if (snap == null) return p.toString() + "(region NOT loaded)";
+        var tile = snap.tile(p.getX(), p.getY(), p.getPlane());
+        if (tile == null) return p.toString() + "(tile NOT in snapshot)";
+        boolean walkable = (tile.movement & net.runelite.api.CollisionDataFlag.BLOCK_MOVEMENT_FULL) == 0;
+        return p.toString() + (walkable ? "(walkable)" : "(blocked flags=0x" + Integer.toHexString(tile.movement) + ")");
     }
 
     /** Plan a route from {@code from} to {@code to} using

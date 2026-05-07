@@ -30,10 +30,15 @@ import net.runelite.client.plugins.recorder.nav.Navigator;
 @Slf4j
 public final class V2Navigator implements Navigator
 {
-    /** Test seam for the planner. Production binds to {@code V2Planner::plan}. */
+    /** Test seam for the planner. Production binds to a real
+     *  {@link V2Planner}. {@link #diagnose} surfaces a one-line
+     *  reason when {@link #plan} returns empty so the no-route log
+     *  line carries actionable info (region not loaded / tile
+     *  missing / no cross-plane transport). */
     public interface PlannerHook
     {
         V2Path plan(WorldPoint from, WorldPoint to, BehaviorMode mode);
+        default String diagnose(WorldPoint from, WorldPoint to) { return "(no diagnostic available)"; }
     }
 
     /** Test seam for the executor. Production wraps a {@link V2Executor}. */
@@ -62,7 +67,18 @@ public final class V2Navigator implements Navigator
 
     public V2Navigator(V2Planner planner, V2Executor executor, PlayerLocSupplier playerLoc)
     {
-        this(planner::plan, hookFor(executor), playerLoc);
+        this(plannerHookFor(planner), hookFor(executor), playerLoc);
+    }
+
+    private static PlannerHook plannerHookFor(V2Planner planner)
+    {
+        return new PlannerHook()
+        {
+            @Override public V2Path plan(WorldPoint from, WorldPoint to, BehaviorMode mode)
+            { return planner.plan(from, to, mode); }
+            @Override public String diagnose(WorldPoint from, WorldPoint to)
+            { return planner.diagnose(from, to); }
+        };
     }
 
     V2Navigator(PlannerHook planner, ExecutorHook executor, PlayerLocSupplier playerLoc)
@@ -104,7 +120,8 @@ public final class V2Navigator implements Navigator
             V2Path path = planner.plan(here, target, request.mode());
             if (path == null || path.isEmpty())
             {
-                log.warn("worldmap-v2: planner returned no route from {} to {}", here, target);
+                log.warn("worldmap-v2: planner returned no route from {} to {} — {}",
+                    here, target, diagnoseSafely(here, target));
                 activeTarget = null;
                 activePath = null;
                 executor.cancel();
@@ -117,6 +134,12 @@ public final class V2Navigator implements Navigator
             executor.setPath(path);
         }
         return mapStatus(executor.tick());
+    }
+
+    private String diagnoseSafely(WorldPoint from, WorldPoint to)
+    {
+        try { return planner.diagnose(from, to); }
+        catch (Throwable th) { return "(diagnostic threw: " + th.getMessage() + ")"; }
     }
 
     private NavStatus mapStatus(V2Executor.Status s)
