@@ -120,4 +120,44 @@ public class MultiRegionAStarTest
         V2Path path = a.plan(new WorldPoint(3208, 3213, 0), new WorldPoint(3212, 3213, 0));
         assertTrue(path.isEmpty());
     }
+
+    @Test
+    public void plan_withNoise_producesVariation()
+    {
+        // 5×3 grid with two diagonal-equivalent paths between
+        // (3208,3213) → (3212,3215). With noise, A* should occasionally
+        // pick different tile sequences even though all share the same
+        // total cost.
+        MapStore store = new MapStore(wm);
+        int regionId = RegionIds.regionIdFor(3208, 3213);
+        List<WorldMemoryFixtures.TileSpec> tiles = new ArrayList<>();
+        for (int x = 3208; x <= 3215; x++)
+        {
+            for (int y = 3213; y <= 3217; y++) tiles.add(walkable(x, y, 0));
+        }
+        WorldMemoryFixtures.installRegion(store, regionId, tiles);
+
+        MultiRegionAStar a = new MultiRegionAStar(store, new TransportIndex(), wm);
+        WorldPoint from = new WorldPoint(3208, 3213, 0);
+        WorldPoint to = new WorldPoint(3215, 3217, 0);
+        java.util.Set<String> distinctTileSequences = new java.util.HashSet<>();
+        for (int trial = 0; trial < 50; trial++)
+        {
+            V2Path p = a.plan(from, to, 0.12);
+            distinctTileSequences.add(tileSeqKey(p));
+        }
+        assertTrue("noise produces ≥3 distinct tile sequences over 50 trials (got "
+            + distinctTileSequences.size() + ")",
+            distinctTileSequences.size() >= 3);
+    }
+
+    private static String tileSeqKey(V2Path p)
+    {
+        StringBuilder sb = new StringBuilder();
+        for (WorldPoint t : p.allTiles())
+        {
+            sb.append(t.getX()).append(',').append(t.getY()).append(';');
+        }
+        return sb.toString();
+    }
 }
