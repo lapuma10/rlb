@@ -37,13 +37,14 @@ import javax.annotation.Nonnull;
 import javax.annotation.Nullable;
 import static net.runelite.api.Constants.TILE_FLAG_BRIDGE;
 import net.runelite.api.coords.LocalPoint;
+import net.runelite.api.coords.WorldPoint;
+import net.runelite.api.gameval.InterfaceID;
 import net.runelite.api.gameval.VarbitID;
 import net.runelite.api.geometry.RectangleUnion;
 import net.runelite.api.geometry.Shapes;
 import net.runelite.api.geometry.SimplePolygon;
 import net.runelite.api.model.Jarvis;
 import net.runelite.api.widgets.Widget;
-import net.runelite.api.widgets.WidgetInfo;
 import org.jetbrains.annotations.ApiStatus;
 
 /**
@@ -565,16 +566,16 @@ public class Perspective
 		{
 			if (client.getVarbitValue(VarbitID.RESIZABLE_STONE_ARRANGEMENT) == 1)
 			{
-				minimapDrawWidget = client.getWidget(WidgetInfo.RESIZABLE_MINIMAP_DRAW_AREA);
+				minimapDrawWidget = client.getWidget(InterfaceID.ToplevelPreEoc.MINIMAP);
 			}
 			else
 			{
-				minimapDrawWidget = client.getWidget(WidgetInfo.RESIZABLE_MINIMAP_STONES_DRAW_AREA);
+				minimapDrawWidget = client.getWidget(InterfaceID.ToplevelOsrsStretch.MINIMAP);
 			}
 		}
 		else
 		{
-			minimapDrawWidget = client.getWidget(WidgetInfo.FIXED_VIEWPORT_MINIMAP_DRAW_AREA);
+			minimapDrawWidget = client.getWidget(InterfaceID.Toplevel.MINIMAP);
 		}
 
 		if (minimapDrawWidget == null || minimapDrawWidget.isHidden())
@@ -1144,6 +1145,248 @@ public class Perspective
 		int yOffset = p.getY() - (int) (bounds.getHeight() / 2) + fm.getAscent();
 
 		return new Point(xOffset, yOffset);
+	}
+
+	/**
+	 * Approximate top of typical OSRS fence / wall geometry, in scene units
+	 * (1 tile = {@link #LOCAL_TILE_SIZE} = 128 units; standard wall ≈ 256).
+	 * Used by {@link #isCameraLineClearTo} as the threshold above which the
+	 * camera can see over a wall flag. RuneLite does not expose per-wall
+	 * heights, so the constant is empirical: tuned against typical fences,
+	 * pen walls, and short stone walls. Tall buildings may slip through.
+	 */
+	public static final int CAMERA_VIS_WALL_TOP = 256;
+
+	/**
+	 * Tests whether the line from the camera's current 3D world position to
+	 * the given local point on the given plane is unobstructed by walls or
+	 * tall game-objects.
+	 *
+	 * <p>Useful when an actor's model still projects onto the canvas (the
+	 * engine renders model geometry regardless of wall occlusion in 3D), and
+	 * the caller needs to know whether a real player could actually see /
+	 * click on it from the current camera angle. {@link Player#getWorldArea}'s
+	 * {@code hasLineOfSightTo} answers a different question — "can my
+	 * character see the target?" — and ignores the camera position entirely.
+	 *
+	 * <p>The check Bresenhams from the camera's scene tile to the target
+	 * tile, with line altitude interpolated from camera height down to
+	 * ground. A wall flag at a tile occludes only when the line altitude
+	 * there is below {@link #CAMERA_VIS_WALL_TOP}, so high pitch (camera
+	 * high above ground) sees over walls and low pitch (camera near
+	 * horizontal) doesn't. The occluder mask combines
+	 * {@link CollisionDataFlag#BLOCK_LINE_OF_SIGHT_FULL},
+	 * {@link CollisionDataFlag#BLOCK_MOVEMENT_OBJECT}, and the directional
+	 * {@code BLOCK_LINE_OF_SIGHT_*} flag matching the line's heading — same
+	 * semantics as the engine's tile-LOS check, but with the wider mask so
+	 * tall game-objects (stone walls, big rocks) that don't set the
+	 * directional LOS flag still occlude.
+	 *
+	 * <p>Plane mismatches and missing collision data are treated as
+	 * "no usable info, accept" — callers that want stricter behaviour
+	 * should filter on plane themselves before calling.
+	 *
+	 * <p>Must be invoked on the client thread —
+	 * {@link Client#getCameraX()} / {@link Client#getCameraY()} /
+	 * {@link Client#getCameraZ()} / {@link Client#getTopLevelWorldView()}
+	 * all assert it under {@code -ea}.
+	 *
+	 * @param client the game client
+	 * @param target the target's local position
+	 * @param plane  the plane on which to test occlusion
+	 * @return {@code true} if no wall / tall object stands between the
+	 *         camera and {@code target}, or if the camera is high enough
+	 *         to see over walls
+	 */
+	public static boolean isCameraLineClearTo(@Nonnull Client client, @Nonnull LocalPoint target, int plane)
+	{
+		WorldView wv = client.getTopLevelWorldView();
+		if (wv == null)
+		{
+			return true;
+		}
+		CollisionData[] cdMaps = wv.getCollisionMaps();
+		if (cdMaps == null || plane < 0 || plane >= cdMaps.length || cdMaps[plane] == null)
+		{
+			return true;
+		}
+		int[][] flags = cdMaps[plane].getFlags();
+		int width = flags.length;
+		int height = width == 0 ? 0 : flags[0].length;
+		if (width == 0 || height == 0)
+		{
+			return true;
+		}
+
+		int camSx = client.getCameraX() >> LOCAL_COORD_BITS;
+		int camSy = client.getCameraY() >> LOCAL_COORD_BITS;
+		int npcSx = target.getSceneX();
+		int npcSy = target.getSceneY();
+
+		if (camSx < 0 || camSx >= width || camSy < 0 || camSy >= height)
+		{
+			return true;
+		}
+		if (npcSx < 0 || npcSx >= width || npcSy < 0 || npcSy >= height)
+		{
+			return true;
+		}
+		if (camSx == npcSx && camSy == npcSy)
+		{
+			return true;
+		}
+
+		// OSRS Z is negative-up; flip so larger = higher.
+		int camHeight = -client.getCameraZ();
+		// Way above any plausible wall — top-down view, nothing occludes.
+		if (camHeight > CAMERA_VIS_WALL_TOP * 4)
+		{
+			return true;
+		}
+
+		int dx = npcSx - camSx;
+		int dy = npcSy - camSy;
+		int dxAbs = Math.abs(dx);
+		int dyAbs = Math.abs(dy);
+		int totalSteps = Math.max(dxAbs, dyAbs);
+
+		int xFlags = CollisionDataFlag.BLOCK_LINE_OF_SIGHT_FULL
+			| CollisionDataFlag.BLOCK_MOVEMENT_OBJECT;
+		int yFlags = CollisionDataFlag.BLOCK_LINE_OF_SIGHT_FULL
+			| CollisionDataFlag.BLOCK_MOVEMENT_OBJECT;
+		if (dx < 0)
+		{
+			xFlags |= CollisionDataFlag.BLOCK_LINE_OF_SIGHT_EAST;
+		}
+		else
+		{
+			xFlags |= CollisionDataFlag.BLOCK_LINE_OF_SIGHT_WEST;
+		}
+		if (dy < 0)
+		{
+			yFlags |= CollisionDataFlag.BLOCK_LINE_OF_SIGHT_NORTH;
+		}
+		else
+		{
+			yFlags |= CollisionDataFlag.BLOCK_LINE_OF_SIGHT_SOUTH;
+		}
+
+		if (dxAbs > dyAbs)
+		{
+			int x = camSx;
+			int yBig = camSy << 16;
+			int slope = (dy << 16) / dxAbs;
+			yBig += 0x8000;
+			if (dy < 0)
+			{
+				yBig--;
+			}
+			int direction = dx < 0 ? -1 : 1;
+			int step = 0;
+			while (x != npcSx)
+			{
+				x += direction;
+				step++;
+				int y = yBig >>> 16;
+				if (x < 0 || x >= width || y < 0 || y >= height)
+				{
+					return true;
+				}
+				int lineHeight = camHeight - (camHeight * step) / totalSteps;
+				if (lineHeight < CAMERA_VIS_WALL_TOP && (flags[x][y] & xFlags) != 0)
+				{
+					return false;
+				}
+				yBig += slope;
+				int nextY = yBig >>> 16;
+				if (nextY != y && nextY >= 0 && nextY < height
+					&& lineHeight < CAMERA_VIS_WALL_TOP
+					&& (flags[x][nextY] & yFlags) != 0)
+				{
+					return false;
+				}
+			}
+		}
+		else
+		{
+			int y = camSy;
+			int xBig = camSx << 16;
+			int slope = (dx << 16) / dyAbs;
+			xBig += 0x8000;
+			if (dx < 0)
+			{
+				xBig--;
+			}
+			int direction = dy < 0 ? -1 : 1;
+			int step = 0;
+			while (y != npcSy)
+			{
+				y += direction;
+				step++;
+				int x = xBig >>> 16;
+				if (x < 0 || x >= width || y < 0 || y >= height)
+				{
+					return true;
+				}
+				int lineHeight = camHeight - (camHeight * step) / totalSteps;
+				if (lineHeight < CAMERA_VIS_WALL_TOP && (flags[x][y] & yFlags) != 0)
+				{
+					return false;
+				}
+				xBig += slope;
+				int nextX = xBig >>> 16;
+				if (nextX != x && nextX >= 0 && nextX < width
+					&& lineHeight < CAMERA_VIS_WALL_TOP
+					&& (flags[nextX][y] & xFlags) != 0)
+				{
+					return false;
+				}
+			}
+		}
+		return true;
+	}
+
+	/**
+	 * Convenience: {@link #isCameraLineClearTo} for an actor — uses the
+	 * actor's current local location and plane. Returns {@code false} when
+	 * the actor or its location is null. Behaves identically to the
+	 * underlying check; see that method for the algorithm + caveats.
+	 *
+	 * <p>Note: passes when the actor's <i>centre tile</i> is camera-visible.
+	 * It does not sample the actor's model footprint or height, so a 1x1
+	 * actor on the far side of a thin wall but with its model partially
+	 * peeking through may still register as not visible (the wall occludes
+	 * the centre). Callers that need finer-grained model-vs-wall occlusion
+	 * should sample multiple offsets themselves.
+	 *
+	 * @param client the game client
+	 * @param actor  the actor to test
+	 * @return {@code true} if no wall / tall object stands between the
+	 *         camera and the actor's current tile
+	 */
+	public static boolean isVisibleToCamera(@Nonnull Client client, @Nullable Actor actor)
+	{
+		if (actor == null)
+		{
+			return false;
+		}
+		LocalPoint lp = actor.getLocalLocation();
+		if (lp == null)
+		{
+			return false;
+		}
+		WorldPoint wp = actor.getWorldLocation();
+		int plane;
+		if (wp != null)
+		{
+			plane = wp.getPlane();
+		}
+		else
+		{
+			WorldView wv = client.getTopLevelWorldView();
+			plane = wv == null ? 0 : wv.getPlane();
+		}
+		return isCameraLineClearTo(client, lp, plane);
 	}
 
 }

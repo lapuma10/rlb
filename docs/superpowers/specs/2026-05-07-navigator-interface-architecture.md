@@ -252,7 +252,7 @@ top-level `~/.runelite/recorder/worldmap/transports.json` index
 #### Persistence layout (LOCKED)
 
 ```
-~/.runelite/recorder/worldmap/regions/<id>.json     region snapshots (collision + objects + NPCs)
+~/.runelite/recorder/worldmap/regions/<id>.json     region snapshots (collision + static / interactive objects — NO NPCs; entity sightings live in entities/)
 ~/.runelite/recorder/worldmap/entities/<id>.json    entity sightings per region
 ~/.runelite/recorder/worldmap/transports.json       transport graph (or per-region; impl decides)
 ~/.runelite/recorder/inspect/                        inspection dumps (separate from world memory)
@@ -752,3 +752,425 @@ Repeat for both north and south bank↔pen routes.
 - [ ] Implementation lands the interface, the V1 adapter, the V2
       implementation, and the switch — wired to at least
       ChickenFarmV3 — in the same merge.
+
+---
+
+## Revised rollout plan — phases 7–17 (LOCKED 2026-05-07)
+
+Phases 1–6 were implicit slices of round-1 plumbing. The rollout below
+**replaces** any prior implicit phase order from this point forward.
+Each phase must end with something the user can actually run on
+ChickenFarmV3 — not "architecture is closer." See the rule at the
+bottom of this section.
+
+**On prior V2 acceptance criteria:** the LOCKED round-1 V2 success
+criteria stated earlier in this spec (route alternation, click
+selection improvements under the empty-tile rule, snapshot invalidation,
+scoped seed pass, inspection tooling) are **final cumulative goals
+across phases 7–17**,
+not Phase 7's bar. Phase 7 only has to make the switch safe; the
+older acceptance bullets resolve as their own dedicated phases below.
+
+### Phase 7 — Make the switch usable now
+
+**Goal:** Turning V2 on must not break ChickenFarmV3.
+
+Implement:
+
+```text
+NavigatorMode:
+- V1_ONLY
+- V2_WITH_V1_FALLBACK
+- V2_STRICT
+```
+
+Behavior:
+
+```text
+V1_ONLY:
+  always use TrailWalker/V1
+
+V2_WITH_V1_FALLBACK:
+  try V2 first
+  if V2 fails for any reason, log why and use V1 for that request
+
+V2_STRICT:
+  try V2 only
+  if it fails, report why and stop cleanly
+```
+
+Acceptance:
+
+```text
+- compile passes
+- V1_ONLY works exactly like before
+- V2_WITH_V1_FALLBACK works even with empty worldmap data
+- V2_STRICT fails clearly with empty worldmap data
+- ChickenFarmV3 never silently hangs because V2 is incomplete
+```
+
+This is the emergency fix.
+
+### Phase 8 — Add readiness checks
+
+**Goal:** Before running V2, you can see whether it has enough data.
+Readiness lands BEFORE the strict-V2 proof so Phase 9 can be debugged
+with a real diagnostic instead of "watch the bot and guess."
+
+Add panel/debug action:
+
+```text
+Check V2 readiness: bank↔pen
+```
+
+Report:
+
+```text
+- known region chunks
+- missing region chunks
+- known tile coverage
+- required transports
+- missing transports
+- can plan bank → pen: yes/no
+- can plan pen → bank: yes/no
+- if no, exact reason
+```
+
+Acceptance:
+
+```text
+- with empty worldmap, readiness says NO_DATA / missing chunks
+- after seed pass, readiness shows what was captured
+- if V2 strict would fail, readiness explains why before you run it
+```
+
+This prevents "watch the bot and guess."
+
+### Phase 9 — Make V2 strict work for bank ↔ pen
+
+**Goal:** V2 alone can complete the smallest useful chicken-farm route.
+
+Scope:
+
+```text
+Only:
+- Lumby bank → chicken pen
+- chicken pen → Lumby bank
+```
+
+Do **not** add route variation yet.
+
+Do **not** add click variation yet.
+
+Do **not** expand to GE/Draynor yet.
+
+Implementation focus:
+
+```text
+- make MultiRegionAStar plan bank↔pen
+- make transport edges work if needed
+- make executor follow one route safely
+- return clear failures when data is missing
+```
+
+Acceptance:
+
+```text
+- V2_STRICT completes bank → pen once
+- V2_STRICT completes pen → bank once
+- logs show route planned, route executed, arrival reached
+- readiness check (Phase 8) reports green for both directions before the run
+- no V1 fallback in strict mode
+```
+
+This is the real "V2 works" proof.
+
+### Phase 10 — Seed pass validation
+
+**Goal:** Verify V2 captured the route data from V1-driven walks.
+
+Run V1 with V2 passive observer active for:
+
+```text
+Required:
+- Lumby bank → pen north
+- pen → Lumby bank north
+- Lumby bank → pen south
+- pen → Lumby bank south
+```
+
+Then inspect:
+
+```text
+- region dumps
+- transport graph
+- readiness report
+- planned route dump
+```
+
+Acceptance:
+
+```text
+- V2 has enough known tiles for bank↔pen
+- required transports are captured
+- readiness passes both directions
+- V2_STRICT bank↔pen still works after restart using persisted data
+```
+
+This proves the map memory is not just in RAM.
+
+### Phase 11 — Route alternation
+
+**Goal:** V2 can choose different valid macro routes across cycles.
+
+Only start this after Phase 9 works.
+
+Implement:
+
+```text
+- top-K routes, K=3
+- repeated A* with edge-reuse penalties
+- route cost rejection if >1.75x cheapest
+- recent route memory
+- noisy A* fallback
+```
+
+Keep config flag:
+
+```text
+enableV2RouteVariation
+```
+
+Acceptance:
+
+```text
+- with variation off: V2 still completes bank↔pen
+- with variation on: V2 completes 10 bank↔pen cycles
+- logs show selected route ID and cost
+- both north and south routes are selected when both exist
+- no perfect ABABAB pattern
+```
+
+If this breaks reliability, turn variation off and V2 still works.
+
+### Phase 12 — Executor click safety baseline
+
+**Goal:** V2 clicks safely before adding variety.
+
+Implement only:
+
+```text
+- fixed safe canvas click target along planned path
+- actual-pixel isLeftClickWalk check
+- live collision/reachability check
+- if candidate fails, pick another canvas tile
+- no forced menu verbs
+```
+
+Acceptance:
+
+```text
+- every canvas click passes isLeftClickWalk
+- failed click candidates are skipped, not forced
+- V2_STRICT still completes bank↔pen
+- logs show rejected click candidates and final accepted click
+```
+
+This locks the non-negotiable click rule.
+
+### Phase 13 — Executor click selection improvements
+
+**Goal:** Improve how the executor selects each canvas click without
+breaking the Phase 12 safety baseline. Framing is route robustness +
+recovery from uncertain input — not "variety for its own sake."
+
+Do one at a time:
+
+```text
+1. variable click distance:
+   long / mid / short
+
+2. intra-tile jitter:
+   random point inside tile poly
+
+3. minimap mode:
+   only when minimap preconditions pass
+
+4. catch-up click:
+   only when movement progress stalls
+```
+
+Each sub-step must have a disable flag or be easy to turn off.
+
+Acceptance after each sub-step:
+
+```text
+- V2_STRICT still completes bank↔pen
+- isLeftClickWalk still gates every canvas click
+- failed canvas candidate = choose another canvas tile
+- no unsafe object/NPC/item clicks
+```
+
+Do not bundle all click changes together.
+
+### Phase 14 — Snapshot invalidation / recovery
+
+**Goal:** V2 recovers when memory is wrong or live state blocks the route.
+
+Implement typed failure handling:
+
+```text
+STATIC_COLLISION_MISMATCH:
+  mark tile/edge dirty, replan
+
+DYNAMIC_BLOCKER:
+  temporary avoidance penalty, do not persist bad data
+
+TRANSPORT_STATE_MISMATCH:
+  mark transport stale for this run, re-resolve or replan
+
+UNKNOWN_FAILURE:
+  count failures, temporarily blacklist after threshold
+```
+
+Acceptance:
+
+```text
+- if one tile becomes blocked, V2 replans or falls back
+- dynamic NPC/player blocker does not permanently corrupt the map
+- repeated bad edge gets temporarily blacklisted
+- V2_WITH_V1_FALLBACK keeps script usable
+```
+
+This makes V2 durable.
+
+### Phase 15 — Secondary routes
+
+**Goal:** Expand after bank↔pen is stable.
+
+Add one route group at a time:
+
+```text
+1. Lumby ↔ Draynor
+2. Lumby ↔ GE
+```
+
+For each route:
+
+```text
+- seed with V1 passive observer
+- readiness check
+- V2_STRICT proof
+- V2_WITH_V1_FALLBACK safety check
+```
+
+Acceptance per route:
+
+```text
+- readiness passes
+- V2_STRICT completes route both directions
+- route dump shows regions/transports used
+- fallback still works if data is deleted
+```
+
+Do not add both routes in one big phase.
+
+### Phase 16 — Entity-targeted navigation
+
+**Goal:** Scripts can ask for "go to chickens / bank / range / Cook"
+instead of exact coordinates.
+
+Use existing EntityIndex.
+
+Implement:
+
+```text
+Navigator request:
+- target entity name
+- target type: NPC / object / area
+- action if needed
+```
+
+Examples:
+
+```text
+goToEntity("Chicken", NPC)
+goToObject("Bank booth")
+goToObject("Range")
+```
+
+Acceptance:
+
+```text
+- V2 can resolve nearest known entity sighting
+- V2 walks near it
+- live scene verifies actual target before interaction
+- if entity data missing, failure reason is ENTITY_NOT_FOUND
+- fallback still works where applicable
+```
+
+This is where scripts start getting easier to write.
+
+### Phase 17 — Remove temporary fallbacks only where proven
+
+**Goal:** Make strict V2 the default only for routes proven stable.
+
+Do **not** remove V1.
+
+Instead, per route/script:
+
+```text
+bank↔pen:
+  default can become V2_WITH_V1_FALLBACK or V2_STRICT if proven
+
+unknown routes:
+  remain V2_WITH_V1_FALLBACK or V1
+```
+
+Acceptance:
+
+```text
+- no global "V2 is done" claim
+- each route has its own proof status
+- V1 remains available
+```
+
+### Execution order
+
+```text
+7.  Make switch usable with V1 fallback
+8.  Readiness checks
+9.  V2 strict bank↔pen once
+10. Seed pass validation
+11. Route alternation
+12. Safe canvas click baseline
+13. Click selection improvements
+14. Snapshot invalidation
+15. Secondary routes
+16. Entity-targeted navigation
+17. Promote proven routes only
+```
+
+### The rule for every phase
+
+Every phase must end with this answer:
+
+```text
+Can I run ChickenFarmV3 now?
+```
+
+Allowed answers:
+
+```text
+Yes, through V1 fallback.
+Yes, through V2 strict for bank↔pen.
+Yes, through V2 with variation.
+```
+
+Not allowed:
+
+```text
+No, but the architecture is closer.
+```
+
+That's the rule that prevents this from happening again.
