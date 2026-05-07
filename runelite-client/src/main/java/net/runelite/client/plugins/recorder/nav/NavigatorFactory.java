@@ -14,11 +14,11 @@ import net.runelite.client.plugins.recorder.trail.TrailWalker;
  *  trail, busy flag) isn't dropped on cross-tick lookups.
  *
  *  <p>Round 1 only registers V1. Selecting {@code WORLDMAP_V2} from
- *  the panel before V2 is wired throws an {@link
- *  UnsupportedOperationException} with a clear hint to flip the
- *  setting back. The V2 registration lands in Phase 6 (per the
- *  implementation plan), at which point the throw becomes a real
- *  return. */
+ *  the panel before V2 is wired logs a warning and falls back to
+ *  V1, rather than throwing. Throwing here would crash plugin
+ *  startup if a stale config value pointed at V2; falling back keeps
+ *  the bot usable and surfaces the mismatch via the log. The V2
+ *  branch is replaced with a real {@code v2} return in Phase 6. */
 @Slf4j
 public final class NavigatorFactory
 {
@@ -50,10 +50,9 @@ public final class NavigatorFactory
             case TRAIL_V1:
                 return trailV1;
             case WORLDMAP_V2:
-                throw new UnsupportedOperationException(
-                    "Navigator V2 (WORLDMAP_V2) is not yet registered. "
-                  + "Set Navigator implementation back to TRAIL_V1 in the "
-                  + "Recorder plugin config until V2 ships in a later phase.");
+                log.warn("nav-factory: V2 (WORLDMAP_V2) selected but not yet "
+                    + "registered — using V1 (TrailWalker) until Phase 6 wires V2");
+                return trailV1;
             default:
                 log.warn("nav-factory: unknown NavigatorImpl {} — falling back to V1", impl);
                 return trailV1;

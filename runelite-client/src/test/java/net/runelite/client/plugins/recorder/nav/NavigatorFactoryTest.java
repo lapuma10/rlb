@@ -22,14 +22,19 @@ public class NavigatorFactoryTest
         assertSame(stub, factory.getNavigator());
     }
 
-    @Test(expected = UnsupportedOperationException.class)
-    public void getNavigator_whenWorldmapV2_andV2NotRegistered_throws()
+    @Test
+    public void getNavigator_whenWorldmapV2_andV2NotRegistered_fallsBackToV1()
     {
         RecorderConfig cfg = mock(RecorderConfig.class);
         when(cfg.navigatorImpl()).thenReturn(RecorderConfig.NavigatorImpl.WORLDMAP_V2);
-        NavigatorFactory factory = new NavigatorFactory(cfg, stubNavigator("trail-v1"));
+        Navigator stubV1 = stubNavigator("trail-v1");
+        NavigatorFactory factory = new NavigatorFactory(cfg, stubV1);
 
-        factory.getNavigator();
+        // Round-1: V2 not registered yet. Plugin startup must stay
+        // resilient to a stale config value, so the factory logs and
+        // returns V1 instead of throwing — Phase 6 replaces the warn
+        // with a real V2 instance.
+        assertSame(stubV1, factory.getNavigator());
     }
 
     @Test
