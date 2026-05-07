@@ -162,6 +162,15 @@ public final class CooksAssistantScript
      *  and the cook never took the items. */
     private static final int MAX_COOK_TALKS = 2;
 
+    /** Centre of the Varrock Grand Exchange used for the "am I at the
+     *  GE?" proximity check on script (re)start. If the player is
+     *  within {@link #GE_PROXIMITY_TILES} of this point we route through
+     *  {@link State#WALK_BACK_TO_LUMBRIDGE} before WALK_TO_COOK so the
+     *  trail-walker isn't asked to path ~270 tiles south in a single
+     *  click (which it can't — minimap pathing is bounded). */
+    private static final WorldPoint GE_CENTER = new WorldPoint(3164, 3487, 0);
+    private static final int GE_PROXIMITY_TILES = 20;
+
     /** Grace window after a booth click before re-attempting. The bank
      *  widget can take 1-3 seconds to render server-side; re-clicking
      *  inside this window finds the booth in a different state and the
@@ -332,6 +341,17 @@ public final class CooksAssistantScript
     {
         if (allIngredientsPresent())
         {
+            // WALK_TO_COOK assumes the player is in/near Lumbridge — its
+            // route 'lumby_bank_to_cook' starts at the bank. If the user
+            // restarts after a GE-side abort (player still standing at
+            // the GE), we have to walk Lumbridge-bound first or the
+            // walker will sit clicking at a tile 270+ tiles away.
+            if (playerAtGrandExchange())
+            {
+                status.set("quest: all ingredients in inventory — walking back from GE to Lumbridge");
+                log.info("cooks-assistant: all ingredients present but player is at GE — routing via WALK_BACK_TO_LUMBRIDGE");
+                return State.WALK_BACK_TO_LUMBRIDGE;
+            }
             status.set("quest: all ingredients in inventory — going to Cook");
             log.info("cooks-assistant: all ingredients present — going straight to Cook");
             return State.WALK_TO_COOK;
@@ -339,6 +359,18 @@ public final class CooksAssistantScript
         status.set("quest: ingredients missing — checking bank");
         log.info("cooks-assistant: missing ingredient(s) — opening bank first, GE as fallback");
         return State.CHECK_BANK;
+    }
+
+    /** True iff the player is currently within {@link #GE_PROXIMITY_TILES}
+     *  of {@link #GE_CENTER} on the same plane. Used to detect a GE-side
+     *  restart so {@link #decideInitialState} can prepend
+     *  {@link State#WALK_BACK_TO_LUMBRIDGE} before WALK_TO_COOK. */
+    private boolean playerAtGrandExchange()
+    {
+        WorldPoint pos = playerPos();
+        if (pos == null) return false;
+        if (pos.getPlane() != GE_CENTER.getPlane()) return false;
+        return pos.distanceTo(GE_CENTER) <= GE_PROXIMITY_TILES;
     }
 
     /** True iff all three ingredients (flour + egg + milk) are in the
