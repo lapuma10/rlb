@@ -55,7 +55,12 @@ public class ChickenCombatLoopTest
         // immediately. We run the loop via the package-private hooks, not via
         // start() — start() spawns a thread which would call doEngage which
         // includes a 5s wait for engagement; we want a synchronous unit test.
-        when(self.getInteracting()).thenReturn(null, null, chicken);
+        // Call sequence: (1) doSelect's detectActiveChickenCombat → null
+        // (no stale adoption), (2) doEngage's wait-for-engaged lambda →
+        // chicken (player-side engagement live). preflightEngage no longer
+        // reads self.getInteracting() since we tightened it to require
+        // chicken-side mutual targeting only.
+        when(self.getInteracting()).thenReturn(null, chicken);
 
         ChickenCombatLoop loop = new ChickenCombatLoop(dispatcher, client, null,
             null,
@@ -77,11 +82,44 @@ public class ChickenCombatLoopTest
     }
 
     @Test
-    public void doSelect_playerAlreadyTargetingChicken_adoptsCombat()
+    public void doSelect_oneSidedSelfTargeting_doesNotAdopt_fallsThroughToPick()
     {
+        // self.getInteracting()==chicken with chicken.getInteracting()==null is
+        // the post-kill stale-pointer case. Earlier behaviour adopted that as
+        // active combat and skipped straight to IN_COMBAT, which deadlocked
+        // the bot for 60+s on a chicken it had never actually attacked. We
+        // now require mutual engagement to adopt; one-sided self-pointing
+        // falls through to the normal selector pick → ENGAGING (and the
+        // attack click goes out from doEngage, not from here).
         Player self = mock(Player.class);
         NPC chicken = mockChicken(44, 3231, 3296, 0);
         when(self.getInteracting()).thenReturn(chicken);
+        Client client = clientWith(self, new WorldPoint(3230, 3296, 0), chicken);
+        CombatDispatcher dispatcher = mock(CombatDispatcher.class);
+
+        ChickenCombatLoop loop = new ChickenCombatLoop(dispatcher, client, null,
+            null,
+            new NpcSelector(ChickenCombatLoop.CHICKEN_NAME),
+            TargetVisibility.alwaysVisible(), s -> {});
+
+        assertTrue(loop.doSelect());
+        assertEquals("must NOT adopt one-sided self-targeting — sticky pointer",
+            ChickenCombatLoop.State.ENGAGING, loop.state());
+        assertNotNull(loop.currentTarget());
+        assertEquals(44, loop.currentTarget().npcIndex());
+        verify(dispatcher, never()).dispatch(any());
+    }
+
+    @Test
+    public void doSelect_mutualEngagement_adoptsCombatWithoutDispatch()
+    {
+        // Both directions set: self.getInteracting()==chicken AND
+        // chicken.getInteracting()==self. This is real, live combat that
+        // should be adopted without an extra Attack click.
+        Player self = mock(Player.class);
+        NPC chicken = mockChicken(44, 3231, 3296, 0);
+        when(self.getInteracting()).thenReturn(chicken);
+        when(chicken.getInteracting()).thenReturn(self);
         Client client = clientWith(self, new WorldPoint(3230, 3296, 0), chicken);
         CombatDispatcher dispatcher = mock(CombatDispatcher.class);
 
@@ -100,6 +138,10 @@ public class ChickenCombatLoopTest
     @Test
     public void doSelect_chickenAlreadyTargetingPlayer_adoptsCombat()
     {
+        // Engine-side flipped first: chicken.getInteracting()==self even though
+        // self.getInteracting() hasn't caught up yet. Adoption is still safe
+        // here because the chicken-side pointer is the truth-tell — it only
+        // gets set when an NPC has acquired a target server-side.
         Player self = mock(Player.class);
         NPC chicken = mockChicken(45, 3231, 3296, 0);
         when(chicken.getInteracting()).thenReturn(self);
@@ -280,6 +322,72 @@ public class ChickenCombatLoopTest
         assertEquals(ChickenCombatLoop.State.SELECTING, loop.state());
         assertNull(loop.currentTarget());
         verify(dispatcher, never()).dispatch(any());
+    }
+
+    @Test
+    public void doEngage_menuMissingAttack_appliesCooldownAndSkipsOnNextSelect()
+    {
+        // Engine refused to offer 'Attack' for this chicken — closed gate /
+        // fence / occlusion. Without the cooldown the next SELECTING tick
+        // re-picks the same NPC and we loop forever (this is exactly the
+        // 17:10:01–17:10:09 cascade in the production logs).
+        Player self = mock(Player.class);
+        NPC unreachable = mockChicken(2878, 3234, 3296, 0);
+        NPC alternate = mockChicken(2879, 3232, 3296, 0);
+        Client client = clientWith(self, new WorldPoint(3236, 3297, 0), unreachable, alternate);
+        CombatDispatcher dispatcher = mock(CombatDispatcher.class);
+        when(dispatcher.isBusy()).thenReturn(false);
+        when(dispatcher.lastErrorMessage())
+            .thenReturn("menu missing 'Attack' on npc 2878");
+
+        ChickenCombatLoop loop = new ChickenCombatLoop(dispatcher, client, null,
+            null,
+            new NpcSelector(ChickenCombatLoop.CHICKEN_NAME),
+            TargetVisibility.alwaysVisible(), s -> {});
+        loop.setTargetForTesting(new CombatTarget(2878, "Chicken", 0));
+        loop.setStateForTesting(ChickenCombatLoop.State.ENGAGING);
+
+        loop.doEngage();
+        assertEquals(ChickenCombatLoop.State.SELECTING, loop.state());
+        assertNull("lock must be released after engage failure", loop.currentTarget());
+
+        // Next selection must NOT pick the unreachable chicken even though
+        // it's slightly closer — the cooldown excludes it.
+        when(dispatcher.lastErrorMessage()).thenReturn(null);
+        assertTrue(loop.doSelect());
+        assertNotNull(loop.currentTarget());
+        assertEquals("should skip the unreachable chicken on cooldown",
+            2879, loop.currentTarget().npcIndex());
+    }
+
+    @Test
+    public void doEngage_menuMissingAttack_onWrongNpcIndex_doesNotCooldown()
+    {
+        // Defensive: a stale error from a previous click chain must not
+        // cooldown the currently-locked NPC. Pin the matcher to the
+        // expected index — different index = different chain, ignore.
+        Player self = mock(Player.class);
+        NPC ours = mockChicken(2878, 3234, 3296, 0);
+        Client client = clientWith(self, new WorldPoint(3236, 3297, 0), ours);
+        CombatDispatcher dispatcher = mock(CombatDispatcher.class);
+        when(dispatcher.isBusy()).thenReturn(false);
+        when(dispatcher.lastErrorMessage())
+            .thenReturn("menu missing 'Attack' on npc 9999");
+
+        ChickenCombatLoop loop = new ChickenCombatLoop(dispatcher, client, null,
+            null,
+            new NpcSelector(ChickenCombatLoop.CHICKEN_NAME),
+            TargetVisibility.alwaysVisible(), s -> {});
+        loop.setTargetForTesting(new CombatTarget(2878, "Chicken", 0));
+        loop.setStateForTesting(ChickenCombatLoop.State.ENGAGING);
+
+        loop.doEngage();
+        assertEquals(ChickenCombatLoop.State.SELECTING, loop.state());
+
+        when(dispatcher.lastErrorMessage()).thenReturn(null);
+        assertTrue(loop.doSelect());
+        assertEquals("stale error for a different NPC must not cool down ours",
+            2878, loop.currentTarget().npcIndex());
     }
 
     @Test

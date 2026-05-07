@@ -51,6 +51,15 @@ public final class CombatStateTracker
     /** Set when {@link #observe} sees the locked NPC vanish from the world view
      *  (interpreted as "killed by someone else / despawned mid-combat"). */
     private boolean vanished = false;
+    /** True once we have observed the chicken targeting the local player
+     *  (chicken-side engagement) at least once. After that point, only the
+     *  chicken-side pointer is trusted to reset {@link #brokenTicks} —
+     *  self.getInteracting() is sticky for 1-2 ticks (sometimes longer) after
+     *  combat actually ends, so a one-sided self→chicken pointer kept
+     *  brokenTicks=0 indefinitely and deadlocked IN_COMBAT (bot sat polling
+     *  for 2+ minutes with no actual attacks until the chicken died from
+     *  another player and despawned, granting a phantom kill). */
+    private boolean chickenEverTargetedUs = false;
     /** Consecutive ticks where the locked NPC's interaction target was a Player
      *  other than the local player AND we have never observed mutual engagement
      *  ourselves. Reset on mutual engagement or when interaction is null. Used
@@ -101,19 +110,37 @@ public final class CombatStateTracker
         boolean selfTargetingLockedNpc =
             selfInteracting instanceof NPC
                 && ((NPC) selfInteracting).getIndex() == npcIndex;
+        boolean chickenTargetingUs =
+            interacting != null && self != null && interacting == self;
         // Match ChickenCombatLoop#doEngage: combat is live as soon as either
         // side has locked the other. In live play the player often acquires the
         // NPC target a tick before the NPC's interacting pointer flips back to
         // us; if we only trust npc.getInteracting()==self, IN_COMBAT can enter
         // successfully and then sit forever with everEngaged=false.
-        boolean engagedWithUs =
-            (interacting != null && self != null && interacting == self)
-                || selfTargetingLockedNpc;
+        boolean engagedWithUs = chickenTargetingUs || selfTargetingLockedNpc;
         boolean engagedByOther = interacting instanceof Player && interacting != self;
         if (engagedWithUs) everEngaged = true;
+        if (chickenTargetingUs) chickenEverTargetedUs = true;
 
-        if (engagedWithUs) brokenTicks = 0;
-        else if (everEngaged) brokenTicks++;
+        // Truth-tell for "still engaged": chicken-side. Once we have ever
+        // observed the chicken targeting us, the player-side pointer is
+        // ignored as a reset signal — it can be sticky long after combat
+        // ends and would otherwise hold brokenTicks at zero indefinitely.
+        // Before chicken-side has been confirmed (the engine sometimes
+        // flips player-side first), accept either side as the engaged
+        // signal so we don't immediately break a fresh engagement.
+        if (chickenTargetingUs)
+        {
+            brokenTicks = 0;
+        }
+        else if (selfTargetingLockedNpc && !chickenEverTargetedUs)
+        {
+            brokenTicks = 0;
+        }
+        else if (everEngaged)
+        {
+            brokenTicks++;
+        }
 
         // Track "another player has it locked" only when we've never had
         // mutual engagement of our own. After we engage once, retain the

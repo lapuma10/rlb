@@ -160,6 +160,15 @@ public final class ChickenCombatLoop
      *  Hard cap so we don't get stuck if loot never spawns or another
      *  player picks it up before us. */
     private long lootDeadlineMs = 0;
+    /** Set true the first time {@link #findOurLootItemId} returns a non-
+     *  null id during the current LOOTING phase. Once true, a subsequent
+     *  null result means "we picked everything up" — exit early instead
+     *  of polling for the rest of {@link #LOOT_TIMEOUT_MS}. Without this
+     *  the bot sits visibly idle on "looting" status for ~7s after the
+     *  last item drops into our bag, which reads as "stuck looting" even
+     *  though the work is done. Reset in {@link #doKilled} on each new
+     *  loot phase. */
+    private boolean lootEverSeen = false;
     private volatile Thread worker;
     /** True for the first {@code doSelect} call after entering SELECTING.
      *  Used to emit the "why no pick" diagnostic exactly once per entry,
@@ -401,12 +410,13 @@ public final class ChickenCombatLoop
         // so we don't crash the worker the moment we're near a real chicken.
         NPC pick = onClient(() -> {
             WorldView wv = client.getTopLevelWorldView();
+            int excluded = activeClaimedNpcCooldownIndex();
             NPC p = selector.pick(snap.npcs, snap.self, snap.playerPos,
-                activeClaimedNpcCooldownIndex(), wv, visibility);
+                excluded, wv, visibility);
             if (p == null && justEnteredSelecting)
             {
                 justEnteredSelecting = false;
-                logSelectionDiagnostic(snap);
+                logSelectionDiagnostic(snap, wv, excluded);
             }
             return p;
         });
@@ -486,6 +496,29 @@ public final class ChickenCombatLoop
             setState(State.SELECTING);
             return;
         }
+        // Camera-POV re-check: doSelect just force-rotated the camera to
+        // face the chicken, which can put the camera itself behind a wall
+        // (camera orbits the player; rotating to face north places camera
+        // ground-projection south of the player, possibly outside the
+        // pen). Selection-time canSee uses player-tile origin and can't
+        // detect this. Without the re-check we'd dispatch a click on a
+        // chicken whose hull pixels are visually behind a wall — a real
+        // wallhack. Cooldown the chicken so the next pick goes elsewhere
+        // and the camera angle changes naturally before we revisit it.
+        Boolean cameraCanSee = onClient(() -> {
+            NPC npc = findNpcByIndex(ct.npcIndex());
+            return npc != null && visibility.cameraCanSeeNpc(npc);
+        });
+        if (!Boolean.TRUE.equals(cameraCanSee))
+        {
+            log.info("chicken #{} occluded from camera POV after rotation — cooldown + re-select",
+                ct.npcIndex());
+            rememberClaimedNpc(ct.npcIndex());
+            target.set(null);
+            setStatus("camera-occluded — re-selecting");
+            setState(State.SELECTING);
+            return;
+        }
         serverRejectedAttack.set(false);
         ActionRequest req = ActionRequest.builder()
             .kind(ActionRequest.Kind.CLICK_NPC)
@@ -517,6 +550,21 @@ public final class ChickenCombatLoop
             // selection and click, etc.). Drop the lock and re-select.
             log.info("engage dispatch failed: {}", err);
             if (isAlreadyClaimedError(err)) rememberClaimedNpc(ct.npcIndex());
+            // "menu missing 'Attack' on npc N" means the engine's right-click
+            // menu had no 'Attack' verb — the NPC is unreachable from our
+            // current tile (closed gate, fence, partial occlusion). The
+            // visibility filter is supposed to cull these up front, but it
+            // relies on a static LOS / BFS heuristic and occasionally lets
+            // edge cases through. Without an exclusion the next SELECTING
+            // tick re-picks the same NPC and we loop forever. Apply the same
+            // 5s cooldown the "already claimed" branch uses; the chicken (or
+            // the player) usually moves into reach in well under that.
+            else if (isMenuMissingAttackError(err, ct.npcIndex()))
+            {
+                log.info("engage on chicken #{} unreachable (no 'Attack' in menu) — cooldown",
+                    ct.npcIndex());
+                rememberClaimedNpc(ct.npcIndex());
+            }
             target.set(null);
             setStatus("engage failed: " + err);
             setState(State.SELECTING);
@@ -673,6 +721,7 @@ public final class ChickenCombatLoop
             return;
         }
         lootDeadlineMs = System.currentTimeMillis() + LOOT_TIMEOUT_MS;
+        lootEverSeen = false;
         setStatus("looting at " + tile);
         setState(State.LOOTING);
     }
@@ -732,11 +781,24 @@ public final class ChickenCombatLoop
         Integer nextItemId = onClient(() -> findOurLootItemId(tile));
         if (nextItemId == null)
         {
-            // No matching loot YET — items may still be in flight. Wait one
-            // poll and re-check; the deadline guards against waiting forever.
+            // Two cases:
+            //   (a) Loot hasn't spawned yet — drops can take a tick or two
+            //       to appear after the kill confirms. Keep polling.
+            //   (b) We've already collected everything — the tile is empty
+            //       because we drained it. No reason to sit on the LOOTING
+            //       status for the rest of LOOT_TIMEOUT_MS.
+            // The flag flips true on the first non-null find; before that,
+            // null means "wait", after that, null means "done".
+            if (lootEverSeen)
+            {
+                log.info("loot complete at {} — items collected, exiting LOOTING early", tile);
+                finishLooting();
+                return;
+            }
             sleepQuiet(POLL_INTERVAL_MS);
             return;
         }
+        lootEverSeen = true;
         ActionRequest req = ActionRequest.builder()
             .kind(ActionRequest.Kind.CLICK_GROUND_ITEM)
             .channel(ActionRequest.Channel.MOUSE)
@@ -811,8 +873,13 @@ public final class ChickenCombatLoop
         NPC npc = findNpcByIndex(ct.npcIndex());
         if (npc == null) return EngagePreflight.TARGET_GONE;
         if (npc.getHealthRatio() == 0) return EngagePreflight.TARGET_GONE;
-        Actor selfInteracting = self.getInteracting();
-        if (selfInteracting == npc) return EngagePreflight.ALREADY_OURS;
+        // ALREADY_OURS only when the chicken is targeting us — that is the
+        // truth-tell for live combat. self.getInteracting() is sticky for
+        // 1-2 ticks (sometimes longer) after a previous fight ended, so
+        // returning ALREADY_OURS off self-side alone caused the loop to
+        // skip the engage click, jump to IN_COMBAT, and sit there as the
+        // tracker re-read the same stale pointer until the chicken died
+        // externally — phantom kill credit, no actual attacks dispatched.
         Actor npcInteracting = npc.getInteracting();
         if (npcInteracting == self) return EngagePreflight.ALREADY_OURS;
         if (npcInteracting instanceof Player) return EngagePreflight.TAKEN_BY_OTHER;
@@ -843,6 +910,18 @@ public final class ChickenCombatLoop
     private static boolean isAlreadyClaimedError(String err)
     {
         return err != null && err.contains("already in combat with another player");
+    }
+
+    /** Match the dispatcher's "menu missing '<verb>' on npc <idx>" error,
+     *  pinned to {@code expectedNpcIndex} so we don't apply the wrong-NPC
+     *  cooldown to a stale error from a different click chain. The exact
+     *  string is set by HumanizedInputDispatcher.npcClick when the right-
+     *  click menu opened but did not contain the requested verb. */
+    private static boolean isMenuMissingAttackError(String err, int expectedNpcIndex)
+    {
+        if (err == null) return false;
+        return err.startsWith("menu missing 'Attack' on npc ")
+            && err.endsWith(" " + expectedNpcIndex);
     }
 
     /** Client-thread: read TileItems on {@code tile}, return the id of the
@@ -907,12 +986,22 @@ public final class ChickenCombatLoop
     /** Walks {@code snap.npcs}, counts how many "Chicken" NPCs there are and
      *  why each one was rejected by {@link NpcSelector}. Logged once per
      *  SELECTING entry so the user gets a concrete reason ("closest 14 tiles
-     *  away") instead of just "no chickens nearby" after 36s. */
-    private void logSelectionDiagnostic(Snapshot snap)
+     *  away") instead of just "no chickens nearby" after 36s.
+     *
+     *  <p>Counts are derived from {@link NpcSelector#classify} so any new
+     *  {@link NpcSelector.Rejection} value is automatically reflected here —
+     *  an earlier hand-rolled pipeline silently dropped {@code NOT_VISIBLE}
+     *  rejects when LOS culling was added, which made the diagnostic read
+     *  "10 chickens, 1 engagedByOther" while the selector was rejecting the
+     *  other 9 behind a fence. */
+    private void logSelectionDiagnostic(Snapshot snap, @Nullable WorldView wv, int excludedIndex)
     {
-        int matching = 0, outOfArea = 0, outOfRange = 0, wrongPlane = 0, dying = 0, engagedByOther = 0;
+        int matching = 0;
         int closestDist = Integer.MAX_VALUE;
         int playerPlane = snap.playerPos.getPlane();
+        java.util.EnumMap<NpcSelector.Rejection, Integer> rejections =
+            new java.util.EnumMap<>(NpcSelector.Rejection.class);
+        int passed = 0;
         for (NPC npc : snap.npcs)
         {
             if (npc == null) continue;
@@ -922,57 +1011,48 @@ public final class ChickenCombatLoop
             if (!CHICKEN_NAME.equalsIgnoreCase(name.replaceAll("<[^>]+>", "").trim())) continue;
             matching++;
             WorldPoint loc = npc.getWorldLocation();
-            if (loc == null) continue;
-            int dist = loc.distanceTo(snap.playerPos);
-            if (dist < closestDist) closestDist = dist;
-            WorldArea conf = selector.confineTo();
-            if (conf != null
-                && (loc.getPlane() != conf.getPlane()
-                 || loc.getX() < conf.getX()
-                 || loc.getX() >= conf.getX() + conf.getWidth()
-                 || loc.getY() < conf.getY()
-                 || loc.getY() >= conf.getY() + conf.getHeight()))
+            if (loc != null)
             {
-                outOfArea++;
-                continue;
+                int dist = loc.distanceTo(snap.playerPos);
+                if (dist < closestDist) closestDist = dist;
             }
-            if (loc.getPlane() != playerPlane) { wrongPlane++; continue; }
-            if (npc.getHealthRatio() == 0) { dying++; continue; }
-            if (dist > NpcSelector.DEFAULT_RANGE) { outOfRange++; continue; }
-            Actor interacting = npc.getInteracting();
-            if (interacting instanceof Player p && p != snap.self) engagedByOther++;
+            NpcSelector.Rejection r = selector.classify(npc, snap.self, snap.playerPos,
+                excludedIndex, wv, visibility);
+            if (r == null) passed++;
+            else rejections.merge(r, 1, Integer::sum);
         }
-        log.info("pick miss at {} (plane {}): {} chicken(s) total, closest dist={}, rejected outOfArea={} outOfRange={} wrongPlane={} dying={} engagedByOther={} (range={})",
+        log.info("pick miss at {} (plane {}): {} chicken(s) total, closest dist={}, passed={}, rejections={} (range={})",
             snap.playerPos, playerPlane, matching,
             closestDist == Integer.MAX_VALUE ? -1 : closestDist,
-            outOfArea, outOfRange, wrongPlane, dying, engagedByOther,
-            NpcSelector.DEFAULT_RANGE);
+            passed, rejections, NpcSelector.DEFAULT_RANGE);
     }
 
     /** If the player is already fighting a chicken when SELECTING starts
      *  (e.g. a stray loot misclick or auto-retaliate engaged one), adopt that
      *  fight instead of trying to click a second target.
      *
-     *  <p><b>Reject if another player is the chicken's current interactor.</b>
-     *  Player.getInteracting() is sticky for a tick or two after a failed /
-     *  cancelled attack flow, so a chicken that is actually being killed by
-     *  another player can briefly look "ours" via self-only interaction.
-     *  Adopting in that case produced the false-IN_COMBAT cascade in the
-     *  pen logs (kill-confirmed for chickens we never landed an Attack on).
-     *  Mutual engagement (chicken targeting us back) is the truth-tell. */
+     *  <p><b>Mutual engagement is required.</b> Player.getInteracting() is
+     *  sticky for 1-2 ticks (sometimes longer) after combat ends, so a chicken
+     *  we already finished off — or just walked past mid-cursor-move — keeps
+     *  showing up as our self.getInteracting() target even though we're not
+     *  fighting it any more. Adopting on one-sided self→chicken interaction
+     *  produced phantom-IN_COMBAT cascades in the pen: the loop sat for 60+s
+     *  polling a chicken it had not actually attacked, the engagement-broken
+     *  re-attack timer never tripped (the same sticky pointer kept feeding
+     *  CombatStateTracker an "engagedWithUs" reading), and we eventually
+     *  credited a phantom kill when something else despawned the NPC. The
+     *  truth-tell is the chicken targeting us back; one-sided in EITHER
+     *  direction is treated as not-yet-engaged. */
     @Nullable
     private CombatTarget detectActiveChickenCombat(Snapshot snap)
     {
         if (snap.self == null) return null;
         NPC adopted = null;
         Actor selfInteracting = snap.self.getInteracting();
-        if (selfInteracting instanceof NPC npc && isAdoptableChicken(npc, snap.playerPos))
+        if (selfInteracting instanceof NPC npc && isAdoptableChicken(npc, snap.playerPos)
+            && npc.getInteracting() == snap.self)
         {
-            Actor npcInteracting = npc.getInteracting();
-            boolean stolenByOther = npcInteracting instanceof Player && npcInteracting != snap.self;
-            if (!stolenByOther) adopted = npc;
-            else log.debug("skip adopt — chicken #{} is being fought by another player",
-                npc.getIndex());
+            adopted = npc;
         }
         if (adopted == null)
         {

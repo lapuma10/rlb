@@ -29,10 +29,13 @@ import java.awt.Rectangle;
 import javax.annotation.Nullable;
 import lombok.extern.slf4j.Slf4j;
 import net.runelite.api.Client;
+import net.runelite.api.CollisionData;
+import net.runelite.api.CollisionDataFlag;
 import net.runelite.api.Menu;
 import net.runelite.api.NPC;
 import net.runelite.api.Player;
 import net.runelite.api.WorldView;
+import net.runelite.api.coords.LocalPoint;
 import net.runelite.api.coords.WorldArea;
 import net.runelite.api.coords.WorldPoint;
 import net.runelite.api.gameval.InterfaceID;
@@ -91,6 +94,26 @@ public interface TargetVisibility
          *  menu has no 'Attack' on it, producing the dispatch failure
          *  cascade we saw in the chicken-pen logs. */
         NO_LOS,
+        /** Player-line is blocked by a wall or tall game-object on the
+         *  same plane. The {@link #NO_LOS} check uses
+         *  {@link WorldArea#hasLineOfSightTo} which only fails on tiles
+         *  with {@code BLOCK_LINE_OF_SIGHT_*} (directional wall) flags —
+         *  it misses tall game-object walls (stone buildings, big rocks,
+         *  large trees) that mark a tile {@code BLOCK_MOVEMENT_OBJECT} but
+         *  leave the LOS bits clear. This stricter check Bresenhams from
+         *  the player tile and includes {@code BLOCK_MOVEMENT_OBJECT} in
+         *  the occluder mask. */
+        OCCLUDED,
+        /** Camera-line is blocked: a wall sits between the camera's actual
+         *  3D position and the NPC. Player-line ({@link #OCCLUDED}) only
+         *  catches walls between the PLAYER and the NPC; after we
+         *  force-rotate the camera, the camera itself can move to a
+         *  position where a different wall stands between camera and NPC
+         *  even though player-line is clean. From a real player's POV
+         *  the chicken is then "behind a wall" and clicking would be a
+         *  wallhack. Height-aware: at high pitch the camera looks over
+         *  walls and this check passes through. */
+        CAMERA_OCCLUDED,
         /** Walking BFS can't reach the NPC's tile within
          *  {@code MAX_REACH_DEPTH}. Catches gates that are closed and
          *  islands behind impassable terrain. */
@@ -124,6 +147,15 @@ public interface TargetVisibility
     {
         return whyHidden(npc, self, wv) == null;
     }
+
+    /** True when the line from the camera's actual 3D world position to the
+     *  NPC is unobstructed by walls / tall game-objects on the same plane.
+     *  Use this AFTER force-rotating the camera, before the click, to verify
+     *  the click won't go through a wall — selection-time {@link #canSee}
+     *  uses player-tile origin and can't catch the case where rotation
+     *  itself moves the camera behind a wall. Default impl returns true so
+     *  test stubs ({@link #alwaysVisible}) remain wallhack-friendly. */
+    default boolean cameraCanSeeNpc(NPC npc) { return true; }
 
     /** Test stub — every NPC passes. Used by selector overloads that don't
      *  take a visibility checker, and by ChickenCombatLoop unit tests. */
@@ -190,6 +222,24 @@ final class ClientVisibility implements TargetVisibility
             log.debug("cull npc {} — no line of sight from self {} to npc {}",
                 npc.getIndex(), selfWp, npcWp);
             return Reason.NO_LOS;
+        }
+        // 1b. Player-to-NPC occlusion with wider mask. The existing NO_LOS
+        //     check above (WorldArea#hasLineOfSightTo) only fails on
+        //     BLOCK_LINE_OF_SIGHT_* (directional wall) flags — it lets
+        //     tall game-object walls (stone buildings, big rocks, large
+        //     trees) through because those tiles set BLOCK_MOVEMENT_OBJECT
+        //     instead. We Bresenham from the player's tile to the NPC's
+        //     tile with BLOCK_MOVEMENT_OBJECT OR'd into the mask, catching
+        //     game-object-wall occlusion that the engine LOS misses.
+        //     Origin is the *player* tile (not the camera tile). A 2D
+        //     camera-tile origin is wrong for high-camera scenes — the
+        //     camera's ground projection sits on the far side of the
+        //     room's wall, so every line crosses the wall on entry and
+        //     every NPC inside the room is falsely rejected.
+        if (!hasClearLineFromSelfToNpc(self, npc, wv, selfWp.getPlane()))
+        {
+            log.debug("cull npc {} — player-line occluded by wall/object", npc.getIndex());
+            return Reason.OCCLUDED;
         }
         // 2. Walking reachability. BFS over collision flags up to
         //    MAX_REACH_DEPTH. Catches "behind a closed gate" and similar
@@ -351,6 +401,230 @@ final class ClientVisibility implements TargetVisibility
     /** Bound widget-tree recursion depth — HUD trees in OSRS are flat
      *  (panel → tabs → orbs/buttons), 6 levels covers every observed case. */
     private static final int HUD_DESCENT_LIMIT = 6;
+
+    @Override
+    public boolean cameraCanSeeNpc(NPC npc)
+    {
+        if (npc == null) return false;
+        LocalPoint npcLp = npc.getLocalLocation();
+        if (npcLp == null) return false;
+        Player self = client.getLocalPlayer();
+        if (self == null) return false;
+        WorldPoint selfWp = self.getWorldLocation();
+        if (selfWp == null) return false;
+        WorldView wv = client.getTopLevelWorldView();
+        if (wv == null) return true;   // can't check, accept
+        return hasClearCameraLineToNpc(npcLp, wv, selfWp.getPlane());
+    }
+
+    /** Camera-POV occlusion: Bresenham from the camera's actual world tile
+     *  to the NPC's tile, with line altitude interpolated from camera-Z to
+     *  ground. A wall flag at a tile only occludes if the line altitude at
+     *  that tile is below the assumed wall top — so high pitch (camera
+     *  high) sees over walls; low pitch (camera near horizontal) doesn't.
+     *
+     *  <p>Origin is the *camera* tile (not the player tile), which is the
+     *  whole point: this catches the case where {@code rotateCameraToward}
+     *  has moved the camera to a position where a wall stands between
+     *  camera and NPC, even when the player's line to the NPC is clear.
+     *
+     *  <p>Wall-top is approximated as a fixed constant — RuneLite doesn't
+     *  expose per-wall heights. The constant is tuned to typical OSRS
+     *  fence/wall heights (~256 scene units). Buildings with taller walls
+     *  may slip through; the player-line {@link #hasClearLineFromSelfToNpc}
+     *  still catches them at selection time. */
+    private boolean hasClearCameraLineToNpc(LocalPoint npcLp, WorldView wv, int plane)
+    {
+        int camX = client.getCameraX();
+        int camY = client.getCameraY();
+        int camZ = client.getCameraZ();   // negative = above ground
+
+        CollisionData[] cdMaps = wv.getCollisionMaps();
+        if (cdMaps == null || plane < 0 || plane >= cdMaps.length || cdMaps[plane] == null)
+        {
+            return true;
+        }
+        int[][] flags = cdMaps[plane].getFlags();
+        int width = flags.length;
+        int height = width == 0 ? 0 : flags[0].length;
+        if (width == 0 || height == 0) return true;
+
+        // Camera world tile (1/128 units per tile in scene-local space).
+        int camSx = camX >> 7;
+        int camSy = camY >> 7;
+        int npcSx = npcLp.getSceneX();
+        int npcSy = npcLp.getSceneY();
+
+        // Out-of-bounds origin/target — accept (no usable data).
+        if (camSx < 0 || camSx >= width || camSy < 0 || camSy >= height) return true;
+        if (npcSx < 0 || npcSx >= width || npcSy < 0 || npcSy >= height) return true;
+        if (camSx == npcSx && camSy == npcSy) return true;
+
+        // Camera height above ground (OSRS Z is negative-up).
+        int camHeight = -camZ;
+        // Typical OSRS fence/wall top is ~256 scene units (2 tiles). Tuned
+        // empirically — too high and low-pitch wallhacks slip through; too
+        // low and high-pitch over-rejects in the chicken pen.
+        final int WALL_TOP = 256;
+
+        // If the camera is well above any plausible wall top, no occlusion
+        // possible — bail out before walking the line. Saves CPU on top-down
+        // viewpoints (the common case for high-pitch botting).
+        if (camHeight > WALL_TOP * 4) return true;
+
+        int dx = npcSx - camSx;
+        int dy = npcSy - camSy;
+        int dxAbs = Math.abs(dx);
+        int dyAbs = Math.abs(dy);
+        int totalSteps = Math.max(dxAbs, dyAbs);
+
+        int xFlags = CollisionDataFlag.BLOCK_LINE_OF_SIGHT_FULL
+                   | CollisionDataFlag.BLOCK_MOVEMENT_OBJECT;
+        int yFlags = CollisionDataFlag.BLOCK_LINE_OF_SIGHT_FULL
+                   | CollisionDataFlag.BLOCK_MOVEMENT_OBJECT;
+        if (dx < 0) xFlags |= CollisionDataFlag.BLOCK_LINE_OF_SIGHT_EAST;
+        else        xFlags |= CollisionDataFlag.BLOCK_LINE_OF_SIGHT_WEST;
+        if (dy < 0) yFlags |= CollisionDataFlag.BLOCK_LINE_OF_SIGHT_NORTH;
+        else        yFlags |= CollisionDataFlag.BLOCK_LINE_OF_SIGHT_SOUTH;
+
+        if (dxAbs > dyAbs)
+        {
+            int x = camSx;
+            int yBig = camSy << 16;
+            int slope = (dy << 16) / dxAbs;
+            yBig += 0x8000;
+            if (dy < 0) yBig--;
+            int direction = dx < 0 ? -1 : 1;
+            int step = 0;
+            while (x != npcSx)
+            {
+                x += direction;
+                step++;
+                int y = yBig >>> 16;
+                if (x < 0 || x >= width || y < 0 || y >= height) return true;
+                // Linear interpolation: height at start = camHeight, at end (NPC) = 0.
+                int lineHeight = camHeight - (camHeight * step) / totalSteps;
+                if (lineHeight < WALL_TOP && (flags[x][y] & xFlags) != 0) return false;
+                yBig += slope;
+                int nextY = yBig >>> 16;
+                if (nextY != y && nextY >= 0 && nextY < height
+                    && lineHeight < WALL_TOP
+                    && (flags[x][nextY] & yFlags) != 0) return false;
+            }
+        }
+        else
+        {
+            int y = camSy;
+            int xBig = camSx << 16;
+            int slope = (dx << 16) / dyAbs;
+            xBig += 0x8000;
+            if (dx < 0) xBig--;
+            int direction = dy < 0 ? -1 : 1;
+            int step = 0;
+            while (y != npcSy)
+            {
+                y += direction;
+                step++;
+                int x = xBig >>> 16;
+                if (x < 0 || x >= width || y < 0 || y >= height) return true;
+                int lineHeight = camHeight - (camHeight * step) / totalSteps;
+                if (lineHeight < WALL_TOP && (flags[x][y] & yFlags) != 0) return false;
+                xBig += slope;
+                int nextX = xBig >>> 16;
+                if (nextX != x && nextX >= 0 && nextX < width
+                    && lineHeight < WALL_TOP
+                    && (flags[nextX][y] & xFlags) != 0) return false;
+            }
+        }
+        return true;
+    }
+
+    /** True when the line from the player's tile to the NPC's tile is
+     *  unobstructed by walls, fences, OR tall game-objects (those set
+     *  {@code BLOCK_MOVEMENT_OBJECT} but no {@code BLOCK_LOS_*} flag) on
+     *  the same plane. Mirrors {@link WorldArea#hasLineOfSightTo}'s
+     *  directional Bresenham but with the wider occluder mask. */
+    private boolean hasClearLineFromSelfToNpc(Player self, NPC npc, WorldView wv, int plane)
+    {
+        LocalPoint selfLp = self.getLocalLocation();
+        LocalPoint npcLp = npc.getLocalLocation();
+        if (selfLp == null || npcLp == null) return true;
+
+        CollisionData[] cdMaps = wv.getCollisionMaps();
+        if (cdMaps == null || plane < 0 || plane >= cdMaps.length || cdMaps[plane] == null)
+        {
+            return true;
+        }
+        int[][] flags = cdMaps[plane].getFlags();
+        int width = flags.length;
+        int height = width == 0 ? 0 : flags[0].length;
+        if (width == 0 || height == 0) return true;
+
+        int sSx = selfLp.getSceneX();
+        int sSy = selfLp.getSceneY();
+        if (sSx < 0 || sSx >= width || sSy < 0 || sSy >= height) return true;
+
+        int npcSx = npcLp.getSceneX();
+        int npcSy = npcLp.getSceneY();
+        if (npcSx < 0 || npcSx >= width || npcSy < 0 || npcSy >= height) return true;
+        if (sSx == npcSx && sSy == npcSy) return true;
+
+        int dx = npcSx - sSx;
+        int dy = npcSy - sSy;
+        int dxAbs = Math.abs(dx);
+        int dyAbs = Math.abs(dy);
+
+        int xFlags = CollisionDataFlag.BLOCK_LINE_OF_SIGHT_FULL
+                   | CollisionDataFlag.BLOCK_MOVEMENT_OBJECT;
+        int yFlags = CollisionDataFlag.BLOCK_LINE_OF_SIGHT_FULL
+                   | CollisionDataFlag.BLOCK_MOVEMENT_OBJECT;
+        if (dx < 0) xFlags |= CollisionDataFlag.BLOCK_LINE_OF_SIGHT_EAST;
+        else        xFlags |= CollisionDataFlag.BLOCK_LINE_OF_SIGHT_WEST;
+        if (dy < 0) yFlags |= CollisionDataFlag.BLOCK_LINE_OF_SIGHT_NORTH;
+        else        yFlags |= CollisionDataFlag.BLOCK_LINE_OF_SIGHT_SOUTH;
+
+        if (dxAbs > dyAbs)
+        {
+            int x = sSx;
+            int yBig = sSy << 16;
+            int slope = (dy << 16) / dxAbs;
+            yBig += 0x8000;
+            if (dy < 0) yBig--;
+            int direction = dx < 0 ? -1 : 1;
+            while (x != npcSx)
+            {
+                x += direction;
+                int y = yBig >>> 16;
+                if (x < 0 || x >= width || y < 0 || y >= height) return true;
+                if ((flags[x][y] & xFlags) != 0) return false;
+                yBig += slope;
+                int nextY = yBig >>> 16;
+                if (nextY != y && nextY >= 0 && nextY < height
+                    && (flags[x][nextY] & yFlags) != 0) return false;
+            }
+        }
+        else
+        {
+            int y = sSy;
+            int xBig = sSx << 16;
+            int slope = (dx << 16) / dyAbs;
+            xBig += 0x8000;
+            if (dx < 0) xBig--;
+            int direction = dy < 0 ? -1 : 1;
+            while (y != npcSy)
+            {
+                y += direction;
+                int x = xBig >>> 16;
+                if (x < 0 || x >= width || y < 0 || y >= height) return true;
+                if ((flags[x][y] & yFlags) != 0) return false;
+                xBig += slope;
+                int nextX = xBig >>> 16;
+                if (nextX != x && nextX >= 0 && nextX < width
+                    && (flags[nextX][y] & xFlags) != 0) return false;
+            }
+        }
+        return true;
+    }
 
     /** Walking-reachability BFS from the player's tile. Returns true when
      *  any tile orthogonally adjacent to (or coincident with) the NPC's

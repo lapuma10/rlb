@@ -122,6 +122,31 @@ public class CombatStateTrackerTest
     }
 
     @Test
+    public void mutualEngagementThenStickySelfSide_breaksAfterThreshold()
+    {
+        // Regression: once chicken-side has confirmed mutual engagement,
+        // a sticky self.getInteracting() pointer to the chicken (left over
+        // after the chicken stopped targeting us — kill-stolen by another
+        // player or the chicken just disengaged) must NOT keep brokenTicks
+        // pinned at zero. Previously this kept IN_COMBAT alive for minutes
+        // until the chicken died externally and we credited a phantom kill.
+        Player self = mock(Player.class);
+        NPC locked = mockNpcWith(33, 30, self);  // tick 1: mutual
+        when(self.getInteracting()).thenReturn(locked);
+
+        CombatStateTracker t = new CombatStateTracker(33);
+        t.observe(locked, self);
+        // Subsequent ticks: chicken-side cleared (chicken disengaged) but
+        // self.getInteracting() is still pointing at the chicken (sticky).
+        t.observe(mockNpcWith(33, 30, null), self);
+        t.observe(mockNpcWith(33, 30, null), self);
+        t.observe(mockNpcWith(33, 30, null), self);
+        assertTrue("sticky self-side after confirmed mutual must still break engagement",
+            t.isEngagementBroken(2));
+        assertFalse(t.isDead());
+    }
+
+    @Test
     public void vanishedAfterEngagement_isDead()
     {
         Player self = mock(Player.class);
