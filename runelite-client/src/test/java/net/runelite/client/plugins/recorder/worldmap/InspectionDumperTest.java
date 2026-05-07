@@ -237,6 +237,49 @@ public class InspectionDumperTest
     }
 
     @Test
+    public void planAToB_withV2Planner_handlesCrossRegion() throws IOException
+    {
+        // Two-region fixture: V2 must successfully plan across the boundary.
+        Path tmp = Files.createTempDirectory("inspect-plan-v2-");
+        WorldMemoryConfig wmConfig = new WorldMemoryConfig();
+        MapStore store = new MapStore(wmConfig);
+        int regionA = net.runelite.client.plugins.recorder.worldmap.RegionIds.regionIdFor(3208, 3263);
+        int regionB = net.runelite.client.plugins.recorder.worldmap.RegionIds.regionIdFor(3208, 3264);
+        java.util.List<net.runelite.client.plugins.recorder.worldmap.WorldMemoryFixtures.TileSpec> tilesA
+            = new java.util.ArrayList<>();
+        for (int y = 3232; y <= 3263; y++)
+            tilesA.add(net.runelite.client.plugins.recorder.worldmap.WorldMemoryFixtures.walkable(3208, y, 0));
+        WorldMemoryFixtures.installRegion(store, regionA, tilesA);
+        java.util.List<net.runelite.client.plugins.recorder.worldmap.WorldMemoryFixtures.TileSpec> tilesB
+            = new java.util.ArrayList<>();
+        for (int y = 3264; y <= 3270; y++)
+            tilesB.add(net.runelite.client.plugins.recorder.worldmap.WorldMemoryFixtures.walkable(3208, y, 0));
+        WorldMemoryFixtures.installRegion(store, regionB, tilesB);
+
+        net.runelite.client.plugins.recorder.nav.v2.MultiRegionAStar planner
+            = new net.runelite.client.plugins.recorder.nav.v2.MultiRegionAStar(
+                store, new TransportIndex(), wmConfig);
+
+        InspectionDumper dumper = new InspectionDumper(store, new EntityIndex(),
+            new TransportIndex(), wmConfig, tmp.toFile(), planner);
+
+        InspectionDumper.PlanOutcome outcome = dumper.planAToB(
+            new WorldPoint(3208, 3260, 0), new WorldPoint(3208, 3268, 0));
+        JsonObject root = readJson(outcome.file());
+
+        assertEquals("success", root.get("result").getAsString());
+        assertEquals(8, root.get("pathLength").getAsInt());
+        // regionsTouched must include both regions (cross-region path).
+        JsonArray regions = root.getAsJsonArray("regionsTouched");
+        assertEquals(2, regions.size());
+        assertEquals(9, root.getAsJsonArray("route").size());
+        assertTrue("summary mentions cross-region tile count",
+            outcome.summary().contains("9 tiles"));
+        assertEquals("outcome route is non-empty so the panel can paint it",
+            9, outcome.route().size());
+    }
+
+    @Test
     public void planAToB_unreachable_writesFailure() throws IOException
     {
         Path tmp = Files.createTempDirectory("inspect-plan-unreachable-");

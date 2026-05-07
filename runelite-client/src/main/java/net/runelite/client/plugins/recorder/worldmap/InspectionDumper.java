@@ -48,16 +48,33 @@ public final class InspectionDumper
     private final TransportIndex transportIndex;
     private final WorldMemoryConfig wmConfig;
     private final File inspectDir;
+    /** Optional cross-region planner. When non-null,
+     *  {@link #planAToB(WorldPoint, WorldPoint)} delegates to this for
+     *  all routes (including same-region same-plane). When null, falls
+     *  back to the round-1 single-region Dijkstra and emits a "deferred
+     *  to Phase 4" placeholder for cross-region. */
+    @javax.annotation.Nullable
+    private final net.runelite.client.plugins.recorder.nav.v2.MultiRegionAStar multiRegionPlanner;
 
     public InspectionDumper(MapStore mapStore, EntityIndex entityIndex,
                             TransportIndex transportIndex, WorldMemoryConfig wmConfig,
                             File inspectDir)
+    {
+        this(mapStore, entityIndex, transportIndex, wmConfig, inspectDir, null);
+    }
+
+    public InspectionDumper(MapStore mapStore, EntityIndex entityIndex,
+                            TransportIndex transportIndex, WorldMemoryConfig wmConfig,
+                            File inspectDir,
+                            @javax.annotation.Nullable
+                            net.runelite.client.plugins.recorder.nav.v2.MultiRegionAStar multiRegionPlanner)
     {
         this.mapStore = mapStore;
         this.entityIndex = entityIndex;
         this.transportIndex = transportIndex;
         this.wmConfig = wmConfig;
         this.inspectDir = inspectDir;
+        this.multiRegionPlanner = multiRegionPlanner;
     }
 
     public File dumpRegion(int regionId)
@@ -127,10 +144,12 @@ public final class InspectionDumper
         return write("entities-" + nowStamp() + ".json", root);
     }
 
-    /** Round-1 stub. Single-region same-plane uses a Dijkstra over the
-     *  region snapshot for the route + rejection counts. Cross-region
-     *  emits a placeholder result that Phase 4 ({@code V2Planner}) will
-     *  replace with a real cross-region plan.
+    /** Plans a route between {@code from} and {@code to} for the
+     *  inspection panel. When a {@link MultiRegionAStar} is wired
+     *  (Phase 4+), delegates to it for all routes — including
+     *  cross-region and cross-plane via known transports. When not
+     *  wired, falls back to a single-region Dijkstra for same-region
+     *  same-plane and a "deferred" placeholder for cross-region.
      *
      *  <p>Returns a {@link PlanOutcome} carrying the dump file, a
      *  short human-readable summary (suitable for a UI status label),
@@ -146,6 +165,12 @@ public final class InspectionDumper
 
         int fromRegion = RegionIds.regionIdFor(from.getX(), from.getY());
         int toRegion = RegionIds.regionIdFor(to.getX(), to.getY());
+
+        // Phase 4 path: real multi-region planner.
+        if (multiRegionPlanner != null)
+        {
+            return planViaMultiRegion(from, to, fromRegion, toRegion, root);
+        }
 
         JsonArray transportEdgesUsed = new JsonArray();
         JsonArray regionsTouched = new JsonArray();
@@ -213,6 +238,69 @@ public final class InspectionDumper
         root.add("rejections", rejections);
         File f = writePlanFile(from, to, root);
         return new PlanOutcome(f, summary, routeOut);
+    }
+
+    /** Phase 4 plan path. Calls the live {@link
+     *  net.runelite.client.plugins.recorder.nav.v2.MultiRegionAStar}
+     *  and writes a spec-shaped dump (regionsTouched + transportEdgesUsed
+     *  populated when applicable). */
+    private PlanOutcome planViaMultiRegion(WorldPoint from, WorldPoint to,
+                                            int fromRegion, int toRegion, JsonObject root)
+    {
+        net.runelite.client.plugins.recorder.nav.v2.V2Path path =
+            multiRegionPlanner.plan(from, to);
+
+        JsonArray regionsTouched = new JsonArray();
+        JsonArray transportEdgesUsed = new JsonArray();
+        JsonArray route = new JsonArray();
+        Set<Integer> regions = new HashSet<>();
+
+        if (path.isEmpty())
+        {
+            root.addProperty("result", "failure");
+            root.addProperty("pathLength", -1);
+            root.add("regionsTouched", regionsTouched);
+            root.add("transportEdgesUsed", transportEdgesUsed);
+            root.add("route", route);
+            root.add("rejections", emptyRejections());
+            File f = writePlanFile(from, to, root);
+            return new PlanOutcome(f, "no route found", List.of());
+        }
+
+        List<WorldPoint> tiles = path.allTiles();
+        for (WorldPoint p : tiles)
+        {
+            route.add(worldPointJson(p));
+            regions.add(RegionIds.regionIdFor(p.getX(), p.getY()));
+        }
+        for (Integer r : new TreeSet<>(regions)) regionsTouched.add(r);
+
+        int transportCount = 0;
+        for (net.runelite.client.plugins.recorder.nav.v2.V2Leg leg : path.legs())
+        {
+            if (leg instanceof net.runelite.client.plugins.recorder.nav.v2.V2Leg.Transport t)
+            {
+                JsonObject ej = new JsonObject();
+                ej.addProperty("verb", t.edge().verb());
+                ej.addProperty("objectName", t.edge().objectName());
+                ej.add("from", worldPointJson(t.edge().fromTile()));
+                ej.add("to", worldPointJson(t.edge().toTile()));
+                transportEdgesUsed.add(ej);
+                transportCount++;
+            }
+        }
+
+        root.addProperty("result", "success");
+        root.addProperty("pathLength", path.totalCost());
+        root.add("regionsTouched", regionsTouched);
+        root.add("transportEdgesUsed", transportEdgesUsed);
+        root.add("route", route);
+        root.add("rejections", emptyRejections());
+        File f = writePlanFile(from, to, root);
+        String summary = "route found — " + path.totalCost() + " cost, "
+            + tiles.size() + " tiles, " + regions.size() + " regions, "
+            + transportCount + " transports";
+        return new PlanOutcome(f, summary, tiles);
     }
 
     /** Outcome of {@link #planAToB} — the dump file, a UI-friendly

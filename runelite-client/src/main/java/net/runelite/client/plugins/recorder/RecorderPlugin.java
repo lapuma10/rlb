@@ -442,9 +442,13 @@ public class RecorderPlugin extends Plugin
         flushDaemon.start();
 
         File inspectDir = new File(RuneLite.RUNELITE_DIR, "recorder/inspect");
+        net.runelite.client.plugins.recorder.nav.v2.MultiRegionAStar v2Planner
+            = new net.runelite.client.plugins.recorder.nav.v2.MultiRegionAStar(
+                worldMapStore, transportIndex, wmConfig);
         net.runelite.client.plugins.recorder.worldmap.InspectionDumper inspectionDumper
             = new net.runelite.client.plugins.recorder.worldmap.InspectionDumper(
-                worldMapStore, worldEntityIndex, transportIndex, wmConfig, inspectDir);
+                worldMapStore, worldEntityIndex, transportIndex, wmConfig, inspectDir,
+                v2Planner);
         worldMapMinimapOverlay = new net.runelite.client.plugins.recorder.worldmap
             .WorldMapMinimapOverlay(client, config, worldMapStore, worldEntityIndex, transportIndex);
         overlayManager.add(worldMapMinimapOverlay);
