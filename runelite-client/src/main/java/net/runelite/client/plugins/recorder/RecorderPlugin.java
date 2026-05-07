@@ -140,6 +140,7 @@ public class RecorderPlugin extends Plugin
     private ChickenOverlay chickenOverlay;
     private RouteOverlay routeOverlay;
     private TrailOverlay trailOverlay;
+    private net.runelite.client.plugins.recorder.worldmap.WorldMapMinimapOverlay worldMapMinimapOverlay;
     private TileMarker tileMarker;
     private ChickenCombatLoop chickenLoop;
     private MiningLoop miningLoop;
@@ -444,8 +445,12 @@ public class RecorderPlugin extends Plugin
         net.runelite.client.plugins.recorder.worldmap.InspectionDumper inspectionDumper
             = new net.runelite.client.plugins.recorder.worldmap.InspectionDumper(
                 worldMapStore, worldEntityIndex, transportIndex, wmConfig, inspectDir);
-        // overlayClearAction wired in Phase 3.3 once WorldMapMinimapOverlay exists.
-        panel.setInspectionDumper(inspectionDumper, null);
+        worldMapMinimapOverlay = new net.runelite.client.plugins.recorder.worldmap
+            .WorldMapMinimapOverlay(client, config, worldMapStore, worldEntityIndex, transportIndex);
+        overlayManager.add(worldMapMinimapOverlay);
+        eventBus.register(worldMapMinimapOverlay);
+        panel.setInspectionDumper(inspectionDumper,
+            net.runelite.client.plugins.recorder.worldmap.WorldMapMinimapOverlay::clearActiveRoute);
 
         BufferedImage icon = ImageUtil.loadImageResource(getClass(), "/util/reset.png");
         navButton = NavigationButton.builder()
@@ -512,6 +517,13 @@ public class RecorderPlugin extends Plugin
         if (chickenOverlay != null) overlayManager.remove(chickenOverlay);
         if (routeOverlay != null) overlayManager.remove(routeOverlay);
         if (trailOverlay != null) { overlayManager.remove(trailOverlay); trailOverlay.detach(); }
+        if (worldMapMinimapOverlay != null)
+        {
+            overlayManager.remove(worldMapMinimapOverlay);
+            eventBus.unregister(worldMapMinimapOverlay);
+            worldMapMinimapOverlay.detach();
+            worldMapMinimapOverlay = null;
+        }
         if (navButton != null) clientToolbar.removeNavigation(navButton);
         if (panel != null) panel.dispose();
         if (markerListener != null) keyManager.unregisterKeyListener(markerListener);

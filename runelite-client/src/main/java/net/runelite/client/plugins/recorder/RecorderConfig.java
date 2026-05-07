@@ -284,4 +284,60 @@ public interface RecorderConfig extends Config
 	{
 		return NavigatorImpl.TRAIL_V1;
 	}
+
+	@ConfigSection(
+		name = "WorldMap overlay (V2 inspect)",
+		description = "Minimap debug overlay for the V2 navigator's world memory: walkable tiles, transport endpoints, the active planned route, and (toggleable) blocked tiles, stale edges, entity sightings.",
+		position = 210,
+		closedByDefault = true
+	)
+	String worldMapOverlaySection = "worldMapOverlay";
+
+	@ConfigItem(
+		keyName = "showWorldMapOverlay",
+		name = "Show WorldMap overlay",
+		description = "Master toggle. When on, the V2 minimap overlay paints known walkable tiles in green, transport endpoints in yellow, and the active planned route in blue. Off by default — debug-only.",
+		section = worldMapOverlaySection,
+		position = 0
+	)
+	default boolean showWorldMapOverlay()
+	{
+		return false;
+	}
+
+	@ConfigItem(
+		keyName = "overlayShowBlocked",
+		name = "Show: blocked tiles",
+		description = "Paint known-blocked tiles in red. Noisy in dense areas — off by default.",
+		section = worldMapOverlaySection,
+		position = 1
+	)
+	default boolean overlayShowBlocked()
+	{
+		return false;
+	}
+
+	@ConfigItem(
+		keyName = "overlayShowStale",
+		name = "Show: stale tiles / edges",
+		description = "Paint tiles or transport edges that have been invalidated this session in orange.",
+		section = worldMapOverlaySection,
+		position = 2
+	)
+	default boolean overlayShowStale()
+	{
+		return false;
+	}
+
+	@ConfigItem(
+		keyName = "overlayShowEntities",
+		name = "Show: entity sightings",
+		description = "Paint NPC / object sightings in purple. Useful to verify the entity index has captured the cooks / bankers / chickens you expect.",
+		section = worldMapOverlaySection,
+		position = 3
+	)
+	default boolean overlayShowEntities()
+	{
+		return false;
+	}
 }
