@@ -60,6 +60,13 @@ public final class TransportObserver
     /** Tick counter — a coarse clock used to expire pending entries. */
     private long tickCount;
 
+    /** Player tile observed on the previous tick. The transition
+     *  {@code lastSeenPlayerTile → currentTile} is what resolves a
+     *  pending — when the player leaves the {@link Pending#fromTile}
+     *  on which they clicked, we record the destination as the
+     *  transport's {@code toTile}. */
+    @Nullable private WorldPoint lastSeenPlayerTile;
+
     public TransportObserver(Client client, TransportIndex index)
     {
         this(client, index, DEFAULT_RESOLUTION_TIMEOUT_TICKS);
@@ -106,11 +113,59 @@ public final class TransportObserver
     @Subscribe
     public void onGameTick(GameTick e)
     {
+        long now = System.currentTimeMillis();
+        WorldPoint here = null;
+        if (client != null)
+        {
+            Player local = client.getLocalPlayer();
+            here = local == null ? null : local.getWorldLocation();
+        }
+        advanceTick(here, now);
+    }
+
+    /** Per-tick resolver. Compares the new player tile with the one
+     *  observed on the previous tick; any pending whose {@code
+     *  fromTile} matches the previous tile counts as resolved and is
+     *  flushed to the index as a complete {@link TransportEdge}. */
+    void advanceTick(@Nullable WorldPoint here, long timestampMs)
+    {
         tickCount++;
-        // Resolution phase lands in Task 2.3. For now, expire pendings
-        // that exceeded the resolution window so the map does not grow
-        // unbounded if no resolution code runs yet.
+        if (here != null)
+        {
+            if (lastSeenPlayerTile != null && !lastSeenPlayerTile.equals(here))
+            {
+                resolveTransitionFrom(lastSeenPlayerTile, here, timestampMs);
+            }
+            lastSeenPlayerTile = here;
+        }
         expireStalePendings();
+    }
+
+    private void resolveTransitionFrom(WorldPoint prevTile, WorldPoint curTile, long nowMs)
+    {
+        Iterator<Map.Entry<Long, Pending>> it = pending.entrySet().iterator();
+        while (it.hasNext())
+        {
+            Pending p = it.next().getValue();
+            if (!p.fromTile.equals(prevTile)) continue;
+
+            long durationMs = Math.max(0L, nowMs - p.clickTimeMs);
+            TransportEdge edge = new TransportEdge(
+                p.fromTile, curTile,
+                p.objectId,
+                p.target == null ? "" : p.target,
+                p.verb,
+                p.param0, p.param1,
+                p.targetKind == null ? "" : p.targetKind,
+                p.fromTile, // approachTile == fromTile for round 1
+                p.fromTile.getRegionID(),
+                1, nowMs, durationMs);
+            index.add(edge);
+            it.remove();
+            log.info("transport-obs: resolved {} at {} → {} (plane Δ={}) in {}ms",
+                p.verb, p.fromTile, curTile,
+                curTile.getPlane() - p.fromTile.getPlane(), durationMs);
+        }
     }
 
     // ──────── pending capture (test-friendly entry point) ────────
@@ -154,11 +209,17 @@ public final class TransportObserver
         return pending.size();
     }
 
-    /** Test hook: drive a synthetic GameTick. Production wiring uses
-     *  the @Subscribe path. */
+    /** Test hook: drive a synthetic GameTick with no player position. */
     void tickForTest()
     {
-        onGameTick(null);
+        advanceTick(null, System.currentTimeMillis());
+    }
+
+    /** Test hook: drive a synthetic GameTick with a known player tile.
+     *  Use to walk a fixture through capture → move → resolve. */
+    void tickForTest(@Nullable WorldPoint here, long timestampMs)
+    {
+        advanceTick(here, timestampMs);
     }
 
     static final class Pending
