@@ -440,6 +440,13 @@ public class RecorderPlugin extends Plugin
             transportIndex, worldmapRoot, wmConfig.flushEverySeconds * 1000L);
         flushDaemon.start();
 
+        File inspectDir = new File(RuneLite.RUNELITE_DIR, "recorder/inspect");
+        net.runelite.client.plugins.recorder.worldmap.InspectionDumper inspectionDumper
+            = new net.runelite.client.plugins.recorder.worldmap.InspectionDumper(
+                worldMapStore, worldEntityIndex, transportIndex, wmConfig, inspectDir);
+        // overlayClearAction wired in Phase 3.3 once WorldMapMinimapOverlay exists.
+        panel.setInspectionDumper(inspectionDumper, null);
+
         BufferedImage icon = ImageUtil.loadImageResource(getClass(), "/util/reset.png");
         navButton = NavigationButton.builder()
             .tooltip("Recorder")

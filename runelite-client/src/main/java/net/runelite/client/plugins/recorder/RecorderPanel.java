@@ -158,6 +158,17 @@ public final class RecorderPanel extends PluginPanel
     private TileMarker tileMarker;
     private RouteOverlay routeOverlay;
     private net.runelite.client.plugins.recorder.inspector.ClickInspector clickInspector;
+    private net.runelite.client.plugins.recorder.worldmap.InspectionDumper inspectionDumper;
+    private Runnable v2OverlayClearAction;
+    private final JButton v2DumpRegionBtn = new JButton("Dump current region");
+    private final JButton v2DumpNearbyBtn = new JButton("Dump nearby regions");
+    private final JButton v2DumpTransportsBtn = new JButton("Dump transport graph");
+    private final JButton v2DumpEntitiesBtn = new JButton("Dump entity sightings");
+    private final JButton v2PlanAToBBtn = new JButton("Plan A→B");
+    private final JButton v2ClearOverlayRouteBtn = new JButton("Clear debug overlay route");
+    private final JTextField v2PlanFromField = new JTextField(10);
+    private final JTextField v2PlanToField = new JTextField(10);
+    private final JLabel v2InspectStatusLabel = new JLabel(" ");
     private final javax.swing.JCheckBox clickInspectorCb =
         new javax.swing.JCheckBox("Click Inspector");
     private final javax.swing.JCheckBox worldMemoryPlannerCb =
@@ -1263,6 +1274,154 @@ public final class RecorderPanel extends PluginPanel
             : "Marked: " + wp.getX() + "," + wp.getY() + " p=" + wp.getPlane());
     }
 
+    // ------------------------------------------------------------------
+    // V2 Inspect tab — dump buttons + Plan A→B + overlay clear stub.
+    // Per spec inspection-tooling section: writes JSON under
+    // <RUNELITE_DIR>/recorder/inspect/. Each button spawns a worker
+    // thread (Swing EDT must not block on file IO).
+    // ------------------------------------------------------------------
+
+    private JPanel buildV2InspectTab()
+    {
+        JPanel p = new JPanel();
+        p.setLayout(new BoxLayout(p, BoxLayout.Y_AXIS));
+        p.setBorder(BorderFactory.createTitledBorder("V2 Inspection"));
+
+        p.add(v2DumpRegionBtn);
+        p.add(v2DumpNearbyBtn);
+        p.add(v2DumpTransportsBtn);
+        p.add(v2DumpEntitiesBtn);
+
+        v2PlanFromField.setToolTipText("from x,y,plane (e.g. 3208,3213,0)");
+        v2PlanToField.setToolTipText("to x,y,plane (e.g. 3236,3294,0)");
+        JPanel planRow = new JPanel(new BorderLayout(4, 4));
+        planRow.add(new JLabel("From:"), BorderLayout.WEST);
+        planRow.add(v2PlanFromField, BorderLayout.CENTER);
+        p.add(planRow);
+        JPanel planRow2 = new JPanel(new BorderLayout(4, 4));
+        planRow2.add(new JLabel("To:"), BorderLayout.WEST);
+        planRow2.add(v2PlanToField, BorderLayout.CENTER);
+        p.add(planRow2);
+        p.add(v2PlanAToBBtn);
+
+        p.add(Box.createVerticalStrut(8));
+        p.add(v2ClearOverlayRouteBtn);
+
+        v2InspectStatusLabel.putClientProperty("html.disable", null);
+        v2InspectStatusLabel.setText("<html>Last dump: (none)</html>");
+        p.add(v2InspectStatusLabel);
+        return p;
+    }
+
+    private void onV2DumpRegion()
+    {
+        if (inspectionDumper == null || client == null) return;
+        if (clientThread == null) return;
+        clientThread.invokeLater(() ->
+        {
+            net.runelite.api.Player self = client.getLocalPlayer();
+            if (self == null || self.getWorldLocation() == null)
+            {
+                SwingUtilities.invokeLater(() ->
+                    v2InspectStatusLabel.setText("Dump region: not logged in"));
+                return;
+            }
+            WorldPoint loc = self.getWorldLocation();
+            int regionId = net.runelite.client.plugins.recorder.worldmap.RegionIds
+                .regionIdFor(loc.getX(), loc.getY());
+            runDump(() -> inspectionDumper.dumpRegion(regionId),
+                "region " + regionId);
+        });
+    }
+
+    private void onV2DumpNearby()
+    {
+        if (inspectionDumper == null || client == null || clientThread == null) return;
+        clientThread.invokeLater(() ->
+        {
+            net.runelite.api.Player self = client.getLocalPlayer();
+            if (self == null || self.getWorldLocation() == null)
+            {
+                SwingUtilities.invokeLater(() ->
+                    v2InspectStatusLabel.setText("Dump nearby: not logged in"));
+                return;
+            }
+            WorldPoint loc = self.getWorldLocation();
+            int regionId = net.runelite.client.plugins.recorder.worldmap.RegionIds
+                .regionIdFor(loc.getX(), loc.getY());
+            runDump(() -> inspectionDumper.dumpNearbyRegions(regionId),
+                "nearby " + regionId);
+        });
+    }
+
+    private void onV2DumpTransports()
+    {
+        if (inspectionDumper == null) return;
+        runDump(inspectionDumper::dumpTransportGraph, "transport graph");
+    }
+
+    private void onV2DumpEntities()
+    {
+        if (inspectionDumper == null) return;
+        runDump(inspectionDumper::dumpEntities, "entities");
+    }
+
+    private void onV2PlanAToB()
+    {
+        if (inspectionDumper == null) return;
+        WorldPoint from = parseWorldPoint(v2PlanFromField.getText());
+        WorldPoint to = parseWorldPoint(v2PlanToField.getText());
+        if (from == null || to == null)
+        {
+            v2InspectStatusLabel.setText(
+                "Plan A→B: enter \"x,y,plane\" in From and To fields");
+            return;
+        }
+        runDump(() -> inspectionDumper.planAToB(from, to),
+            "plan " + from.getX() + "," + from.getY() + "p" + from.getPlane()
+                + " → " + to.getX() + "," + to.getY() + "p" + to.getPlane());
+    }
+
+    private void onV2ClearOverlayRoute()
+    {
+        if (v2OverlayClearAction != null)
+        {
+            v2OverlayClearAction.run();
+            v2InspectStatusLabel.setText("<html>Cleared overlay route.</html>");
+        }
+        else
+        {
+            v2InspectStatusLabel.setText(
+                "<html>Overlay not registered yet (Phase 3.3).</html>");
+        }
+    }
+
+    /** Run a dump on a worker thread; update the status label on the EDT
+     *  with the resulting file path or any thrown exception. {@code label}
+     *  is the user-facing dump description. */
+    private void runDump(java.util.function.Supplier<java.io.File> task, String label)
+    {
+        Thread t = new Thread(() ->
+        {
+            String msg;
+            try
+            {
+                java.io.File out = task.get();
+                msg = "Dumped " + label + " → " + out.getAbsolutePath();
+            }
+            catch (RuntimeException ex)
+            {
+                msg = "Dump " + label + " failed: " + ex.getMessage();
+            }
+            final String finalMsg = msg;
+            SwingUtilities.invokeLater(() ->
+                v2InspectStatusLabel.setText("<html>" + finalMsg + "</html>"));
+        }, "v2-inspect-dump");
+        t.setDaemon(true);
+        t.start();
+    }
+
+
     /** Wire the chicken combat loop. Called by the plugin during startUp once
      *  the dispatcher is constructed. The loop's status callback updates
      *  {@link #chickenStatusLabel} via the EDT. */
@@ -2244,6 +2403,32 @@ public final class RecorderPanel extends PluginPanel
         {
             grandExchangeTab = new GrandExchangeTab(script, itemManager);
             tabs.addTab("GE Core", new javax.swing.JScrollPane(grandExchangeTab));
+        }
+    }
+
+    /** Wire the V2 inspection dumper. The plugin constructs it once
+     *  MapStore + EntityIndex + TransportIndex are live; the panel
+     *  builds the V2 Inspect tab on first wiring. {@code overlayClearAction}
+     *  is the no-arg callback the "Clear debug overlay route" button
+     *  invokes — pass null on first wiring (Phase 3.2) and a real one
+     *  in Phase 3.3 once {@code WorldMapMinimapOverlay} exists. */
+    public void setInspectionDumper(
+        net.runelite.client.plugins.recorder.worldmap.InspectionDumper dumper,
+        Runnable overlayClearAction)
+    {
+        if (dumper == null) return;
+        boolean firstWiring = (this.inspectionDumper == null);
+        this.inspectionDumper = dumper;
+        this.v2OverlayClearAction = overlayClearAction;
+        if (firstWiring)
+        {
+            tabs.addTab("V2 Inspect", tabScroll(buildV2InspectTab()));
+            v2DumpRegionBtn.addActionListener(e -> onV2DumpRegion());
+            v2DumpNearbyBtn.addActionListener(e -> onV2DumpNearby());
+            v2DumpTransportsBtn.addActionListener(e -> onV2DumpTransports());
+            v2DumpEntitiesBtn.addActionListener(e -> onV2DumpEntities());
+            v2PlanAToBBtn.addActionListener(e -> onV2PlanAToB());
+            v2ClearOverlayRouteBtn.addActionListener(e -> onV2ClearOverlayRoute());
         }
     }
 
