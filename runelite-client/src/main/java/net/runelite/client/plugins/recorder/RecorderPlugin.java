@@ -710,18 +710,41 @@ public class RecorderPlugin extends Plugin
 
     /** Worker-thread bootstrap: cold-loads region snapshots, entity
      *  sightings, and the transport graph for the player's current
-     *  region + 8 neighbours. Reads {@link Client#getLocalPlayer()}
-     *  off the client thread; if that races and returns null (e.g.
-     *  GameState fired LOGGED_IN before the player object was
-     *  populated), reset the guard so the next state-change retries. */
+     *  region + 8 neighbours.
+     *
+     *  <p>LOGGED_IN fires before the {@link Player} object is fully
+     *  populated — the next-LOGGED_IN-event retry that used to live
+     *  here was wrong, because the state stays LOGGED_IN so no second
+     *  event arrives. Poll instead: sleep 500ms × up to 20 tries
+     *  (10 s budget). If the player still isn't ready after that, give
+     *  up cleanly and reset the guard so a future state cycle can
+     *  retry. */
     private void runWorldMapBootstrap()
     {
         Player self = client.getLocalPlayer();
-        if (self == null || self.getWorldLocation() == null)
+        int attempts = 0;
+        while (self == null || self.getWorldLocation() == null)
         {
-            log.info("worldmap-bootstrap: player not yet ready; will retry on next LOGGED_IN");
-            worldMapBootstrapped.set(false);
-            return;
+            if (attempts >= 20)
+            {
+                log.warn("worldmap-bootstrap: player not ready after {} attempts ({}s) — giving up; "
+                    + "next LOGGED_IN cycle will retry", attempts, attempts / 2);
+                worldMapBootstrapped.set(false);
+                return;
+            }
+            try { Thread.sleep(500); }
+            catch (InterruptedException ie)
+            {
+                Thread.currentThread().interrupt();
+                worldMapBootstrapped.set(false);
+                return;
+            }
+            self = client.getLocalPlayer();
+            attempts++;
+        }
+        if (attempts > 0)
+        {
+            log.info("worldmap-bootstrap: player ready after {} retries", attempts);
         }
         int rx = self.getWorldLocation().getX() >> 6;
         int ry = self.getWorldLocation().getY() >> 6;
