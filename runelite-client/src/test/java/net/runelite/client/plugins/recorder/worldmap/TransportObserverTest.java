@@ -189,4 +189,122 @@ public class TransportObserverTest
         assertEquals("dedupe by key — single edge", 1, idx.size());
         assertEquals(2, idx.getAll().iterator().next().seenCount());
     }
+
+    // ──────────── click-target-aware tests ────────────
+
+    @Test
+    public void onTick_clickAdjacentToTarget_engineWalkOntoTargetDoesNotResolve()
+    {
+        // Reproduces the bug from the live transports.json smoke test:
+        // user clicks "Top-floor" on a staircase from one tile away;
+        // engine routes them onto the staircase tile FIRST, then
+        // teleports them to the next plane. Without click-target
+        // gating the engine-walk tick was being recorded as the
+        // transport, producing a same-plane 1-tile edge with no
+        // teleport.
+        TransportIndex idx = new TransportIndex();
+        TransportObserver obs = new TransportObserver(null, idx);
+
+        WorldPoint adjacentToStair = new WorldPoint(3207, 3228, 0);
+        WorldPoint stairTile = new WorldPoint(3207, 3229, 0);
+        WorldPoint topFloor = new WorldPoint(3207, 3229, 2);
+
+        obs.capturePending(adjacentToStair, stairTile,
+            "Top-floor", "Staircase",
+            56230, 20, 61, "GAME_OBJECT_SECOND_OPTION", 1_000L);
+
+        // T=1: engine routes player onto the staircase tile. This is
+        // a 1-tile same-plane move — must NOT resolve.
+        obs.tickForTest(stairTile, 1_600L);
+        assertEquals("engine walk to stair must not resolve", 0, idx.size());
+
+        // T=2: settle tick (animation playing).
+        obs.tickForTest(stairTile, 2_200L);
+        assertEquals(0, idx.size());
+
+        // T=3: teleport to plane 2.
+        obs.tickForTest(topFloor, 2_800L);
+
+        assertEquals(1, idx.size());
+        TransportEdge edge = idx.getAll().iterator().next();
+        assertEquals("fromTile is the staircase, NOT the engine-walk start",
+            stairTile, edge.fromTile());
+        assertEquals(topFloor, edge.toTile());
+        assertEquals("Top-floor", edge.verb());
+        assertEquals("plane delta captured",
+            2, edge.toTile().getPlane() - edge.fromTile().getPlane());
+    }
+
+    @Test
+    public void onTick_doorScenario_resolvesAfterArrivalAndSettle()
+    {
+        // Door / gate case: no plane change. Player walks to approach
+        // tile, door opens (one settle tick), player walks through to
+        // the far side. The captured edge's fromTile must be the
+        // approach tile, not an intermediate walking tile.
+        TransportIndex idx = new TransportIndex();
+        TransportObserver obs = new TransportObserver(null, idx);
+
+        WorldPoint farAway = new WorldPoint(3232, 3300, 0);
+        WorldPoint walkTile = new WorldPoint(3231, 3299, 0);
+        WorldPoint approach = new WorldPoint(3230, 3298, 0);
+        WorldPoint doorTile = new WorldPoint(3230, 3297, 0);
+        WorldPoint farSide = new WorldPoint(3230, 3296, 0);
+
+        obs.capturePending(farAway, doorTile,
+            "Open", "Gate",
+            1530, 56, 18, "GAME_OBJECT_FIRST_OPTION", 1_000L);
+
+        // Walking toward the door — far from clickTarget, must NOT resolve.
+        obs.tickForTest(walkTile, 1_600L);
+        assertEquals(0, idx.size());
+
+        // Arrives at approach tile (Chebyshev 1 from door) → ARRIVED.
+        obs.tickForTest(approach, 2_200L);
+        assertEquals("arrival tile change must NOT resolve immediately",
+            0, idx.size());
+
+        // Settle tick — door opening animation. ARRIVED → READY.
+        obs.tickForTest(approach, 2_800L);
+        assertEquals(0, idx.size());
+
+        // Walks through to far side. READY + tile change → resolve.
+        obs.tickForTest(farSide, 3_400L);
+
+        assertEquals(1, idx.size());
+        TransportEdge edge = idx.getAll().iterator().next();
+        assertEquals("fromTile is the approach tile (just before walking through)",
+            approach, edge.fromTile());
+        assertEquals(farSide, edge.toTile());
+        assertEquals("Open", edge.verb());
+        assertEquals("same plane — door, not stair",
+            0, edge.toTile().getPlane() - edge.fromTile().getPlane());
+    }
+
+    @Test
+    public void onTick_walkingTowardClickTarget_intermediateTilesDoNotResolve()
+    {
+        // Belt-and-suspenders: every walk tile BEFORE arrival must
+        // not produce an edge.
+        TransportIndex idx = new TransportIndex();
+        TransportObserver obs = new TransportObserver(null, idx);
+
+        WorldPoint start = new WorldPoint(3220, 3300, 0);
+        WorldPoint mid1 = new WorldPoint(3221, 3300, 0);
+        WorldPoint mid2 = new WorldPoint(3222, 3300, 0);
+        WorldPoint approach = new WorldPoint(3223, 3300, 0);
+        WorldPoint clickTarget = new WorldPoint(3224, 3300, 0);
+
+        obs.capturePending(start, clickTarget,
+            "Open", "Door",
+            1530, 24, 0, "GAME_OBJECT_FIRST_OPTION", 1_000L);
+
+        obs.tickForTest(mid1, 1_600L);
+        obs.tickForTest(mid2, 2_200L);
+        obs.tickForTest(approach, 2_800L);
+
+        assertEquals("nothing resolves before settle tick after arrival",
+            0, idx.size());
+        assertEquals("pending still alive", 1, obs.pendingCount());
+    }
 }

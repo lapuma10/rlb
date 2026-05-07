@@ -10,6 +10,8 @@ import net.runelite.api.Client;
 import net.runelite.api.GameState;
 import net.runelite.api.MenuEntry;
 import net.runelite.api.Player;
+import net.runelite.api.WorldView;
+import net.runelite.api.coords.LocalPoint;
 import net.runelite.api.coords.WorldPoint;
 import net.runelite.api.events.GameTick;
 import net.runelite.api.events.MenuOptionClicked;
@@ -42,10 +44,12 @@ import net.runelite.client.plugins.recorder.trail.TrailRecorder;
 public final class TransportObserver
 {
     /** Default ticks an entry waits in {@link #pending} before being
-     *  discarded. ~10 ticks ≈ 6s wall clock — long enough for stair
-     *  / ladder animations to settle, short enough that a missed
-     *  resolution does not contaminate a later click. */
-    public static final long DEFAULT_RESOLUTION_TIMEOUT_TICKS = 10;
+     *  discarded. ~20 ticks ≈ 12s wall clock — long enough that a
+     *  click on a transport ten tiles away (~6s walk) plus the
+     *  arrival + settle + transport effect (3+ ticks) all fit, short
+     *  enough that a missed resolution does not contaminate a later
+     *  click. */
+    public static final long DEFAULT_RESOLUTION_TIMEOUT_TICKS = 20;
 
     private final Client client;
     private final TransportIndex index;
@@ -101,13 +105,41 @@ public final class TransportObserver
         WorldPoint fromTile = local.getWorldLocation();
         if (fromTile == null) return;
 
-        capturePending(fromTile, verb,
+        // Resolve the click target's actual world tile from scene
+        // coords. Without this we'd treat the player's location at
+        // click time as the transport's fromTile, but the engine
+        // routes the player to the click target first — the captured
+        // edge would point at wherever the player was standing instead
+        // of the staircase / door / gate. Falls back to the player's
+        // tile when the engine can't resolve scene coords (rare; same
+        // fallback TrailRecorder uses).
+        WorldPoint clickTargetTile = resolveClickTargetTile(entry, fromTile);
+
+        capturePending(fromTile, clickTargetTile, verb,
             entry.getTarget() == null ? "" : entry.getTarget(),
             entry.getIdentifier(),
             entry.getParam0(),
             entry.getParam1(),
             entry.getType() == null ? "" : entry.getType().toString(),
             System.currentTimeMillis());
+    }
+
+    private WorldPoint resolveClickTargetTile(MenuEntry entry, WorldPoint fallback)
+    {
+        if (client == null) return fallback;
+        try
+        {
+            WorldView wv = client.getTopLevelWorldView();
+            if (wv == null) return fallback;
+            LocalPoint lp = LocalPoint.fromScene(entry.getParam0(), entry.getParam1(), wv);
+            WorldPoint wp = WorldPoint.fromLocal(client, lp);
+            return wp == null ? fallback : wp;
+        }
+        catch (Throwable th)
+        {
+            log.debug("transport-obs: resolveClickTargetTile threw; using fallback", th);
+            return fallback;
+        }
     }
 
     @Subscribe
@@ -123,49 +155,119 @@ public final class TransportObserver
         advanceTick(here, now);
     }
 
-    /** Per-tick resolver. Compares the new player tile with the one
-     *  observed on the previous tick; any pending whose {@code
-     *  fromTile} matches the previous tile counts as resolved and is
-     *  flushed to the index as a complete {@link TransportEdge}. */
+    /** Per-tick resolver. Drives the per-pending state machine
+     *  (WAITING_TO_ARRIVE → ARRIVED → READY) and applies two
+     *  resolution rules:
+     *
+     *  <ul>
+     *    <li><b>Strong</b>: plane change or {@code Chebyshev > 1}
+     *        between previous and current tile. Unambiguous transport
+     *        (stairs, ladders, teleports). Resolves regardless of
+     *        state.</li>
+     *    <li><b>Weak</b>: 1-tile same-plane change while state is
+     *        {@code READY}. Covers doors, gates, stiles — where the
+     *        post-arrival walk-through tile move IS the transport.
+     *        The state machine ensures we don't resolve on the
+     *        engine-routed walk to the click target itself.</li>
+     *  </ul>
+     */
     void advanceTick(@Nullable WorldPoint here, long timestampMs)
     {
         tickCount++;
         if (here != null)
         {
-            if (lastSeenPlayerTile != null && !lastSeenPlayerTile.equals(here))
+            WorldPoint prev = lastSeenPlayerTile;
+            boolean strong = prev != null && (
+                prev.getPlane() != here.getPlane()
+                || chebyshev(prev, here) > 1);
+            boolean tileChanged = prev != null && !prev.equals(here);
+
+            Iterator<Map.Entry<Long, Pending>> it = pending.entrySet().iterator();
+            while (it.hasNext())
             {
-                resolveTransitionFrom(lastSeenPlayerTile, here, timestampMs);
+                Pending p = it.next().getValue();
+                // Strong rule (plane change / teleport) only fires once
+                // the pending has reached its click target. Without
+                // this gate, a teleport from elsewhere — or, in
+                // back-to-back stair runs, a fresh pending captured
+                // while the observer is still seeing the previous
+                // run's terminal tile — would consume the strong
+                // signal even though the player hasn't yet walked to
+                // the new click target.
+                boolean stateAdvanced = (p.state == PendingState.ARRIVED
+                    || p.state == PendingState.READY);
+                boolean strongResolve = strong && stateAdvanced;
+                boolean weakResolve = (p.state == PendingState.READY) && tileChanged;
+                if (strongResolve || weakResolve)
+                {
+                    publishResolved(p, prev, here, timestampMs,
+                        strongResolve ? "strong" : "weak");
+                    it.remove();
+                    continue;
+                }
+                advancePendingState(p, here);
             }
             lastSeenPlayerTile = here;
         }
         expireStalePendings();
     }
 
-    private void resolveTransitionFrom(WorldPoint prevTile, WorldPoint curTile, long nowMs)
+    private void advancePendingState(Pending p, WorldPoint here)
     {
-        Iterator<Map.Entry<Long, Pending>> it = pending.entrySet().iterator();
-        while (it.hasNext())
+        switch (p.state)
         {
-            Pending p = it.next().getValue();
-            if (!p.fromTile.equals(prevTile)) continue;
-
-            long durationMs = Math.max(0L, nowMs - p.clickTimeMs);
-            TransportEdge edge = new TransportEdge(
-                p.fromTile, curTile,
-                p.objectId,
-                p.target == null ? "" : p.target,
-                p.verb,
-                p.param0, p.param1,
-                p.targetKind == null ? "" : p.targetKind,
-                p.fromTile, // approachTile == fromTile for round 1
-                p.fromTile.getRegionID(),
-                1, nowMs, durationMs);
-            index.add(edge);
-            it.remove();
-            log.info("transport-obs: resolved {} at {} → {} (plane Δ={}) in {}ms",
-                p.verb, p.fromTile, curTile,
-                curTile.getPlane() - p.fromTile.getPlane(), durationMs);
+            case WAITING_TO_ARRIVE:
+                if (isAtClickTarget(here, p)) p.state = PendingState.ARRIVED;
+                break;
+            case ARRIVED:
+                // One settle tick after arrival before we accept weak
+                // resolutions — keeps the engine-routed walk to the
+                // click target from being misread as the transport.
+                p.state = PendingState.READY;
+                break;
+            case READY:
+                // Stays READY until a tile change resolves it (or TTL
+                // expires).
+                break;
         }
+    }
+
+    private static boolean isAtClickTarget(WorldPoint here, Pending p)
+    {
+        if (p.clickTargetTile == null) return true;
+        if (here.getPlane() != p.clickTargetTile.getPlane()) return false;
+        return chebyshev(here, p.clickTargetTile) <= 1;
+    }
+
+    private static int chebyshev(WorldPoint a, WorldPoint b)
+    {
+        return Math.max(Math.abs(a.getX() - b.getX()), Math.abs(a.getY() - b.getY()));
+    }
+
+    private void publishResolved(Pending p, WorldPoint prevTile, WorldPoint curTile,
+                                 long nowMs, String rule)
+    {
+        long durationMs = Math.max(0L, nowMs - p.clickTimeMs);
+        // fromTile is the player's tile JUST BEFORE the transport
+        // effect — for stairs / ladders that's the staircase tile
+        // itself; for doors / gates that's the approach tile. This is
+        // exactly what the planner wants: "to use this transport, be
+        // standing here."
+        WorldPoint resolvedFrom = prevTile != null ? prevTile : p.fromTile;
+        TransportEdge edge = new TransportEdge(
+            resolvedFrom, curTile,
+            p.objectId,
+            p.target == null ? "" : p.target,
+            p.verb,
+            p.param0, p.param1,
+            p.targetKind == null ? "" : p.targetKind,
+            resolvedFrom, // approachTile == fromTile for round 1
+            resolvedFrom.getRegionID(),
+            1, nowMs, durationMs);
+        index.add(edge);
+        log.info("transport-obs: resolved {} at {} → {} (plane Δ={}) in {}ms via {} rule",
+            p.verb, resolvedFrom, curTile,
+            curTile.getPlane() - resolvedFrom.getPlane(), durationMs, rule);
     }
 
     // ──────── pending capture (test-friendly entry point) ────────
@@ -173,17 +275,36 @@ public final class TransportObserver
     /** Mirrors what {@link #onMenuOptionClicked} does after unpacking
      *  {@link MenuEntry}. Tests drive this directly to exercise the
      *  pending-phase contract without standing up a Client +
-     *  MenuEntry mock chain. */
-    void capturePending(WorldPoint fromTile, String verb, String target,
+     *  MenuEntry mock chain. The {@code clickTargetTile} parameter
+     *  carries the world tile resolved from the menu's scene coords
+     *  — production passes it from {@link #resolveClickTargetTile};
+     *  tests pass it directly. {@code null} disables the
+     *  arrival-gating heuristic (every weak transition resolves) and
+     *  is intended for tests that don't care about the state machine. */
+    void capturePending(WorldPoint fromTile, @Nullable WorldPoint clickTargetTile,
+                        String verb, String target,
                         int objectId, int param0, int param1,
                         String targetKind, long timestampMs)
     {
         if (fromTile == null || verb == null || verb.isBlank()) return;
         if (!TrailRecorder.isTransportVerb(verb)) return;
         long id = nextPendingId.getAndIncrement();
-        pending.put(id, new Pending(id, fromTile, verb, target, objectId,
+        pending.put(id, new Pending(id, fromTile, clickTargetTile, verb, target, objectId,
             param0, param1, targetKind, timestampMs, tickCount));
-        log.debug("transport-obs: pending #{} {} at {} obj={}", id, verb, fromTile, objectId);
+        log.debug("transport-obs: pending #{} {} at {} target={} obj={}",
+            id, verb, fromTile, clickTargetTile, objectId);
+    }
+
+    /** Pre-Phase-2.6 overload kept so existing tests that don't pass
+     *  a click-target tile keep working. The state machine treats a
+     *  null clickTargetTile as "always at target" so weak resolution
+     *  fires on the first tile change after one settle tick. */
+    void capturePending(WorldPoint fromTile, String verb, String target,
+                        int objectId, int param0, int param1,
+                        String targetKind, long timestampMs)
+    {
+        capturePending(fromTile, null, verb, target,
+            objectId, param0, param1, targetKind, timestampMs);
     }
 
     private void expireStalePendings()
@@ -222,10 +343,19 @@ public final class TransportObserver
         advanceTick(here, timestampMs);
     }
 
+    /** Lifecycle of a pending click. {@code WAITING_TO_ARRIVE} until
+     *  the player reaches at-or-adjacent the click-target tile;
+     *  {@code ARRIVED} for one settle tick; {@code READY} thereafter,
+     *  at which point the next 1-tile same-plane change is treated as
+     *  the transport's effect. Plane changes / multi-tile teleports
+     *  bypass the state machine entirely (they are unambiguous). */
+    enum PendingState { WAITING_TO_ARRIVE, ARRIVED, READY }
+
     static final class Pending
     {
         final long id;
         final WorldPoint fromTile;
+        @Nullable final WorldPoint clickTargetTile;
         final String verb;
         @Nullable final String target;
         final int objectId;
@@ -234,13 +364,16 @@ public final class TransportObserver
         @Nullable final String targetKind;
         final long clickTimeMs;
         final long clickTickCount;
+        PendingState state = PendingState.WAITING_TO_ARRIVE;
 
-        Pending(long id, WorldPoint fromTile, String verb, @Nullable String target,
+        Pending(long id, WorldPoint fromTile, @Nullable WorldPoint clickTargetTile,
+                String verb, @Nullable String target,
                 int objectId, int param0, int param1, @Nullable String targetKind,
                 long clickTimeMs, long clickTickCount)
         {
             this.id = id;
             this.fromTile = fromTile;
+            this.clickTargetTile = clickTargetTile;
             this.verb = verb;
             this.target = target;
             this.objectId = objectId;
