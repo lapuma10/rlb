@@ -138,11 +138,18 @@ are called out as "implementation determines."
 - `worldmap/MapPlanner` — A* within one region, one plane, no
   transports. Used today only by CookingScript V3 stand-tile pick.
 
-### Known blockers in `MapPlanner.java` (must be lifted for V2)
+### Known blockers in `MapPlanner.java` (resolved in Phase 4 by MultiRegionAStar)
 
 - Lines 32–35: cross-plane reject.
 - Lines 45–50: cross-region reject.
 - No transport edges in the A* graph.
+
+**Resolution (Phase 4):** MapPlanner is unchanged. V2's
+`MultiRegionAStar` composes single-region MapPlanner-equivalent
+expansions plus transport edges into one A* graph; the cross-region /
+cross-plane / transport-aware logic lives in `MultiRegionAStar`, not
+inside MapPlanner. MapPlanner stays as the single-region helper used by
+existing CookingScript V3.
 
 ### Resolved V2 design decisions
 
