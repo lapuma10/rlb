@@ -29,8 +29,10 @@ import javax.inject.Inject;
 import java.io.File;
 import lombok.extern.slf4j.Slf4j;
 import net.runelite.api.Client;
+import net.runelite.api.GameState;
 import net.runelite.api.Player;
 import net.runelite.api.WorldView;
+import net.runelite.api.events.GameStateChanged;
 import net.runelite.api.events.GameTick;
 import net.runelite.client.RuneLite;
 import net.runelite.client.callback.ClientThread;
@@ -165,6 +167,15 @@ public class RecorderPlugin extends Plugin
     private WorldMemoryConfig wmConfig;
     private FlushDaemon flushDaemon;
     private int tickCounter;
+    /** Root for persisted region/entity/transport JSON. Set in startUp;
+     *  read by both the FlushDaemon and the bootstrap path. */
+    private File worldmapRoot;
+    /** Once-per-plugin-startup guard: the disk bootstrap should run
+     *  exactly once after the first LOGGED_IN event so subsequent
+     *  log-out / log-in cycles don't overwrite warm in-memory state
+     *  with potentially older disk snapshots. */
+    private final java.util.concurrent.atomic.AtomicBoolean worldMapBootstrapped
+        = new java.util.concurrent.atomic.AtomicBoolean(false);
 
     @Provides
     RecorderConfig provideConfig(ConfigManager cm)
@@ -395,38 +406,25 @@ public class RecorderPlugin extends Plugin
         // (otherwise the planner returns empty for the first scrape cycle
         // even when JSON exists from a prior session). Done off the client
         // thread to avoid blocking startup.
-        File worldmapRoot = new File(RuneLite.RUNELITE_DIR, "recorder/worldmap");
-        Thread bootstrapThread = new Thread(() -> {
-            Player self = client.getLocalPlayer();
-            if (self == null || self.getWorldLocation() == null) return;
-            int rx = self.getWorldLocation().getX() >> 6;
-            int ry = self.getWorldLocation().getY() >> 6;
-            for (int dx = -1; dx <= 1; dx++)
-            {
-                for (int dy = -1; dy <= 1; dy++)
-                {
-                    int regionId = ((rx + dx) << 8) | ((ry + dy) & 0xff);
-                    worldMapStore.loadFromDisk(worldmapRoot, regionId);
-                }
-            }
-            // Entity sightings — for nearestNpc/Object queries.
-            for (int dx = -1; dx <= 1; dx++)
-            {
-                for (int dy = -1; dy <= 1; dy++)
-                {
-                    int regionId = ((rx + dx) << 8) | ((ry + dy) & 0xff);
-                    for (EntitySighting s : MapStoreIO.readEntities(worldmapRoot, regionId))
-                    {
-                        worldEntityIndex.recordNpcSighting(s.id, s.name, s.lastTile, s.lastSeenAt);
-                    }
-                }
-            }
-            // Transport graph — single top-level file. Loaded once
-            // here so the planner has known transports immediately.
-            transportIndex.replaceAll(TransportIO.readAll(worldmapRoot));
-        }, "worldmap-bootstrap");
-        bootstrapThread.setDaemon(true);
-        bootstrapThread.start();
+        //
+        // Trigger model — fire ONCE per plugin lifetime, on first LOGGED_IN:
+        //  * If the plugin loads while the player is already in-game (rare
+        //    at cold launch but happens on /reload-plugins or hot-swap),
+        //    the initial check below fires the bootstrap immediately.
+        //  * Otherwise, onGameStateChanged catches the LOGGED_IN transition
+        //    that follows a normal title-screen → world login flow.
+        //
+        // The previous one-shot startup thread silently no-op'd whenever
+        // the player wasn't logged in at startUp (the common case),
+        // leaving MapStore empty until SceneScraper rebuilt — which left
+        // gaps wherever the corridor wasn't walked in the live scrape
+        // window. Symptom: V2_STRICT returning "no route" with persisted
+        // region JSON sitting unread on disk.
+        worldmapRoot = new File(RuneLite.RUNELITE_DIR, "recorder/worldmap");
+        if (client.getGameState() == GameState.LOGGED_IN)
+        {
+            triggerWorldMapBootstrap();
+        }
 
         flushDaemon = new FlushDaemon(worldMapStore, worldEntityIndex,
             transportIndex, worldmapRoot, wmConfig.flushEverySeconds * 1000L);
@@ -678,4 +676,82 @@ public class RecorderPlugin extends Plugin
 
     /** Public accessor for scripts (e.g. CookingScriptV3). */
     public MapPlanner mapPlanner() { return mapPlanner; }
+
+    /** Listen for LOGGED_IN so the disk bootstrap fires the moment the
+     *  player has a real {@link Player#getWorldLocation()}. Idempotent
+     *  via {@link #worldMapBootstrapped} — the first successful fire
+     *  marks the plugin lifetime as bootstrapped; subsequent log-out /
+     *  log-in cycles leave the warm in-memory MapStore alone. */
+    @Subscribe
+    public void onGameStateChanged(GameStateChanged event)
+    {
+        if (event.getGameState() == GameState.LOGGED_IN)
+        {
+            triggerWorldMapBootstrap();
+        }
+    }
+
+    /** Idempotent kick. Safe to call from any thread; the actual disk
+     *  reads run on a daemon worker. */
+    private void triggerWorldMapBootstrap()
+    {
+        if (worldmapRoot == null || worldMapStore == null || transportIndex == null
+            || worldEntityIndex == null)
+        {
+            // Plugin still mid-startUp; the explicit check at the end of
+            // startUp will run the bootstrap once everything's wired.
+            return;
+        }
+        if (!worldMapBootstrapped.compareAndSet(false, true)) return;
+        Thread t = new Thread(this::runWorldMapBootstrap, "worldmap-bootstrap");
+        t.setDaemon(true);
+        t.start();
+    }
+
+    /** Worker-thread bootstrap: cold-loads region snapshots, entity
+     *  sightings, and the transport graph for the player's current
+     *  region + 8 neighbours. Reads {@link Client#getLocalPlayer()}
+     *  off the client thread; if that races and returns null (e.g.
+     *  GameState fired LOGGED_IN before the player object was
+     *  populated), reset the guard so the next state-change retries. */
+    private void runWorldMapBootstrap()
+    {
+        Player self = client.getLocalPlayer();
+        if (self == null || self.getWorldLocation() == null)
+        {
+            log.info("worldmap-bootstrap: player not yet ready; will retry on next LOGGED_IN");
+            worldMapBootstrapped.set(false);
+            return;
+        }
+        int rx = self.getWorldLocation().getX() >> 6;
+        int ry = self.getWorldLocation().getY() >> 6;
+        log.info("worldmap-bootstrap: loading regions around ({}, {})", rx, ry);
+        int regionsLoaded = 0;
+        int sightingsLoaded = 0;
+        for (int dx = -1; dx <= 1; dx++)
+        {
+            for (int dy = -1; dy <= 1; dy++)
+            {
+                int regionId = ((rx + dx) << 8) | ((ry + dy) & 0xff);
+                if (worldMapStore.loadFromDisk(worldmapRoot, regionId)) regionsLoaded++;
+            }
+        }
+        for (int dx = -1; dx <= 1; dx++)
+        {
+            for (int dy = -1; dy <= 1; dy++)
+            {
+                int regionId = ((rx + dx) << 8) | ((ry + dy) & 0xff);
+                for (EntitySighting s : MapStoreIO.readEntities(worldmapRoot, regionId))
+                {
+                    worldEntityIndex.recordNpcSighting(s.id, s.name, s.lastTile, s.lastSeenAt);
+                    sightingsLoaded++;
+                }
+            }
+        }
+        java.util.Collection<net.runelite.client.plugins.recorder.worldmap.TransportEdge> transports
+            = TransportIO.readAll(worldmapRoot);
+        transportIndex.replaceAll(transports);
+        log.info("worldmap-bootstrap: complete — {} regions, {} entity sightings, {} transports",
+            regionsLoaded, sightingsLoaded, transports.size());
+    }
 }
