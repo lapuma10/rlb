@@ -81,7 +81,7 @@ public class ChickenFarmV3ScriptTest
             @Override public String name() { return "idle-stub"; }
         };
         RecorderConfig cfg = mock(RecorderConfig.class);
-        when(cfg.navigatorImpl()).thenReturn(RecorderConfig.NavigatorImpl.TRAIL_V1);
+        when(cfg.navigatorMode()).thenReturn(RecorderConfig.NavigatorMode.V1_ONLY);
         return new NavigatorFactory(cfg, idle);
     }
 }

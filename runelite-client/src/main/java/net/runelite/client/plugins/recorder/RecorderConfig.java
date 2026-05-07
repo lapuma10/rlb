@@ -259,30 +259,37 @@ public interface RecorderConfig extends Config
 		return false;
 	}
 
-	/** Selects which Navigator implementation scripts receive from the
-	 *  factory. {@code TRAIL_V1} replays recorded trails via the existing
-	 *  {@link net.runelite.client.plugins.recorder.trail.TrailWalker};
-	 *  {@code WORLDMAP_V2} drives navigation from live WorldMemory + A*
-	 *  with route alternation. V1 is the supported fallback; V2 lands
-	 *  incrementally and is registered in a later phase. */
-	enum NavigatorImpl
+	/** Phase-7 navigator mode. Picked by the {@link
+	 *  net.runelite.client.plugins.recorder.nav.HybridNavigator} on every
+	 *  request — turning V2 on must not break ChickenFarmV3, so the
+	 *  default ({@link #V1_ONLY}) and the fallback variant
+	 *  ({@link #V2_WITH_V1_FALLBACK}) are always usable.
+	 *
+	 *  <p>{@link #V1_ONLY} — always use TrailWalker/V1.
+	 *  <br>{@link #V2_WITH_V1_FALLBACK} — try V2 first; if V2 fails for
+	 *  any reason, log why and use V1 for that request.
+	 *  <br>{@link #V2_STRICT} — try V2 only; if it fails, report why and
+	 *  stop cleanly (no fallback). */
+	enum NavigatorMode
 	{
-		TRAIL_V1,
-		WORLDMAP_V2
+		V1_ONLY,
+		V2_WITH_V1_FALLBACK,
+		V2_STRICT
 	}
 
 	@ConfigItem(
-		keyName = "navigatorImpl",
-		name = "Navigator implementation",
-		description = "Which Navigator scripts use: V1 replays recorded "
-			+ "trails (default, supported fallback); V2 plans live from "
-			+ "WorldMemory (experimental, only ChickenFarmV3 wired in round 1).",
+		keyName = "navigatorMode",
+		name = "Navigator mode",
+		description = "How HybridNavigator dispatches requests. V1_ONLY = "
+			+ "TrailWalker only (default, safe). V2_WITH_V1_FALLBACK = try "
+			+ "V2 first, fall back to V1 if V2 fails for any reason. "
+			+ "V2_STRICT = V2 only, fail clearly if V2 can't satisfy.",
 		section = experimentalSection,
 		position = 2
 	)
-	default NavigatorImpl navigatorImpl()
+	default NavigatorMode navigatorMode()
 	{
-		return NavigatorImpl.TRAIL_V1;
+		return NavigatorMode.V1_ONLY;
 	}
 
 	@ConfigSection(

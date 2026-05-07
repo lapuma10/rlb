@@ -173,8 +173,8 @@ public final class RecorderPanel extends PluginPanel
         new javax.swing.JCheckBox("Click Inspector");
     private final javax.swing.JCheckBox worldMemoryPlannerCb =
         new javax.swing.JCheckBox("WorldMemory planner (experimental)");
-    private final JComboBox<RecorderConfig.NavigatorImpl> navigatorImplCombo =
-        new JComboBox<>(RecorderConfig.NavigatorImpl.values());
+    private final JComboBox<RecorderConfig.NavigatorMode> navigatorModeCombo =
+        new JComboBox<>(RecorderConfig.NavigatorMode.values());
     private Timer refreshTimer;
     private final JButton chickenStartBtn = new JButton("Start chicken loop");
     private final JButton chickenStopBtn = new JButton("Stop");
@@ -384,16 +384,16 @@ public final class RecorderPanel extends PluginPanel
         // Action listener wired by setWorldMemoryPlannerConfig() once the
         // plugin has injected config + configManager.
 
-        // Navigator V1/V2 selector — single switch site for which
-        // Navigator implementation scripts use. Wired by
-        // setNavigatorImplConfig() at plugin startup.
+        // Navigator mode selector — Phase-7 switch. HybridNavigator reads
+        // this every tick, so flipping the dropdown takes effect on the
+        // next request without restarting the script.
         JPanel navRow = new JPanel(new BorderLayout(4, 0));
         navRow.setBackground(p.getBackground());
-        navRow.add(new JLabel("Navigator:"), BorderLayout.WEST);
-        navRow.add(navigatorImplCombo, BorderLayout.CENTER);
+        navRow.add(new JLabel("Navigator mode:"), BorderLayout.WEST);
+        navRow.add(navigatorModeCombo, BorderLayout.CENTER);
         navRow.setMaximumSize(new java.awt.Dimension(
             Integer.MAX_VALUE,
-            navigatorImplCombo.getPreferredSize().height));
+            navigatorModeCombo.getPreferredSize().height));
         p.add(navRow);
         return p;
     }
@@ -419,21 +419,21 @@ public final class RecorderPanel extends PluginPanel
                 worldMemoryPlannerCb.isSelected()));
     }
 
-    /** Wire the Navigator-implementation dropdown to the config. Called
-     *  by the plugin once {@link RecorderConfig} and {@link ConfigManager}
-     *  are available. The combo reflects the persisted value at startup
-     *  and writes back on user selection. */
-    public void setNavigatorImplConfig(RecorderConfig cfg, ConfigManager cm)
+    /** Wire the Navigator mode dropdown to the config. Called by the
+     *  plugin once {@link RecorderConfig} and {@link ConfigManager}
+     *  are available. The combo reflects the persisted value at
+     *  startup and writes back on user selection. */
+    public void setNavigatorModeConfig(RecorderConfig cfg, ConfigManager cm)
     {
-        RecorderConfig.NavigatorImpl current = cfg.navigatorImpl();
-        if (current == null) current = RecorderConfig.NavigatorImpl.TRAIL_V1;
-        navigatorImplCombo.setSelectedItem(current);
-        navigatorImplCombo.addActionListener(e ->
+        RecorderConfig.NavigatorMode current = cfg.navigatorMode();
+        if (current == null) current = RecorderConfig.NavigatorMode.V1_ONLY;
+        navigatorModeCombo.setSelectedItem(current);
+        navigatorModeCombo.addActionListener(e ->
         {
-            Object sel = navigatorImplCombo.getSelectedItem();
-            if (sel instanceof RecorderConfig.NavigatorImpl impl)
+            Object sel = navigatorModeCombo.getSelectedItem();
+            if (sel instanceof RecorderConfig.NavigatorMode mode)
             {
-                cm.setConfiguration("recorder", "navigatorImpl", impl);
+                cm.setConfiguration("recorder", "navigatorMode", mode);
             }
         });
     }

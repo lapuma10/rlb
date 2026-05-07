@@ -2,75 +2,47 @@ package net.runelite.client.plugins.recorder.nav;
 
 import net.runelite.client.plugins.recorder.RecorderConfig;
 import org.junit.Test;
-import static org.junit.Assert.*;
-import static org.mockito.Mockito.*;
+import static org.junit.Assert.assertNotNull;
+import static org.junit.Assert.assertSame;
+import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.when;
 
-/** Verifies the factory's switch behavior in isolation: given a
- *  RecorderConfig stub it returns the right instance, falls back to
- *  V1 when V2 isn't bound (round-1 stale config), and surfaces a
- *  stable instance across calls. */
+/** Phase 7: the factory always returns a {@link HybridNavigator} that
+ *  reads the live mode each tick. Tests cover the factory's stability
+ *  guarantees + the resilient-fallback behavior when V2 is missing. */
 public class NavigatorFactoryTest
 {
     @Test
-    public void getNavigator_whenTrailV1_returnsTrailNavigator()
+    public void getNavigator_returnsStableHybrid()
     {
         RecorderConfig cfg = mock(RecorderConfig.class);
-        when(cfg.navigatorImpl()).thenReturn(RecorderConfig.NavigatorImpl.TRAIL_V1);
-        Navigator stub = stubNavigator("trail-v1");
-        NavigatorFactory factory = new NavigatorFactory(cfg, stub, stubNavigator("worldmap-v2"));
-
-        assertSame(stub, factory.getNavigator());
-    }
-
-    @Test
-    public void getNavigator_whenWorldmapV2_returnsV2Navigator()
-    {
-        RecorderConfig cfg = mock(RecorderConfig.class);
-        when(cfg.navigatorImpl()).thenReturn(RecorderConfig.NavigatorImpl.WORLDMAP_V2);
-        Navigator stubV1 = stubNavigator("trail-v1");
-        Navigator stubV2 = stubNavigator("worldmap-v2");
-        NavigatorFactory factory = new NavigatorFactory(cfg, stubV1, stubV2);
-
-        assertSame("V2 selection must surface the bound V2 instance",
-            stubV2, factory.getNavigator());
-    }
-
-    @Test
-    public void getNavigator_whenWorldmapV2_andV2Null_fallsBackToV1()
-    {
-        RecorderConfig cfg = mock(RecorderConfig.class);
-        when(cfg.navigatorImpl()).thenReturn(RecorderConfig.NavigatorImpl.WORLDMAP_V2);
-        Navigator stubV1 = stubNavigator("trail-v1");
-        // Plugin built without V2 (legacy path / test setup) — config
-        // pointing at V2 must NOT crash startup; fall back to V1.
-        NavigatorFactory factory = new NavigatorFactory(cfg, stubV1, (Navigator) null);
-
-        assertSame(stubV1, factory.getNavigator());
-    }
-
-    @Test
-    public void getNavigator_isStableWithinSession()
-    {
-        RecorderConfig cfg = mock(RecorderConfig.class);
-        when(cfg.navigatorImpl()).thenReturn(RecorderConfig.NavigatorImpl.TRAIL_V1);
+        when(cfg.navigatorMode()).thenReturn(RecorderConfig.NavigatorMode.V1_ONLY);
         NavigatorFactory factory = new NavigatorFactory(cfg, stubNavigator("trail-v1"),
             stubNavigator("worldmap-v2"));
 
         Navigator a = factory.getNavigator();
         Navigator b = factory.getNavigator();
-
-        assertSame("repeated lookups must surface the same instance", a, b);
+        assertNotNull(a);
+        assertSame("repeated lookups must surface the same hybrid instance", a, b);
+        assertSame("hybrid", a.name() == null ? "?" : a.name());
     }
 
     @Test
-    public void getNavigator_whenConfigReturnsNull_fallsBackToTrailV1()
+    public void getNavigator_v2Null_stillReturnsHybrid_whichDelegatesToV1() throws Exception
     {
         RecorderConfig cfg = mock(RecorderConfig.class);
-        when(cfg.navigatorImpl()).thenReturn(null);
-        Navigator stub = stubNavigator("trail-v1");
-        NavigatorFactory factory = new NavigatorFactory(cfg, stub, stubNavigator("worldmap-v2"));
+        when(cfg.navigatorMode()).thenReturn(RecorderConfig.NavigatorMode.V2_WITH_V1_FALLBACK);
+        Navigator stubV1 = stubNavigator("trail-v1");
+        // Plugin built without V2 (legacy / test setup) — factory must NOT
+        // crash; V2 selection in HybridNavigator falls back to V1.
+        NavigatorFactory factory = new NavigatorFactory(cfg, stubV1, (Navigator) null);
 
-        assertSame(stub, factory.getNavigator());
+        Navigator nav = factory.getNavigator();
+        assertNotNull(nav);
+        // Tick once to confirm it doesn't throw — actual behavior is tested
+        // by HybridNavigatorTest; here we just verify the factory wires
+        // a usable instance.
+        nav.tick(NavRequest.byTrail("any", BehaviorMode.VARIED));
     }
 
     private static Navigator stubNavigator(String name)
