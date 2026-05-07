@@ -20,6 +20,7 @@ import net.runelite.client.plugins.recorder.nav.BehaviorMode;
 import net.runelite.client.plugins.recorder.nav.NavRequest;
 import net.runelite.client.plugins.recorder.nav.NavStatus;
 import net.runelite.client.plugins.recorder.nav.Navigator;
+import net.runelite.client.plugins.recorder.nav.NavigatorFactory;
 import net.runelite.client.plugins.recorder.trail.TrailRegistry;
 import net.runelite.client.sequence.dispatch.HumanizedInputDispatcher;
 import net.runelite.client.sequence.dispatch.SequenceSleep;
@@ -62,12 +63,16 @@ public final class ChickenFarmV3Script
     private final ClientThread clientThread;
     private final HumanizedInputDispatcher dispatcher;
     private final TrailRegistry registry;
-    private final Navigator nav;
+    private final NavigatorFactory navFactory;
     private final BankInteraction bank;
     private final ChickenCombatLoop combat;
     private final TrainingSession trainingSession;
     private final LogoutHelper logoutHelper;
     private volatile TrainingPlan trainingPlan;
+    /** Resolved at {@link #start()} from {@link #navFactory}, so flipping
+     *  the panel's V1/V2 selector is honored on the next Start. Held
+     *  for the duration of one run; null between runs. */
+    private volatile Navigator nav;
 
     private final AtomicReference<State> state = new AtomicReference<>(State.IDLE);
     private final AtomicReference<String> status = new AtomicReference<>("idle");
@@ -78,9 +83,9 @@ public final class ChickenFarmV3Script
     public ChickenFarmV3Script(Client client, ClientThread clientThread,
                                HumanizedInputDispatcher dispatcher,
                                TrailRegistry registry,
-                               Navigator nav)
+                               NavigatorFactory navFactory)
     {
-        this(client, clientThread, dispatcher, registry, null, nav);
+        this(client, clientThread, dispatcher, registry, null, navFactory);
     }
 
     /** Full ctor — passes the {@link net.runelite.client.eventbus.EventBus}
@@ -92,13 +97,13 @@ public final class ChickenFarmV3Script
                                TrailRegistry registry,
                                @javax.annotation.Nullable
                                net.runelite.client.eventbus.EventBus eventBus,
-                               Navigator nav)
+                               NavigatorFactory navFactory)
     {
         this.client = client;
         this.clientThread = clientThread;
         this.dispatcher = dispatcher;
         this.registry = registry;
-        this.nav = nav;
+        this.navFactory = navFactory;
         this.bank = new BankInteraction(client, clientThread, dispatcher);
         this.combat = new ChickenCombatLoop(dispatcher, client, clientThread, PEN_AREA, eventBus);
         this.trainingSession = new TrainingSession(client, clientThread, dispatcher, eventBus);
@@ -124,6 +129,11 @@ public final class ChickenFarmV3Script
     public void start()
     {
         if (!running.compareAndSet(false, true)) return;
+        // Resolve which Navigator implementation to drive on this run.
+        // Done at start() rather than ctor time so flipping the panel's
+        // V1/V2 selector between runs takes effect on the next Start
+        // without restarting the plugin.
+        nav = navFactory.getNavigator();
         // All startup work runs on the worker thread, never on the caller.
         // The Start Training button handler runs on the Swing EDT, and the
         // resume path calls onClient() which awaits a CountDownLatch on the

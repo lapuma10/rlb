@@ -32,7 +32,9 @@ public final class NavigatorFactory
         this(config, new TrailNavigator(walker, registry));
     }
 
-    NavigatorFactory(RecorderConfig config, Navigator trailV1)
+    /** Test-friendly ctor — bind a pre-built (or stubbed) V1 Navigator
+     *  directly. Production code uses the 3-arg ctor above. */
+    public NavigatorFactory(RecorderConfig config, Navigator trailV1)
     {
         this.config = config;
         this.trailV1 = trailV1;

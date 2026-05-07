@@ -8,9 +8,11 @@ import net.runelite.api.Skill;
 import net.runelite.client.callback.ClientThread;
 import net.runelite.client.plugins.recorder.combat.SkillTarget;
 import net.runelite.client.plugins.recorder.combat.TrainingPlan;
+import net.runelite.client.plugins.recorder.RecorderConfig;
 import net.runelite.client.plugins.recorder.nav.NavRequest;
 import net.runelite.client.plugins.recorder.nav.NavStatus;
 import net.runelite.client.plugins.recorder.nav.Navigator;
+import net.runelite.client.plugins.recorder.nav.NavigatorFactory;
 import net.runelite.client.plugins.recorder.trail.TrailRegistry;
 import net.runelite.client.sequence.dispatch.HumanizedInputDispatcher;
 import org.junit.Test;
@@ -29,7 +31,7 @@ public class ChickenFarmV3ScriptTest
         ChickenFarmV3Script s = new ChickenFarmV3Script(
             mock(Client.class), mock(ClientThread.class),
             mock(HumanizedInputDispatcher.class),
-            reg, idleNavigator());
+            reg, idleFactory());
         assertEquals(ChickenFarmV3Script.State.IDLE, s.state());
     }
 
@@ -56,7 +58,7 @@ public class ChickenFarmV3ScriptTest
         HumanizedInputDispatcher dispatcher = mock(HumanizedInputDispatcher.class);
         TrailRegistry reg = new TrailRegistry(Files.createTempDirectory("v3-logoff-test-"));
         ChickenFarmV3Script s = new ChickenFarmV3Script(
-            client, clientThread, dispatcher, reg, idleNavigator());
+            client, clientThread, dispatcher, reg, idleFactory());
         // Confirm LOGGING_OFF is a valid state.
         assertNotNull(ChickenFarmV3Script.State.valueOf("LOGGING_OFF"));
         // Confirm setTrainingPlan accepts a real plan without throwing.
@@ -69,14 +71,17 @@ public class ChickenFarmV3ScriptTest
         assertEquals(ChickenFarmV3Script.State.IDLE, s.state());
     }
 
-    private static Navigator idleNavigator()
+    private static NavigatorFactory idleFactory()
     {
-        return new Navigator()
+        Navigator idle = new Navigator()
         {
             @Override public NavStatus tick(NavRequest request) { return NavStatus.IDLE; }
             @Override public void cancel() { }
             @Override public boolean isBusy() { return false; }
             @Override public String name() { return "idle-stub"; }
         };
+        RecorderConfig cfg = mock(RecorderConfig.class);
+        when(cfg.navigatorImpl()).thenReturn(RecorderConfig.NavigatorImpl.TRAIL_V1);
+        return new NavigatorFactory(cfg, idle);
     }
 }

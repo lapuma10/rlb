@@ -296,7 +296,7 @@ public class RecorderPlugin extends Plugin
         net.runelite.client.plugins.recorder.scripts.ChickenFarmV3Script chickenFarmV3 =
             new net.runelite.client.plugins.recorder.scripts.ChickenFarmV3Script(
                 client, clientThread, v3Dispatcher, trailRegistry, eventBus,
-                v3NavFactory.getNavigator());
+                v3NavFactory);
         panel.setChickenFarmV3(chickenFarmV3);
 
         // Mining loop: separate dispatcher, independent busy flag from
