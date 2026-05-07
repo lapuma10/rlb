@@ -713,17 +713,18 @@ public class RecorderPlugin extends Plugin
      *  region + 8 neighbours.
      *
      *  <p>LOGGED_IN fires before the {@link Player} object is fully
-     *  populated — the next-LOGGED_IN-event retry that used to live
-     *  here was wrong, because the state stays LOGGED_IN so no second
-     *  event arrives. Poll instead: sleep 500ms × up to 20 tries
-     *  (10 s budget). If the player still isn't ready after that, give
-     *  up cleanly and reset the guard so a future state cycle can
-     *  retry. */
+     *  populated. Poll for the player location every 500ms, up to 20
+     *  attempts (10s budget). Reads MUST go through the client thread
+     *  — {@code Player.getWorldLocation()} asserts under {@code -ea}.
+     *
+     *  <p>If the player still isn't ready after the budget, give up
+     *  cleanly and reset the guard so a future LOGGED_IN cycle can
+     *  retry (e.g. on a logout/login). */
     private void runWorldMapBootstrap()
     {
-        Player self = client.getLocalPlayer();
+        net.runelite.api.coords.WorldPoint loc = playerLocOnClientThread();
         int attempts = 0;
-        while (self == null || self.getWorldLocation() == null)
+        while (loc == null)
         {
             if (attempts >= 20)
             {
@@ -739,15 +740,15 @@ public class RecorderPlugin extends Plugin
                 worldMapBootstrapped.set(false);
                 return;
             }
-            self = client.getLocalPlayer();
+            loc = playerLocOnClientThread();
             attempts++;
         }
         if (attempts > 0)
         {
             log.info("worldmap-bootstrap: player ready after {} retries", attempts);
         }
-        int rx = self.getWorldLocation().getX() >> 6;
-        int ry = self.getWorldLocation().getY() >> 6;
+        int rx = loc.getX() >> 6;
+        int ry = loc.getY() >> 6;
         log.info("worldmap-bootstrap: loading regions around ({}, {})", rx, ry);
         int regionsLoaded = 0;
         int sightingsLoaded = 0;
