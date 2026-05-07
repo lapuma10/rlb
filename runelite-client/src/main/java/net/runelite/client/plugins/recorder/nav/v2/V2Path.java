@@ -53,10 +53,21 @@ public final class V2Path
     }
 
     /** Stable hash over the leg sequence. Walk legs contribute their
-     *  start + end (not intermediate tiles); transport legs contribute
-     *  the {@link TransportEdge#key()}. SHA-1 hex truncated to 16 chars
-     *  — collision probability is negligible for the small route sets
-     *  V2 produces. */
+     *  start, midpoint, and end — each bucketed to a 4-tile grid so
+     *  small tile-level wiggle (noisy A* runs picking slightly
+     *  different diagonals) maps to the same routeId, but two
+     *  genuinely different corridors (e.g. north vs south of the
+     *  Lumby church) produce different routeIds because their
+     *  midpoints fall in different buckets. Transport legs contribute
+     *  the full {@link TransportEdge#key()}.
+     *
+     *  <p>Bucket size 4 was picked empirically for the chicken-pen
+     *  fixtures: two parallel corridors 3 tiles apart still bucket
+     *  apart (3210>>2 = 802, 3213>>2 = 803), while a 1-tile diagonal
+     *  noise variant of the same corridor stays in one bucket.
+     *
+     *  <p>SHA-1 hex truncated to 16 chars — collision probability is
+     *  negligible for the small route sets V2 produces. */
     private static String computeRouteId(List<V2Leg> legs)
     {
         StringBuilder sb = new StringBuilder();
@@ -65,7 +76,10 @@ public final class V2Path
             if (leg instanceof V2Leg.Walk w)
             {
                 sb.append("W|").append(w.regionId()).append('|');
-                sb.append(fingerprint(w.start())).append('-').append(fingerprint(w.end()));
+                WorldPoint mid = w.tiles().get(w.tiles().size() / 2);
+                sb.append(bucket(w.start())).append('-')
+                  .append(bucket(mid)).append('-')
+                  .append(bucket(w.end()));
             }
             else if (leg instanceof V2Leg.Transport t)
             {
@@ -89,9 +103,9 @@ public final class V2Path
         }
     }
 
-    private static String fingerprint(WorldPoint p)
+    private static String bucket(WorldPoint p)
     {
-        return p.getX() + "," + p.getY() + "," + p.getPlane();
+        return (p.getX() >> 2) + "," + (p.getY() >> 2) + "," + p.getPlane();
     }
 
     public static final V2Path EMPTY = new V2Path(List.of(), 0);

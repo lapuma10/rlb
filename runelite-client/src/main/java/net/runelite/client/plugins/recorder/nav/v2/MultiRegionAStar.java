@@ -167,14 +167,13 @@ public final class MultiRegionAStar
             (int) Math.round(gScore.get(goalKey)));
     }
 
-    /** Heuristic in milliunits (we use long math in the priority queue).
-     *  Chebyshev distance × 1000 + 0 plane penalty (transports pay their
-     *  own cost). */
-    private static long heuristic(WorldPoint a, WorldPoint b)
+    /** Chebyshev heuristic in tile units (the open queue's f is
+     *  computed as (g + h) × 1000 so this stays in plain units). */
+    private static int heuristic(WorldPoint a, WorldPoint b)
     {
         int dx = Math.abs(a.getX() - b.getX());
         int dy = Math.abs(a.getY() - b.getY());
-        return Math.max(dx, dy) * 1000L;
+        return Math.max(dx, dy);
     }
 
     /** Reconstruct the V2Path by walking back from goal via the parent

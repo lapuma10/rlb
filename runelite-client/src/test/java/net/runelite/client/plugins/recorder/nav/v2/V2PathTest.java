@@ -17,24 +17,35 @@ public class V2PathTest
     }
 
     @Test
-    public void routeId_differs_forDifferentLegs()
+    public void routeId_isStable_withinSameMidpointBucket()
     {
-        V2Path a = new V2Path(List.of(walkLeg()), 10);
-        V2Path b = new V2Path(List.of(walkLegAlt()), 10);
-        assertNotEquals(a.routeId(), b.routeId());
+        // Two routes between the same start + end whose midpoints fall
+        // in the same 4-tile bucket — should hash to the same id (noise
+        // variants of one macro corridor).
+        WorldPoint start = new WorldPoint(3208, 3213, 0);
+        WorldPoint end = new WorldPoint(3216, 3213, 0);
+        WorldPoint mid1 = new WorldPoint(3212, 3213, 0);   // bucket (803, 803)
+        WorldPoint mid2 = new WorldPoint(3213, 3213, 0);   // also bucket (803, 803)
+        V2Path a = new V2Path(List.of(new V2Leg.Walk(12850, List.of(start, mid1, end))), 1);
+        V2Path b = new V2Path(List.of(new V2Leg.Walk(12850, List.of(start, mid2, end))), 2);
+        assertEquals("midpoints in same bucket → same routeId",
+            a.routeId(), b.routeId());
     }
 
     @Test
-    public void routeId_ignores_intermediateTiles_keepsStartAndEnd()
+    public void routeId_differs_whenMidpointBucketsDiffer()
     {
-        WorldPoint a = new WorldPoint(3208, 3213, 0);
-        WorldPoint b = new WorldPoint(3209, 3213, 0);
-        WorldPoint c = new WorldPoint(3210, 3213, 0);
-        WorldPoint c2 = new WorldPoint(3210, 3213, 0);
-        V2Path direct = new V2Path(List.of(new V2Leg.Walk(12850, List.of(a, c))), 1);
-        V2Path detour = new V2Path(List.of(new V2Leg.Walk(12850, List.of(a, b, c2))), 2);
-        assertEquals("intermediate tiles do not change routeId",
-            direct.routeId(), detour.routeId());
+        // Two genuinely different corridors between the same endpoints —
+        // their midpoints are in different 4-tile buckets, so the
+        // routeIds must differ (top-K relies on this to dedup).
+        WorldPoint start = new WorldPoint(3208, 3213, 0);
+        WorldPoint end = new WorldPoint(3216, 3213, 0);
+        WorldPoint midNorth = new WorldPoint(3212, 3213, 0);   // bucket (803, 803)
+        WorldPoint midSouth = new WorldPoint(3212, 3210, 0);   // bucket (803, 802)
+        V2Path north = new V2Path(List.of(new V2Leg.Walk(12850, List.of(start, midNorth, end))), 8);
+        V2Path south = new V2Path(List.of(new V2Leg.Walk(12850, List.of(start, midSouth, end))), 14);
+        assertNotEquals("different macro corridor midpoints → different routeId",
+            north.routeId(), south.routeId());
     }
 
     @Test
@@ -66,13 +77,6 @@ public class V2PathTest
         return new V2Leg.Walk(12850, List.of(
             new WorldPoint(3208, 3213, 0),
             new WorldPoint(3209, 3213, 0)));
-    }
-
-    private static V2Leg.Walk walkLegAlt()
-    {
-        return new V2Leg.Walk(12850, List.of(
-            new WorldPoint(3208, 3213, 0),
-            new WorldPoint(3208, 3214, 0)));
     }
 
     private static TransportEdge staircase()
