@@ -97,6 +97,14 @@ public final class V2Executor
          *  decoration/door/ground-item — this is just the dynamic-
          *  blocker channel. */
         default boolean dynamicEntityOnTile(WorldPoint tile) { return false; }
+
+        /** Read-and-clear the dispatcher's last-error message. Returns
+         *  null when the previous chain succeeded. The executor uses
+         *  this to detect strict-walk rejections (the engine's menu
+         *  at the cursor pixel was not "Walk here" — overlapping tree,
+         *  ground-item, NPC, etc.) and pick a different tile on the
+         *  next tick instead of waiting for the stall cycle. */
+        @Nullable default String lastDispatchError() { return null; }
     }
 
     /** Ticks of zero progress before treating the leg as stalled and
@@ -109,6 +117,16 @@ public final class V2Executor
      *  Per spec lines 293-298: catch-up is a bounded recovery, not
      *  a per-cycle decoration. */
     public static final int MAX_CATCHUP_CLICKS_PER_LEG = 2;
+
+    /** Maximum consecutive strict-walk rejections (engine menu at the
+     *  click pixel was not "Walk here") per leg. Each rejection
+     *  blacklists the tile and the next pick chooses a different one;
+     *  if every alternate also gets rejected, we FAIL so the navigator
+     *  can replan. Bound is high enough to absorb a busy area where
+     *  several consecutive path tiles share an offending overlay
+     *  (e.g. cluster of trees), but low enough to surface a pathing
+     *  bug instead of looping forever. */
+    public static final int MAX_CLICK_REJECTS_PER_LEG = 5;
 
     /** Recent-filter window size for the modality bias decision. */
     private static final int FILTER_REJECT_WINDOW = 4;
@@ -124,6 +142,7 @@ public final class V2Executor
     @Nullable private V2Path path;
     private int legIdx;
     private int catchupClicksThisLeg;
+    private int clickRejectsThisLeg;
     private int ticksSinceProgress;
     @Nullable private WorldPoint lastPlayerLoc;
     @Nullable private WorldPoint lastDispatchedTile;
@@ -149,6 +168,7 @@ public final class V2Executor
         this.path = newPath;
         this.legIdx = 0;
         this.catchupClicksThisLeg = 0;
+        this.clickRejectsThisLeg = 0;
         this.ticksSinceProgress = 0;
         this.lastPlayerLoc = null;
         this.lastDispatchedTile = null;
@@ -204,6 +224,33 @@ public final class V2Executor
         // it out. Don't tick the stall counter while the dispatcher is
         // busy — the player legitimately hasn't started moving yet.
         if (env.dispatcherBusy()) return status;
+
+        // Strict-walk rejection? (engine menu at the click pixel wasn't
+        // "Walk here" — overlapping tree's "Chop down", a ground item,
+        // an NPC's "Attack", etc.). The dispatcher aborted without
+        // pressing and stashed the reason in lastError. Per the spec's
+        // HARD CONSTRAINT we MUST pick a different canvas tile, NOT
+        // wait for stall detection. Blacklist this tile for the leg so
+        // the next pick won't choose it again.
+        String lastErr = env.lastDispatchError();
+        if (lastErr != null && lastDispatchedTile != null && !lastDispatchWasMinimap)
+        {
+            log.info("v2-executor: click rejected at {} — \"{}\"; blacklisting + picking different tile",
+                lastDispatchedTile, lastErr);
+            classifier.blacklistTile(lastDispatchedTile);
+            clickRejectsThisLeg++;
+            lastDispatchedTile = null;
+            ticksSinceProgress = 0;   // not a stall — the click never landed
+            if (clickRejectsThisLeg >= MAX_CLICK_REJECTS_PER_LEG)
+            {
+                log.warn("v2-executor: {} consecutive strict-walk rejections — FAILED so navigator replans",
+                    clickRejectsThisLeg);
+                status = Status.FAILED;
+                return status;
+            }
+            // Fall through into the same tick's pick path so we choose
+            // a different tile right away (no wasted tick).
+        }
 
         // Update progress tracking AFTER the busy gate so each tick of
         // mid-walk silence doesn't get counted as a stall.

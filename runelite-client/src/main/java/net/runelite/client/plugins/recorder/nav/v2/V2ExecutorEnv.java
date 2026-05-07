@@ -110,6 +110,17 @@ public final class V2ExecutorEnv implements V2Executor.Env
     }
 
     @Override
+    @Nullable
+    public String lastDispatchError()
+    {
+        // dispatcher.lastErrorMessage() is read-and-clear by design.
+        // Calling it here every tick after the dispatcher settles
+        // means we either consume the message (and act on it) or it
+        // stays null until the next failed dispatch.
+        return dispatcher.lastErrorMessage();
+    }
+
+    @Override
     public long nowMs()
     {
         return System.currentTimeMillis();

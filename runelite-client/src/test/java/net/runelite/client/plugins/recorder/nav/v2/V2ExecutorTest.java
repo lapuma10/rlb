@@ -11,6 +11,7 @@ import javax.annotation.Nullable;
 import net.runelite.api.coords.WorldPoint;
 import org.junit.Test;
 import static org.junit.Assert.assertEquals;
+import static org.junit.Assert.assertNotEquals;
 import static org.junit.Assert.assertSame;
 import static org.junit.Assert.assertTrue;
 
@@ -28,6 +29,7 @@ public class V2ExecutorTest
         final Set<WorldPoint> dynamicEntities = new HashSet<>();  // NPC standing on tile
         final List<WorldPoint> walkDispatches = new ArrayList<>();
         final List<WorldPoint> minimapDispatches = new ArrayList<>();
+        @Nullable String pendingDispatchError;
 
         @Override @Nullable public WorldPoint playerLoc() { return player; }
         @Override public boolean isPlausiblyClean(WorldPoint t) { return !uncleanTiles.contains(t); }
@@ -52,6 +54,15 @@ public class V2ExecutorTest
         @Override public boolean snapshotSaysWalkable(WorldPoint t) { return true; }
         @Override public boolean liveCollisionAllows(WorldPoint t) { return !staticBlocked.contains(t); }
         @Override public boolean dynamicEntityOnTile(WorldPoint t) { return dynamicEntities.contains(t); }
+
+        @Override
+        @Nullable
+        public String lastDispatchError()
+        {
+            String e = pendingDispatchError;
+            pendingDispatchError = null;
+            return e;
+        }
     }
 
     private static V2Path eastPath(int n)
@@ -301,6 +312,58 @@ public class V2ExecutorTest
             env.walkDispatches.size() >= 2);
         assertEquals("status remains RUNNING during dynamic-blocker recovery",
             V2Executor.Status.RUNNING, x.status());
+    }
+
+    @Test
+    public void tick_strictWalkRejection_blacklistsTile_andPicksDifferentSameTick()
+    {
+        // The dispatcher rejected the press because the engine menu at
+        // the click pixel said "Chop down" (tree overlay covering the
+        // path tile). V2 must NOT wait for stall — it must blacklist
+        // the rejected tile and dispatch a different tile this same
+        // tick.
+        FakeEnv env = new FakeEnv();
+        env.player = new WorldPoint(3208, 3217, 0);
+        V2Executor x = newExecutor(env);
+        V2Path p = eastPath(20);
+        x.setPath(p);
+        x.tick();
+        assertTrue(env.walkDispatches.size() >= 1);
+        WorldPoint rejectedTile = env.walkDispatches.get(0);
+
+        // Dispatcher chain finished, pre-press abort set lastError.
+        env.busy = false;
+        env.pendingDispatchError = "strict-walk: menu was 'Chop down Tree' — caller must pick a different tile";
+
+        x.tick();
+
+        // Same tick must produce a NEW dispatch (not wait, not catch-up).
+        assertEquals("rejection must not block forward progress",
+            2, env.walkDispatches.size());
+        WorldPoint replacement = env.walkDispatches.get(1);
+        assertNotEquals("replacement tile must differ from the rejected one",
+            rejectedTile, replacement);
+    }
+
+    @Test
+    public void tick_repeatedRejections_eventuallyFails_forNavigatorReplan()
+    {
+        // Cluster of trees: every consecutive canvas pick is rejected
+        // by isLeftClickWalk. Bound at MAX_CLICK_REJECTS_PER_LEG so
+        // the navigator can replan instead of looping.
+        FakeEnv env = new FakeEnv();
+        env.player = new WorldPoint(3208, 3217, 0);
+        V2Executor x = newExecutor(env);
+        x.setPath(eastPath(40));
+        x.tick();   // initial dispatch
+        for (int i = 0; i < V2Executor.MAX_CLICK_REJECTS_PER_LEG + 1; i++)
+        {
+            env.busy = false;
+            env.pendingDispatchError = "strict-walk: menu was 'Chop down Tree'";
+            x.tick();
+        }
+        assertEquals("after MAX_CLICK_REJECTS_PER_LEG consecutive rejections, FAILED",
+            V2Executor.Status.FAILED, x.status());
     }
 
     @Test

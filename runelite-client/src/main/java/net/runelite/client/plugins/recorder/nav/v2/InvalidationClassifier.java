@@ -129,6 +129,18 @@ public final class InvalidationClassifier
         return blacklist.contains(tile);
     }
 
+    /** Add a tile to the attempt-local blacklist directly, bypassing
+     *  the {@link #classify} flow. Used for failures where the cause
+     *  is already known and a {@link FailureContext} would be made-up
+     *  data — e.g. the dispatcher rejecting a press because
+     *  {@code isLeftClickWalk} reported a non-walk top verb (tree
+     *  "Chop down" overlay covering the cursor pixel). */
+    public void blacklistTile(WorldPoint tile)
+    {
+        if (tile == null) return;
+        blacklist.add(tile);
+    }
+
     /** True if the tile has a non-expired transient penalty. */
     public boolean hasTransientPenalty(WorldPoint tile)
     {
