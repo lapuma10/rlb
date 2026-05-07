@@ -243,7 +243,14 @@ public final class InspectionDumper
     /** Phase 4 plan path. Calls the live {@link
      *  net.runelite.client.plugins.recorder.nav.v2.MultiRegionAStar}
      *  and writes a spec-shaped dump (regionsTouched + transportEdgesUsed
-     *  populated when applicable). */
+     *  populated when applicable).
+     *
+     *  <p>The inspection panel deliberately uses raw A* (a single
+     *  deterministic shortest path) rather than {@code V2Planner} so the
+     *  dumps are easy to diff across runs and the inspect button doesn't
+     *  perturb the live {@code RouteHistory}. Top-K alternation +
+     *  weighted-random + recent-route penalty live in {@code V2Planner}
+     *  and are exercised by the executor wired in Phase 5. */
     private PlanOutcome planViaMultiRegion(WorldPoint from, WorldPoint to,
                                             int fromRegion, int toRegion, JsonObject root)
     {
