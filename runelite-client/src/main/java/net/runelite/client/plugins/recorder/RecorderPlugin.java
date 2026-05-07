@@ -441,7 +441,8 @@ public class RecorderPlugin extends Plugin
             = new net.runelite.client.plugins.recorder.nav.v2.RouteHistory();
         net.runelite.client.plugins.recorder.nav.v2.V2Planner sharedV2Planner
             = new net.runelite.client.plugins.recorder.nav.v2.V2Planner(
-                worldMapStore, transportIndex, wmConfig, v2RouteHistory);
+                worldMapStore, transportIndex, wmConfig, v2RouteHistory,
+                config::enableV2RouteVariation);
 
         // Chicken farm V3 — Navigator-driven outer FSM. Each script that
         // opts into V2 carries its own dispatcher (no busy-flag contention)
@@ -471,6 +472,14 @@ public class RecorderPlugin extends Plugin
         eventBus.register(worldMapMinimapOverlay);
         panel.setInspectionDumper(inspectionDumper,
             net.runelite.client.plugins.recorder.worldmap.WorldMapMinimapOverlay::clearActiveRoute);
+
+        // Phase 8 readiness service — shared across the panel buttons.
+        // Built once here so it can sit beside V2Planner and read live
+        // world memory without any per-script wiring.
+        net.runelite.client.plugins.recorder.nav.v2.RouteReadiness routeReadiness =
+            new net.runelite.client.plugins.recorder.nav.v2.RouteReadiness(
+                worldMapStore, transportIndex, sharedV2Planner);
+        panel.setRouteReadiness(routeReadiness);
 
         BufferedImage icon = ImageUtil.loadImageResource(getClass(), "/util/reset.png");
         navButton = NavigationButton.builder()
@@ -539,7 +548,7 @@ public class RecorderPlugin extends Plugin
             = new net.runelite.client.plugins.recorder.nav.v2.V2Executor(
                 env, picker, classifier, new java.util.Random());
         return new net.runelite.client.plugins.recorder.nav.v2.V2Navigator(
-            planner, executor, () -> playerLocOnClientThread());
+            planner, executor, () -> playerLocOnClientThread(), worldEntityIndex);
     }
 
     /** Synchronous client-thread read of the local player's world

@@ -144,6 +144,150 @@ public final class InspectionDumper
         return write("entities-" + nowStamp() + ".json", root);
     }
 
+    /** Dump per-row corridor analysis between {@code from} and {@code to}.
+     *  Used to debug "V2 says NO_ROUTE": each y-row reports its x range,
+     *  count of known tiles, count reachable from start, blocked-edge
+     *  count, and the region IDs the row touches. The user can scan
+     *  the output and see exactly where the corridor breaks.
+     *
+     *  <p>Shape:
+     *  <pre>{@code
+     *  {
+     *    "schema": 1,
+     *    "from": {x,y,plane},
+     *    "to":   {x,y,plane},
+     *    "summary": {
+     *      "rows": 17, "knownTiles": 280, "reachable": 90,
+     *      "blockedEdges": 14, "regions": [12850],
+     *      "firstBreakReason": "COLLISION_BLOCKED"
+     *    },
+     *    "rows": [
+     *      {"y": 3217, "xMin": 3204, "xMax": 3220, "knownTiles": 17, "reachable": 12,
+     *       "blockedEdges": 0, "regions": [12850]},
+     *      ...
+     *    ]
+     *  }
+     *  }</pre>
+     *
+     *  <p>Lives next to {@link #planAToB} so the user can run readiness
+     *  + corridor dump from one panel section. */
+    public File dumpCorridor(net.runelite.client.plugins.recorder.nav.v2.RouteReadiness readiness,
+                             WorldPoint from, WorldPoint to)
+    {
+        JsonObject root = new JsonObject();
+        root.addProperty("schema", SCHEMA_V1);
+        root.addProperty("dumpedAt", System.currentTimeMillis());
+        root.add("from", worldPointJson(from));
+        root.add("to", worldPointJson(to));
+
+        net.runelite.client.plugins.recorder.nav.v2.RouteReadiness.Report rep =
+            readiness.check(from, to);
+        root.addProperty("firstBreakReason", rep.firstBreakReason().name());
+        root.addProperty("canPlan", rep.canPlan());
+        root.addProperty("knownTilesInBbox", rep.knownTilesInBbox());
+        root.addProperty("reachableFromStart", rep.reachableFromStart());
+
+        java.util.Map<Integer, net.runelite.client.plugins.recorder.nav.v2.RouteReadiness.RowAnalysis> rows
+            = readiness.analyzeCorridor(from, to);
+
+        JsonArray rowArr = new JsonArray();
+        int totalKnown = 0, totalReach = 0, totalBlocked = 0;
+        Set<Integer> allRegions = new TreeSet<>();
+        // y ascending so the dump reads top-to-bottom on a printed map.
+        java.util.List<Integer> ys = new ArrayList<>(rows.keySet());
+        java.util.Collections.sort(ys);
+        for (Integer y : ys)
+        {
+            net.runelite.client.plugins.recorder.nav.v2.RouteReadiness.RowAnalysis row = rows.get(y);
+            JsonObject rj = new JsonObject();
+            rj.addProperty("y", row.y());
+            rj.addProperty("xMin", row.xMin());
+            rj.addProperty("xMax", row.xMax());
+            rj.addProperty("knownTiles", row.knownTileCount());
+            rj.addProperty("reachable", row.reachableFromStartCount());
+            rj.addProperty("blockedEdges", row.blockedEdgeCount());
+            JsonArray rg = new JsonArray();
+            for (Integer rid : row.regionIds()) rg.add(rid);
+            rj.add("regions", rg);
+            rowArr.add(rj);
+            totalKnown += row.knownTileCount();
+            totalReach += row.reachableFromStartCount();
+            totalBlocked += row.blockedEdgeCount();
+            allRegions.addAll(row.regionIds());
+        }
+
+        JsonObject summary = new JsonObject();
+        summary.addProperty("rows", rowArr.size());
+        summary.addProperty("knownTiles", totalKnown);
+        summary.addProperty("reachable", totalReach);
+        summary.addProperty("blockedEdges", totalBlocked);
+        summary.addProperty("firstBreakReason", rep.firstBreakReason().name());
+        JsonArray rgAll = new JsonArray();
+        for (Integer rid : allRegions) rgAll.add(rid);
+        summary.add("regions", rgAll);
+        root.add("summary", summary);
+        root.add("rows", rowArr);
+
+        String name = "corridor-"
+            + from.getX() + "x" + from.getY() + "p" + from.getPlane()
+            + "-to-"
+            + to.getX() + "x" + to.getY() + "p" + to.getPlane()
+            + "-" + nowStamp() + ".json";
+        return write(name, root);
+    }
+
+    /** Dump a readiness report alone (no per-row corridor breakdown).
+     *  Smaller payload than {@link #dumpCorridor} — meant for quick
+     *  yes/no checks. */
+    public File dumpReadiness(net.runelite.client.plugins.recorder.nav.v2.RouteReadiness readiness,
+                              WorldPoint from, WorldPoint to, String label)
+    {
+        JsonObject root = new JsonObject();
+        root.addProperty("schema", SCHEMA_V1);
+        root.addProperty("dumpedAt", System.currentTimeMillis());
+        if (label != null) root.addProperty("label", label);
+        root.add("from", worldPointJson(from));
+        root.add("to", worldPointJson(to));
+
+        net.runelite.client.plugins.recorder.nav.v2.RouteReadiness.Report rep =
+            readiness.check(from, to);
+        root.addProperty("fromWalkable", rep.fromWalkable());
+        root.addProperty("toWalkable", rep.toWalkable());
+        root.addProperty("fromRegion", rep.fromRegion());
+        root.addProperty("toRegion", rep.toRegion());
+        JsonArray loaded = new JsonArray();
+        for (Integer rid : rep.loadedRegionIds()) loaded.add(rid);
+        root.add("loadedRegions", loaded);
+        JsonArray missing = new JsonArray();
+        for (Integer rid : rep.missingRegionIds()) missing.add(rid);
+        root.add("missingRegions", missing);
+        root.addProperty("knownTilesInBbox", rep.knownTilesInBbox());
+        root.addProperty("reachableFromStart", rep.reachableFromStart());
+        if (rep.lastReachableFromStart() != null)
+            root.add("lastReachableFromStart", worldPointJson(rep.lastReachableFromStart()));
+        if (rep.nearestKnownToTarget() != null)
+            root.add("nearestKnownToTarget", worldPointJson(rep.nearestKnownToTarget()));
+        root.addProperty("firstBreakReason", rep.firstBreakReason().name());
+        if (rep.collisionDetail() != null)
+        {
+            JsonObject cd = new JsonObject();
+            cd.add("a", worldPointJson(rep.collisionDetail().a()));
+            cd.add("b", worldPointJson(rep.collisionDetail().b()));
+            cd.addProperty("movementFlags", rep.collisionDetail().movementFlags());
+            cd.addProperty("dx", rep.collisionDetail().dx());
+            cd.addProperty("dy", rep.collisionDetail().dy());
+            root.add("collisionDetail", cd);
+        }
+        root.addProperty("canPlan", rep.canPlan());
+        if (rep.plannerDiagnostic() != null) root.addProperty("plannerDiagnostic", rep.plannerDiagnostic());
+        root.addProperty("transportRequired", rep.transportRequired());
+        root.addProperty("transportEdgesAvailable", rep.transportEdgesAvailable());
+
+        String slug = label == null ? "readiness" : "readiness-" + label.replaceAll("[^A-Za-z0-9_-]", "_");
+        String name = slug + "-" + nowStamp() + ".json";
+        return write(name, root);
+    }
+
     /** Plans a route between {@code from} and {@code to} for the
      *  inspection panel. When a {@link MultiRegionAStar} is wired
      *  (Phase 4+), delegates to it for all routes — including

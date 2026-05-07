@@ -159,16 +159,50 @@ public final class RecorderPanel extends PluginPanel
     private RouteOverlay routeOverlay;
     private net.runelite.client.plugins.recorder.inspector.ClickInspector clickInspector;
     private net.runelite.client.plugins.recorder.worldmap.InspectionDumper inspectionDumper;
+    private net.runelite.client.plugins.recorder.nav.v2.RouteReadiness routeReadiness;
     private Runnable v2OverlayClearAction;
     private final JButton v2DumpRegionBtn = new JButton("Dump current region");
     private final JButton v2DumpNearbyBtn = new JButton("Dump nearby regions");
     private final JButton v2DumpTransportsBtn = new JButton("Dump transport graph");
     private final JButton v2DumpEntitiesBtn = new JButton("Dump entity sightings");
     private final JButton v2PlanAToBBtn = new JButton("Plan A→B");
+    private final JButton v2ReadinessBtn = new JButton("Check V2 readiness (A→B)");
+    private final JButton v2DumpCorridorBtn = new JButton("Dump corridor (A→B)");
     private final JButton v2ClearOverlayRouteBtn = new JButton("Clear debug overlay route");
     private final JTextField v2PlanFromField = new JTextField(10);
     private final JTextField v2PlanToField = new JTextField(10);
     private final JLabel v2InspectStatusLabel = new JLabel(" ");
+    /** Named A↔B presets used by the V2 readiness/dump panel. Each entry
+     *  defines a label + from/to coords for one route shoulder; selecting
+     *  a preset fills the From/To text fields so the user can run
+     *  readiness, corridor dump, or Plan A→B without typing coordinates.
+     *  Anchors are plane-0 entry tiles (V2 round-1 cannot drive transport
+     *  legs, so plane-0 endpoints surface real corridor data). */
+    private static final java.util.List<RoutePreset> V2_PRESETS = java.util.List.of(
+        new RoutePreset("Lumby bank → pen (north)",
+            new WorldPoint(3208, 3220, 0), new WorldPoint(3236, 3294, 0)),
+        new RoutePreset("Pen → Lumby bank (north)",
+            new WorldPoint(3236, 3294, 0), new WorldPoint(3208, 3220, 0)),
+        new RoutePreset("Lumby bank → pen (south)",
+            new WorldPoint(3208, 3220, 0), new WorldPoint(3232, 3289, 0)),
+        new RoutePreset("Pen → Lumby bank (south)",
+            new WorldPoint(3232, 3289, 0), new WorldPoint(3208, 3220, 0)),
+        new RoutePreset("Lumby → Draynor",
+            new WorldPoint(3221, 3219, 0), new WorldPoint(3092, 3245, 0)),
+        new RoutePreset("Draynor → Lumby",
+            new WorldPoint(3092, 3245, 0), new WorldPoint(3221, 3219, 0)),
+        new RoutePreset("Lumby → GE",
+            new WorldPoint(3221, 3219, 0), new WorldPoint(3164, 3486, 0)),
+        new RoutePreset("GE → Lumby",
+            new WorldPoint(3164, 3486, 0), new WorldPoint(3221, 3219, 0)));
+    private final JComboBox<RoutePreset> v2PresetCombo = new JComboBox<>(V2_PRESETS.toArray(new RoutePreset[0]));
+    private final JButton v2PresetApplyBtn = new JButton("Apply preset");
+
+    /** Named (label, from, to) triple for the V2 readiness preset combo box. */
+    private record RoutePreset(String label, WorldPoint from, WorldPoint to)
+    {
+        @Override public String toString() { return label; }
+    }
     private final javax.swing.JCheckBox clickInspectorCb =
         new javax.swing.JCheckBox("Click Inspector");
     private final javax.swing.JCheckBox worldMemoryPlannerCb =
@@ -1302,7 +1336,19 @@ public final class RecorderPanel extends PluginPanel
         planRow2.add(new JLabel("To:"), BorderLayout.WEST);
         planRow2.add(v2PlanToField, BorderLayout.CENTER);
         p.add(planRow2);
+
+        // Preset row: drop-down + Apply. Selecting + clicking Apply fills
+        // From/To. Keeps the readiness UI flat — same fields drive Plan,
+        // Readiness, Corridor.
+        JPanel presetRow = new JPanel(new BorderLayout(4, 4));
+        presetRow.add(new JLabel("Preset:"), BorderLayout.WEST);
+        presetRow.add(v2PresetCombo, BorderLayout.CENTER);
+        presetRow.add(v2PresetApplyBtn, BorderLayout.EAST);
+        p.add(presetRow);
+
         p.add(v2PlanAToBBtn);
+        p.add(v2ReadinessBtn);
+        p.add(v2DumpCorridorBtn);
 
         p.add(Box.createVerticalStrut(8));
         p.add(v2ClearOverlayRouteBtn);
@@ -1415,6 +1461,85 @@ public final class RecorderPanel extends PluginPanel
             v2InspectStatusLabel.setText(
                 "<html>Overlay not registered yet (Phase 3.3).</html>");
         }
+    }
+
+    private void onV2ApplyPreset()
+    {
+        RoutePreset preset = (RoutePreset) v2PresetCombo.getSelectedItem();
+        if (preset == null) return;
+        v2PlanFromField.setText(preset.from().getX() + "," + preset.from().getY()
+            + "," + preset.from().getPlane());
+        v2PlanToField.setText(preset.to().getX() + "," + preset.to().getY()
+            + "," + preset.to().getPlane());
+        v2InspectStatusLabel.setText("<html>Preset \"" + preset.label() + "\" applied.</html>");
+    }
+
+    private void onV2Readiness()
+    {
+        if (routeReadiness == null || inspectionDumper == null) return;
+        WorldPoint from = parseWorldPoint(v2PlanFromField.getText());
+        WorldPoint to = parseWorldPoint(v2PlanToField.getText());
+        if (from == null || to == null)
+        {
+            v2InspectStatusLabel.setText("Readiness: enter x,y,plane in From and To");
+            return;
+        }
+        // Use the selected preset's label if From/To match it; otherwise
+        // synthesize one from the coordinates.
+        RoutePreset selected = (RoutePreset) v2PresetCombo.getSelectedItem();
+        String label = (selected != null && selected.from().equals(from) && selected.to().equals(to))
+            ? selected.label() : "custom";
+        Thread t = new Thread(() ->
+        {
+            String msg;
+            try
+            {
+                java.io.File out = inspectionDumper.dumpReadiness(routeReadiness, from, to, label);
+                net.runelite.client.plugins.recorder.nav.v2.RouteReadiness.Report rep
+                    = routeReadiness.check(from, to);
+                msg = "Readiness " + label + " " + rep.summary()
+                    + " → " + out.getAbsolutePath();
+            }
+            catch (RuntimeException ex)
+            {
+                msg = "Readiness " + label + " failed: " + ex.getMessage();
+            }
+            final String finalMsg = msg;
+            SwingUtilities.invokeLater(() ->
+                v2InspectStatusLabel.setText("<html>" + finalMsg + "</html>"));
+        }, "v2-readiness");
+        t.setDaemon(true);
+        t.start();
+    }
+
+    private void onV2DumpCorridor()
+    {
+        if (routeReadiness == null || inspectionDumper == null) return;
+        WorldPoint from = parseWorldPoint(v2PlanFromField.getText());
+        WorldPoint to = parseWorldPoint(v2PlanToField.getText());
+        if (from == null || to == null)
+        {
+            v2InspectStatusLabel.setText("Corridor dump: enter x,y,plane in From and To");
+            return;
+        }
+        Thread t = new Thread(() ->
+        {
+            String msg;
+            try
+            {
+                java.io.File out = inspectionDumper.dumpCorridor(routeReadiness, from, to);
+                msg = "Corridor dump → " + out.getAbsolutePath();
+            }
+            catch (RuntimeException ex)
+            {
+                msg = "Corridor dump failed: " + ex.getMessage();
+            }
+            final String finalMsg = msg;
+            SwingUtilities.invokeLater(() ->
+                v2InspectStatusLabel.setText("<html>" + finalMsg + "</html>"));
+        }, "v2-corridor-dump");
+        t.setDaemon(true);
+        t.start();
     }
 
     /** Run a dump on a worker thread; update the status label on the EDT
@@ -2449,8 +2574,21 @@ public final class RecorderPanel extends PluginPanel
             v2DumpTransportsBtn.addActionListener(e -> onV2DumpTransports());
             v2DumpEntitiesBtn.addActionListener(e -> onV2DumpEntities());
             v2PlanAToBBtn.addActionListener(e -> onV2PlanAToB());
+            v2ReadinessBtn.addActionListener(e -> onV2Readiness());
+            v2DumpCorridorBtn.addActionListener(e -> onV2DumpCorridor());
+            v2PresetApplyBtn.addActionListener(e -> onV2ApplyPreset());
             v2ClearOverlayRouteBtn.addActionListener(e -> onV2ClearOverlayRoute());
         }
+    }
+
+    /** Wire the V2 readiness service. The plugin constructs a single
+     *  {@link net.runelite.client.plugins.recorder.nav.v2.RouteReadiness}
+     *  alongside V2Planner and hands it here. The panel uses it for the
+     *  "Check V2 readiness" + "Dump corridor" buttons; if it is never
+     *  wired, those buttons fail with a status-label message. */
+    public void setRouteReadiness(net.runelite.client.plugins.recorder.nav.v2.RouteReadiness readiness)
+    {
+        this.routeReadiness = readiness;
     }
 
     private void onCookV2Start()

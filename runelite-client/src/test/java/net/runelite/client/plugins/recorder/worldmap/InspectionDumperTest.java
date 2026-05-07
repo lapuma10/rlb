@@ -303,6 +303,78 @@ public class InspectionDumperTest
             outcome.summary().toLowerCase().contains("no route"));
     }
 
+    @Test
+    public void dumpCorridor_writesPerRowAnalysis() throws IOException
+    {
+        Path tmp = Files.createTempDirectory("inspect-corridor-");
+        WorldMemoryConfig wmConfig = new WorldMemoryConfig();
+        MapStore store = new MapStore(wmConfig);
+        int regionId = 12850;
+        java.util.List<WorldMemoryFixtures.TileSpec> tiles = new java.util.ArrayList<>();
+        for (int x = 3204; x <= 3220; x++)
+            for (int y = 3213; y <= 3221; y++)
+                tiles.add(WorldMemoryFixtures.walkable(x, y, 0));
+        WorldMemoryFixtures.installRegion(store, regionId, tiles);
+        TransportIndex transports = new TransportIndex();
+        net.runelite.client.plugins.recorder.nav.v2.V2Planner planner =
+            new net.runelite.client.plugins.recorder.nav.v2.V2Planner(store, transports, wmConfig,
+                new net.runelite.client.plugins.recorder.nav.v2.RouteHistory());
+        net.runelite.client.plugins.recorder.nav.v2.RouteReadiness readiness =
+            new net.runelite.client.plugins.recorder.nav.v2.RouteReadiness(store, transports, planner);
+
+        InspectionDumper dumper = new InspectionDumper(store, new EntityIndex(),
+            transports, wmConfig, tmp.toFile());
+        File out = dumper.dumpCorridor(readiness,
+            new WorldPoint(3208, 3217, 0),
+            new WorldPoint(3216, 3217, 0));
+
+        assertTrue("corridor dump file written", out.exists());
+        JsonObject root = readJson(out);
+        assertTrue("dump has summary", root.has("summary"));
+        assertTrue("dump has rows array", root.has("rows") && root.get("rows").isJsonArray());
+        JsonArray rows = root.getAsJsonArray("rows");
+        assertTrue("at least one row recorded", rows.size() >= 1);
+        for (JsonElement el : rows)
+        {
+            JsonObject row = el.getAsJsonObject();
+            assertTrue(row.has("y"));
+            assertTrue(row.has("knownTiles"));
+            assertTrue(row.has("reachable"));
+            assertTrue(row.has("blockedEdges"));
+            assertTrue(row.has("regions"));
+        }
+    }
+
+    @Test
+    public void dumpReadiness_writesReadinessFields() throws IOException
+    {
+        Path tmp = Files.createTempDirectory("inspect-readiness-");
+        WorldMemoryConfig wmConfig = new WorldMemoryConfig();
+        MapStore store = new MapStore(wmConfig);
+        TransportIndex transports = new TransportIndex();
+        net.runelite.client.plugins.recorder.nav.v2.V2Planner planner =
+            new net.runelite.client.plugins.recorder.nav.v2.V2Planner(store, transports, wmConfig,
+                new net.runelite.client.plugins.recorder.nav.v2.RouteHistory());
+        net.runelite.client.plugins.recorder.nav.v2.RouteReadiness readiness =
+            new net.runelite.client.plugins.recorder.nav.v2.RouteReadiness(store, transports, planner);
+
+        InspectionDumper dumper = new InspectionDumper(store, new EntityIndex(),
+            transports, wmConfig, tmp.toFile());
+        File out = dumper.dumpReadiness(readiness,
+            new WorldPoint(3208, 3217, 0),
+            new WorldPoint(3216, 3217, 0),
+            "bank-to-pen");
+
+        assertTrue(out.exists());
+        assertTrue("file name reflects label",
+            out.getName().contains("bank-to-pen"));
+        JsonObject root = readJson(out);
+        assertEquals("bank-to-pen", root.get("label").getAsString());
+        assertTrue("readiness fields present",
+            root.has("fromWalkable") && root.has("toWalkable")
+            && root.has("firstBreakReason") && root.has("canPlan"));
+    }
+
     private static JsonObject readJson(File f) throws IOException
     {
         return JsonParser.parseString(Files.readString(f.toPath())).getAsJsonObject();
