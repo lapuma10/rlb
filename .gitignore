@@ -40,3 +40,6 @@ bin/
 
 ### Claude Code ###
 .claude/worktrees/
+
+### Docker seed caches (regenerated from ~/.runelite/) ###
+/seed/

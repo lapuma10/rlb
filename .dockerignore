@@ -1,0 +1,19 @@
+# Keep the docker build context tiny: send only the files COPY'd in
+# the Dockerfile, not the whole repo.
+
+# Default: ignore everything
+*
+
+# Re-include only what we actually copy
+!entrypoint.sh
+!seed/
+
+# Walk the path to the built jar (parent dirs must be un-ignored too
+# for the file pattern to match)
+!runelite-client
+runelite-client/*
+!runelite-client/build
+runelite-client/build/*
+!runelite-client/build/libs
+runelite-client/build/libs/*
+!runelite-client/build/libs/client-*-shaded.jar

@@ -314,19 +314,26 @@ public final class AccountLauncher
         String finalName = name;
         String finalId   = id;
 
-        // Inject --insecure-write-credentials into launcher settings.json AND
-        // into the system env via launchctl so Jagex Launcher's child processes see it.
+        // Inject --insecure-write-credentials into launcher settings.json so
+        // the Jagex Launcher writes plaintext creds we can capture.
         try { injectLauncherFlag(INSECURE_FLAG); }
         catch (IOException ex)
         {
             setStatus("Could not update launcher settings: " + ex.getMessage());
             return;
         }
+
+        // Snapshot host's current ACTIVE_CREDS bytes so we can restore them
+        // after capture — adding a Jagex account must not change which
+        // account host's RuneLite would auto-launch into next time.
+        byte[] credsSnapshot = null;
         try
         {
-            new ProcessBuilder("launchctl", "setenv", "RUNELITE_ARGS", INSECURE_FLAG).start().waitFor();
+            if (Files.exists(AccountStore.ACTIVE_CREDS))
+                credsSnapshot = Files.readAllBytes(AccountStore.ACTIVE_CREDS);
         }
-        catch (Exception ignored) {}
+        catch (IOException ignored) {}
+        final byte[] fCredsSnapshot = credsSnapshot;
 
         // Snapshot current mtime so we detect when a FRESH file is written.
         long baseMtime = 0L;
@@ -338,9 +345,14 @@ public final class AccountLauncher
         catch (IOException ignored) {}
         long fBase = baseMtime;
 
-        // Open Jagex Launcher so the user only needs to click Play
-        try { new ProcessBuilder("open", "-a", "Jagex Launcher").start(); }
-        catch (IOException ignored) {}
+        // Launch Jagex Launcher (OS-specific — see launchJagexLauncher).
+        try { launchJagexLauncher(); }
+        catch (Exception ex)
+        {
+            setStatus("Could not launch Jagex Launcher: " + ex.getMessage());
+            cleanupInsecureFlag();
+            return;
+        }
 
         // ---- waiting dialog ----
         JDialog dlg = new JDialog(frame, "Add Jagex Account — " + finalName, true);
@@ -390,8 +402,21 @@ public final class AccountLauncher
                 long mtime = Files.getLastModifiedTime(AccountStore.ACTIVE_CREDS).toMillis();
                 if (mtime <= fBase) return;
 
-                // Fresh credentials written — save, register, clean flag
+                // Fresh credentials written — save to per-account dir,
+                // restore host's pre-capture state, register, clean flag.
                 AccountStore.saveCredentials(finalId, AccountStore.ACTIVE_CREDS);
+
+                // Restore (or remove) ACTIVE_CREDS so host's next launch
+                // picks the same account it would have before the capture.
+                try
+                {
+                    if (fCredsSnapshot != null)
+                        Files.write(AccountStore.ACTIVE_CREDS, fCredsSnapshot);
+                    else
+                        Files.deleteIfExists(AccountStore.ACTIVE_CREDS);
+                }
+                catch (IOException ignored) {}
+
                 List<AccountStore.AccountEntry> list = AccountStore.load();
                 list.add(new AccountStore.AccountEntry(finalId, finalName, true));
                 AccountStore.save(list);
@@ -461,8 +486,57 @@ public final class AccountLauncher
     private static void cleanupInsecureFlag()
     {
         try { removeLauncherFlag(INSECURE_FLAG); } catch (IOException ignored) {}
-        try { new ProcessBuilder("launchctl", "unsetenv", "RUNELITE_ARGS").start().waitFor(); }
-        catch (Exception ignored) {}
+        if (isMac())
+        {
+            try { new ProcessBuilder("launchctl", "unsetenv", "RUNELITE_ARGS").start().waitFor(); }
+            catch (Exception ignored) {}
+        }
+        // On Linux the env var is scoped to the wine ProcessBuilder we
+        // started, so it dies with that process — no system-level cleanup.
+    }
+
+    private static boolean isMac()
+    {
+        return System.getProperty("os.name").toLowerCase().contains("mac");
+    }
+
+    private static boolean isLinux()
+    {
+        return System.getProperty("os.name").toLowerCase().contains("linux");
+    }
+
+    /**
+     * Launch the Jagex Launcher with --insecure-write-credentials in scope.
+     * Mac uses the bundled .app via {@code open -a}, with launchctl setting
+     * RUNELITE_ARGS so the launchd-spawned child can see it. Linux uses Wine
+     * and inherits the env directly via {@link ProcessBuilder#environment()}.
+     * The Wine path is taken from JAGEX_LAUNCHER_EXE — the rlb-capture
+     * container bakes the .exe in and points this at it.
+     */
+    private static void launchJagexLauncher() throws IOException, InterruptedException
+    {
+        if (isMac())
+        {
+            new ProcessBuilder("launchctl", "setenv", "RUNELITE_ARGS", INSECURE_FLAG)
+                .start().waitFor();
+            new ProcessBuilder("open", "-a", "Jagex Launcher").start();
+            return;
+        }
+        if (isLinux())
+        {
+            String exe = System.getenv("JAGEX_LAUNCHER_EXE");
+            if (exe == null || exe.isBlank())
+            {
+                throw new IOException("JAGEX_LAUNCHER_EXE env var not set — " +
+                    "running outside the rlb-capture container?");
+            }
+            ProcessBuilder pb = new ProcessBuilder("wine", exe);
+            pb.environment().put("RUNELITE_ARGS", INSECURE_FLAG);
+            pb.inheritIO();
+            pb.start();
+            return;
+        }
+        throw new IOException("Add Jagex not supported on " + System.getProperty("os.name"));
     }
 
     private static void injectLauncherFlag(String flag) throws IOException

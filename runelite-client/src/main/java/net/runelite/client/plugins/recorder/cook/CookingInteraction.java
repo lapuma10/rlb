@@ -586,6 +586,48 @@ public final class CookingInteraction
         return true;
     }
 
+    /** One-click Cook flow for ranges.  When the inventory holds a
+     *  single type of cookable raw food, OSRS exposes "Cook
+     *  &lt;Range-name&gt;" as the range's left-click verb (the
+     *  GAME_OBJECT_FIRST_OPTION) — clicking goes straight to the
+     *  Skillmulti dialog without the use-on-target two-click sequence
+     *  that {@link #clickHeatSourceForCook} runs for fires.  Camera
+     *  rotates toward the range tile (force=true, waits for the tween)
+     *  before bounds are read so the convex-hull projection isn't
+     *  off-canvas at click time.
+     *
+     *  <p>Returns true when the verified L-click lands.  Returns false
+     *  if the menu under the cursor doesn't show "Cook &lt;name&gt;" —
+     *  caller should fall back to {@link #clickHeatSourceForCook} or
+     *  retry next tick.
+     *
+     *  <p>Pre-condition: the inventory has exactly one cookable type;
+     *  with multiple, OSRS shows a "What would you like to cook?"
+     *  sub-menu and the verified verb won't match. */
+    public boolean clickRangeCookDirect(Match heatMatch, String heatSourceName)
+        throws InterruptedException
+    {
+        if (heatMatch == null || heatMatch.tile == null) return false;
+        if (heatSourceName == null || heatSourceName.isBlank()) return false;
+        dispatcher.rotateCameraToward(heatMatch.tile, true);
+        Rectangle b = onClient(() -> {
+            Rectangle hull = gameObjectBounds(heatMatch);
+            if (hull != null) return hull;
+            return tileItemBounds(heatMatch);
+        });
+        if (b == null) return false;
+        log.info("cook: direct-cook verify-click — wanted 'Cook {}' bounds={}",
+            heatSourceName, b);
+        boolean clicked = dispatcher.boundsClickVerifiedAction(
+            b, "Cook", heatSourceName);
+        if (!clicked)
+        {
+            log.info("cook: direct-cook hover mismatch — range not under cursor / wrong verb");
+            return false;
+        }
+        return true;
+    }
+
     private String itemName(int itemId) throws InterruptedException
     {
         String name = onClient(() -> {

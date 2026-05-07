@@ -256,8 +256,11 @@ public final class RecorderPanel extends PluginPanel
         new javax.swing.JCheckBox("Cook pizza (loop 3)", true);
     private final javax.swing.JCheckBox pizzaAnchoviesBox =
         new javax.swing.JCheckBox("Add anchovies (loop 4)", true);
+    private final javax.swing.JCheckBox pizzaBreaksBox =
+        new javax.swing.JCheckBox("AFK breaks (humanizer)", true);
     private final JLabel  pizzaStatusLabel = new JLabel("Pizza: idle");
     private final JLabel  pizzaCountsLabel = new JLabel("Made: 0");
+    private final JLabel  pizzaBreakLabel  = new JLabel("breaks: idle");
     // GE Core (Phase A): wired by RecorderPlugin via setGrandExchangeScript.
     private GrandExchangeTab grandExchangeTab;
     private final JTabbedPane tabs = new JTabbedPane();
@@ -2044,16 +2047,20 @@ public final class RecorderPanel extends PluginPanel
         pizzaCheeseBox.setAlignmentX(Component.LEFT_ALIGNMENT);
         pizzaCookBox.setAlignmentX(Component.LEFT_ALIGNMENT);
         pizzaAnchoviesBox.setAlignmentX(Component.LEFT_ALIGNMENT);
+        pizzaBreaksBox.setAlignmentX(Component.LEFT_ALIGNMENT);
         buttons.setAlignmentX(Component.LEFT_ALIGNMENT);
         pizzaStatusLabel.setAlignmentX(Component.LEFT_ALIGNMENT);
         pizzaCountsLabel.setAlignmentX(Component.LEFT_ALIGNMENT);
+        pizzaBreakLabel.setAlignmentX(Component.LEFT_ALIGNMENT);
         // Pin label heights so BoxLayout doesn't stretch them vertically.
         capHeight(pizzaTomatoBox);
         capHeight(pizzaCheeseBox);
         capHeight(pizzaCookBox);
         capHeight(pizzaAnchoviesBox);
+        capHeight(pizzaBreaksBox);
         capHeight(pizzaStatusLabel);
         capHeight(pizzaCountsLabel);
+        capHeight(pizzaBreakLabel);
 
         p.add(desc);
         p.add(Box.createVerticalStrut(4));
@@ -2061,9 +2068,11 @@ public final class RecorderPanel extends PluginPanel
         p.add(pizzaCheeseBox);
         p.add(pizzaCookBox);
         p.add(pizzaAnchoviesBox);
+        p.add(pizzaBreaksBox);
         p.add(buttons);
         p.add(pizzaStatusLabel);
         p.add(pizzaCountsLabel);
+        p.add(pizzaBreakLabel);
         p.add(Box.createVerticalGlue());
 
         pizzaStartBtn.addActionListener(e -> onPizzaStart());
@@ -2083,6 +2092,9 @@ public final class RecorderPanel extends PluginPanel
         pizzaAnchoviesBox.addActionListener(e -> {
             if (pizzaScript != null) pizzaScript.setAddAnchovies(pizzaAnchoviesBox.isSelected());
         });
+        pizzaBreaksBox.addActionListener(e -> {
+            if (pizzaScript != null) pizzaScript.setAfkBreaksEnabled(pizzaBreaksBox.isSelected());
+        });
         return p;
     }
 
@@ -2095,6 +2107,7 @@ public final class RecorderPanel extends PluginPanel
             script.setAddCheese(pizzaCheeseBox.isSelected());
             script.setCookPizza(pizzaCookBox.isSelected());
             script.setAddAnchovies(pizzaAnchoviesBox.isSelected());
+            script.setAfkBreaksEnabled(pizzaBreaksBox.isSelected());
         }
     }
 

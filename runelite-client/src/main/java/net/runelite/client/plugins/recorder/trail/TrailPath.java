@@ -45,6 +45,14 @@ public final class TrailPath
         List<Leg> legs = new ArrayList<>();
         List<WorldPoint> walkBuf = new ArrayList<>();
         TrailEvent.Transport pendingStairs = null;
+        // Tracks the LAST same-plane TILE event seen after a stair TRANSPORT
+        // and before the plane change.  This is where the engine routed the
+        // player to actually use the stair — i.e. the standing-tile right
+        // next to the stair object — and it's the correct "walk closer to
+        // the stair" target.  Clicking the stair object's own tile
+        // (transport.tile) often pathfinds the player around walls because
+        // the object's tile is inside the wall geometry.
+        WorldPoint pendingStairsApproach = null;
         int prevPlane = Integer.MIN_VALUE;
         // After a non-stair transport (gate / door), the engine records
         // the player's still-current tile a tick later — a no-op duplicate
@@ -67,13 +75,20 @@ public final class TrailPath
                     if (prevPlane != Integer.MIN_VALUE && plane != prevPlane)
                     {
                         flushWalk(legs, walkBuf);
-                        legs.add(toTransportLeg(pendingStairs));
+                        legs.add(toTransportLeg(pendingStairs, pendingStairsApproach));
                         pendingStairs = null;
+                        pendingStairsApproach = null;
                         walkBuf.add(tile);
                         prevPlane = plane;
                     }
-                    // else: same-plane post-click tile (engine walks the
-                    // player onto the stair), drop it — not a real waypoint.
+                    else
+                    {
+                        // Same-plane post-click tile — the engine routed
+                        // the player onto the stair tile here.  Track the
+                        // LAST one as the approach tile (drop the
+                        // intermediate steps).
+                        pendingStairsApproach = tile;
+                    }
                 }
                 else
                 {
@@ -100,13 +115,22 @@ public final class TrailPath
                 if (isStairTransport(tr.option()))
                 {
                     pendingStairs = tr;
+                    // Seed approach tile with the LAST recorded TILE event
+                    // before the click — engine routes the player from
+                    // here to the stair tile.  Replaced (and refined) by
+                    // any post-click same-plane tile we see next.
+                    pendingStairsApproach = walkBuf.isEmpty()
+                        ? null : walkBuf.get(walkBuf.size() - 1);
                 }
                 else
                 {
                     WorldPoint preGateTile = walkBuf.isEmpty()
                         ? null : walkBuf.get(walkBuf.size() - 1);
                     flushWalk(legs, walkBuf);
-                    legs.add(toTransportLeg(tr));
+                    // For gate / door transports the standing-tile is the
+                    // pre-gate tile (clicking the gate doesn't move the
+                    // player); use it as the approach target too.
+                    legs.add(toTransportLeg(tr, preGateTile));
                     suppressEqualTo = preGateTile;
                 }
             }
@@ -117,7 +141,7 @@ public final class TrailPath
         {
             // Trail ended without the expected plane change — emit the
             // transport anyway so the walker at least tries the action.
-            legs.add(toTransportLeg(pendingStairs));
+            legs.add(toTransportLeg(pendingStairs, pendingStairsApproach));
         }
         return new TrailPath(legs);
     }
@@ -202,7 +226,8 @@ public final class TrailPath
         buf.clear();
     }
 
-    private static Leg.Transport toTransportLeg(TrailEvent.Transport tr)
+    private static Leg.Transport toTransportLeg(TrailEvent.Transport tr,
+                                                 WorldPoint approachTile)
     {
         return new Leg.Transport(
             tr.tile(),
@@ -210,7 +235,8 @@ public final class TrailPath
             tr.targetId(),
             tr.targetKind(),
             tr.param0(),
-            tr.param1());
+            tr.param1(),
+            approachTile);
     }
 
     private static boolean isStairTransport(String option)

@@ -626,10 +626,22 @@ public final class TrailWalker
         }
 
         if (s == Status.IN_PROGRESS && legIdx == path.size() - 1
-            && active instanceof Leg.Walk fin
-            && pos.equals(fin.tiles().get(fin.tiles().size() - 1)))
+            && active instanceof Leg.Walk fin)
         {
-            return Status.ARRIVED;
+            // Lenient ARRIVED: with corridor jitter the player rarely
+            // lands EXACTLY on the recorded last tile — they oscillate
+            // around it and the walker keeps issuing "stale" reclicks
+            // every ~5s while the FSM thinks it's still walking.
+            // Treat "within 1 tile of the last waypoint" as arrived;
+            // corridor radius is at most 3, so anything inside that
+            // bound is the bot deliberately not landing on the
+            // centerline rather than missing the destination.
+            WorldPoint legEnd = fin.tiles().get(fin.tiles().size() - 1);
+            if (pos.getPlane() == legEnd.getPlane()
+                && chebyshev(pos, legEnd) <= 1)
+            {
+                return Status.ARRIVED;
+            }
         }
         return s;
     }
@@ -867,6 +879,16 @@ public final class TrailWalker
         throws InterruptedException
     {
         WorldPoint t = leg.tile();
+        // Walk-closer target: prefer the recorded approach tile (the
+        // standing-tile the engine routed the player to in the recording)
+        // over the transport object's own tile.  Object tiles are often
+        // inside wall geometry, so dispatching a WALK to them pathfinds
+        // around the wall — bot walks outside the building, around, and
+        // back in.  Approach tile is on the same side of the wall as the
+        // player and reachable directly.  Fall back to {@code t} when
+        // the trail predates the approach-tile capture.
+        WorldPoint walkTarget = leg.approachTile() != null
+            ? leg.approachTile() : t;
         if (dispatcher.isBusy()) return Status.IN_PROGRESS;
 
         TransportVerbState verbState = checkVerbPresence(t, leg.verb());
@@ -899,7 +921,7 @@ public final class TrailWalker
         // also have returned null for the same reason as the verb miss).
         if (!adjacent && (verbState == TransportVerbState.UNKNOWN || !withinClickRange))
         {
-            walkCloserToTransport(t, leg.verb(), now, distToTransport, verbState,
+            walkCloserToTransport(walkTarget, leg.verb(), now, distToTransport, verbState,
                 "out-of-range-or-unknown");
             return Status.IN_PROGRESS;
         }
@@ -969,7 +991,7 @@ public final class TrailWalker
                 // Either rotation can't fix it (HUD / menu / unreachable / plane)
                 // OR rotation already attempted and the visibility check still
                 // failed. Walk closer and try again next tick.
-                walkCloserToTransport(t, leg.verb(), now, distToTransport, verbState,
+                walkCloserToTransport(walkTarget, leg.verb(), now, distToTransport, verbState,
                     "vis=" + reason + (rotatedThisLeg ? " (post-rotate)" : ""));
                 return Status.IN_PROGRESS;
             }

@@ -1,0 +1,88 @@
+# Account-capture image — Linux + Wine + Firefox + the Jagex Launcher
+# Windows installer. Used to onboard new Jagex accounts WITHOUT host
+# disk involvement: the OAuth handshake happens inside the container,
+# captured credentials write to a Docker named volume that production
+# rlb-bot containers also mount.
+#
+# Forced to linux/amd64 because Wine fundamentally requires i386
+# packages (wine32) and the arm64 Ubuntu mirror has no i386 binaries.
+# On Apple Silicon, Docker Desktop runs this under QEMU emulation —
+# slower than native, but capture is a brief one-time operation per
+# account so the perf hit doesn't matter.
+#
+# Build (one-time):
+#   1. Download Jagex Launcher Windows installer:
+#        curl -L "https://cdn.jagex.com/Jagex%20Launcher%20Installer.exe" \
+#          -o seed/JagexLauncher.exe
+#   2. ./gradlew :client:shadowJar  (if jar isn't current)
+#   3. cp -r ~/.runelite/cache       seed/   (if not done for rlb-bot)
+#   4. cp -r ~/.runelite/jagexcache  seed/   (ditto)
+#   5. docker build -f Dockerfile.capture -t rlb-capture .
+#
+# First-time Wine setup (once per rlb-capture rebuild, ~5 min):
+#   docker run --rm -it -p 5901:5900 \
+#     -v rlb-wine:/root/.wine \
+#     rlb-capture /entrypoint.sh wine-install
+#   open vnc://localhost:5901   # password rlb — click through installer
+#
+# Capture flow (per new Jagex account):
+#   docker run --rm -it -p 5901:5900 \
+#     -v rlb-wine:/root/.wine \
+#     -v rlb-shared-accounts:/root/.runelite/rlb/accounts \
+#     rlb-capture
+#   open vnc://localhost:5901
+#   # Click Add Jagex → Wine launches Jagex Launcher → Play → captured.
+
+FROM --platform=linux/amd64 eclipse-temurin:17-jre-jammy
+
+# Wine + browser for OAuth callback + xdg-utils for URL handling +
+# the same X / AWT runtime libs the production image uses. Note:
+# Ubuntu Jammy is used (not Noble) because Noble dropped firefox-esr
+# from the apt repos; Jammy still has it in main/universe.
+RUN dpkg --add-architecture i386 \
+    && apt-get update \
+    && apt-get install -y --no-install-recommends \
+       xvfb x11vnc \
+       wine wine32 wine64 \
+       winbind cabextract \
+       firefox xdg-utils \
+       libgl1 \
+       libxext6 libxrender1 libxtst6 libxi6 libxrandr2 \
+       fontconfig fonts-dejavu \
+       ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+COPY runelite-client/build/libs/client-*-shaded.jar /app/client.jar
+COPY entrypoint.sh /entrypoint.sh
+RUN chmod +x /entrypoint.sh
+
+# Same public game caches as rlb-bot so RuneLite can also launch from
+# this image if needed (e.g. to verify a captured account works).
+COPY seed/cache       /seed/.runelite/cache
+COPY seed/jagexcache  /seed/.runelite/jagexcache
+
+# The Jagex Launcher Windows installer. Baked in; the actual installed
+# launcher binary lives in the Wine prefix (named volume) after running
+# /entrypoint.sh wine-install.
+COPY seed/JagexLauncher.exe /opt/jagex/JagexLauncher.exe
+
+ENV WINEPREFIX=/root/.wine
+ENV WINEDEBUG=-all
+# Disable Mono and IE Wine subsystems we don't need — speeds Wine boot
+# and dodges popup dialogs about installing them.
+ENV WINEDLLOVERRIDES="mscoree=,mshtml="
+
+# AccountLauncher.launchJagexLauncher() reads this. Adjust if your
+# installer drops the binary somewhere else inside the prefix.
+ENV JAGEX_LAUNCHER_EXE="/root/.wine/drive_c/Program Files/Jagex Launcher/JagexLauncher.exe"
+
+ENV DISPLAY=:99
+EXPOSE 5900
+
+# /root/.wine MUST be a volume — the installed Jagex Launcher inside
+# the prefix needs to persist across container runs.
+VOLUME ["/root/.wine"]
+VOLUME ["/root/.runelite"]
+
+ENTRYPOINT ["/entrypoint.sh"]

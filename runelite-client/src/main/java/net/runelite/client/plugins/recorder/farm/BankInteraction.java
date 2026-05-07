@@ -1163,7 +1163,26 @@ public final class BankInteraction implements BankActions
                         matched, itemId, sb.bounds);
                     return true;
                 }
-                // No candidate verb in the menu — caller falls back.
+                // First-attempt miss can be a transient menu-population
+                // race (rRight after a fresh bank reopen the cached
+                // Withdraw-Y row sometimes hasn't rendered yet by the
+                // time rightClickAndPickFirstMatching reads the menu).
+                // Dismiss the open menu, sleep one full game tick, and
+                // try once more before falling back to the chatbox path
+                // — saves ~5s of Withdraw-X chatbox typing on the
+                // ~10% of withdraws that hit this race.
+                log.info("bank: verb-scan first attempt missed itemId={} — retrying after settle",
+                    itemId);
+                dispatcher.dismissMenu();
+                SequenceSleep.sleep(client, 250L);
+                String retry = dispatcher.rightClickAndPickFirstMatching(cx, cy, verbs);
+                if (retry != null)
+                {
+                    log.info("bank: verb-scan hit '{}' on retry itemId={} at bounds={}",
+                        retry, itemId, sb.bounds);
+                    return true;
+                }
+                // Still no candidate after retry — caller falls back.
                 return false;
             }
             int notches = Math.max(1, Math.min(3, sb.scrollNotches));
