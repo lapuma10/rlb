@@ -6,9 +6,9 @@ import static org.junit.Assert.*;
 import static org.mockito.Mockito.*;
 
 /** Verifies the factory's switch behavior in isolation: given a
- *  RecorderConfig stub, it returns the right instance, throws on V2
- *  before that's registered, and returns the same V1 instance across
- *  calls. */
+ *  RecorderConfig stub it returns the right instance, falls back to
+ *  V1 when V2 isn't bound (round-1 stale config), and surfaces a
+ *  stable instance across calls. */
 public class NavigatorFactoryTest
 {
     @Test
@@ -17,23 +17,34 @@ public class NavigatorFactoryTest
         RecorderConfig cfg = mock(RecorderConfig.class);
         when(cfg.navigatorImpl()).thenReturn(RecorderConfig.NavigatorImpl.TRAIL_V1);
         Navigator stub = stubNavigator("trail-v1");
-        NavigatorFactory factory = new NavigatorFactory(cfg, stub);
+        NavigatorFactory factory = new NavigatorFactory(cfg, stub, stubNavigator("worldmap-v2"));
 
         assertSame(stub, factory.getNavigator());
     }
 
     @Test
-    public void getNavigator_whenWorldmapV2_andV2NotRegistered_fallsBackToV1()
+    public void getNavigator_whenWorldmapV2_returnsV2Navigator()
     {
         RecorderConfig cfg = mock(RecorderConfig.class);
         when(cfg.navigatorImpl()).thenReturn(RecorderConfig.NavigatorImpl.WORLDMAP_V2);
         Navigator stubV1 = stubNavigator("trail-v1");
-        NavigatorFactory factory = new NavigatorFactory(cfg, stubV1);
+        Navigator stubV2 = stubNavigator("worldmap-v2");
+        NavigatorFactory factory = new NavigatorFactory(cfg, stubV1, stubV2);
 
-        // Round-1: V2 not registered yet. Plugin startup must stay
-        // resilient to a stale config value, so the factory logs and
-        // returns V1 instead of throwing — Phase 6 replaces the warn
-        // with a real V2 instance.
+        assertSame("V2 selection must surface the bound V2 instance",
+            stubV2, factory.getNavigator());
+    }
+
+    @Test
+    public void getNavigator_whenWorldmapV2_andV2Null_fallsBackToV1()
+    {
+        RecorderConfig cfg = mock(RecorderConfig.class);
+        when(cfg.navigatorImpl()).thenReturn(RecorderConfig.NavigatorImpl.WORLDMAP_V2);
+        Navigator stubV1 = stubNavigator("trail-v1");
+        // Plugin built without V2 (legacy path / test setup) — config
+        // pointing at V2 must NOT crash startup; fall back to V1.
+        NavigatorFactory factory = new NavigatorFactory(cfg, stubV1, (Navigator) null);
+
         assertSame(stubV1, factory.getNavigator());
     }
 
@@ -42,7 +53,8 @@ public class NavigatorFactoryTest
     {
         RecorderConfig cfg = mock(RecorderConfig.class);
         when(cfg.navigatorImpl()).thenReturn(RecorderConfig.NavigatorImpl.TRAIL_V1);
-        NavigatorFactory factory = new NavigatorFactory(cfg, stubNavigator("trail-v1"));
+        NavigatorFactory factory = new NavigatorFactory(cfg, stubNavigator("trail-v1"),
+            stubNavigator("worldmap-v2"));
 
         Navigator a = factory.getNavigator();
         Navigator b = factory.getNavigator();
@@ -56,7 +68,7 @@ public class NavigatorFactoryTest
         RecorderConfig cfg = mock(RecorderConfig.class);
         when(cfg.navigatorImpl()).thenReturn(null);
         Navigator stub = stubNavigator("trail-v1");
-        NavigatorFactory factory = new NavigatorFactory(cfg, stub);
+        NavigatorFactory factory = new NavigatorFactory(cfg, stub, stubNavigator("worldmap-v2"));
 
         assertSame(stub, factory.getNavigator());
     }

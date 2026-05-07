@@ -1,0 +1,196 @@
+package net.runelite.client.plugins.recorder.nav.v2;
+
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.atomic.AtomicReference;
+import java.util.function.Supplier;
+import javax.annotation.Nullable;
+import lombok.extern.slf4j.Slf4j;
+import net.runelite.api.Client;
+import net.runelite.api.CollisionData;
+import net.runelite.api.NPC;
+import net.runelite.api.Player;
+import net.runelite.api.WorldView;
+import net.runelite.api.coords.WorldPoint;
+import net.runelite.client.callback.ClientThread;
+import net.runelite.client.plugins.recorder.worldmap.MapStore;
+import net.runelite.client.plugins.recorder.worldmap.RegionChunkSnapshot;
+import net.runelite.client.plugins.recorder.worldmap.RegionIds;
+import net.runelite.client.sequence.dispatch.HumanizedInputDispatcher;
+import net.runelite.client.sequence.internal.ActionRequest;
+
+/** Production binding for {@link V2Executor.Env}. Wraps live RuneLite
+ *  state and the dispatcher so the executor can read game state and
+ *  enqueue clicks without knowing about the threading model.
+ *
+ *  <p>Reads ({@link #playerLoc}, {@link #isPlausiblyClean},
+ *  {@link #canMinimapClick}, {@link #snapshotSaysWalkable},
+ *  {@link #liveCollisionAllows}, {@link #dynamicEntityOnTile}) marshal
+ *  to the client thread via {@link ClientThread#invokeLater} and block
+ *  the calling worker until the result is back. RuneLite asserts on
+ *  the client thread for {@link net.runelite.api.Scene} /
+ *  {@link WorldView} reads.
+ *
+ *  <p>Writes ({@link #dispatchWalk}, {@link #dispatchMinimap}) hand
+ *  the request off to the dispatcher's worker thread. They return
+ *  promptly; the caller polls {@link #dispatcherBusy} to know when
+ *  the chain has finished. Neither one is itself a blocking flow. */
+@Slf4j
+public final class V2ExecutorEnv implements V2Executor.Env
+{
+    private final Client client;
+    private final ClientThread clientThread;
+    private final HumanizedInputDispatcher dispatcher;
+    private final EmptyTileFilter emptyTileFilter;
+    private final MinimapClicker minimapClicker;
+    private final MapStore mapStore;
+
+    public V2ExecutorEnv(Client client, ClientThread clientThread,
+                         HumanizedInputDispatcher dispatcher,
+                         EmptyTileFilter emptyTileFilter,
+                         MinimapClicker minimapClicker,
+                         MapStore mapStore)
+    {
+        this.client = client;
+        this.clientThread = clientThread;
+        this.dispatcher = dispatcher;
+        this.emptyTileFilter = emptyTileFilter;
+        this.minimapClicker = minimapClicker;
+        this.mapStore = mapStore;
+    }
+
+    @Override
+    @Nullable
+    public WorldPoint playerLoc()
+    {
+        return onClient(() -> {
+            Player self = client.getLocalPlayer();
+            return self == null ? null : self.getWorldLocation();
+        });
+    }
+
+    @Override
+    public boolean isPlausiblyClean(WorldPoint tile)
+    {
+        return Boolean.TRUE.equals(onClient(() -> emptyTileFilter.isPlausiblyClean(tile)));
+    }
+
+    @Override
+    public boolean canMinimapClick(WorldPoint tile)
+    {
+        return Boolean.TRUE.equals(onClient(() -> minimapClicker.canClick(tile)));
+    }
+
+    @Override
+    public boolean dispatchWalk(WorldPoint tile)
+    {
+        if (dispatcher.isBusy()) return false;
+        ActionRequest req = ActionRequest.builder()
+            .kind(ActionRequest.Kind.WALK)
+            .channel(ActionRequest.Channel.MOUSE)
+            .tile(tile)
+            .strictWalk(true)
+            .build();
+        dispatcher.dispatch(req);
+        return true;
+    }
+
+    @Override
+    public boolean dispatchMinimap(WorldPoint tile)
+    {
+        if (dispatcher.isBusy()) return false;
+        // MinimapClicker does the resolve on the client thread before
+        // enqueuing CLICK_BOUNDS; marshal accordingly.
+        return Boolean.TRUE.equals(onClient(() -> minimapClicker.dispatch(tile)));
+    }
+
+    @Override
+    public boolean dispatcherBusy()
+    {
+        return dispatcher.isBusy();
+    }
+
+    @Override
+    public long nowMs()
+    {
+        return System.currentTimeMillis();
+    }
+
+    @Override
+    public boolean snapshotSaysWalkable(WorldPoint tile)
+    {
+        if (tile == null) return false;
+        int regionId = RegionIds.regionIdFor(tile.getX(), tile.getY());
+        RegionChunkSnapshot snap = mapStore.snapshotFor(regionId);
+        if (snap == null) return false;   // unknown chunk → conservative
+        return snap.isStandableLocal(tile.getX(), tile.getY(), tile.getPlane());
+    }
+
+    @Override
+    public boolean liveCollisionAllows(WorldPoint tile)
+    {
+        if (tile == null) return false;
+        return Boolean.TRUE.equals(onClient(() -> {
+            WorldView wv = client.getTopLevelWorldView();
+            if (wv == null) return false;
+            CollisionData[] maps = wv.getCollisionMaps();
+            if (maps == null) return false;
+            int plane = tile.getPlane();
+            if (plane < 0 || plane >= maps.length) return false;
+            CollisionData cd = maps[plane];
+            if (cd == null) return false;
+            int[][] flags = cd.getFlags();
+            if (flags == null) return false;
+            int sx = tile.getX() - wv.getBaseX();
+            int sy = tile.getY() - wv.getBaseY();
+            if (sx < 0 || sy < 0 || sx >= flags.length || sy >= flags[sx].length) return false;
+            return (flags[sx][sy] & net.runelite.api.CollisionDataFlag.BLOCK_MOVEMENT_FULL) == 0;
+        }));
+    }
+
+    @Override
+    public boolean dynamicEntityOnTile(WorldPoint tile)
+    {
+        if (tile == null) return false;
+        return Boolean.TRUE.equals(onClient(() -> {
+            WorldView wv = client.getTopLevelWorldView();
+            if (wv == null) return false;
+            try
+            {
+                for (NPC npc : wv.npcs())
+                {
+                    if (npc == null) continue;
+                    WorldPoint loc = npc.getWorldLocation();
+                    if (loc != null && loc.equals(tile)) return true;
+                }
+            }
+            catch (Throwable th)
+            {
+                log.debug("dynamicEntityOnTile: npc iteration threw", th);
+            }
+            return false;
+        }));
+    }
+
+    /** TrailWalker-style synchronous client-thread read. Blocks the
+     *  caller's worker thread until the supplier has run on the client
+     *  thread. Returns null on interrupt — the caller's RUNNING/IDLE
+     *  contract handles that as a no-op tick. */
+    @Nullable
+    private <T> T onClient(Supplier<T> sup)
+    {
+        AtomicReference<T> ref = new AtomicReference<>();
+        CountDownLatch latch = new CountDownLatch(1);
+        clientThread.invokeLater(() -> {
+            try { ref.set(sup.get()); }
+            catch (Throwable th) { log.warn("v2-executor-env: onClient threw", th); }
+            finally { latch.countDown(); }
+        });
+        try { latch.await(); }
+        catch (InterruptedException ie)
+        {
+            Thread.currentThread().interrupt();
+            return null;
+        }
+        return ref.get();
+    }
+}

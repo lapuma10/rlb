@@ -292,18 +292,9 @@ public class RecorderPlugin extends Plugin
         panel.setTrailRecorder(trailRecorder);
         panel.setTrailRegistry(trailRegistry);
 
-        // Chicken farm V3 — same outer FSM, walking phases driven via
-        // the Navigator interface. Independent dispatcher + walker so
-        // V1/V2/V3 coexist without dispatcher-busy contention. Wired
-        // after trailRegistry is created.
-        HumanizedInputDispatcher v3Dispatcher = new HumanizedInputDispatcher(client, clientThread);
-        TrailWalker v3Walker = new TrailWalker(client, clientThread, v3Dispatcher);
-        NavigatorFactory v3NavFactory = new NavigatorFactory(config, v3Walker, trailRegistry);
-        net.runelite.client.plugins.recorder.scripts.ChickenFarmV3Script chickenFarmV3 =
-            new net.runelite.client.plugins.recorder.scripts.ChickenFarmV3Script(
-                client, clientThread, v3Dispatcher, trailRegistry, eventBus,
-                v3NavFactory);
-        panel.setChickenFarmV3(chickenFarmV3);
+        // Chicken farm V3 wiring is deferred to after the worldmap subsystem
+        // is constructed (below) — the Navigator factory now also accepts
+        // a V2Navigator built on shared MapStore + TransportIndex.
 
         // Mining loop: separate dispatcher, independent busy flag from
         // combat / login / test-walk. The user adds candidate rocks via
@@ -441,6 +432,33 @@ public class RecorderPlugin extends Plugin
             transportIndex, worldmapRoot, wmConfig.flushEverySeconds * 1000L);
         flushDaemon.start();
 
+        // V2 Navigator stack — shared planner + per-script executor.
+        // V2Planner + RouteHistory are stateless w.r.t. who is calling
+        // (planning reads world memory, doesn't mutate per-script state),
+        // so a single instance serves every script that opts in. The
+        // executor + invalidation classifier are per-script because they
+        // own attempt-local state (blacklist, transient penalties, recent-
+        // reject window) that shouldn't bleed across independent walks.
+        net.runelite.client.plugins.recorder.nav.v2.RouteHistory v2RouteHistory
+            = new net.runelite.client.plugins.recorder.nav.v2.RouteHistory();
+        net.runelite.client.plugins.recorder.nav.v2.V2Planner sharedV2Planner
+            = new net.runelite.client.plugins.recorder.nav.v2.V2Planner(
+                worldMapStore, transportIndex, wmConfig, v2RouteHistory);
+
+        // Chicken farm V3 — Navigator-driven outer FSM. Each script that
+        // opts into V2 carries its own dispatcher (no busy-flag contention)
+        // and its own executor (independent recovery state).
+        HumanizedInputDispatcher v3Dispatcher = new HumanizedInputDispatcher(client, clientThread);
+        TrailWalker v3Walker = new TrailWalker(client, clientThread, v3Dispatcher);
+        net.runelite.client.plugins.recorder.nav.v2.V2Navigator v3V2Nav =
+            buildV2Navigator(v3Dispatcher, sharedV2Planner);
+        NavigatorFactory v3NavFactory = new NavigatorFactory(config, v3Walker, trailRegistry, v3V2Nav);
+        net.runelite.client.plugins.recorder.scripts.ChickenFarmV3Script chickenFarmV3 =
+            new net.runelite.client.plugins.recorder.scripts.ChickenFarmV3Script(
+                client, clientThread, v3Dispatcher, trailRegistry, eventBus,
+                v3NavFactory);
+        panel.setChickenFarmV3(chickenFarmV3);
+
         File inspectDir = new File(RuneLite.RUNELITE_DIR, "recorder/inspect");
         net.runelite.client.plugins.recorder.nav.v2.MultiRegionAStar v2Planner
             = new net.runelite.client.plugins.recorder.nav.v2.MultiRegionAStar(
@@ -497,6 +515,56 @@ public class RecorderPlugin extends Plugin
         keyManager.registerKeyListener(toggleListener);
 
         log.info("Recorder plugin started");
+    }
+
+    /** Build a per-script V2Navigator on top of the shared planner. The
+     *  executor + invalidation classifier + filter/clicker collaborators
+     *  are private to the script so its recovery state doesn't bleed
+     *  into other scripts that might be running V2 concurrently. */
+    private net.runelite.client.plugins.recorder.nav.v2.V2Navigator buildV2Navigator(
+        HumanizedInputDispatcher dispatcher,
+        net.runelite.client.plugins.recorder.nav.v2.V2Planner planner)
+    {
+        net.runelite.client.plugins.recorder.nav.v2.EmptyTileFilter filter
+            = new net.runelite.client.plugins.recorder.nav.v2.EmptyTileFilter(client);
+        net.runelite.client.plugins.recorder.nav.v2.MinimapClicker minimap
+            = new net.runelite.client.plugins.recorder.nav.v2.MinimapClicker(
+                client, dispatcher.pixelResolver(), dispatcher);
+        net.runelite.client.plugins.recorder.nav.v2.CanvasTilePicker picker
+            = new net.runelite.client.plugins.recorder.nav.v2.CanvasTilePicker();
+        net.runelite.client.plugins.recorder.nav.v2.InvalidationClassifier classifier
+            = new net.runelite.client.plugins.recorder.nav.v2.InvalidationClassifier();
+        net.runelite.client.plugins.recorder.nav.v2.V2Executor.Env env
+            = new net.runelite.client.plugins.recorder.nav.v2.V2ExecutorEnv(
+                client, clientThread, dispatcher, filter, minimap, worldMapStore);
+        net.runelite.client.plugins.recorder.nav.v2.V2Executor executor
+            = new net.runelite.client.plugins.recorder.nav.v2.V2Executor(
+                env, picker, classifier, new java.util.Random());
+        return new net.runelite.client.plugins.recorder.nav.v2.V2Navigator(
+            planner, executor, () -> playerLocOnClientThread());
+    }
+
+    /** Synchronous client-thread read of the local player's world
+     *  location. Reused by V2Navigator's planner-input supplier — it
+     *  runs on the script's worker thread, so getLocalPlayer (which
+     *  asserts on the client thread) needs marshalling. */
+    @javax.annotation.Nullable
+    private net.runelite.api.coords.WorldPoint playerLocOnClientThread()
+    {
+        java.util.concurrent.atomic.AtomicReference<net.runelite.api.coords.WorldPoint> ref
+            = new java.util.concurrent.atomic.AtomicReference<>();
+        java.util.concurrent.CountDownLatch latch = new java.util.concurrent.CountDownLatch(1);
+        clientThread.invokeLater(() -> {
+            try
+            {
+                net.runelite.api.Player self = client.getLocalPlayer();
+                ref.set(self == null ? null : self.getWorldLocation());
+            }
+            finally { latch.countDown(); }
+        });
+        try { latch.await(); }
+        catch (InterruptedException ie) { Thread.currentThread().interrupt(); return null; }
+        return ref.get();
     }
 
     @Override
