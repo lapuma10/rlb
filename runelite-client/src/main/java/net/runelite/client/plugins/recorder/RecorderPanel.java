@@ -1377,9 +1377,30 @@ public final class RecorderPanel extends PluginPanel
                 "Plan A→B: enter \"x,y,plane\" in From and To fields");
             return;
         }
-        runDump(() -> inspectionDumper.planAToB(from, to),
-            "plan " + from.getX() + "," + from.getY() + "p" + from.getPlane()
-                + " → " + to.getX() + "," + to.getY() + "p" + to.getPlane());
+        Thread t = new Thread(() ->
+        {
+            String msg;
+            try
+            {
+                net.runelite.client.plugins.recorder.worldmap.InspectionDumper.PlanOutcome o
+                    = inspectionDumper.planAToB(from, to);
+                if (!o.route().isEmpty())
+                {
+                    net.runelite.client.plugins.recorder.worldmap.WorldMapMinimapOverlay
+                        .publishActiveRoute(o.route());
+                }
+                msg = "Plan A→B " + o.summary() + " → " + o.file().getAbsolutePath();
+            }
+            catch (RuntimeException ex)
+            {
+                msg = "Plan A→B failed: " + ex.getMessage();
+            }
+            final String finalMsg = msg;
+            SwingUtilities.invokeLater(() ->
+                v2InspectStatusLabel.setText("<html>" + finalMsg + "</html>"));
+        }, "v2-inspect-plan");
+        t.setDaemon(true);
+        t.start();
     }
 
     private void onV2ClearOverlayRoute()

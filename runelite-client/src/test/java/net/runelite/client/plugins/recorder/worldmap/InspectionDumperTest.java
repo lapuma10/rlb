@@ -198,8 +198,9 @@ public class InspectionDumperTest
         InspectionDumper dumper = new InspectionDumper(store, new EntityIndex(),
             new TransportIndex(), wmConfig, tmp.toFile());
 
-        File out = dumper.planAToB(new WorldPoint(3208, 3213, 0), new WorldPoint(3212, 3213, 0));
-        JsonObject root = readJson(out);
+        InspectionDumper.PlanOutcome outcome = dumper.planAToB(
+            new WorldPoint(3208, 3213, 0), new WorldPoint(3212, 3213, 0));
+        JsonObject root = readJson(outcome.file());
         assertEquals("success", root.get("result").getAsString());
         assertEquals(4, root.get("pathLength").getAsInt());
         assertTrue(root.has("regionsTouched"));
@@ -210,6 +211,10 @@ public class InspectionDumperTest
         assertTrue(rej.has("blocked"));
         assertTrue(rej.has("unknown"));
         assertTrue(rej.has("stale"));
+        assertEquals("route on outcome matches path length",
+            5, outcome.route().size());
+        assertTrue("summary mentions tile count",
+            outcome.summary().contains("4 tiles"));
     }
 
     @Test
@@ -220,12 +225,15 @@ public class InspectionDumperTest
         InspectionDumper dumper = new InspectionDumper(new MapStore(wmConfig),
             new EntityIndex(), new TransportIndex(), wmConfig, tmp.toFile());
 
-        File out = dumper.planAToB(new WorldPoint(3208, 3213, 0),
-            new WorldPoint(3093, 3245, 0));   // Draynor
-        JsonObject root = readJson(out);
+        InspectionDumper.PlanOutcome outcome = dumper.planAToB(
+            new WorldPoint(3208, 3213, 0), new WorldPoint(3093, 3245, 0));   // Draynor
+        JsonObject root = readJson(outcome.file());
         assertTrue("cross-region marked deferred",
             root.get("result").getAsString().toLowerCase().contains("phase 4"));
         assertTrue(root.has("rejections"));
+        assertTrue("summary mentions cross-region",
+            outcome.summary().toLowerCase().contains("cross-region"));
+        assertTrue(outcome.route().isEmpty());
     }
 
     @Test
@@ -244,9 +252,12 @@ public class InspectionDumperTest
         InspectionDumper dumper = new InspectionDumper(store, new EntityIndex(),
             new TransportIndex(), wmConfig, tmp.toFile());
 
-        File out = dumper.planAToB(new WorldPoint(3208, 3213, 0), new WorldPoint(3215, 3213, 0));
-        JsonObject root = readJson(out);
+        InspectionDumper.PlanOutcome outcome = dumper.planAToB(
+            new WorldPoint(3208, 3213, 0), new WorldPoint(3215, 3213, 0));
+        JsonObject root = readJson(outcome.file());
         assertEquals("failure", root.get("result").getAsString());
+        assertTrue("summary mentions no route",
+            outcome.summary().toLowerCase().contains("no route"));
     }
 
     private static JsonObject readJson(File f) throws IOException

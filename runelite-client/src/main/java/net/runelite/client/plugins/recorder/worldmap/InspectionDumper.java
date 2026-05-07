@@ -130,8 +130,13 @@ public final class InspectionDumper
     /** Round-1 stub. Single-region same-plane uses a Dijkstra over the
      *  region snapshot for the route + rejection counts. Cross-region
      *  emits a placeholder result that Phase 4 ({@code V2Planner}) will
-     *  replace with a real cross-region plan. */
-    public File planAToB(WorldPoint from, WorldPoint to)
+     *  replace with a real cross-region plan.
+     *
+     *  <p>Returns a {@link PlanOutcome} carrying the dump file, a
+     *  short human-readable summary (suitable for a UI status label),
+     *  and the reconstructed route (empty when none — callers can
+     *  publish this to the minimap overlay). */
+    public PlanOutcome planAToB(WorldPoint from, WorldPoint to)
     {
         JsonObject root = new JsonObject();
         root.addProperty("schema", SCHEMA_V1);
@@ -147,14 +152,17 @@ public final class InspectionDumper
 
         if (from.getPlane() != to.getPlane() || fromRegion != toRegion)
         {
-            root.addProperty("result",
-                "cross-region/cross-plane planning is implemented in Phase 4 (V2Planner)");
+            String msg = "cross-region/cross-plane planning is implemented in Phase 4 (V2Planner)";
+            root.addProperty("result", msg);
             root.addProperty("pathLength", -1);
             root.add("regionsTouched", regionsTouched);
             root.add("transportEdgesUsed", transportEdgesUsed);
             root.add("route", new JsonArray());
             root.add("rejections", emptyRejections());
-            return writePlanFile(from, to, root);
+            File f = writePlanFile(from, to, root);
+            String summary = "cross-region " + fromRegion + " → " + toRegion
+                + " (deferred to Phase 4)";
+            return new PlanOutcome(f, summary, List.of());
         }
 
         regionsTouched.add(toRegion);
@@ -172,15 +180,22 @@ public final class InspectionDumper
             rejections.addProperty("unknown", 1);
             rejections.addProperty("stale", 0);
             root.add("rejections", rejections);
-            return writePlanFile(from, to, root);
+            File f = writePlanFile(from, to, root);
+            return new PlanOutcome(f,
+                "no snapshot loaded for region " + toRegion + " — walk through it first",
+                List.of());
         }
 
         PathResult pr = reconstructPath(snap, from, to);
+        String summary;
+        List<WorldPoint> routeOut;
         if (pr.path.isEmpty())
         {
             root.addProperty("result", "failure");
             root.addProperty("pathLength", -1);
             root.add("route", new JsonArray());
+            summary = "no route found — blocked=" + pr.blocked + ", unknown=" + pr.unknown;
+            routeOut = List.of();
         }
         else
         {
@@ -189,13 +204,20 @@ public final class InspectionDumper
             JsonArray route = new JsonArray();
             for (WorldPoint p : pr.path) route.add(worldPointJson(p));
             root.add("route", route);
+            summary = "route found — " + (pr.path.size() - 1) + " tiles";
+            routeOut = List.copyOf(pr.path);
         }
         rejections.addProperty("blocked", pr.blocked);
         rejections.addProperty("unknown", pr.unknown);
         rejections.addProperty("stale", 0);   // round-1: no staleness tracking yet
         root.add("rejections", rejections);
-        return writePlanFile(from, to, root);
+        File f = writePlanFile(from, to, root);
+        return new PlanOutcome(f, summary, routeOut);
     }
+
+    /** Outcome of {@link #planAToB} — the dump file, a UI-friendly
+     *  one-line summary, and the reconstructed route (empty when none). */
+    public record PlanOutcome(File file, String summary, List<WorldPoint> route) {}
 
     private File writePlanFile(WorldPoint from, WorldPoint to, JsonObject root)
     {
