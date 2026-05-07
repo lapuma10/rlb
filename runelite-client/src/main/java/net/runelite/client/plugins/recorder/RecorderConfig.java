@@ -258,4 +258,30 @@ public interface RecorderConfig extends Config
 	{
 		return false;
 	}
+
+	/** Selects which Navigator implementation scripts receive from the
+	 *  factory. {@code TRAIL_V1} replays recorded trails via the existing
+	 *  {@link net.runelite.client.plugins.recorder.trail.TrailWalker};
+	 *  {@code WORLDMAP_V2} drives navigation from live WorldMemory + A*
+	 *  with route alternation. V1 is the supported fallback; V2 lands
+	 *  incrementally and is registered in a later phase. */
+	enum NavigatorImpl
+	{
+		TRAIL_V1,
+		WORLDMAP_V2
+	}
+
+	@ConfigItem(
+		keyName = "navigatorImpl",
+		name = "Navigator implementation",
+		description = "Which Navigator scripts use: V1 replays recorded "
+			+ "trails (default, supported fallback); V2 plans live from "
+			+ "WorldMemory (experimental, only ChickenFarmV3 wired in round 1).",
+		section = experimentalSection,
+		position = 2
+	)
+	default NavigatorImpl navigatorImpl()
+	{
+		return NavigatorImpl.TRAIL_V1;
+	}
 }
