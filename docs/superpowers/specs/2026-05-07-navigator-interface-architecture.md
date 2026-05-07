@@ -10,13 +10,15 @@
 ## TL;DR
 
 The bot has one walker today (TrailWalker, "V1") that replays recorded
-trails deterministically. It looks botted because it clicks the same
-tiles in the same order every cycle. We are building a second walker
-("V2") that uses WorldMemory + dynamic A* + transport edges + route
-and click variety.
+trails deterministically. Deterministic replay is brittle: when the
+recorded tile is blocked, claimed by an entity, or stale relative to
+live world state, V1 has no recovery path other than re-running the
+same fixed leg. We are building a second walker ("V2") that uses
+WorldMemory + dynamic A* + transport edges + route and click variety
+to make navigation less brittle.
 
-**V1 stays exactly as-is. V2 is a separate implementation. A single
-switch picks which one a script uses. They coexist forever.**
+**V1 remains the supported fallback indefinitely. V2 is a separate
+implementation. A single switch picks which one a script uses.**
 
 This doc locks the architecture AND the V2 round-1 internals: capture
 mechanism, leg-executor click behavior with the empty-tile hard
@@ -84,9 +86,10 @@ switch entry, and has at least one script wired to use it. No
 - Switch site is ONE constructor / factory. Scripts never branch on
   which implementation is active.
 
-### 6. Both coexist forever
+### 6. V1 remains the supported fallback indefinitely
 
-- No deprecation path, no migration plan, no removal of V1.
+- No active deprecation path, no migration plan, no removal of V1
+  on the round-1 timeline.
 - If V2 misbehaves, flip the switch back to V1 and the bot keeps
   working.
 - This is the load-bearing reason V1 stays frozen.
@@ -114,18 +117,24 @@ are called out as "implementation determines."
 
 ### Goals (from user)
 
-1. Walking looks player-like — not the same path every cycle, not the
-   same tiles within a path.
-2. Pre-planned routes that can alternate between cycles.
+1. Walking is less brittle than deterministic trail replay:
+   - routes can vary when equivalent alternatives exist in the world
+     model
+   - click targets are selected from currently valid, reachable tiles
+     (live state, not the recording)
+   - executor avoids repeating stale or unsafe click points and
+     recovers when a click does not register
+2. Pre-planned routes that can alternate between cycles when more
+   than one route is known to be viable.
 3. Track what is where (NPCs, objects, transports) in a persistent
-   world memory.
+   world memory so the planner has real data to work with.
 
 ### Known building blocks (already in the repo)
 
 - `worldmap/SceneScraper` — passively scrapes 18×18 collision +
   objects around the player every 2 ticks.
-- `worldmap/MapStore` — LRU in-memory + persistent
-  `~/.runelite/recorder/regions/<id>.json`.
+- `worldmap/MapStore` — LRU in-memory + persistent under
+  `~/.runelite/recorder/worldmap/regions/<id>.json`.
 - `worldmap/MapPlanner` — A* within one region, one plane, no
   transports. Used today only by CookingScript V3 stand-tile pick.
 
@@ -147,15 +156,24 @@ are called out as "implementation determines."
   scraper and transport-capture run but V2 does NOT drive. After the
   seed pass, V2's world memory should hold enough collision +
   transport + entity data to drive these routes itself.
-  - Seed routes: **Lumby bank ↔ chicken pen**, **Lumby ↔ GE**,
-    **Lumby ↔ Draynor** (both directions where we have trails).
+  - Seed routes: **Lumby bank ↔ chicken pen** (north and south
+    alternates both required), **Lumby ↔ GE**, **Lumby ↔ Draynor**
+    (both directions where we have trails).
   - Seed pass doubles as a regression test for V1 (still walks fine)
     and a capture-validation test for V2 (data shows up where
     expected).
-  - **Acceptance test for V2:** after the seed pass, flip the switch
-    to V2 and walk **Draynor → Lumbridge** using only the scraped
-    world model. If V2 reaches Lumby without the trail-replay path,
-    the automap works.
+  - **Acceptance tests for V2 (in order):**
+    1. **Primary:** flip the switch to V2 and run ChickenFarmV3
+       through several Lumby bank ↔ chicken pen cycles. V2 must
+       complete the loop using its own world model, AND the route-
+       selection layer must demonstrably pick both north and south
+       alternates across cycles (visible in inspection logs / dump
+       output, not just in code).
+    2. **Secondary:** with V2 still active, walk **Draynor →
+       Lumbridge** using only the scraped world model from the seed
+       pass. If V2 reaches Lumby without falling back to V1, the
+       cross-region planning works.
+    Primary must pass before secondary is treated as load-bearing.
 
 ### What V2 captures (LOCKED)
 
@@ -164,13 +182,44 @@ JSONs at runtime, no dependency on V1's file format.
 
 - **Collision + objects + NPCs:** today's `SceneScraper` already does
   this. V2 keeps it.
+- **Entity sightings** persist alongside region snapshots under
+  `~/.runelite/recorder/worldmap/entities/<id>.json`.
 - **Transport edges:** new component `TransportObserver` (in
   `worldmap/`) subscribes to `MenuOptionClicked` in parallel to
-  TrailRecorder. When the user / bot clicks a whitelisted transport
-  verb (Climb-up/down, Open, Cross, Pay-toll, etc.) it records
-  `(from_tile, verb, target, target_kind, param0, param1, to_tile)`
-  into the region snapshot. Same machinery TrailRecorder uses, just
-  a parallel sink. V1 and TrailRecorder are not touched.
+  TrailRecorder. Same source event TrailRecorder uses, just a
+  parallel sink. V1 and TrailRecorder are not touched.
+
+#### TransportObserver capture lifecycle
+
+Transport edges cannot be recorded as a single instantaneous event.
+Stairs, ladders, doors, gates: the click happens on tick T, the
+player position/plane only changes some ticks later when the
+animation/script resolves. The observer therefore captures in two
+phases:
+
+1. **Pending interaction (on `MenuOptionClicked`)** — record:
+   - `fromTile` (player tile at click time)
+   - clicked object / NPC / menu target id
+   - verb (Open / Close / Climb-up / Climb-down / Cross /
+     Pay-toll / etc.)
+   - menu params (param0, param1, target kind)
+   - timestamp
+2. **Resolution (on next position / plane / state change)** — fill
+   in:
+   - `toTile` (player tile after the action settles)
+   - plane delta
+   - success / failure
+   - observed duration
+
+If no movement, plane change, or relevant state change occurs within
+a bounded timeout (implementation determines exact tick count),
+discard the pending capture and log it as unresolved. Do NOT persist
+half-formed transport edges — they would corrupt the planner.
+
+Persisted transport edges live with their region snapshot OR in a
+top-level `~/.runelite/recorder/worldmap/transports.json` index
+(implementation determines which; both are acceptable).
+
 - **Why no trail-JSON ingestion at boot:** the seed pass IS how V2
   gets initial data. If the live listener misses anything during the
   seed pass we want it to surface immediately so we fix the
@@ -178,72 +227,120 @@ JSONs at runtime, no dependency on V1's file format.
   trail-import utility can be added later if useful, but never as a
   runtime path.
 
+#### Persistence layout (LOCKED)
+
+```
+~/.runelite/recorder/worldmap/regions/<id>.json     region snapshots (collision + objects + NPCs)
+~/.runelite/recorder/worldmap/entities/<id>.json    entity sightings per region
+~/.runelite/recorder/worldmap/transports.json       transport graph (or per-region; impl decides)
+~/.runelite/recorder/inspect/                        inspection dumps (separate from world memory)
+~/.runelite/recorder/trails/                         V1 trail JSONs — UNCHANGED
+```
+
+World memory data lives under `worldmap/`. Inspection output is
+separate so it never competes with the read path.
+
 ### V2 leg-executor click behavior (LOCKED)
 
 The leg executor turns "go from A to B via these waypoints" into
-actual cursor moves and clicks. Variety lives here. Three click
-modalities, mixed across a single trip:
+actual cursor moves and clicks. Variety lives here, scoped to what
+the executor can do safely without coupling to widget-state edge
+cases that haven't been validated yet.
 
-- **Canvas click** (most frequent). Pick a tile along the visible
-  path at a weighted-random distance — long (12–16 tiles), mid
-  (6–8), short (2–3) — and click it. Position inside the tile poly
-  is jittered.
+Round-1 active modalities:
+
+- **Canvas click** (default). Pick a tile along the visible path at
+  a weighted-random distance — long (12–16 tiles), mid (6–8), short
+  (2–3) — and click it. Position inside the tile poly is jittered.
 - **Minimap click** (occasional alternate). Click the corresponding
-  spot on the minimap instead of the canvas. Bypasses the
-  "what's hovering the tile" question because minimap clicks are
-  pure walk-to commands.
-- **Worldmap click** (rare, behavior-mode). Occasionally open the
-  worldmap, do several walk clicks via the worldmap UI, close it.
-  Mimics the human "checking the map" pattern. Not per-click — a
-  multi-leg session.
+  spot on the minimap. Used to avoid entity-hover ambiguity in busy
+  areas where canvas candidates keep getting filtered out.
 
-Plus the round-1 humanization extras the user picked:
+Round-1 deferred modalities:
 
-- **Catch-up clicks.** On a small fraction of legs, V2 issues a
-  redundant click on a tile already mid-path. Models the human
-  "did it register?" re-click.
-- **Run toggle.** V2 toggles run on/off based on energy varbit
-  reading + a noise factor. (Run-orb widget click; exact widget id
-  to discover during implementation.)
+- **Worldmap click — DEFERRED to V2.5.** The Navigator interface and
+  modal-selection layer reserve a slot for `WORLDMAP` mode, but no
+  worldmap click code ships in round 1. Reasons: widget open/close
+  state, coordinate transforms, possible interference with script UI
+  state, additional failure modes during seed validation. Reactivate
+  in V2.5 once the canvas + minimap path is proven and the seed
+  pass shows clean capture.
 
-#### HARD CONSTRAINT: every canvas click MUST resolve to a "Walk here" left-click
+Round-1 executor robustness/variety extras:
+
+- **Catch-up clicks.** On a small fraction of legs, V2 may issue a
+  bounded redundant re-click on a tile already mid-path when
+  movement progress stalls or the executor has reason to doubt the
+  previous click registered. NOT a per-cycle decoration — a
+  recovery mechanism gated on stalled progress signals. Bound the
+  number per leg.
+- **Run toggle (interface only in round 1, behavior deferred).**
+  The Navigator interface exposes a run-toggle hook so future work
+  can wire it without API churn. Round-1 executor does NOT toggle
+  run state by default — it leaves whatever state the user/script
+  configured. Activation requires implementation to confirm the
+  varbit/widget path is stable AND a follow-up sign-off; until
+  then, run state is untouched. This avoids run-toggle bugs
+  contaminating planner/executor proof.
+
+#### HARD CONSTRAINT: every canvas click MUST resolve to a "Walk here" left-click at the actual click point
 
 NON-NEGOTIABLE. The user surfaced this explicitly.
 
-Every candidate tile chosen for a canvas click MUST satisfy ALL of:
+The **authoritative check** is the live menu at the intended click
+pixel, immediately before press. Static tile/object filtering is a
+**pre-filter only** — it cuts obviously bad candidates cheaply, but
+does not by itself certify a tile as safe to click. Camera angle,
+click point inside the tile poly, model bounds, and live entity
+movement can all change which menu verb the click pixel resolves to,
+even on a tile that looked clean to the pre-filter.
 
-1. **No entity on the tile that changes the default left-click verb.**
-   Filter out tiles with: any NPC standing on them, any ground item
-   present, any GameObject whose first menu verb is not "Walk here"
-   (so doors, stairs, ladders, fences, NPCs, items, bones, etc. all
-   disqualify the tile). Use live `Scene` / `WorldView` reads on the
-   client thread immediately before the click pick.
-2. **Re-verified at press time.** The dispatcher already exposes an
-   `isLeftClickWalk` pre-check. V2 MUST gate its press on that
-   check. If the pre-check fails (an NPC walked onto the tile in
-   the ~100ms between pick and press), V2 MUST abort the click,
-   pick a different tile, and retry — NOT auto-fall-back to
-   minimap, NOT force a menu verb. Different tile is the only
-   correct response.
+Every canvas click MUST satisfy ALL of:
+
+1. **Pre-filter (cheap, advisory).** Drop candidates with obviously
+   problematic content on the tile: any NPC standing on it, any
+   ground item, any GameObject whose first menu verb is plausibly
+   non-walk (doors, stairs, ladders, etc.). Use live
+   `Scene` / `WorldView` reads on the client thread at pick time.
+   This filter is conservative — it may reject some technically-
+   clickable tiles, that's fine.
+2. **Authoritative live verification at press time.** The dispatcher
+   already exposes an `isLeftClickWalk` pre-check that reads the
+   actual menu the engine would build at the intended click pixel.
+   V2 MUST gate the press on this check. If it fails, V2 MUST abort
+   the press, pick a different canvas tile, and retry — NOT
+   auto-fall-back to minimap, NOT force a menu verb. Different tile
+   is the only correct response. The pre-filter passing does not
+   override this — `isLeftClickWalk` is the truth.
 3. **Reachable.** The tile is on V2's planned path AND is currently
    walkable per the live collision flags (not just the snapshot).
 
-Minimap clicks are subject to (3) but not (1) or (2) because the
-minimap interprets all clicks as walk-to commands regardless of
-what's on the tile. Worldmap clicks behave the same.
+Minimap clicks have their own preconditions:
+
+- minimap is visible on screen
+- no blocking interface or modal dialog covering the minimap region
+- the target minimap point falls inside the clickable minimap
+  bounds (not on the border, orb, compass, etc.)
+- live reachability + progress validation after the click (player
+  actually starts moving; if not, treat as a click failure and
+  classify per the Snapshot Invalidation rules)
+
+So minimap is safer than canvas with respect to entity-hover
+ambiguity, but not unconditional. Worldmap (deferred to V2.5) would
+have analogous preconditions when activated.
 
 **Two distinct rules — don't conflate them:**
 
 - *Per-click failure:* if THIS canvas-click target fails the
-  empty-tile pre-check or `isLeftClickWalk` re-verify, the immediate
-  response is **pick a different canvas tile**. Not minimap. Not a
-  forced verb.
+  pre-filter or `isLeftClickWalk` re-verify, the immediate response
+  is **pick a different canvas tile**. Not minimap. Not a forced
+  verb.
 - *Between-leg modal selection:* when picking the next leg's click
-  modality (canvas / minimap / worldmap), V2 may bias toward
-  minimap/worldmap if the current area has been producing lots of
-  empty-tile filter rejects (busy NPCs, ground items everywhere).
+  modality (canvas / minimap), V2 may bias toward minimap if the
+  current area has been producing lots of pre-filter or
+  `isLeftClickWalk` rejects (busy NPCs, ground items everywhere).
   This is a higher-level scheduling decision, not a fallback from a
-  failed click.
+  single failed click.
 
 ### V2 route alternation (LOCKED)
 
@@ -310,8 +407,9 @@ penalty rules:
 ```
 
 Produces something like `north, north, south, north, south` instead
-of perfect alternation. Both robotic patterns ("always north" AND
-"perfect ABABAB") are out.
+of perfect alternation. Both deterministic patterns ("always north"
+AND "perfect ABABAB") are out — both are equally brittle replays
+that fail the moment one route becomes unviable.
 
 #### Edge-cost noise rule
 
@@ -395,8 +493,8 @@ refreshed passively by `SceneScraper`. Regions outside the loaded
 scene may be stale; V2 discovers staleness through live validation
 during execution.
 
-Before each canvas/minimap/worldmap walk click, the executor
-validates the chosen tile/edge against the live scene:
+Before each canvas/minimap walk click (worldmap deferred to V2.5),
+the executor validates the chosen tile/edge against the live scene:
 
 - live collision must still allow movement
 - canvas clicks must still resolve to "Walk here"
