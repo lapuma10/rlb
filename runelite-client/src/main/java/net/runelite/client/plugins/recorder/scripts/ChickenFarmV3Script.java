@@ -238,6 +238,15 @@ public final class ChickenFarmV3Script
         return null;
     }
 
+    /** Resolve a trail name to its last recorded tile — V2's planning
+     *  destination. Returns null if the trail isn't in the registry
+     *  (the script falls back to a V1-only request). */
+    private WorldPoint trailEndTile(String trailName)
+    {
+        net.runelite.client.plugins.recorder.trail.Trail trail = registry.byName(trailName);
+        return lastTileOf(trail);
+    }
+
     private static boolean near(WorldPoint a, WorldPoint b, int chebyshev)
     {
         return a.getPlane() == b.getPlane()
@@ -297,7 +306,14 @@ public final class ChickenFarmV3Script
         }
 
         String trailName = outbound ? OUTBOUND_TRAIL_NAME : RETURN_TRAIL_NAME;
-        NavStatus st = nav.tick(NavRequest.byTrail(trailName, BehaviorMode.VARIED));
+        // Compose request — V1 reads the trail name; V2 plans to the
+        // trail's destination tile. Resolving here lets the panel's
+        // V1/V2 selector swap implementations without script changes.
+        WorldPoint destTile = trailEndTile(trailName);
+        NavRequest req = destTile == null
+            ? NavRequest.byTrail(trailName, BehaviorMode.VARIED)
+            : NavRequest.compose(trailName, destTile, BehaviorMode.VARIED);
+        NavStatus st = nav.tick(req);
         status.set("walk: " + (outbound ? "outbound" : "return") + " (" + st + ")");
         switch (st)
         {

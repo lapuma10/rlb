@@ -562,7 +562,14 @@ public class RecorderPlugin extends Plugin
             }
             finally { latch.countDown(); }
         });
-        try { latch.await(); }
+        try
+        {
+            if (!latch.await(1500, java.util.concurrent.TimeUnit.MILLISECONDS))
+            {
+                log.warn("v2: playerLocOnClientThread timed out — returning null");
+                return null;
+            }
+        }
         catch (InterruptedException ie) { Thread.currentThread().interrupt(); return null; }
         return ref.get();
     }

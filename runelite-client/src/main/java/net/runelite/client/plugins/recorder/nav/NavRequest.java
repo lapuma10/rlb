@@ -35,4 +35,13 @@ public record NavRequest(@Nullable WorldPoint to,
     {
         return new NavRequest(null, mode, trailName);
     }
+
+    /** Both forms — trail name plus the trail's destination tile. V1
+     *  uses the trail name; V2 plans to the {@code to} point. Use this
+     *  for scripts that want to support either Navigator behind one
+     *  request, e.g. ChickenFarmV3 driving the bank↔pen loop. */
+    public static NavRequest compose(String trailName, WorldPoint to, BehaviorMode mode)
+    {
+        return new NavRequest(to, mode, trailName);
+    }
 }

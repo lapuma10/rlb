@@ -171,10 +171,15 @@ public final class V2ExecutorEnv implements V2Executor.Env
         }));
     }
 
-    /** TrailWalker-style synchronous client-thread read. Blocks the
-     *  caller's worker thread until the supplier has run on the client
-     *  thread. Returns null on interrupt — the caller's RUNNING/IDLE
-     *  contract handles that as a no-op tick. */
+    /** Synchronous client-thread read with a bounded wait. The caller
+     *  (V2Executor) tolerates a null return as "try again next tick",
+     *  so a missed deadline collapses to a one-tick no-op rather than
+     *  hanging the worker. Bound matches HumanizedInputDispatcher's
+     *  own onClient timeout (2× one tick) — generous enough to absorb
+     *  scene-load contention without becoming a deadlock vector during
+     *  shutdown. */
+    private static final long ONCLIENT_TIMEOUT_MS = 1500;
+
     @Nullable
     private <T> T onClient(Supplier<T> sup)
     {
@@ -185,7 +190,15 @@ public final class V2ExecutorEnv implements V2Executor.Env
             catch (Throwable th) { log.warn("v2-executor-env: onClient threw", th); }
             finally { latch.countDown(); }
         });
-        try { latch.await(); }
+        try
+        {
+            if (!latch.await(ONCLIENT_TIMEOUT_MS, java.util.concurrent.TimeUnit.MILLISECONDS))
+            {
+                log.warn("v2-executor-env: onClient timed out after {} ms — returning null",
+                    ONCLIENT_TIMEOUT_MS);
+                return null;
+            }
+        }
         catch (InterruptedException ie)
         {
             Thread.currentThread().interrupt();
