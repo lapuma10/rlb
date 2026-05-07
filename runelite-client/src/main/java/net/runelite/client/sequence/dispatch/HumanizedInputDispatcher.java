@@ -977,6 +977,24 @@ public class HumanizedInputDispatcher implements InputDispatcher
         if (tile == null) { lastError.set("null tile for gameObjectClick"); return; }
         if (verb == null || verb.isBlank())
         { lastError.set("null verb for gameObjectClick"); return; }
+        // Reject cross-plane clicks: the target object lives on a different
+        // floor than the player. Common cause is a trail-walker that queued
+        // an opportunistic transport click for the previous-plane staircase
+        // tile after the descent had already started; resolving the pixel
+        // for that tile against the post-descent scene lands on random
+        // scenery on the new floor.
+        Integer playerPlane = onClient(() -> {
+            var local = client.getLocalPlayer();
+            return local == null ? null : local.getWorldLocation().getPlane();
+        });
+        if (playerPlane != null && playerPlane != tile.getPlane())
+        {
+            lastError.set("cross-plane click refused: player plane="
+                + playerPlane + " tile plane=" + tile.getPlane());
+            log.info("gameObjectClick {} verb='{}' — cross-plane (player={}, tile={}), refusing",
+                tile, verb, playerPlane, tile.getPlane());
+            return;
+        }
         // Resolve the object + pixel on the client thread.
         TransportResolver tr = new TransportResolver(client);
         TransportResolver.Match match = onClient(() -> tr.findTransport(tile, verb));
