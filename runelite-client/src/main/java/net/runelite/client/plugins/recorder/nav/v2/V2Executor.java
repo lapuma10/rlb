@@ -235,15 +235,15 @@ public final class V2Executor
         String lastErr = env.lastDispatchError();
         if (lastErr != null && lastDispatchedTile != null && !lastDispatchWasMinimap)
         {
-            log.info("v2-executor: click rejected at {} — \"{}\"; blacklisting + picking different tile",
-                lastDispatchedTile, lastErr);
+            log.info("v2-executor: UNSAFE_CANVAS_CLICK at {} — \"{}\"; blacklisting + picking different tile (rejects this leg: {}/{})",
+                lastDispatchedTile, lastErr, clickRejectsThisLeg + 1, MAX_CLICK_REJECTS_PER_LEG);
             classifier.blacklistTile(lastDispatchedTile);
             clickRejectsThisLeg++;
             lastDispatchedTile = null;
             ticksSinceProgress = 0;   // not a stall — the click never landed
             if (clickRejectsThisLeg >= MAX_CLICK_REJECTS_PER_LEG)
             {
-                log.warn("v2-executor: {} consecutive strict-walk rejections — FAILED so navigator replans",
+                log.warn("v2-executor: UNSAFE_CANVAS_CLICK — FAILED after {} consecutive rejections, all canvas candidates blacklisted; navigator should replan",
                     clickRejectsThisLeg);
                 status = Status.FAILED;
                 return status;
