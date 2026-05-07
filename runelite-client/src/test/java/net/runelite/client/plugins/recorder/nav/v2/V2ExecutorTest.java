@@ -9,9 +9,11 @@ import java.util.Random;
 import java.util.Set;
 import javax.annotation.Nullable;
 import net.runelite.api.coords.WorldPoint;
+import net.runelite.client.plugins.recorder.worldmap.TransportEdge;
 import org.junit.Test;
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertNotEquals;
+import static org.junit.Assert.assertNull;
 import static org.junit.Assert.assertSame;
 import static org.junit.Assert.assertTrue;
 
@@ -376,5 +378,135 @@ public class V2ExecutorTest
         V2Executor.Status s = x.tick();
         assertEquals("missing player loc must not advance state", V2Executor.Status.RUNNING, s);
         assertEquals("no dispatch when player loc unknown", 0, env.walkDispatches.size());
+    }
+
+    // ------------------------------------------------------------------
+    // Phase-7 fallback correctness: V2 cannot drive transport legs in
+    // round 1. The executor must fail cleanly with a tagged reason so
+    // the hybrid navigator can fall back to V1 (or strict mode surfaces
+    // the FAILED) instead of stalling on a tile whose plane the player
+    // can't reach by walking.
+    // ------------------------------------------------------------------
+
+    private static TransportEdge stairs(WorldPoint from, WorldPoint to, String verb)
+    {
+        return new TransportEdge(from, to, 12345, "Staircase", verb,
+            0, 0, "object", from, 12345, 1, 0L, 0L);
+    }
+
+    @Test
+    public void setPath_withTransportLeg_failsImmediately_withTransportReason()
+    {
+        FakeEnv env = new FakeEnv();
+        env.player = new WorldPoint(3208, 3217, 0);
+        V2Executor x = newExecutor(env);
+
+        // walk plane=0 → climb-up → walk plane=2 — the chicken-castle shape
+        // that exposed the bug.
+        List<WorldPoint> w0 = List.of(new WorldPoint(3208, 3217, 0),
+                                      new WorldPoint(3209, 3217, 0));
+        List<WorldPoint> w2 = List.of(new WorldPoint(3210, 3220, 2),
+                                      new WorldPoint(3211, 3220, 2));
+        TransportEdge edge = stairs(new WorldPoint(3209, 3217, 0),
+                                    new WorldPoint(3210, 3220, 2),
+                                    "Climb-up");
+        V2Path p = new V2Path(List.of(
+            new V2Leg.Walk(0, w0),
+            new V2Leg.Transport(edge),
+            new V2Leg.Walk(2, w2)
+        ), 100);
+
+        x.setPath(p);
+
+        assertEquals("transport in path → FAILED before any tick runs",
+            V2Executor.Status.FAILED, x.status());
+        assertEquals("FailureReason must be TRANSPORT_EXECUTOR_MISSING",
+            V2Executor.FailureReason.TRANSPORT_EXECUTOR_MISSING,
+            x.lastFailureReason());
+
+        // Subsequent ticks must not produce dispatches — including any
+        // dispatch onto the plane=2 walk leg's tiles while the player
+        // is on plane=0. This is the exact symptom of the bug.
+        for (int i = 0; i < 5; i++) {
+            env.busy = false;
+            x.tick();
+        }
+        assertEquals("no walk dispatch after FAILED", 0, env.walkDispatches.size());
+        assertEquals("no minimap dispatch after FAILED", 0, env.minimapDispatches.size());
+    }
+
+    @Test
+    public void setPath_walkOnlyPath_clearsFailureReason()
+    {
+        // After a failed transport route, replanning to a walk-only route
+        // must clear the FAILED state and reason — fresh path, fresh state.
+        FakeEnv env = new FakeEnv();
+        env.player = new WorldPoint(3208, 3217, 0);
+        V2Executor x = newExecutor(env);
+
+        TransportEdge edge = stairs(new WorldPoint(3209, 3217, 0),
+                                    new WorldPoint(3210, 3220, 2),
+                                    "Climb-up");
+        x.setPath(new V2Path(List.of(new V2Leg.Transport(edge)), 10));
+        assertEquals(V2Executor.FailureReason.TRANSPORT_EXECUTOR_MISSING,
+            x.lastFailureReason());
+
+        x.setPath(eastPath(20));
+        assertEquals("walk-only path resets to RUNNING",
+            V2Executor.Status.RUNNING, x.status());
+        assertNull("walk-only path clears FailureReason", x.lastFailureReason());
+    }
+
+    @Test
+    public void setPath_emptyPath_noFailureReason()
+    {
+        // Empty path is IDLE, not FAILED — the failure reason must stay null.
+        FakeEnv env = new FakeEnv();
+        env.player = new WorldPoint(0, 0, 0);
+        V2Executor x = newExecutor(env);
+        x.setPath(V2Path.EMPTY);
+        assertNull("empty path is IDLE, no reason", x.lastFailureReason());
+    }
+
+    @Test
+    public void tick_crossPlaneCandidate_neverDispatched_repeatedFailures_failTheLeg()
+    {
+        // Defense-in-depth plane guard: synthesize a Walk leg whose tiles
+        // are on plane=2 while the player is on plane=0. This shape can
+        // only arise from a malformed route or planner bug, but the
+        // executor must NEVER click a tile on a plane the player can't
+        // reach by walking — and after repeated cross-plane picks it
+        // must FAIL the leg instead of stalling silently.
+        FakeEnv env = new FakeEnv();
+        env.player = new WorldPoint(3208, 3217, 0);   // plane 0
+        V2Executor x = newExecutor(env);
+
+        // 30 walk tiles all on plane=2 — every candidate is cross-plane.
+        List<WorldPoint> badPlane = new ArrayList<>();
+        for (int i = 0; i < 30; i++) badPlane.add(new WorldPoint(3208 + i, 3217, 2));
+        V2Path p = new V2Path(List.of(new V2Leg.Walk(0, badPlane)), 29);
+        x.setPath(p);
+
+        // Drive enough ticks that the buggy code path would have produced
+        // off-plane dispatches.
+        for (int i = 0; i < 30; i++) {
+            env.busy = false;
+            x.tick();
+            if (x.status() == V2Executor.Status.FAILED) break;
+        }
+
+        for (WorldPoint w : env.walkDispatches) {
+            assertEquals("cross-plane walk dispatch leaked through guard",
+                0, w.getPlane());
+        }
+        for (WorldPoint w : env.minimapDispatches) {
+            assertEquals("cross-plane minimap dispatch leaked through guard",
+                0, w.getPlane());
+        }
+        assertEquals("repeated cross-plane candidates must FAIL the leg",
+            V2Executor.Status.FAILED, x.status());
+        assertEquals("FailureReason for cross-plane exhaustion",
+            V2Executor.FailureReason.CROSS_PLANE_CANDIDATES_EXHAUSTED,
+            x.lastFailureReason());
     }
 }

@@ -4,6 +4,7 @@ import java.util.Random;
 import javax.annotation.Nullable;
 import lombok.extern.slf4j.Slf4j;
 import net.runelite.api.coords.WorldPoint;
+import net.runelite.client.plugins.recorder.worldmap.TransportEdge;
 
 /** Per-tick state machine that turns a {@link V2Path} into walk-clicks
  *  and minimap-clicks. Lives behind {@link V2Navigator}; the Navigator
@@ -44,6 +45,26 @@ public final class V2Executor
     public enum Modality { CANVAS, MINIMAP, WORLDMAP }
 
     public enum Status { IDLE, RUNNING, ARRIVED, FAILED }
+
+    /** Tagged reason attached to a {@link Status#FAILED} transition.
+     *  {@code null} while RUNNING / ARRIVED / IDLE. */
+    public enum FailureReason
+    {
+        /** Route contains at least one {@link V2Leg.Transport} leg
+         *  but round-1 V2 cannot drive verb-clicks on transport
+         *  objects. The hybrid navigator falls back to V1; strict
+         *  mode surfaces this cleanly. */
+        TRANSPORT_EXECUTOR_MISSING,
+        /** Defense-in-depth: repeated candidate picks resolved to
+         *  tiles on a plane different from the player's current
+         *  plane, beyond the per-leg bound. Indicates a malformed
+         *  route or planner bug. */
+        CROSS_PLANE_CANDIDATES_EXHAUSTED,
+        /** Catch-all for round-1 FAILED paths whose specific reason
+         *  is logged inline (catch-up exhausted, click-reject bound,
+         *  stall classifier escalations, etc.). */
+        OTHER
+    }
 
     /** Live-state seam. Production binds these to {@link
      *  net.runelite.api.Client}, {@link net.runelite.client.callback.ClientThread},
@@ -128,6 +149,15 @@ public final class V2Executor
      *  bug instead of looping forever. */
     public static final int MAX_CLICK_REJECTS_PER_LEG = 5;
 
+    /** Defense-in-depth bound for cross-plane candidate rejections per
+     *  route. The planner shouldn't produce walk legs whose tiles span
+     *  planes (transitions are encoded as {@link V2Leg.Transport} legs)
+     *  but a malformed snapshot or planner bug could still surface one.
+     *  Each off-plane pick is rejected and blacklisted; once we exceed
+     *  this count we FAIL so the navigator replans / falls back rather
+     *  than spinning silently. */
+    public static final int MAX_CROSS_PLANE_REJECTS_PER_ROUTE = 5;
+
     /** Recent-filter window size for the modality bias decision. */
     private static final int FILTER_REJECT_WINDOW = 4;
     /** Switch to minimap modality when rejection rate is at or above
@@ -143,6 +173,7 @@ public final class V2Executor
     private int legIdx;
     private int catchupClicksThisLeg;
     private int clickRejectsThisLeg;
+    private int crossPlaneRejectsThisRoute;
     private int ticksSinceProgress;
     @Nullable private WorldPoint lastPlayerLoc;
     @Nullable private WorldPoint lastDispatchedTile;
@@ -151,6 +182,7 @@ public final class V2Executor
     private int rejectCursor;
     private RunMode runMode = RunMode.UNCHANGED;
     private Status status = Status.IDLE;
+    @Nullable private FailureReason lastFailureReason;
 
     public V2Executor(Env env, CanvasTilePicker canvasPicker,
                       InvalidationClassifier classifier, Random rng)
@@ -162,13 +194,22 @@ public final class V2Executor
     }
 
     /** Start executing a new path. Clears all per-leg state and
-     *  resets the classifier's attempt-local blacklist. */
+     *  resets the classifier's attempt-local blacklist.
+     *
+     *  <p>If the path contains any {@link V2Leg.Transport} leg, the
+     *  executor immediately transitions to {@link Status#FAILED} with
+     *  reason {@link FailureReason#TRANSPORT_EXECUTOR_MISSING}. Round 1
+     *  V2 has no verb-click implementation; without this guard the
+     *  picker would flatten walk-leg tiles across planes and dispatch a
+     *  click on a tile the player can't reach by walking, then stall
+     *  silently — which defeats {@code V2_WITH_V1_FALLBACK}'s contract. */
     public void setPath(V2Path newPath)
     {
         this.path = newPath;
         this.legIdx = 0;
         this.catchupClicksThisLeg = 0;
         this.clickRejectsThisLeg = 0;
+        this.crossPlaneRejectsThisRoute = 0;
         this.ticksSinceProgress = 0;
         this.lastPlayerLoc = null;
         this.lastDispatchedTile = null;
@@ -176,13 +217,42 @@ public final class V2Executor
         this.rejectCursor = 0;
         for (int i = 0; i < recentRejects.length; i++) recentRejects[i] = false;
         this.classifier.resetForNewRoute();
-        this.status = (newPath == null || newPath.isEmpty()) ? Status.IDLE : Status.RUNNING;
+        this.lastFailureReason = null;
+        if (newPath == null || newPath.isEmpty())
+        {
+            this.status = Status.IDLE;
+            return;
+        }
+        TransportEdge unsupported = firstTransportEdge(newPath);
+        if (unsupported != null)
+        {
+            log.warn("v2-executor: route contains TRANSPORT leg (objectName=\"{}\" verb=\"{}\" objectId={} fromPlane={} toPlane={}) "
+                + "— transport execution not implemented in round 1; FAILED with reason TRANSPORT_EXECUTOR_MISSING "
+                + "so the navigator can fall back to V1 (or strict mode surfaces the failure)",
+                unsupported.objectName(), unsupported.verb(), unsupported.objectId(),
+                unsupported.fromTile().getPlane(), unsupported.toTile().getPlane());
+            this.status = Status.FAILED;
+            this.lastFailureReason = FailureReason.TRANSPORT_EXECUTOR_MISSING;
+            return;
+        }
+        this.status = Status.RUNNING;
+    }
+
+    @Nullable
+    private static TransportEdge firstTransportEdge(V2Path p)
+    {
+        for (V2Leg leg : p.legs())
+        {
+            if (leg instanceof V2Leg.Transport t) return t.edge();
+        }
+        return null;
     }
 
     public void cancel()
     {
         this.path = null;
         this.status = Status.IDLE;
+        this.lastFailureReason = null;
     }
 
     /** Round-1 stub. Logs a warning and falls through to UNCHANGED for
@@ -200,6 +270,11 @@ public final class V2Executor
     }
 
     public Status status() { return status; }
+
+    /** Tag attached to the most recent {@link Status#FAILED} transition.
+     *  {@code null} when status has never been FAILED on the active path
+     *  (or the failure was cleared by {@link #setPath} / {@link #cancel}). */
+    @Nullable public FailureReason lastFailureReason() { return lastFailureReason; }
 
     /** Drive one tick of execution. Returns the post-tick status; the
      *  Navigator collapses RUNNING / ARRIVED / FAILED into NavStatus. */
@@ -291,6 +366,11 @@ public final class V2Executor
         if (modality == Modality.CANVAS)
         {
             WorldPoint pick = canvasPicker.pickNext(path, here, this::canvasFilter, rng);
+            if (!acceptCandidate(pick, here, "canvas"))
+            {
+                pick = null;
+                if (status == Status.FAILED) return status;
+            }
             recordReject(pick == null);
             if (pick != null)
             {
@@ -308,6 +388,11 @@ public final class V2Executor
 
         // MINIMAP modality.
         WorldPoint mmTarget = pickMinimapTarget(here);
+        if (!acceptCandidate(mmTarget, here, "minimap"))
+        {
+            mmTarget = null;
+            if (status == Status.FAILED) return status;
+        }
         if (mmTarget == null)
         {
             // Both modalities failed for this tick. Counter the stall
@@ -327,6 +412,34 @@ public final class V2Executor
             log.debug("v2-executor: minimap dispatch → {}", mmTarget);
         }
         return status;
+    }
+
+    /** Hard plane guard. Returns false (and applies recovery) if the
+     *  candidate is on a plane the player can't reach by walking. The
+     *  caller treats a false return as "no candidate this tick"; the
+     *  guard itself blacklists the rejected tile (so the next pick
+     *  chooses a different one) and FAILS the route after
+     *  {@link #MAX_CROSS_PLANE_REJECTS_PER_ROUTE} rejections — repeated
+     *  cross-plane candidates indicate a malformed route, not a
+     *  recoverable click. */
+    private boolean acceptCandidate(@Nullable WorldPoint candidate,
+                                    WorldPoint playerHere, String modalityTag)
+    {
+        if (candidate == null) return true;   // nothing to accept; caller handles null
+        if (candidate.getPlane() == playerHere.getPlane()) return true;
+        crossPlaneRejectsThisRoute++;
+        log.warn("v2-executor: rejected cross-plane {} candidate {} (player on plane {}); rejects this route: {}/{}",
+            modalityTag, candidate, playerHere.getPlane(),
+            crossPlaneRejectsThisRoute, MAX_CROSS_PLANE_REJECTS_PER_ROUTE);
+        classifier.blacklistTile(candidate);
+        if (crossPlaneRejectsThisRoute >= MAX_CROSS_PLANE_REJECTS_PER_ROUTE)
+        {
+            log.warn("v2-executor: cross-plane candidate budget exhausted ({} ≥ {}) — FAILED so navigator can replan / fall back",
+                crossPlaneRejectsThisRoute, MAX_CROSS_PLANE_REJECTS_PER_ROUTE);
+            status = Status.FAILED;
+            lastFailureReason = FailureReason.CROSS_PLANE_CANDIDATES_EXHAUSTED;
+        }
+        return false;
     }
 
     private boolean canvasFilter(WorldPoint tile)
