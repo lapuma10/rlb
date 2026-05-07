@@ -60,10 +60,15 @@ public final class ConfirmOfferStep implements Step {
      *  GeOfferPriceTooHigh while the popup is still on screen. */
     private InputDispatcher dispatcher;
 
-    /** Default behaviour: reject the high-price warning and abort with
-     *  {@link GeBlockReason.GeOfferPriceTooHigh}. */
+    /** Default behaviour: auto-accept the high-price warning for small,
+     *  cheap buys (qty==1 && priceEach<5000gp) — the warning fires whenever
+     *  bid is much higher than guide, and for cheap pennies-on-the-GE
+     *  ingredients (flour, milk, eggs) we deliberately overpay to fill
+     *  fast. For anything larger, reject and abort with
+     *  {@link GeBlockReason.GeOfferPriceTooHigh} so the caller can
+     *  reconcile rather than silently overcommitting coins. */
     public ConfirmOfferStep(int itemId, OfferSide side, int quantity, int priceEach, GeActions ge) {
-        this(itemId, side, quantity, priceEach, ge, false);
+        this(itemId, side, quantity, priceEach, ge, quantity == 1 && priceEach < 5000);
     }
 
     /** Variant for price-check probes: pass {@code acceptHighPriceWarning=true}
