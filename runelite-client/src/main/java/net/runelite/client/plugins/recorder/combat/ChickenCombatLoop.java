@@ -419,9 +419,31 @@ public final class ChickenCombatLoop
             var c = pick.getComposition();
             return c == null ? pick.getName() : c.getName();
         }, "Chicken");
+        WorldPoint pickTile = onClient(pick::getWorldLocation);
         CombatTarget ct = new CombatTarget(pick.getIndex(), pickName, tick);
         target.set(ct);
         setStatus("engaging " + pickName + " #" + ct.npcIndex());
+        // Pan camera toward the locked target before the engage click. The
+        // dispatcher's CLICK_NPC phase-2 only rotates non-forced and skips
+        // when the tile is "comfortably visible" — in the chicken pen that
+        // early-exit fires every tick, so the engage click resolves on a
+        // chicken model at whatever screen edge it happened to be at when
+        // we entered SELECTING. Forcing a pan here recentres the viewport
+        // and gives the click the freshest possible hull projection.
+        if (pickTile != null)
+        {
+            try
+            {
+                dispatcher.rotateCameraToward(pickTile, true);
+            }
+            catch (InterruptedException ie)
+            {
+                Thread.currentThread().interrupt();
+                target.set(null);
+                setStatus("interrupted during camera pan");
+                return false;
+            }
+        }
         setState(State.ENGAGING);
         return true;
     }
@@ -929,7 +951,15 @@ public final class ChickenCombatLoop
 
     /** If the player is already fighting a chicken when SELECTING starts
      *  (e.g. a stray loot misclick or auto-retaliate engaged one), adopt that
-     *  fight instead of trying to click a second target. */
+     *  fight instead of trying to click a second target.
+     *
+     *  <p><b>Reject if another player is the chicken's current interactor.</b>
+     *  Player.getInteracting() is sticky for a tick or two after a failed /
+     *  cancelled attack flow, so a chicken that is actually being killed by
+     *  another player can briefly look "ours" via self-only interaction.
+     *  Adopting in that case produced the false-IN_COMBAT cascade in the
+     *  pen logs (kill-confirmed for chickens we never landed an Attack on).
+     *  Mutual engagement (chicken targeting us back) is the truth-tell. */
     @Nullable
     private CombatTarget detectActiveChickenCombat(Snapshot snap)
     {
@@ -938,7 +968,11 @@ public final class ChickenCombatLoop
         Actor selfInteracting = snap.self.getInteracting();
         if (selfInteracting instanceof NPC npc && isAdoptableChicken(npc, snap.playerPos))
         {
-            adopted = npc;
+            Actor npcInteracting = npc.getInteracting();
+            boolean stolenByOther = npcInteracting instanceof Player && npcInteracting != snap.self;
+            if (!stolenByOther) adopted = npc;
+            else log.debug("skip adopt — chicken #{} is being fought by another player",
+                npc.getIndex());
         }
         if (adopted == null)
         {

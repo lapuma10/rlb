@@ -24,6 +24,7 @@
  */
 package net.runelite.client.plugins.recorder.combat;
 
+import net.runelite.api.coords.WorldPoint;
 import net.runelite.client.sequence.dispatch.HumanizedInputDispatcher;
 import net.runelite.client.sequence.internal.ActionRequest;
 import javax.annotation.Nullable;
@@ -35,10 +36,10 @@ import javax.annotation.Nullable;
  * doubles that record dispatch calls without touching the real cursor/canvas
  * plumbing.
  *
- * <p>Methods here are exactly the surface the loop needs: dispatch a click,
- * check single-flight busy, read the most-recent error. Everything else
- * (camera rotation, key taps, cursor parking) stays on the concrete
- * dispatcher and is not relevant to combat orchestration.
+ * <p>The surface mirrors what the loop actually needs: dispatch a click,
+ * check single-flight busy, read the most-recent error, and force-rotate
+ * the camera toward a freshly-locked target tile (so the engage click
+ * resolves on a centred viewport instead of a chicken at screen edge).
  */
 public interface CombatDispatcher
 {
@@ -48,6 +49,18 @@ public interface CombatDispatcher
 
     @Nullable
     String lastErrorMessage();
+
+    /** Pan camera toward {@code target}. {@code force} skips the
+     *  "already comfortably visible" early-exit so a centred-but-edge
+     *  target still pans inward; the yaw deadband (~22°) still no-ops.
+     *  Default is no-op so {@link Mockito} mocks don't need to stub it.
+     *  May throw {@link InterruptedException} if the worker is interrupted
+     *  mid-pan; callers should propagate. */
+    default void rotateCameraToward(WorldPoint target, boolean force)
+        throws InterruptedException
+    {
+        // no-op for tests
+    }
 
     /**
      * Adapter over the concrete humanized dispatcher.
@@ -59,6 +72,11 @@ public interface CombatDispatcher
             @Override public void dispatch(ActionRequest req) { d.dispatch(req); }
             @Override public boolean isBusy() { return d.isBusy(); }
             @Override @Nullable public String lastErrorMessage() { return d.lastErrorMessage(); }
+            @Override public void rotateCameraToward(WorldPoint target, boolean force)
+                throws InterruptedException
+            {
+                d.rotateCameraToward(target, force);
+            }
         };
     }
 }

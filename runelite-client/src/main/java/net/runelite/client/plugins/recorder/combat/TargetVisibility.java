@@ -46,21 +46,18 @@ import net.runelite.api.widgets.Widget;
  *
  * <ol start="0">
  *   <li>Plane match — same floor as the player.</li>
- *   <li>World line-of-sight (no walls / fences between player and NPC) via
- *       {@link WorldArea#hasLineOfSightTo}.</li>
+ *   <li>Tile-to-tile line-of-sight via {@link WorldArea#hasLineOfSightTo} —
+ *       no wall / fence / closed door between player and NPC.</li>
  *   <li value="2">Walking reachability — a bounded BFS over
- *       {@link WorldArea#canTravelInDirection} catches NPCs behind a fence
- *       that LOS alone would let through.</li>
- *   <li value="3">Roof occlusion — when the player is under a hidden roof
- *       ({@link Constants#TILE_FLAG_UNDER_ROOF} via
- *       {@link Scene#getRoofs()}), NPCs on rendered-roof tiles are culled.</li>
- *   <li value="4">NPC's tile is currently projected onto the canvas (not
+ *       {@link WorldArea#canTravelInDirection} catches closed gates and
+ *       impassable terrain that LOS through a window would otherwise pass.</li>
+ *   <li value="3">NPC's tile is currently projected onto the canvas (not
  *       behind the camera or off-screen).</li>
- *   <li value="5">NPC's projected pixel is inside the playable game viewport
+ *   <li value="4">NPC's projected pixel is inside the playable game viewport
  *       (in fixed-mode this excludes the chrome around the play area).</li>
- *   <li value="6">If a right-click menu is open, the NPC's pixel is not under
+ *   <li value="5">If a right-click menu is open, the NPC's pixel is not under
  *       that menu's rectangle.</li>
- *   <li value="7">Resizable mode only: NPC's pixel is not under the HUD
+ *   <li value="6">Resizable mode only: NPC's pixel is not under the HUD
  *       widget tree (inventory / tabs / minimap / orbs / chatbox) — fixed
  *       mode already excludes those via the viewport rect.</li>
  * </ol>
@@ -87,6 +84,13 @@ public interface TargetVisibility
         NULL_INPUT,
         /** Player and NPC are on different floors. */
         PLANE_MISMATCH,
+        /** Tile-to-tile line-of-sight is blocked by a wall / fence /
+         *  closed door. A clean LOS is required for melee click reliability:
+         *  if a fence sits between the player tile and the chicken tile,
+         *  the engine resolves the click to the wall and the right-click
+         *  menu has no 'Attack' on it, producing the dispatch failure
+         *  cascade we saw in the chicken-pen logs. */
+        NO_LOS,
         /** Walking BFS can't reach the NPC's tile within
          *  {@code MAX_REACH_DEPTH}. Catches gates that are closed and
          *  islands behind impassable terrain. */
@@ -167,17 +171,30 @@ final class ClientVisibility implements TargetVisibility
                 npc.getIndex(), selfWp.getPlane(), npcWp.getPlane());
             return Reason.PLANE_MISMATCH;
         }
-        // 1. Walking reachability. The selector is for melee combat — what
-        //    matters is "can I walk to a tile adjacent to this NPC?", NOT
-        //    "is there a clear projectile arc?". Projectile LOS culls
-        //    chickens in the open courtyard if a wooden fence is between
-        //    them and the player even though you can plainly walk around
-        //    it; we use the canvas-projection check below to confirm the
-        //    chicken is actually on screen for the player. BFS over
-        //    collision flags up to MAX_REACH_DEPTH.
         WorldArea selfArea = self.getWorldArea();
         WorldArea npcArea = npc.getWorldArea();
         if (selfArea == null || npcArea == null) return Reason.NULL_INPUT;
+        // 1. Tile-to-tile line-of-sight. We previously skipped this in favour
+        //    of pure walking-reachability with the rationale "you can walk
+        //    around a fence to reach the chicken anyway". The chicken-pen
+        //    logs disprove that: when a fence sits between the player and
+        //    the chicken, the chicken's hull still projects on canvas (the
+        //    fence just clips it), so the dispatcher resolves a click pixel,
+        //    but the engine's hover lands on the fence wall and the
+        //    right-click menu has no 'Attack', producing repeated 'menu
+        //    missing Attack' dispatch failures and the false-IN_COMBAT
+        //    knock-on. Cull these targets up front. Reachability still runs
+        //    next as a coarser check for closed gates / impassable terrain.
+        if (!selfArea.hasLineOfSightTo(wv, npcArea))
+        {
+            log.debug("cull npc {} — no line of sight from self {} to npc {}",
+                npc.getIndex(), selfWp, npcWp);
+            return Reason.NO_LOS;
+        }
+        // 2. Walking reachability. BFS over collision flags up to
+        //    MAX_REACH_DEPTH. Catches "behind a closed gate" and similar
+        //    cases where a tile has LOS through a window/grate but isn't
+        //    walkable.
         if (!isReachable(selfArea, npcArea, wv))
         {
             log.debug("cull npc {} — not reachable on foot", npc.getIndex());
