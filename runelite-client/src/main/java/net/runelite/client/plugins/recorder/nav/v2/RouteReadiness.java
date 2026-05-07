@@ -39,9 +39,24 @@ import net.runelite.client.plugins.recorder.worldmap.TransportIndex;
 public final class RouteReadiness
 {
     /** Reason a connected corridor between {@code from} and {@code to}
-     *  breaks. Inspection order: REGION_MISSING > UNKNOWN_TILE >
-     *  COLLISION_BLOCKED > DIAGONAL_BLOCKED > PLANE_MISMATCH >
-     *  TRANSPORT_REQUIRED / TRANSPORT_EXECUTOR_MISSING > NONE. */
+     *  breaks. Classifier precedence (see {@link #classify}):
+     *  <ol>
+     *    <li>If the deterministic A* found a path AND the path uses an
+     *        unsupported transport leg → {@link #TRANSPORT_EXECUTOR_MISSING}.</li>
+     *    <li>If the planner found a path → {@link #NONE}.</li>
+     *    <li>If the from-tile or to-tile is not walkable, surface the
+     *        endpoint problem first: missing region snapshot →
+     *        {@link #REGION_MISSING}; tile not in snapshot →
+     *        {@link #UNKNOWN_TILE}.</li>
+     *    <li>If the endpoints are on different planes:
+     *        no transports known → {@link #TRANSPORT_REQUIRED};
+     *        transports known → {@link #PLANE_MISMATCH}.</li>
+     *    <li>Otherwise the BFS from the start populates either
+     *        {@link #COLLISION_BLOCKED} or {@link #DIAGONAL_BLOCKED}
+     *        from the first edge it could not traverse.</li>
+     *    <li>Fallback (shouldn't be reachable in practice) →
+     *        {@link #UNKNOWN_TILE}.</li>
+     *  </ol> */
     public enum BreakReason
     {
         NONE,
@@ -162,8 +177,12 @@ public final class RouteReadiness
         boolean transportExecutorMissing = false;
         if (planner != null)
         {
-            V2Path path = planner.plan(from, to,
-                net.runelite.client.plugins.recorder.nav.BehaviorMode.VARIED);
+            // Use the deterministic A* — readiness is a yes/no diagnostic,
+            // it must NOT depend on the user's variation flag or the
+            // current RouteHistory state. Two consecutive readiness
+            // checks against the same world memory must return the same
+            // BreakReason / canPlan answer.
+            V2Path path = planner.planDeterministic(from, to);
             canPlan = path != null && !path.isEmpty();
             plannerDiag = planner.diagnose(from, to);
             if (canPlan)

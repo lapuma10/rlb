@@ -52,6 +52,13 @@ public final class V2Navigator implements Navigator
         V2Executor.Status tick();
         void cancel();
         V2Executor.Status status();
+        /** Underlying executor failure reason (if any). The navigator
+         *  surfaces this via {@link V2Navigator#lastExecutorFailureReason}
+         *  so log lines and panel reports can attribute an
+         *  {@code EXECUTOR_FAILED} navigator status to the precise
+         *  executor cause (TRANSPORT_EXECUTOR_MISSING / CATCHUP_EXHAUSTED
+         *  / PLAYER_LOC_LOST / …). */
+        @Nullable default V2Executor.FailureReason lastFailureReason() { return null; }
     }
 
     /** Supplier for the player's current world location. Production
@@ -139,12 +146,23 @@ public final class V2Navigator implements Navigator
             @Override public V2Executor.Status tick() { return executor.tick(); }
             @Override public void cancel() { executor.cancel(); }
             @Override public V2Executor.Status status() { return executor.status(); }
+            @Override public V2Executor.FailureReason lastFailureReason() { return executor.lastFailureReason(); }
         };
     }
 
     /** Tagged reason for the most recent FAILED transition. {@code null}
      *  while RUNNING / ARRIVED / IDLE or after {@link #cancel}. */
     @Nullable public FailureReason lastFailureReason() { return lastFailureReason; }
+
+    /** When {@link #lastFailureReason} is {@link FailureReason#EXECUTOR_FAILED},
+     *  the underlying executor's reason explains *why* the executor
+     *  failed (TRANSPORT_EXECUTOR_MISSING / CATCHUP_EXHAUSTED / etc.).
+     *  Returns {@code null} for non-executor failures or when the
+     *  executor never failed. */
+    @Nullable public V2Executor.FailureReason lastExecutorFailureReason()
+    {
+        return executor.lastFailureReason();
+    }
 
     @Override
     public NavStatus tick(NavRequest request) throws InterruptedException
@@ -189,7 +207,12 @@ public final class V2Navigator implements Navigator
             executor.setPath(path);
         }
         NavStatus s = mapStatus(executor.tick());
-        if (s == NavStatus.FAILED) lastFailureReason = FailureReason.EXECUTOR_FAILED;
+        if (s == NavStatus.FAILED)
+        {
+            lastFailureReason = FailureReason.EXECUTOR_FAILED;
+            log.warn("worldmap-v2: executor FAILED — exec.reason={}",
+                executor.lastFailureReason());
+        }
         else if (s == NavStatus.ARRIVED) lastFailureReason = null;
         return s;
     }
@@ -257,13 +280,14 @@ public final class V2Navigator implements Navigator
         }
         if (nearest.isEmpty())
         {
-            log.info("worldmap-v2: ENTITY_NOT_FOUND for name=\"{}\" kind={} from {} — "
-                + "no sightings in EntityIndex", ref.name(), ref.kind(), here);
+            log.info("worldmap-v2: ENTITY_NOT_FOUND for name=\"{}\" kind={} action={} from {} — "
+                + "no sightings in EntityIndex",
+                ref.name(), ref.kind(), ref.action() == null ? "(none)" : ref.action(), here);
             return null;
         }
         WorldPoint t = nearest.get().lastTile;
-        log.info("worldmap-v2: resolved entity name=\"{}\" kind={} → {} (via nearest sighting)",
-            ref.name(), ref.kind(), t);
+        log.info("worldmap-v2: resolved entity name=\"{}\" kind={} action={} → {} (via nearest sighting)",
+            ref.name(), ref.kind(), ref.action() == null ? "(none)" : ref.action(), t);
         return t;
     }
 

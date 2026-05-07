@@ -183,6 +183,26 @@ public class V2NavigatorTest
     }
 
     @Test
+    public void executorArrived_afterPriorFailure_clearsLastFailureReason() throws InterruptedException
+    {
+        // Pass-3 P1: ARRIVED must clear a stale FailureReason left over
+        // from a previous failed-then-replanned trip — otherwise the
+        // panel surfaces "FAILED" tags on a successful trip.
+        FakePlanner planner = new FakePlanner();
+        FakeExecutor executor = new FakeExecutor();
+        // First trip — fails.
+        executor.nextStatus = V2Executor.Status.FAILED;
+        V2Navigator nav = new V2Navigator(planner, executor, locSupplier(HERE));
+        nav.tick(NavRequest.toPoint(THERE, BehaviorMode.VARIED));
+        assertEquals(V2Navigator.FailureReason.EXECUTOR_FAILED, nav.lastFailureReason());
+        // Second trip same target — executor reports ARRIVED. (Same
+        // request reuses cached path; we only test status transition.)
+        executor.nextStatus = V2Executor.Status.ARRIVED;
+        nav.tick(NavRequest.toPoint(THERE, BehaviorMode.VARIED));
+        assertNull("ARRIVED must clear lastFailureReason", nav.lastFailureReason());
+    }
+
+    @Test
     public void executorArrivedStatus_mapsToNavArrived() throws InterruptedException
     {
         FakePlanner planner = new FakePlanner();

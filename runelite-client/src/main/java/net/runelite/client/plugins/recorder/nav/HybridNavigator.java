@@ -117,14 +117,30 @@ public final class HybridNavigator implements Navigator
         NavStatus s = v2.tick(request);
         if (s == NavStatus.FAILED)
         {
-            log.warn("hybrid: V2_STRICT FAILED for {} — no fallback. See worldmap-v2 logs "
-                + "for the specific reason (NO_DATA / NO_ROUTE / executor stall)", request);
+            log.warn("hybrid: V2_STRICT FAILED for {} — no fallback. {}",
+                request, v2FailureSummary());
         }
         else
         {
             logTerminal("V2_STRICT", "worldmap-v2", s);
         }
         return s;
+    }
+
+    /** Best-effort one-line summary of why V2 just failed, for the
+     *  hybrid log line. Pulls live tags from {@link V2Navigator} when
+     *  the underlying instance is one (production wiring); falls back
+     *  to a generic pointer otherwise (test stubs implement
+     *  {@link Navigator} directly without a {@code FailureReason}). */
+    private String v2FailureSummary()
+    {
+        if (v2 instanceof net.runelite.client.plugins.recorder.nav.v2.V2Navigator v2n)
+        {
+            return "v2.reason=" + v2n.lastFailureReason()
+                + " executor.reason=" + v2n.lastExecutorFailureReason();
+        }
+        return "(see worldmap-v2 logs for the specific reason: BAD_REQUEST / "
+            + "NO_ROUTE / NO_PLAYER_LOC / ENTITY_NOT_FOUND / EXECUTOR_FAILED)";
     }
 
     private NavStatus runV2WithFallback(NavRequest request) throws InterruptedException
@@ -163,8 +179,8 @@ public final class HybridNavigator implements Navigator
 
         // V2 failed — log, cancel V2's residual state, hand the SAME
         // request to V1 for the rest of this leg.
-        log.info("hybrid: V2 FAILED for {} — falling back to V1 for this request "
-            + "(see worldmap-v2 logs for V2's reason)", request);
+        log.info("hybrid: V2 FAILED for {} — falling back to V1 for this request. {}",
+            request, v2FailureSummary());
         v2.cancel();
         fellBackForActiveRequest = true;
         activeHandler = v1;

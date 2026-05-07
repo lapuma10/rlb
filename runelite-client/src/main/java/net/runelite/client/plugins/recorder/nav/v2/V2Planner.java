@@ -140,6 +140,17 @@ public final class V2Planner
         return p.toString() + (walkable ? "(walkable)" : "(blocked flags=0x" + Integer.toHexString(tile.movement) + ")");
     }
 
+    /** Deterministic shortest-path plan, ignoring the variation flag and
+     *  RouteHistory. Used by diagnostics ({@link RouteReadiness}) so the
+     *  yes/no answer is stable across calls regardless of the user's
+     *  variation setting. Production routing still goes through
+     *  {@link #plan(WorldPoint, WorldPoint, BehaviorMode)}. */
+    public V2Path planDeterministic(WorldPoint from, WorldPoint to)
+    {
+        if (from == null || to == null) return V2Path.EMPTY;
+        return planner.plan(from, to);
+    }
+
     /** Plan a route from {@code from} to {@code to} using
      *  {@code behaviorMode}. Returns {@link V2Path#EMPTY} if unreachable.
      *

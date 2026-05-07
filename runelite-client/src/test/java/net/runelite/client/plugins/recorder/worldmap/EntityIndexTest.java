@@ -43,4 +43,37 @@ public class EntityIndexTest
         EntityIndex idx = new EntityIndex();
         assertTrue(idx.findNpcsByName("Nonexistent").isEmpty());
     }
+
+    @Test
+    public void findNpcsByName_dedupesRepeatRecordsOfSameId()
+    {
+        // Pass-3 P1: byName tracks every record() call. The findByName
+        // dedupe step (added 2026-05-07) ensures three sightings of the
+        // same Cook id surface as ONE entry, not three. A regression
+        // that drops the dedupe makes nearestNpc / findNpcsByName
+        // double-count the same entity.
+        EntityIndex idx = new EntityIndex();
+        WorldPoint t1 = new WorldPoint(3208, 3213, 0);
+        WorldPoint t2 = new WorldPoint(3211, 3214, 0);
+        WorldPoint t3 = new WorldPoint(3215, 3215, 0);
+        idx.recordNpcSighting(4626, "Cook", t1, 1L);
+        idx.recordNpcSighting(4626, "Cook", t2, 2L);
+        idx.recordNpcSighting(4626, "Cook", t3, 3L);
+        List<EntitySighting> cooks = idx.findNpcsByName("Cook");
+        assertEquals("three sightings of one id collapse to one entry", 1, cooks.size());
+        assertEquals(t3, cooks.get(0).lastTile);
+        assertEquals(3, cooks.get(0).seenCount);
+    }
+
+    @Test
+    public void findObjectsByName_dedupesRepeatRecordsOfSameId()
+    {
+        EntityIndex idx = new EntityIndex();
+        WorldPoint t1 = new WorldPoint(3185, 3438, 0);
+        WorldPoint t2 = new WorldPoint(3185, 3439, 0);
+        idx.recordObjectSighting(10583, "Bank booth", t1, 1L);
+        idx.recordObjectSighting(10583, "Bank booth", t2, 2L);
+        List<EntitySighting> booths = idx.findObjectsByName("Bank booth");
+        assertEquals("repeat object sightings collapse to one entry", 1, booths.size());
+    }
 }

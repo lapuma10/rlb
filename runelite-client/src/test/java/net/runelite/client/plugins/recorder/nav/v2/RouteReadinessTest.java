@@ -258,4 +258,100 @@ public class RouteReadinessTest
         assertEquals(RouteReadiness.BreakReason.UNKNOWN_TILE, rep.firstBreakReason());
         assertFalse(rep.canPlan());
     }
+
+    @Test
+    public void check_collisionInCorridor_breakReasonIsCollisionBlocked()
+    {
+        MapStore s = store();
+        TransportIndex t = new TransportIndex();
+        WorldPoint from = new WorldPoint(3208, 3217, 0);
+        WorldPoint to = new WorldPoint(3220, 3217, 0);
+        // Single full-block tile blocks BFS expansion to its east neighbour
+        // via cardinal direction; planner can detour diagonally so the
+        // resulting BFS encounters a cardinal-block before any diagonal one.
+        java.util.List<WorldMemoryFixtures.TileSpec> tiles = new java.util.ArrayList<>();
+        for (int x = 3206; x <= 3222; x++)
+            for (int y = 3215; y <= 3219; y++)
+            {
+                int mv = (x == 3210 && y == 3217)
+                    ? CollisionDataFlag.BLOCK_MOVEMENT_FULL : 0;
+                tiles.add(WorldMemoryFixtures.withMovement(x, y, 0, mv));
+            }
+        java.util.Map<Integer, java.util.List<WorldMemoryFixtures.TileSpec>> byRegion = new java.util.HashMap<>();
+        for (var ts : tiles) byRegion.computeIfAbsent(RegionIds.regionIdFor(ts.x(), ts.y()),
+            k -> new java.util.ArrayList<>()).add(ts);
+        for (var e : byRegion.entrySet())
+            WorldMemoryFixtures.installRegion(s, e.getKey(), e.getValue());
+        RouteReadiness.Report rep = new RouteReadiness(s, t, planner(s, t)).check(from, to);
+        // A reachable detour exists, so canPlan is true → break = NONE OR
+        // first-encounter is COLLISION_BLOCKED. We assert the collision
+        // detail is captured AND its movementFlags carry BLOCK_MOVEMENT_FULL
+        // — the diagnostic that matters for live debugging.
+        assertNotNull("collision detail captured during BFS", rep.collisionDetail());
+        assertTrue("collision detail movementFlags include BLOCK_MOVEMENT_FULL",
+            (rep.collisionDetail().movementFlags()
+                & CollisionDataFlag.BLOCK_MOVEMENT_FULL) != 0);
+    }
+
+    @Test
+    public void check_loadedAndMissingPartition_disjoint_andCoverBbox()
+    {
+        MapStore s = store();
+        TransportIndex t = new TransportIndex();
+        WorldPoint from = new WorldPoint(3208, 3217, 0);
+        WorldPoint to = new WorldPoint(3216, 3217, 0);
+        seedCorridor(s, from, to);
+        RouteReadiness.Report rep = new RouteReadiness(s, t, planner(s, t)).check(from, to);
+        java.util.Set<Integer> intersect = new java.util.HashSet<>(rep.loadedRegionIds());
+        intersect.retainAll(rep.missingRegionIds());
+        assertTrue("loaded ∩ missing must be empty", intersect.isEmpty());
+        java.util.Set<Integer> union = new java.util.HashSet<>(rep.loadedRegionIds());
+        union.addAll(rep.missingRegionIds());
+        assertEquals("loaded ∪ missing == bboxRegionIds", rep.bboxRegionIds(), union);
+    }
+
+    @Test
+    public void bboxTiles_returnsTilesWithinPaddedRange_only()
+    {
+        MapStore s = store();
+        TransportIndex t = new TransportIndex();
+        WorldPoint from = new WorldPoint(3208, 3217, 0);
+        WorldPoint to = new WorldPoint(3215, 3217, 0);
+        seedCorridor(s, from, to);
+        java.util.List<net.runelite.client.plugins.recorder.worldmap.RegionChunkSnapshot.TileEntry>
+            tiles = new RouteReadiness(s, t, planner(s, t)).bboxTiles(from, to);
+        int xMin = Math.min(from.getX(), to.getX()) - RouteReadiness.BBOX_PADDING;
+        int xMax = Math.max(from.getX(), to.getX()) + RouteReadiness.BBOX_PADDING;
+        int yMin = Math.min(from.getY(), to.getY()) - RouteReadiness.BBOX_PADDING;
+        int yMax = Math.max(from.getY(), to.getY()) + RouteReadiness.BBOX_PADDING;
+        for (var te : tiles)
+        {
+            assertTrue("bboxTiles must stay on plane 0", te.plane == 0);
+            assertTrue("bbox x range", te.x >= xMin && te.x <= xMax);
+            assertTrue("bbox y range", te.y >= yMin && te.y <= yMax);
+        }
+    }
+
+    @Test
+    public void check_isDeterministic_acrossRepeatedCallsRegardlessOfRng()
+    {
+        // Pass-3 P1: readiness must NOT depend on the variation flag
+        // because it is a yes/no diagnostic. Two consecutive checks
+        // against the same world memory must return the same answer.
+        MapStore s = store();
+        TransportIndex t = new TransportIndex();
+        WorldPoint from = new WorldPoint(3208, 3217, 0);
+        WorldPoint to = new WorldPoint(3220, 3217, 0);
+        seedCorridor(s, from, to);
+        // Variation enabled — readiness must still be stable.
+        V2Planner p = new V2Planner(s, t, new WorldMemoryConfig(),
+            new RouteHistory(), () -> true);
+        RouteReadiness r = new RouteReadiness(s, t, p);
+        RouteReadiness.BreakReason first = r.check(from, to).firstBreakReason();
+        for (int i = 0; i < 10; i++)
+        {
+            assertEquals("readiness must be deterministic with variation ON",
+                first, r.check(from, to).firstBreakReason());
+        }
+    }
 }
