@@ -60,8 +60,10 @@ import net.runelite.client.plugins.recorder.scripts.PieDishScript;
 import net.runelite.client.plugins.recorder.scripts.PizzaScript;
 import net.runelite.api.coords.WorldArea;
 import net.runelite.client.plugins.recorder.scripts.LumbridgeBankPenScript;
+import net.runelite.client.plugins.recorder.nav.NavigatorFactory;
 import net.runelite.client.plugins.recorder.trail.TrailRecorder;
 import net.runelite.client.plugins.recorder.trail.TrailRegistry;
+import net.runelite.client.plugins.recorder.trail.TrailWalker;
 import net.runelite.client.plugins.recorder.transport.TransportResolver;
 import net.runelite.client.plugins.recorder.capture.CameraSampler;
 import net.runelite.client.plugins.recorder.capture.ChatFilter;
@@ -284,13 +286,17 @@ public class RecorderPlugin extends Plugin
         panel.setTrailRecorder(trailRecorder);
         panel.setTrailRegistry(trailRegistry);
 
-        // Chicken farm V3 — same outer FSM as V2 but uses the recorded
-        // trail framework for the walking phases. Independent dispatcher
-        // so V1/V2/V3 can coexist. Wired after trailRegistry is created.
+        // Chicken farm V3 — same outer FSM, walking phases driven via
+        // the Navigator interface. Independent dispatcher + walker so
+        // V1/V2/V3 coexist without dispatcher-busy contention. Wired
+        // after trailRegistry is created.
         HumanizedInputDispatcher v3Dispatcher = new HumanizedInputDispatcher(client, clientThread);
+        TrailWalker v3Walker = new TrailWalker(client, clientThread, v3Dispatcher);
+        NavigatorFactory v3NavFactory = new NavigatorFactory(config, v3Walker, trailRegistry);
         net.runelite.client.plugins.recorder.scripts.ChickenFarmV3Script chickenFarmV3 =
             new net.runelite.client.plugins.recorder.scripts.ChickenFarmV3Script(
-                client, clientThread, v3Dispatcher, trailRegistry, eventBus);
+                client, clientThread, v3Dispatcher, trailRegistry, eventBus,
+                v3NavFactory.getNavigator());
         panel.setChickenFarmV3(chickenFarmV3);
 
         // Mining loop: separate dispatcher, independent busy flag from

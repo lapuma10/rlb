@@ -8,6 +8,9 @@ import net.runelite.api.Skill;
 import net.runelite.client.callback.ClientThread;
 import net.runelite.client.plugins.recorder.combat.SkillTarget;
 import net.runelite.client.plugins.recorder.combat.TrainingPlan;
+import net.runelite.client.plugins.recorder.nav.NavRequest;
+import net.runelite.client.plugins.recorder.nav.NavStatus;
+import net.runelite.client.plugins.recorder.nav.Navigator;
 import net.runelite.client.plugins.recorder.trail.TrailRegistry;
 import net.runelite.client.sequence.dispatch.HumanizedInputDispatcher;
 import org.junit.Test;
@@ -21,12 +24,12 @@ public class ChickenFarmV3ScriptTest
     {
         // TrailRegistry is final — use a real registry pointed at an empty
         // temp dir. The script only uses start() to run, which this test
-        // does not do.
+        // does not do. Navigator is a no-op stub since no tick happens.
         TrailRegistry reg = new TrailRegistry(Files.createTempDirectory("v3-test-"));
         ChickenFarmV3Script s = new ChickenFarmV3Script(
             mock(Client.class), mock(ClientThread.class),
             mock(HumanizedInputDispatcher.class),
-            reg);
+            reg, idleNavigator());
         assertEquals(ChickenFarmV3Script.State.IDLE, s.state());
     }
 
@@ -34,10 +37,10 @@ public class ChickenFarmV3ScriptTest
     public void trailNamesAreThoseSpecified()
     {
         // The script reads two specific trail names from the registry —
-        // 'lumby-bank-to-pen' and 'pen-to-lumby-bank'. These are the
+        // 'lumby_bank_to_pen' and 'pen_to_lumby_bank'. These are the
         // names the user is told to record.
-        assertEquals("lumby-bank-to-pen", ChickenFarmV3Script.OUTBOUND_TRAIL_NAME);
-        assertEquals("pen-to-lumby-bank", ChickenFarmV3Script.RETURN_TRAIL_NAME);
+        assertEquals("lumby_bank_to_pen", ChickenFarmV3Script.OUTBOUND_TRAIL_NAME);
+        assertEquals("pen_to_lumby_bank", ChickenFarmV3Script.RETURN_TRAIL_NAME);
     }
 
     @Test
@@ -53,7 +56,7 @@ public class ChickenFarmV3ScriptTest
         HumanizedInputDispatcher dispatcher = mock(HumanizedInputDispatcher.class);
         TrailRegistry reg = new TrailRegistry(Files.createTempDirectory("v3-logoff-test-"));
         ChickenFarmV3Script s = new ChickenFarmV3Script(
-            client, clientThread, dispatcher, reg);
+            client, clientThread, dispatcher, reg, idleNavigator());
         // Confirm LOGGING_OFF is a valid state.
         assertNotNull(ChickenFarmV3Script.State.valueOf("LOGGING_OFF"));
         // Confirm setTrainingPlan accepts a real plan without throwing.
@@ -64,5 +67,16 @@ public class ChickenFarmV3ScriptTest
         assertSame(plan, s.trainingPlan());
         // Without start(), state stays IDLE.
         assertEquals(ChickenFarmV3Script.State.IDLE, s.state());
+    }
+
+    private static Navigator idleNavigator()
+    {
+        return new Navigator()
+        {
+            @Override public NavStatus tick(NavRequest request) { return NavStatus.IDLE; }
+            @Override public void cancel() { }
+            @Override public boolean isBusy() { return false; }
+            @Override public String name() { return "idle-stub"; }
+        };
     }
 }

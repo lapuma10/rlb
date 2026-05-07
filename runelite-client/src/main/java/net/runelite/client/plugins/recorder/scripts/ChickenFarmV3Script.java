@@ -16,27 +16,30 @@ import net.runelite.client.plugins.recorder.combat.TrainingPlan;
 import net.runelite.client.plugins.recorder.combat.TrainingSession;
 import net.runelite.client.plugins.recorder.farm.BankInteraction;
 import net.runelite.client.plugins.recorder.farm.InventoryUtil;
-import net.runelite.client.plugins.recorder.trail.TrailPath;
+import net.runelite.client.plugins.recorder.nav.BehaviorMode;
+import net.runelite.client.plugins.recorder.nav.NavRequest;
+import net.runelite.client.plugins.recorder.nav.NavStatus;
+import net.runelite.client.plugins.recorder.nav.Navigator;
 import net.runelite.client.plugins.recorder.trail.TrailRegistry;
-import net.runelite.client.plugins.recorder.trail.TrailWalker;
 import net.runelite.client.sequence.dispatch.HumanizedInputDispatcher;
 import net.runelite.client.sequence.dispatch.SequenceSleep;
 import net.runelite.client.sequence.internal.ActionRequest;
 
 /**
- * Chicken farm bot, V3 — uses the recorded {@link
- * net.runelite.client.plugins.recorder.trail.Trail trail framework} for
- * the WALKING phases. The user records two trails once
- * ({@code lumby-bank-to-pen} and {@code pen-to-lumby-bank}); V3 plans
- * over the resulting graph at each phase transition and feeds the path
- * into a {@link TrailWalker}.
+ * Chicken farm bot, V3 — drives the WALKING phases via the {@link
+ * Navigator} interface. With V1 selected (the default) the Navigator
+ * replays recorded trails by name; with V2 selected the Navigator
+ * plans live from WorldMemory. The script depends on the interface,
+ * never the concrete walker, so flipping the panel switch swaps
+ * implementations without script changes.
  *
- * <p>BANKING and AT_PEN are reused from V2 unchanged: same
- * {@link BankInteraction} primitives, same {@link ChickenCombatLoop}.
+ * <p>The user records two trails once ({@code lumby_bank_to_pen} and
+ * {@code pen_to_lumby_bank}); the Navigator resolves them. BANKING
+ * and AT_PEN reuse V2 unchanged: same {@link BankInteraction}
+ * primitives, same {@link ChickenCombatLoop}.
  *
- * <p>If the registry is missing the required trails, V3 surfaces a
- * status message and aborts — the user has to record the trails before
- * V3 can run.
+ * <p>If the Navigator returns FAILED on a walk leg (trail missing,
+ * walker stuck, etc.), V3 surfaces a status message and aborts.
  */
 @Slf4j
 public final class ChickenFarmV3Script
@@ -59,7 +62,7 @@ public final class ChickenFarmV3Script
     private final ClientThread clientThread;
     private final HumanizedInputDispatcher dispatcher;
     private final TrailRegistry registry;
-    private final TrailWalker walker;
+    private final Navigator nav;
     private final BankInteraction bank;
     private final ChickenCombatLoop combat;
     private final TrainingSession trainingSession;
@@ -71,30 +74,31 @@ public final class ChickenFarmV3Script
     private final AtomicBoolean running = new AtomicBoolean(false);
     private final AtomicReference<Thread> worker = new AtomicReference<>();
     private long lastBankActionAtMs;
-    private TrailPath currentPath;
 
     public ChickenFarmV3Script(Client client, ClientThread clientThread,
                                HumanizedInputDispatcher dispatcher,
-                               TrailRegistry registry)
+                               TrailRegistry registry,
+                               Navigator nav)
     {
-        this(client, clientThread, dispatcher, registry, null);
+        this(client, clientThread, dispatcher, registry, null, nav);
     }
 
     /** Full ctor — passes the {@link net.runelite.client.eventbus.EventBus}
      *  through to {@link TrainingSession} so it can subscribe to
      *  {@code StatChanged} events for instant level-up detection. The
-     *  3-arg ctor above retains the pre-EventBus signature for tests. */
+     *  shorter ctor above omits it for tests that don't need event-bus wiring. */
     public ChickenFarmV3Script(Client client, ClientThread clientThread,
                                HumanizedInputDispatcher dispatcher,
                                TrailRegistry registry,
                                @javax.annotation.Nullable
-                               net.runelite.client.eventbus.EventBus eventBus)
+                               net.runelite.client.eventbus.EventBus eventBus,
+                               Navigator nav)
     {
         this.client = client;
         this.clientThread = clientThread;
         this.dispatcher = dispatcher;
         this.registry = registry;
-        this.walker = new TrailWalker(client, clientThread, dispatcher);
+        this.nav = nav;
         this.bank = new BankInteraction(client, clientThread, dispatcher);
         this.combat = new ChickenCombatLoop(dispatcher, client, clientThread, PEN_AREA, eventBus);
         this.trainingSession = new TrainingSession(client, clientThread, dispatcher, eventBus);
@@ -274,74 +278,34 @@ public final class ChickenFarmV3Script
         // someone dropped loot we picked up, an event mob, etc.), pivot
         // to RETURN immediately rather than continuing all the way to the
         // pen and finding out we have no slots when combat tries to start.
-        // Same shape as V1's tickOutbound check.
         if (outbound && Boolean.TRUE.equals(onClient(() -> InventoryUtil.isInventoryFull(client))))
         {
             status.set("inventory full mid-outbound — switching to RETURN");
-            walker.reset();
-            currentPath = null;
+            nav.cancel();
             setState(State.RETURN);
             return;
         }
-        if (currentPath == null) currentPath = planForCurrentPhase(outbound);
-        if (currentPath == null) return;
-        TrailWalker.Status st = walker.tick(currentPath);
+
+        String trailName = outbound ? OUTBOUND_TRAIL_NAME : RETURN_TRAIL_NAME;
+        NavStatus st = nav.tick(NavRequest.byTrail(trailName, BehaviorMode.VARIED));
         status.set("walk: " + (outbound ? "outbound" : "return") + " (" + st + ")");
         switch (st)
         {
             case ARRIVED:
-                walker.reset();
-                currentPath = null;
+                nav.cancel();
                 setState(outbound ? State.AT_PEN : State.BANKING);
                 break;
-            case STUCK:
-            case ERROR:
-                log.warn("v3: walker {} on {} — aborting", st, outbound ? "OUTBOUND" : "RETURN");
-                walker.reset();
-                currentPath = null;
+            case FAILED:
+                log.warn("v3: nav FAILED on {} (trail '{}') — aborting",
+                    outbound ? "OUTBOUND" : "RETURN", trailName);
+                nav.cancel();
                 setState(State.ABORTED);
                 break;
-            case IN_PROGRESS:
+            case RUNNING:
+            case IDLE:
             default:
                 break;
         }
-    }
-
-    private TrailPath planForCurrentPhase(boolean outbound)
-    {
-        WorldPoint here = onClient(() -> {
-            Player p = client.getLocalPlayer();
-            return p == null ? null : p.getWorldLocation();
-        });
-        if (here == null) { status.set("no player — abort"); setState(State.ABORTED); return null; }
-        // Replay the matching trail directly — no planner / A* / junction
-        // edges. The graph-based approach kept finding short-cut paths
-        // through "post-staircase" tiles (tiles the engine routes the
-        // player onto AS PART OF the climb action) and emitting them as
-        // ordinary WALK legs, so the bot tried to walk-click stair tiles
-        // instead of clicking the staircase object. V1/V2 worked by
-        // walking to a stairs landing area and triggering the action;
-        // TrailPath.fromTrail produces the same shape from the recording.
-        String trailName = outbound ? OUTBOUND_TRAIL_NAME : RETURN_TRAIL_NAME;
-        net.runelite.client.plugins.recorder.trail.Trail trail = registry.byName(trailName);
-        if (trail == null || trail.events().isEmpty())
-        {
-            status.set("trail \"" + trailName + "\" missing or empty — re-record");
-            setState(State.ABORTED);
-            return null;
-        }
-        TrailPath full = TrailPath.fromTrail(trail);
-        int entry = full.findEntryLeg(here);
-        TrailPath path = full.subPath(entry);
-        if (path.isEmpty())
-        {
-            status.set("trail \"" + trailName + "\" has no usable legs from " + here);
-            setState(State.ABORTED);
-            return null;
-        }
-        log.info("v3: replay \"{}\" {} legs (entry leg {} of {}) from {}",
-            trailName, path.size(), entry, full.size(), here);
-        return path;
     }
 
     private void tickBanking() throws InterruptedException
