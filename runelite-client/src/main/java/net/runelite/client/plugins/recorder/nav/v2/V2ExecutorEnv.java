@@ -194,6 +194,22 @@ public final class V2ExecutorEnv implements V2Executor.Env
     @Nullable
     private <T> T onClient(Supplier<T> sup)
     {
+        // Fast path: if the caller is already on the client thread, run
+        // the supplier directly. Without this guard, a future caller
+        // that lands on the client thread (e.g. a Sequence engine
+        // Step.check() or a legacy event handler) would self-deadlock
+        // for ONCLIENT_TIMEOUT_MS per call and silently return null —
+        // exactly the silent-freeze class CLAUDE.md flags. Production
+        // callers (V2Executor on a worker) take the slow path as before.
+        if (client.isClientThread())
+        {
+            try { return sup.get(); }
+            catch (Throwable th)
+            {
+                log.warn("v2-executor-env: onClient (inline) threw", th);
+                return null;
+            }
+        }
         AtomicReference<T> ref = new AtomicReference<>();
         CountDownLatch latch = new CountDownLatch(1);
         clientThread.invokeLater(() -> {

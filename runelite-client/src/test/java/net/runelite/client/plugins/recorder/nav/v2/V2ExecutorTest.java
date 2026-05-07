@@ -380,6 +380,115 @@ public class V2ExecutorTest
         assertEquals("no dispatch when player loc unknown", 0, env.walkDispatches.size());
     }
 
+    @Test
+    public void tick_persistentNullPlayerLoc_eventuallyFails_PLAYER_LOC_LOST()
+    {
+        // Spec hard rule: never silently hang. After MAX_NO_PLAYER_LOC_TICKS
+        // consecutive null reads, FAIL so V2_WITH_V1_FALLBACK can engage.
+        FakeEnv env = new FakeEnv();
+        env.player = null;
+        V2Executor x = newExecutor(env);
+        x.setPath(eastPath(5));
+        for (int i = 0; i < V2Executor.MAX_NO_PLAYER_LOC_TICKS + 1; i++)
+        {
+            env.busy = false;
+            x.tick();
+        }
+        assertEquals("persistent null playerLoc must FAIL after MAX_NO_PLAYER_LOC_TICKS",
+            V2Executor.Status.FAILED, x.status());
+        assertEquals(V2Executor.FailureReason.PLAYER_LOC_LOST, x.lastFailureReason());
+    }
+
+    @Test
+    public void tick_noCandidateOnEitherModality_failsWithNO_CANDIDATE_AVAILABLE()
+    {
+        // Both canvas and minimap return null for many consecutive ticks
+        // and no click was ever dispatched (so the stall branch can't
+        // fire). Without an explicit cap, this would RUNNING-forever.
+        FakeEnv env = new FakeEnv();
+        env.player = new WorldPoint(3208, 3217, 0);
+        V2Path p = eastPath(20);
+        // Reject every canvas + minimap candidate by marking all path
+        // tiles unclean and minimap-blocked.
+        for (V2Leg leg : p.legs())
+        {
+            if (leg instanceof V2Leg.Walk w)
+            {
+                for (WorldPoint t : w.tiles())
+                {
+                    env.uncleanTiles.add(t);
+                    env.minimapBlocked.add(t);
+                }
+            }
+        }
+        V2Executor x = newExecutor(env);
+        x.setPath(p);
+        for (int i = 0; i < V2Executor.MAX_NO_CANDIDATE_TICKS + 1; i++)
+        {
+            env.busy = false;
+            x.tick();
+        }
+        assertEquals(V2Executor.Status.FAILED, x.status());
+        assertEquals(V2Executor.FailureReason.NO_CANDIDATE_AVAILABLE, x.lastFailureReason());
+    }
+
+    @Test
+    public void tick_stalledStaticCollision_failureReasonTagged()
+    {
+        // Pin the FailureReason on STATIC_COLLISION_MISMATCH stall —
+        // QC pass 2 surfaced this assertion gap.
+        FakeEnv env = new FakeEnv();
+        env.player = new WorldPoint(3208, 3217, 0);
+        V2Executor x = newExecutor(env);
+        V2Path p = eastPath(20);
+        x.setPath(p);
+        x.tick();
+        WorldPoint clicked = env.walkDispatches.get(0);
+        env.staticBlocked.add(clicked);
+        for (int i = 0; i < V2Executor.STALL_TICKS + 1; i++)
+        {
+            env.busy = false;
+            x.tick();
+        }
+        assertEquals(V2Executor.Status.FAILED, x.status());
+        assertEquals(V2Executor.FailureReason.STALL_CLASSIFIER_REPLAN, x.lastFailureReason());
+    }
+
+    @Test
+    public void tick_catchupExhausted_reasonTaggedCATCHUP_EXHAUSTED()
+    {
+        FakeEnv env = new FakeEnv();
+        env.player = new WorldPoint(3208, 3217, 0);
+        V2Executor x = newExecutor(env);
+        x.setPath(eastPath(20));
+        x.tick();
+        for (int i = 0; i < (V2Executor.MAX_CATCHUP_CLICKS_PER_LEG + 1) * (V2Executor.STALL_TICKS + 1); i++)
+        {
+            env.busy = false;
+            x.tick();
+        }
+        assertEquals(V2Executor.Status.FAILED, x.status());
+        assertEquals(V2Executor.FailureReason.CATCHUP_EXHAUSTED, x.lastFailureReason());
+    }
+
+    @Test
+    public void tick_repeatedRejections_reasonTaggedUNSAFE_CANVAS_CLICK_EXHAUSTED()
+    {
+        FakeEnv env = new FakeEnv();
+        env.player = new WorldPoint(3208, 3217, 0);
+        V2Executor x = newExecutor(env);
+        x.setPath(eastPath(40));
+        x.tick();
+        for (int i = 0; i < V2Executor.MAX_CLICK_REJECTS_PER_LEG + 1; i++)
+        {
+            env.busy = false;
+            env.pendingDispatchError = "strict-walk: menu was 'Chop down Tree'";
+            x.tick();
+        }
+        assertEquals(V2Executor.Status.FAILED, x.status());
+        assertEquals(V2Executor.FailureReason.UNSAFE_CANVAS_CLICK_EXHAUSTED, x.lastFailureReason());
+    }
+
     // ------------------------------------------------------------------
     // Phase-7 fallback correctness: V2 cannot drive transport legs in
     // round 1. The executor must fail cleanly with a tagged reason so

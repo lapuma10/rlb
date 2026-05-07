@@ -11,6 +11,7 @@ import org.junit.Test;
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertNotNull;
+import static org.junit.Assert.assertNull;
 import static org.junit.Assert.assertTrue;
 
 public class V2NavigatorTest
@@ -129,6 +130,56 @@ public class V2NavigatorTest
         V2Navigator nav = new V2Navigator(planner, executor, locSupplier(HERE));
         NavStatus s = nav.tick(NavRequest.toPoint(THERE, BehaviorMode.VARIED));
         assertEquals("empty plan = no route = FAILED", NavStatus.FAILED, s);
+        assertEquals("FailureReason must be NO_ROUTE",
+            V2Navigator.FailureReason.NO_ROUTE, nav.lastFailureReason());
+    }
+
+    @Test
+    public void nullPlayerLocAtPlanTime_returnsFailed_NO_PLAYER_LOC() throws InterruptedException
+    {
+        FakePlanner planner = new FakePlanner();
+        FakeExecutor executor = new FakeExecutor();
+        V2Navigator nav = new V2Navigator(planner, executor, locSupplier(null));
+        NavStatus s = nav.tick(NavRequest.toPoint(THERE, BehaviorMode.VARIED));
+        assertEquals(NavStatus.FAILED, s);
+        assertEquals(V2Navigator.FailureReason.NO_PLAYER_LOC, nav.lastFailureReason());
+        assertEquals("planner must not be called when player loc unknown",
+            0, planner.callCount);
+    }
+
+    @Test
+    public void requestWithNullDestination_failureReason_BAD_REQUEST() throws InterruptedException
+    {
+        FakePlanner planner = new FakePlanner();
+        FakeExecutor executor = new FakeExecutor();
+        V2Navigator nav = new V2Navigator(planner, executor, locSupplier(HERE));
+        NavStatus s = nav.tick(NavRequest.byTrail("ignored", BehaviorMode.VARIED));
+        assertEquals(NavStatus.FAILED, s);
+        assertEquals(V2Navigator.FailureReason.BAD_REQUEST, nav.lastFailureReason());
+    }
+
+    @Test
+    public void executorFailed_navigatorReportsEXECUTOR_FAILED() throws InterruptedException
+    {
+        FakePlanner planner = new FakePlanner();
+        FakeExecutor executor = new FakeExecutor();
+        executor.nextStatus = V2Executor.Status.FAILED;
+        V2Navigator nav = new V2Navigator(planner, executor, locSupplier(HERE));
+        nav.tick(NavRequest.toPoint(THERE, BehaviorMode.VARIED));
+        assertEquals(V2Navigator.FailureReason.EXECUTOR_FAILED, nav.lastFailureReason());
+    }
+
+    @Test
+    public void cancel_clearsLastFailureReason() throws InterruptedException
+    {
+        FakePlanner planner = new FakePlanner();
+        FakeExecutor executor = new FakeExecutor();
+        executor.nextStatus = V2Executor.Status.FAILED;
+        V2Navigator nav = new V2Navigator(planner, executor, locSupplier(HERE));
+        nav.tick(NavRequest.toPoint(THERE, BehaviorMode.VARIED));
+        assertEquals(V2Navigator.FailureReason.EXECUTOR_FAILED, nav.lastFailureReason());
+        nav.cancel();
+        assertNull("cancel clears lastFailureReason", nav.lastFailureReason());
     }
 
     @Test

@@ -73,6 +73,17 @@ public final class V2Executor
         /** Catch-up budget exhausted on a stalled leg
          *  ({@link #MAX_CATCHUP_CLICKS_PER_LEG}). */
         CATCHUP_EXHAUSTED,
+        /** Player location went null and stayed null for more than
+         *  {@link #MAX_NO_PLAYER_LOC_TICKS} ticks. Prevents a silent
+         *  RUNNING-forever when the client is logged out / scene
+         *  unloaded after the path was set. */
+        PLAYER_LOC_LOST,
+        /** Both modalities returned no candidate for more than
+         *  {@link #MAX_NO_CANDIDATE_TICKS} consecutive ticks before any
+         *  click was dispatched (so the stall branch can't fire because
+         *  it needs {@code lastDispatchedTile}). Prevents a tight
+         *  null-pick loop. */
+        NO_CANDIDATE_AVAILABLE,
         /** Catch-all — kept for tests that don't care about the
          *  precise enum case. New code paths should pick a more
          *  specific value. */
@@ -171,6 +182,20 @@ public final class V2Executor
      *  than spinning silently. */
     public static final int MAX_CROSS_PLANE_REJECTS_PER_ROUTE = 5;
 
+    /** Bound on consecutive ticks where {@link Env#playerLoc} returns
+     *  null. Prevents a silent RUNNING-forever when the client is
+     *  logged out / scene unloaded after the path was set. 20 ticks ≈
+     *  12 s — generous enough to absorb a transient scene rebuild but
+     *  short enough to surface the failure to the script's outer loop. */
+    public static final int MAX_NO_PLAYER_LOC_TICKS = 20;
+
+    /** Bound on consecutive ticks with no candidate from either
+     *  modality. Without this bound, an executor whose canvas+minimap
+     *  both return null AND has no in-flight dispatch can RUNNING
+     *  forever because the stall branch only triggers when
+     *  {@code lastDispatchedTile != null}. */
+    public static final int MAX_NO_CANDIDATE_TICKS = 8;
+
     /** Recent-filter window size for the modality bias decision. */
     private static final int FILTER_REJECT_WINDOW = 4;
     /** Switch to minimap modality when rejection rate is at or above
@@ -203,6 +228,8 @@ public final class V2Executor
     private int clickRejectsThisLeg;
     private int crossPlaneRejectsThisRoute;
     private int ticksSinceProgress;
+    private int consecutiveNullPlayerLocTicks;
+    private int consecutiveNoCandidateTicks;
     @Nullable private WorldPoint lastPlayerLoc;
     @Nullable private WorldPoint lastDispatchedTile;
     private boolean lastDispatchWasMinimap;
@@ -247,6 +274,8 @@ public final class V2Executor
         this.clickRejectsThisLeg = 0;
         this.crossPlaneRejectsThisRoute = 0;
         this.ticksSinceProgress = 0;
+        this.consecutiveNullPlayerLocTicks = 0;
+        this.consecutiveNoCandidateTicks = 0;
         this.lastPlayerLoc = null;
         this.lastDispatchedTile = null;
         this.lastDispatchWasMinimap = false;
@@ -320,7 +349,24 @@ public final class V2Executor
         if (status != Status.RUNNING) return status;
 
         WorldPoint here = env.playerLoc();
-        if (here == null) return status;   // logged out / mid-load — try again next tick
+        if (here == null)
+        {
+            // Logged out / mid-load — try again next tick. Bound the
+            // wait so a permanent logout doesn't RUNNING-forever and
+            // starve V1 fallback. 20-tick ≈ 12 s threshold leaves room
+            // for a real scene rebuild.
+            consecutiveNullPlayerLocTicks++;
+            if (consecutiveNullPlayerLocTicks >= MAX_NO_PLAYER_LOC_TICKS)
+            {
+                log.warn("v2-executor: PLAYER_LOC_LOST — null playerLoc for {} consecutive ticks; "
+                    + "FAILED so navigator can replan / fall back to V1",
+                    consecutiveNullPlayerLocTicks);
+                status = Status.FAILED;
+                lastFailureReason = FailureReason.PLAYER_LOC_LOST;
+            }
+            return status;
+        }
+        consecutiveNullPlayerLocTicks = 0;
 
         // Arrived?
         WorldPoint dest = pathEnd();
@@ -416,6 +462,7 @@ public final class V2Executor
                 {
                     lastDispatchedTile = pick;
                     lastDispatchWasMinimap = false;
+                    consecutiveNoCandidateTicks = 0;
                     log.debug("v2-executor: canvas dispatch → {}", pick);
                 }
                 return status;
@@ -444,19 +491,44 @@ public final class V2Executor
         if (mmTarget == null)
         {
             // Both modalities failed for this tick. Counter the stall
-            // budget so we don't loop forever with no candidate.
+            // budget so we don't loop forever with no candidate. Also
+            // increment the consecutive-no-candidate counter — the
+            // stall branch needs lastDispatchedTile != null to fire,
+            // so without an explicit bound here a "no candidate ever"
+            // state would RUNNING-forever.
             ticksSinceProgress++;
+            consecutiveNoCandidateTicks++;
+            if (consecutiveNoCandidateTicks >= MAX_NO_CANDIDATE_TICKS)
+            {
+                log.warn("v2-executor: NO_CANDIDATE_AVAILABLE — both modalities returned null for {} consecutive ticks; "
+                    + "FAILED so navigator can replan / fall back",
+                    consecutiveNoCandidateTicks);
+                status = Status.FAILED;
+                lastFailureReason = FailureReason.NO_CANDIDATE_AVAILABLE;
+            }
             return status;
         }
         if (!env.canMinimapClick(mmTarget))
         {
+            // Minimap precondition failed — same "no candidate this tick"
+            // outcome as a null pick. Tick the no-candidate counter so a
+            // permanent precondition failure doesn't RUNNING-forever.
             ticksSinceProgress++;
+            consecutiveNoCandidateTicks++;
+            if (consecutiveNoCandidateTicks >= MAX_NO_CANDIDATE_TICKS)
+            {
+                log.warn("v2-executor: NO_CANDIDATE_AVAILABLE — minimap precondition failed for {} consecutive ticks; FAILED",
+                    consecutiveNoCandidateTicks);
+                status = Status.FAILED;
+                lastFailureReason = FailureReason.NO_CANDIDATE_AVAILABLE;
+            }
             return status;
         }
         if (env.dispatchMinimap(mmTarget))
         {
             lastDispatchedTile = mmTarget;
             lastDispatchWasMinimap = true;
+            consecutiveNoCandidateTicks = 0;
             log.debug("v2-executor: minimap dispatch → {}", mmTarget);
         }
         return status;

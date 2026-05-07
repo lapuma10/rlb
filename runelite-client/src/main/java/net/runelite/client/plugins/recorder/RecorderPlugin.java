@@ -561,10 +561,20 @@ public class RecorderPlugin extends Plugin
     /** Synchronous client-thread read of the local player's world
      *  location. Reused by V2Navigator's planner-input supplier — it
      *  runs on the script's worker thread, so getLocalPlayer (which
-     *  asserts on the client thread) needs marshalling. */
+     *  asserts on the client thread) needs marshalling.
+     *
+     *  <p>Fast path: if the caller is already on the client thread,
+     *  read inline. Mirrors the {@code V2ExecutorEnv.onClient} guard:
+     *  prevents a 1500 ms self-deadlock if a future caller invokes
+     *  this from the client thread. */
     @javax.annotation.Nullable
     private net.runelite.api.coords.WorldPoint playerLocOnClientThread()
     {
+        if (client.isClientThread())
+        {
+            net.runelite.api.Player self = client.getLocalPlayer();
+            return self == null ? null : self.getWorldLocation();
+        }
         java.util.concurrent.atomic.AtomicReference<net.runelite.api.coords.WorldPoint> ref
             = new java.util.concurrent.atomic.AtomicReference<>();
         java.util.concurrent.CountDownLatch latch = new java.util.concurrent.CountDownLatch(1);
