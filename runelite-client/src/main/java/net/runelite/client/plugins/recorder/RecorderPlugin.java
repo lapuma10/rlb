@@ -50,6 +50,9 @@ import net.runelite.client.plugins.recorder.worldmap.MapPlanner;
 import net.runelite.client.plugins.recorder.worldmap.MapStore;
 import net.runelite.client.plugins.recorder.worldmap.MapStoreIO;
 import net.runelite.client.plugins.recorder.worldmap.SceneScraper;
+import net.runelite.client.plugins.recorder.worldmap.TransportIO;
+import net.runelite.client.plugins.recorder.worldmap.TransportIndex;
+import net.runelite.client.plugins.recorder.worldmap.TransportObserver;
 import net.runelite.client.plugins.recorder.worldmap.WorldMemoryConfig;
 import net.runelite.client.plugins.recorder.annotator.AnnotatorHudOverlay;
 import net.runelite.client.plugins.recorder.annotator.AreaSelector;
@@ -153,6 +156,8 @@ public class RecorderPlugin extends Plugin
     // WorldMemory subsystem — passive tile/entity scrapers + planner.
     private MapStore worldMapStore;
     private EntityIndex worldEntityIndex;
+    private TransportIndex transportIndex;
+    private TransportObserver transportObserver;
     private SceneScraper sceneScraper;
     private EntityScraper entityScraper;
     private MapPlanner mapPlanner;
@@ -386,6 +391,9 @@ public class RecorderPlugin extends Plugin
         wmConfig = new WorldMemoryConfig();
         worldMapStore = new MapStore(wmConfig);
         worldEntityIndex = new EntityIndex();
+        transportIndex = new TransportIndex();
+        transportObserver = new TransportObserver(client, transportIndex);
+        eventBus.register(transportObserver);
         sceneScraper = new SceneScraper(client, worldMapStore, worldEntityIndex, wmConfig);
         entityScraper = new EntityScraper();
         mapPlanner = new MapPlanner(worldMapStore, wmConfig);
@@ -421,12 +429,15 @@ public class RecorderPlugin extends Plugin
                     }
                 }
             }
+            // Transport graph — single top-level file. Loaded once
+            // here so the planner has known transports immediately.
+            transportIndex.replaceAll(TransportIO.readAll(worldmapRoot));
         }, "worldmap-bootstrap");
         bootstrapThread.setDaemon(true);
         bootstrapThread.start();
 
         flushDaemon = new FlushDaemon(worldMapStore, worldEntityIndex,
-            worldmapRoot, wmConfig.flushEverySeconds * 1000L);
+            transportIndex, worldmapRoot, wmConfig.flushEverySeconds * 1000L);
         flushDaemon.start();
 
         BufferedImage icon = ImageUtil.loadImageResource(getClass(), "/util/reset.png");
@@ -527,6 +538,11 @@ public class RecorderPlugin extends Plugin
         eventCapture = null; manager = null; hotkeys = null;
         chickenLoop = null;
         miningLoop = null;
+        if (transportObserver != null)
+        {
+            eventBus.unregister(transportObserver);
+            transportObserver = null;
+        }
         if (flushDaemon != null)
         {
             flushDaemon.stop();
@@ -535,6 +551,7 @@ public class RecorderPlugin extends Plugin
         }
         worldMapStore = null;
         worldEntityIndex = null;
+        transportIndex = null;
         sceneScraper = null;
         entityScraper = null;
         mapPlanner = null;

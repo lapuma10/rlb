@@ -23,6 +23,7 @@ import net.runelite.api.coords.WorldPoint;
 public final class TransportIndex
 {
     private final Map<String, TransportEdge> byKey = new ConcurrentHashMap<>();
+    private volatile boolean dirty;
 
     /** Insert or merge. If an edge with the same key already exists,
      *  its seenCount is bumped and lastSeenAtMs is updated to the
@@ -34,6 +35,18 @@ public final class TransportIndex
         if (edge == null) return;
         byKey.merge(edge.key(), edge, (existing, incoming) ->
             existing.bumpSeen(incoming.lastSeenAtMs()));
+        dirty = true;
+    }
+
+    /** Returns whether the in-memory state diverged from the last
+     *  persisted snapshot, then clears the flag. The {@link
+     *  net.runelite.client.plugins.recorder.worldmap.FlushDaemon} uses
+     *  this to skip writes when nothing changed since the last flush. */
+    public boolean takeDirty()
+    {
+        boolean was = dirty;
+        dirty = false;
+        return was;
     }
 
     public int size()
@@ -62,7 +75,8 @@ public final class TransportIndex
     /** Replace all in-memory contents with the given edges — used by
      *  TransportIO when loading the persisted snapshot at plugin
      *  startup. Atomic: clears then bulk-inserts under the underlying
-     *  map's locking. */
+     *  map's locking. Does NOT mark dirty: in-memory and on-disk are
+     *  in sync immediately after a load. */
     public void replaceAll(Collection<TransportEdge> edges)
     {
         byKey.clear();

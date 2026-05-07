@@ -69,6 +69,20 @@ public class TransportIndexTest
         assertEquals("Climb-up", e.verb());
     }
 
+    @Test
+    public void add_marksDirty_replaceAllDoesNot()
+    {
+        TransportIndex idx = new TransportIndex();
+        assertFalse("fresh index is clean", idx.takeDirty());
+
+        idx.add(sampleEdge(3208, 3216, "Open", 1530, 1_000L));
+        assertTrue("add must mark dirty", idx.takeDirty());
+        assertFalse("takeDirty resets the flag", idx.takeDirty());
+
+        idx.replaceAll(List.of(sampleEdge(9999, 9999, "Climb-up", 16671, 5_000L)));
+        assertFalse("loading from disk must NOT mark dirty", idx.takeDirty());
+    }
+
     private static TransportEdge sampleEdge(int x, int y, String verb,
                                             int objectId, long timestampMs)
     {
