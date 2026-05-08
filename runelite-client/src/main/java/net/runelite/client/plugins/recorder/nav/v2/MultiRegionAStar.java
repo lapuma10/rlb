@@ -52,21 +52,18 @@ public final class MultiRegionAStar
     static final int TRANSPORT_BASE_COST = 2;
 
     /** Cost multiplier for a step into a tile not present in the
-     *  {@link MapStore} snapshot (region not loaded, or region loaded
-     *  but tile missing). Set to 1.0 — the planner is fully neutral
-     *  between known-walkable and unknown.
+     *  {@link MapStore} snapshot. Set to 1.0001 — effectively neutral
+     *  with known-walkable tiles, but enough of a tie-break that A*
+     *  prefers known corridors when both are equally direct.
      *
      *  <p>Earlier experiments tried 5.0 (NO_ROUTE: heuristic became
-     *  massively under-admissible) and 1.05 (planner detoured 110
-     *  tiles via bridge/church through known terrain over a 75-tile
-     *  direct unknown corridor). At 1.0 there is no bias: A* picks
-     *  the shortest by Chebyshev. The executor's openable-blocker
-     *  recovery + replan-on-mismatch handles the case where an
-     *  unknown step turns out to be a real wall. The wider scrape
-     *  window (radius 52, full loaded scene) makes the unknown
-     *  set shrink fast: after one trip through a corridor, the
-     *  surrounding tiles are all known. */
-    static final double UNKNOWN_TILE_COST = 1.0;
+     *  massively under-admissible), 1.05 (planner detoured 110 tiles
+     *  through known terrain), and 1.0 (NO_ROUTE again because
+     *  same-plane unknown walking became cheaper than transport+walk
+     *  on the destination plane, so A* never considered transports).
+     *  1.0001 is the empirical sweet spot — biases priority order
+     *  toward known-walkable without distorting cost arithmetic. */
+    static final double UNKNOWN_TILE_COST = 1.0001;
     /** Sentinel: walk impossible. Distinct from UNKNOWN_TILE_COST
      *  (allowed-but-expensive) so the caller can drop the neighbor
      *  with a cheap isInfinite check. */
@@ -189,13 +186,29 @@ public final class MultiRegionAStar
             (int) Math.round(gScore.get(goalKey)));
     }
 
-    /** Chebyshev heuristic in tile units (the open queue's f is
-     *  computed as (g + h) × 1000 so this stays in plain units). */
+    /** Plane-aware Chebyshev heuristic. Returns the lower bound on
+     *  remaining cost: Chebyshev distance in (x, y) plus the minimum
+     *  cost of any required plane change. Any path between tiles on
+     *  different planes must traverse at least one transport edge
+     *  (cost {@link #TRANSPORT_BASE_COST}), so adding that cost when
+     *  the planes differ stays admissible while telling A* that
+     *  same-plane wandering toward a cross-plane goal is provably
+     *  more expensive than descending via a transport.
+     *
+     *  <p>Without the plane term, A* with Chebyshev_xy alone treats
+     *  walking 75 tiles on the source plane as equivalent in
+     *  estimated cost to (transport + walking 75 on the destination
+     *  plane). With {@link #TRANSPORT_BASE_COST}=2 and unknown-tile
+     *  cost ≈ 1.0, the same-plane walk wins the priority queue, A*
+     *  floods the source plane, and a cross-plane plan exhausts
+     *  {@link WorldMemoryConfig#maxExpandedTiles} before reaching
+     *  the goal — exactly the live failure that surfaced this fix. */
     private static int heuristic(WorldPoint a, WorldPoint b)
     {
         int dx = Math.abs(a.getX() - b.getX());
         int dy = Math.abs(a.getY() - b.getY());
-        return Math.max(dx, dy);
+        int planeMismatch = a.getPlane() != b.getPlane() ? TRANSPORT_BASE_COST : 0;
+        return Math.max(dx, dy) + planeMismatch;
     }
 
     /** Reconstruct the V2Path by walking back from goal via the parent
