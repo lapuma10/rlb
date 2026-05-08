@@ -1049,10 +1049,23 @@ public final class V2Executor
                 return true;
             }
         }
-        log.warn("v2-executor: stall recovery exhausted after {} catch-up click(s) — FAILED",
-            catchupClicksThisLeg);
-        status = Status.FAILED;
+        // Catch-up budget exhausted on this leg. Instead of failing the
+        // whole script, blacklist the tile and request a replan from
+        // current position. The classifier already added the tile to
+        // its blacklist (per-route), so the next plan won't pick it.
+        // The navigator's replan budget (MAX_REPLANS_PER_REQUEST=3)
+        // bounds how many times this can recur before propagating
+        // FAILED. Live observation that motivated this: bot reached
+        // 80%+ of bank → pen route, stalled on a single water/sentinel
+        // tile near the destination, gave up despite the rest of the
+        // route being walkable.
+        log.warn("v2-executor: stall recovery exhausted after {} catch-up click(s) on {} — requesting replan",
+            catchupClicksThisLeg, lastDispatchedTile);
+        if (lastDispatchedTile != null) classifier.blacklistTile(lastDispatchedTile);
+        wantsReplanFromHere = true;
         lastFailureReason = FailureReason.CATCHUP_EXHAUSTED;
+        // Don't FAIL — leave status RUNNING so the navigator picks up
+        // wantsReplanFromHere and replans within its budget.
         return true;
     }
 

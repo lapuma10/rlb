@@ -321,21 +321,31 @@ public class V2ExecutorTest
     }
 
     @Test
-    public void tick_catchupExhausted_returnsFailed()
+    public void tick_catchupExhausted_signalsReplanInsteadOfFail()
     {
+        // Round-2 stabilization: stall recovery exhaustion no longer
+        // FAILs the script — it sets wantsReplanFromHere() so the
+        // navigator can blacklist the bad tile and replan within its
+        // budget. Live observation: bot reached 80% of bank → pen,
+        // stalled on a single sentinel tile, gave up despite the rest
+        // of the route being walkable.
         FakeEnv env = new FakeEnv();
         env.player = new WorldPoint(3208, 3217, 0);
         V2Executor x = newExecutor(env);
         x.setPath(eastPath(20));
 
-        // First click + repeated stalls until catch-up budget exhausts.
         x.tick();   // initial dispatch
         for (int i = 0; i < (V2Executor.MAX_CATCHUP_CLICKS_PER_LEG + 1) * (V2Executor.STALL_TICKS + 1); i++)
         {
             env.busy = false;
             x.tick();
         }
-        assertEquals(V2Executor.Status.FAILED, x.status());
+        assertEquals("status remains RUNNING; navigator handles replan",
+            V2Executor.Status.RUNNING, x.status());
+        assertTrue("wantsReplanFromHere set so navigator can replan",
+            x.wantsReplanFromHere());
+        assertEquals("failure reason still tagged CATCHUP_EXHAUSTED for diagnostics",
+            V2Executor.FailureReason.CATCHUP_EXHAUSTED, x.lastFailureReason());
     }
 
     @Test
@@ -563,8 +573,10 @@ public class V2ExecutorTest
     }
 
     @Test
-    public void tick_catchupExhausted_reasonTaggedCATCHUP_EXHAUSTED()
+    public void tick_catchupExhausted_reasonTaggedCATCHUP_EXHAUSTED_andReplanRequested()
     {
+        // Same as tick_catchupExhausted_signalsReplanInsteadOfFail but
+        // pinning the diagnostic reason tag.
         FakeEnv env = new FakeEnv();
         env.player = new WorldPoint(3208, 3217, 0);
         V2Executor x = newExecutor(env);
@@ -575,7 +587,8 @@ public class V2ExecutorTest
             env.busy = false;
             x.tick();
         }
-        assertEquals(V2Executor.Status.FAILED, x.status());
+        assertEquals(V2Executor.Status.RUNNING, x.status());
+        assertTrue(x.wantsReplanFromHere());
         assertEquals(V2Executor.FailureReason.CATCHUP_EXHAUSTED, x.lastFailureReason());
     }
 

@@ -70,6 +70,19 @@ public final class MultiRegionAStar
      *  1.0001 is the empirical sweet spot — biases priority order
      *  toward known-walkable without distorting cost arithmetic. */
     static final double UNKNOWN_TILE_COST = 1.0001;
+
+    /** Cost for a tile flagged with the engine's "off-scene" sentinel
+     *  (0x00ffffff — every block-bit set). The scraper used to write
+     *  this for tiles inside the scrape window but outside the truly-
+     *  loaded scene chunks. New scrapes skip writing it, but historical
+     *  snapshots have it baked in. The sentinel often masks WATER or
+     *  VOID tiles, which are genuinely unwalkable — so charge a stiff
+     *  but not infinite cost. The planner prefers known walkable +
+     *  truly-missing tiles over sentinel tiles when alternatives
+     *  exist, but still routes through sentinels when no other path is
+     *  available. The executor's stall handling + replan recovers if
+     *  a sentinel tile turns out to be water/wall mid-route. */
+    static final double SENTINEL_TILE_COST = 3.0;
     /** Sentinel: walk impossible. Distinct from UNKNOWN_TILE_COST
      *  (allowed-but-expensive) so the caller can drop the neighbor
      *  with a cheap isInfinite check. */
@@ -319,10 +332,16 @@ public final class MultiRegionAStar
         // Engine's "off-scene" sentinel — collision data for a tile
         // inside the scrape window but outside the truly-loaded scene
         // chunks. The scraper now skips writing it (see SceneScraper)
-        // but historical snapshots have it baked in; treat as unknown
-        // so the planner can route through corridors the bot can
-        // actually traverse.
-        if (destFlags == 0x00ffffff) return UNKNOWN_TILE_COST;
+        // but historical snapshots have it baked in. Treat as
+        // *expensive* unknown: more costly than a truly-missing tile
+        // (which is genuinely unscraped terrain, often walkable) so
+        // the planner prefers known walkables and truly-missing tiles
+        // over sentinel ones — but still routes through sentinel
+        // tiles when no alternative exists. Mid-route the bot
+        // discovers some sentinel tiles are walkable and others are
+        // water/walls; the executor's stall handling + replan
+        // recovers either way. */
+        if (destFlags == 0x00ffffff) return SENTINEL_TILE_COST;
 
         int xFlags = CollisionDataFlag.BLOCK_MOVEMENT_FULL;
         int yFlags = CollisionDataFlag.BLOCK_MOVEMENT_FULL;
