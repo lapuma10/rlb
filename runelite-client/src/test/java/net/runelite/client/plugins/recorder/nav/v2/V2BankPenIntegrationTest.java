@@ -296,13 +296,15 @@ public class V2BankPenIntegrationTest
     }
 
     @Test
-    public void v2Strict_transportRequiredRoute_executorFailsCleanly()
+    public void v2Strict_transportRequiredRoute_executesTransportLeg()
     {
         // Cross-plane fixture: bank on plane 0, target on plane 2, with
         // a transport edge in the middle. V2Planner produces a valid
-        // path containing a Transport leg. The executor MUST NOT
-        // attempt to drive the verb-click — it must FAIL with
-        // TRANSPORT_EXECUTOR_MISSING so V2_WITH_V1_FALLBACK engages.
+        // path containing a Transport leg. Round-2 executor accepts the
+        // route and drives leg-by-leg; this test confirms the route is
+        // ACCEPTED (status RUNNING, no failure tag) and the picker only
+        // ever dispatches walks on the player's current plane (the
+        // sequencing guard from the live regression).
         MapStore s = new MapStore(new WorldMemoryConfig());
         TransportIndex t = new TransportIndex();
         seedTiles(s, rect(3204, 3216, 3216, 3225));
@@ -339,13 +341,26 @@ public class V2BankPenIntegrationTest
         env.player = BANK;
         V2Executor exec = executorFor(env);
         exec.setPath(path);
-        assertEquals("executor must FAIL transport-bearing path",
-            V2Executor.Status.FAILED, exec.status());
-        assertEquals("FailureReason must be TRANSPORT_EXECUTOR_MISSING",
-            V2Executor.FailureReason.TRANSPORT_EXECUTOR_MISSING,
-            exec.lastFailureReason());
-        // No dispatches should have happened.
-        assertEquals(0, env.walkDispatches.size());
-        assertEquals(0, env.minimapDispatches.size());
+        assertEquals("transport-bearing route is now ACCEPTED, not rejected",
+            V2Executor.Status.RUNNING, exec.status());
+
+        // Drive a few ticks while the player is on plane 0 — every
+        // dispatch (canvas or minimap) must target a plane-0 tile.
+        for (int i = 0; i < 6; i++)
+        {
+            env.busy = false;
+            exec.tick();
+            if (exec.status() != V2Executor.Status.RUNNING) break;
+        }
+        for (WorldPoint w : env.walkDispatches)
+        {
+            assertEquals("WALK leg sequencing: dispatch plane must equal player plane",
+                0, w.getPlane());
+        }
+        for (WorldPoint w : env.minimapDispatches)
+        {
+            assertEquals("WALK leg sequencing: minimap dispatch plane must equal player plane",
+                0, w.getPlane());
+        }
     }
 }

@@ -55,10 +55,20 @@ public final class CanvasTilePicker
                                boolean variableDistance)
     {
         if (path == null || path.isEmpty()) return null;
-        if (player == null || filter == null || rng == null) return null;
+        return pickNextInTiles(collectWalkTiles(path), player, filter, rng, variableDistance);
+    }
 
-        List<WorldPoint> walkTiles = collectWalkTiles(path);
-        if (walkTiles.isEmpty()) return null;
+    /** Per-leg overload — operates on an explicit tile list (typically
+     *  one walk leg's tiles) instead of flattening the whole path. The
+     *  V2 executor uses this once leg-sequencing is on so candidate
+     *  tiles never span legs / planes. Same bucket / filter semantics
+     *  as {@link #pickNext(V2Path, WorldPoint, Predicate, Random, boolean)}. */
+    public WorldPoint pickNextInTiles(List<WorldPoint> walkTiles, WorldPoint player,
+                                      Predicate<WorldPoint> filter, Random rng,
+                                      boolean variableDistance)
+    {
+        if (walkTiles == null || walkTiles.isEmpty()) return null;
+        if (player == null || filter == null || rng == null) return null;
 
         int playerIdx = closestIndex(walkTiles, player);
         // Available forward tiles after the player's projected index.

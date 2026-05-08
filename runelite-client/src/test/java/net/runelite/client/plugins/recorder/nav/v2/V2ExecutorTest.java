@@ -31,6 +31,15 @@ public class V2ExecutorTest
         final Set<WorldPoint> dynamicEntities = new HashSet<>();  // NPC standing on tile
         final List<WorldPoint> walkDispatches = new ArrayList<>();
         final List<WorldPoint> minimapDispatches = new ArrayList<>();
+        /** Live transport-object lookup result. Map key is the tile passed
+         *  in by the executor (it iterates fromTile + 1-ring); the value is
+         *  the resolved click tile (or {@code null} to mean "verb not on
+         *  this tile"). When the key is absent, resolve returns null. */
+        final Map<WorldPoint, WorldPoint> transportObjects = new HashMap<>();
+        /** Records every dispatchTransport call as (tile, verb). */
+        final List<TransportClick> transportClicks = new ArrayList<>();
+        /** When non-null, dispatchTransport returns false (simulates dispatcher busy). */
+        boolean refuseTransportDispatch;
         @Nullable String pendingDispatchError;
 
         @Override @Nullable public WorldPoint playerLoc() { return player; }
@@ -65,6 +74,40 @@ public class V2ExecutorTest
             pendingDispatchError = null;
             return e;
         }
+
+        @Override
+        @Nullable
+        public WorldPoint resolveTransportClickTile(int objectId, String verb, WorldPoint fromTile)
+        {
+            // Mimic production: try fromTile first, then 8-neighbor ring.
+            if (transportObjects.containsKey(fromTile)) return transportObjects.get(fromTile);
+            int[][] dirs = { {0,1}, {1,0}, {0,-1}, {-1,0},
+                             {1,1}, {1,-1}, {-1,1}, {-1,-1} };
+            for (int[] d : dirs)
+            {
+                WorldPoint near = new WorldPoint(
+                    fromTile.getX() + d[0], fromTile.getY() + d[1], fromTile.getPlane());
+                if (transportObjects.containsKey(near)) return transportObjects.get(near);
+            }
+            return null;
+        }
+
+        @Override
+        public boolean dispatchTransport(WorldPoint clickTile, String verb)
+        {
+            if (refuseTransportDispatch) return false;
+            if (busy) return false;
+            transportClicks.add(new TransportClick(clickTile, verb));
+            busy = true;
+            return true;
+        }
+    }
+
+    private static final class TransportClick
+    {
+        final WorldPoint tile;
+        final String verb;
+        TransportClick(WorldPoint t, String v) { this.tile = t; this.verb = v; }
     }
 
     private static V2Path eastPath(int n)
@@ -490,91 +533,322 @@ public class V2ExecutorTest
     }
 
     // ------------------------------------------------------------------
-    // Phase-7 fallback correctness: V2 cannot drive transport legs in
-    // round 1. The executor must fail cleanly with a tagged reason so
-    // the hybrid navigator can fall back to V1 (or strict mode surfaces
-    // the FAILED) instead of stalling on a tile whose plane the player
-    // can't reach by walking.
+    // Round-2 transport execution: V2 walks WALK→TRANSPORT→WALK routes
+    // for itself. Acceptance tests A–J below cover leg sequencing,
+    // approach, click, success, missing object, missing action, timeout,
+    // fallback (in HybridNavigatorTest), strict (also there), and the
+    // cross-plane guard.
     // ------------------------------------------------------------------
 
     private static TransportEdge stairs(WorldPoint from, WorldPoint to, String verb)
     {
-        return new TransportEdge(from, to, 12345, "Staircase", verb,
-            0, 0, "object", from, 12345, 1, 0L, 0L);
+        return new TransportEdge(from, to, 56230, "Staircase", verb,
+            0, 0, "object", from, from.getX() << 8, 1, 0L, 0L);
     }
 
+    /** Composite WALK p0 → TRANSPORT → WALK p2 path matching the
+     *  Lumbridge-castle staircase shape from the live failure log. */
+    private static V2Path stairRoute()
+    {
+        List<WorldPoint> w0 = new ArrayList<>();
+        for (int i = 0; i < 5; i++) w0.add(new WorldPoint(3204 + i, 3207, 0));
+        // last walk tile = approach tile of the staircase.
+        WorldPoint approach = w0.get(w0.size() - 1);
+        TransportEdge edge = new TransportEdge(approach,
+            new WorldPoint(3204, 3207, 2), 56230, "Staircase", "Top-floor",
+            0, 0, "object", approach, 12850, 1, 0L, 0L);
+        List<WorldPoint> w2 = new ArrayList<>();
+        for (int i = 0; i < 5; i++) w2.add(new WorldPoint(3204 - i, 3207, 2));
+        return new V2Path(List.of(
+            new V2Leg.Walk(12850, w0),
+            new V2Leg.Transport(edge),
+            new V2Leg.Walk(12850, w2)
+        ), 100);
+    }
+
+    /** A. Leg sequencing: while player is on plane 0, executor must
+     *  not dispatch any tile on plane 2 (the second walk leg). */
     @Test
-    public void setPath_withTransportLeg_failsImmediately_withTransportReason()
+    public void transport_legSequencing_noPlane2DispatchWhilePlayerOnPlane0()
     {
         FakeEnv env = new FakeEnv();
-        env.player = new WorldPoint(3208, 3217, 0);
+        env.player = new WorldPoint(3204, 3207, 0);  // start of plane-0 walk
         V2Executor x = newExecutor(env);
+        x.setPath(stairRoute());
+        assertEquals(V2Executor.Status.RUNNING, x.status());
 
-        // walk plane=0 → climb-up → walk plane=2 — the chicken-castle shape
-        // that exposed the bug.
-        List<WorldPoint> w0 = List.of(new WorldPoint(3208, 3217, 0),
-                                      new WorldPoint(3209, 3217, 0));
-        List<WorldPoint> w2 = List.of(new WorldPoint(3210, 3220, 2),
-                                      new WorldPoint(3211, 3220, 2));
-        TransportEdge edge = stairs(new WorldPoint(3209, 3217, 0),
-                                    new WorldPoint(3210, 3220, 2),
-                                    "Climb-up");
-        V2Path p = new V2Path(List.of(
-            new V2Leg.Walk(0, w0),
-            new V2Leg.Transport(edge),
-            new V2Leg.Walk(2, w2)
-        ), 100);
-
-        x.setPath(p);
-
-        assertEquals("transport in path → FAILED before any tick runs",
-            V2Executor.Status.FAILED, x.status());
-        assertEquals("FailureReason must be TRANSPORT_EXECUTOR_MISSING",
-            V2Executor.FailureReason.TRANSPORT_EXECUTOR_MISSING,
-            x.lastFailureReason());
-
-        // Subsequent ticks must not produce dispatches — including any
-        // dispatch onto the plane=2 walk leg's tiles while the player
-        // is on plane=0. This is the exact symptom of the bug.
-        for (int i = 0; i < 5; i++) {
+        // Drive several ticks WITHOUT advancing the player — only the
+        // first walk leg should be eligible for clicks.
+        for (int i = 0; i < 10; i++)
+        {
             env.busy = false;
             x.tick();
+            if (x.status() != V2Executor.Status.RUNNING) break;
         }
-        assertEquals("no walk dispatch after FAILED", 0, env.walkDispatches.size());
-        assertEquals("no minimap dispatch after FAILED", 0, env.minimapDispatches.size());
+        for (WorldPoint w : env.walkDispatches)
+        {
+            assertEquals("walk dispatch on plane other than player's plane (sequencing leak)",
+                0, w.getPlane());
+        }
+        for (WorldPoint w : env.minimapDispatches)
+        {
+            assertEquals("minimap dispatch on plane other than player's plane (sequencing leak)",
+                0, w.getPlane());
+        }
+        assertTrue("at least one walk dispatch on plane 0",
+            !env.walkDispatches.isEmpty() || !env.minimapDispatches.isEmpty());
     }
 
+    /** B. Transport approach: when the player is far from approachTile,
+     *  executor walks toward approach BEFORE attempting the verb-click. */
     @Test
-    public void setPath_walkOnlyPath_clearsFailureReason()
+    public void transport_approachWalk_beforeClick()
     {
-        // After a failed transport route, replanning to a walk-only route
-        // must clear the FAILED state and reason — fresh path, fresh state.
         FakeEnv env = new FakeEnv();
-        env.player = new WorldPoint(3208, 3217, 0);
+        // Place player at start of walk leg, approach is at end (4 tiles east).
+        env.player = new WorldPoint(3204, 3207, 0);
+        // Wire a live object on the approach tile so click is possible
+        // once we get there.
+        env.transportObjects.put(new WorldPoint(3208, 3207, 0),
+            new WorldPoint(3208, 3207, 0));
         V2Executor x = newExecutor(env);
+        x.setPath(stairRoute());
 
-        TransportEdge edge = stairs(new WorldPoint(3209, 3217, 0),
-                                    new WorldPoint(3210, 3220, 2),
-                                    "Climb-up");
-        x.setPath(new V2Path(List.of(new V2Leg.Transport(edge)), 10));
-        assertEquals(V2Executor.FailureReason.TRANSPORT_EXECUTOR_MISSING,
-            x.lastFailureReason());
-
-        x.setPath(eastPath(20));
-        assertEquals("walk-only path resets to RUNNING",
-            V2Executor.Status.RUNNING, x.status());
-        assertNull("walk-only path clears FailureReason", x.lastFailureReason());
+        // First few ticks: should walk on the WALK leg.
+        env.busy = false; x.tick();
+        assertTrue("first tick must be a walk dispatch (still on WALK leg)",
+            !env.walkDispatches.isEmpty());
+        assertTrue("must not click transport before approach reached",
+            env.transportClicks.isEmpty());
     }
 
+    /** C. Transport click: with player adjacent to approach and live
+     *  object present, executor dispatches the verb-click. */
+    @Test
+    public void transport_dispatchesVerbClick_whenAdjacent()
+    {
+        FakeEnv env = new FakeEnv();
+        // Skip walk leg by making the executor see the player at the end of
+        // the WALK leg already — the leg advances on first tick.
+        env.player = new WorldPoint(3208, 3207, 0);
+        env.transportObjects.put(new WorldPoint(3208, 3207, 0),
+            new WorldPoint(3208, 3207, 0));
+        V2Executor x = newExecutor(env);
+        x.setPath(stairRoute());
+
+        // Tick 1: walk leg should advance (player is at end tile).
+        env.busy = false;
+        x.tick();
+        // Tick 2: transport leg — player adjacent, click dispatched.
+        env.busy = false;
+        x.tick();
+
+        assertEquals("transport leg should issue exactly one verb-click",
+            1, env.transportClicks.size());
+        assertEquals("Top-floor", env.transportClicks.get(0).verb);
+        assertEquals(new WorldPoint(3208, 3207, 0), env.transportClicks.get(0).tile);
+        assertTrue("executor should be in WAITING_FOR_TRANSPORT after click",
+            x.isWaitingForTransport());
+    }
+
+    /** D. Transport success: after the player's plane changes to the
+     *  destination plane, executor advances to the next WALK leg. */
+    @Test
+    public void transport_advancesLeg_whenPlayerReachesDestPlane()
+    {
+        FakeEnv env = new FakeEnv();
+        env.player = new WorldPoint(3208, 3207, 0);
+        env.transportObjects.put(new WorldPoint(3208, 3207, 0),
+            new WorldPoint(3208, 3207, 0));
+        V2Executor x = newExecutor(env);
+        x.setPath(stairRoute());
+
+        // Run through walk-advance + transport-click.
+        for (int i = 0; i < 3; i++) { env.busy = false; x.tick(); }
+        assertTrue("transport must have been clicked",
+            !env.transportClicks.isEmpty());
+        assertEquals("legIdx should be 1 (transport leg)", 1, x.currentLegIndex());
+
+        // Simulate plane change — player teleports to plane 2 destination tile.
+        env.player = new WorldPoint(3204, 3207, 2);
+        env.busy = false;
+        x.tick();
+        assertEquals("after plane change, legIdx should advance to walk-leg 2",
+            2, x.currentLegIndex());
+        assertTrue("transport flag must be cleared on advance",
+            !x.isWaitingForTransport());
+        // Subsequent tick should produce a WALK dispatch on plane 2 (or arrive).
+        env.busy = false;
+        x.tick();
+        for (WorldPoint w : env.walkDispatches)
+        {
+            // Once the transport completed, plane-2 dispatches are now valid.
+            assertTrue("dispatch plane should be 0 (pre-transport) or 2 (post-transport)",
+                w.getPlane() == 0 || w.getPlane() == 2);
+        }
+    }
+
+    /** E. Missing object: live object not on fromTile or 1-ring. */
+    @Test
+    public void transport_missingObject_failsWithTRANSPORT_OBJECT_NOT_FOUND()
+    {
+        FakeEnv env = new FakeEnv();
+        env.player = new WorldPoint(3208, 3207, 0);
+        // No transportObjects entry → resolve returns null.
+        V2Executor x = newExecutor(env);
+        x.setPath(stairRoute());
+
+        for (int i = 0; i < 3; i++) { env.busy = false; x.tick(); }
+        assertEquals(V2Executor.Status.FAILED, x.status());
+        assertEquals(V2Executor.FailureReason.TRANSPORT_OBJECT_NOT_FOUND,
+            x.lastFailureReason());
+        assertEquals("no transport click should have been dispatched",
+            0, env.transportClicks.size());
+    }
+
+    /** F. Missing action: the resolver mapping intentionally returns null
+     *  for the recorded fromTile — same channel as missing-object since
+     *  TransportResolver collapses both into Match.failure(); test confirms
+     *  the FAILED reason is the canonical not-found tag. */
+    @Test
+    public void transport_actionAbsent_failsWithObjectNotFound()
+    {
+        FakeEnv env = new FakeEnv();
+        env.player = new WorldPoint(3208, 3207, 0);
+        // Map fromTile to null — resolver explicitly says "no verb here".
+        env.transportObjects.put(new WorldPoint(3208, 3207, 0), null);
+        V2Executor x = newExecutor(env);
+        x.setPath(stairRoute());
+
+        for (int i = 0; i < 3; i++) { env.busy = false; x.tick(); }
+        assertEquals(V2Executor.Status.FAILED, x.status());
+        assertEquals(V2Executor.FailureReason.TRANSPORT_OBJECT_NOT_FOUND,
+            x.lastFailureReason());
+    }
+
+    /** G. Timeout: clicked but plane never changes. */
+    @Test
+    public void transport_timeout_failsWithTRANSPORT_TIMEOUT()
+    {
+        FakeEnv env = new FakeEnv();
+        env.player = new WorldPoint(3208, 3207, 0);
+        env.transportObjects.put(new WorldPoint(3208, 3207, 0),
+            new WorldPoint(3208, 3207, 0));
+        V2Executor x = newExecutor(env);
+        x.setPath(stairRoute());
+
+        // Drive through walk-advance + click + timeout polling.
+        for (int i = 0; i < V2Executor.TRANSPORT_TIMEOUT_TICKS + 5; i++)
+        {
+            env.busy = false;
+            x.tick();
+            if (x.status() == V2Executor.Status.FAILED) break;
+        }
+        assertEquals(V2Executor.Status.FAILED, x.status());
+        assertEquals(V2Executor.FailureReason.TRANSPORT_TIMEOUT,
+            x.lastFailureReason());
+    }
+
+    /** Click-failed (dispatcher refused). */
+    @Test
+    public void transport_clickRefused_failsWithTRANSPORT_CLICK_FAILED()
+    {
+        FakeEnv env = new FakeEnv();
+        env.player = new WorldPoint(3208, 3207, 0);
+        env.transportObjects.put(new WorldPoint(3208, 3207, 0),
+            new WorldPoint(3208, 3207, 0));
+        env.refuseTransportDispatch = true;
+        V2Executor x = newExecutor(env);
+        x.setPath(stairRoute());
+
+        for (int i = 0; i < 3; i++) { env.busy = false; x.tick(); }
+        assertEquals(V2Executor.Status.FAILED, x.status());
+        assertEquals(V2Executor.FailureReason.TRANSPORT_CLICK_FAILED,
+            x.lastFailureReason());
+    }
+
+    /** Plane mismatch: player is on neither from nor to plane. */
+    @Test
+    public void transport_planeMismatch_failsWithTRANSPORT_PLANE_MISMATCH()
+    {
+        FakeEnv env = new FakeEnv();
+        // Player on plane 1 — neither from (0) nor to (2).
+        env.player = new WorldPoint(3208, 3207, 1);
+        V2Executor x = newExecutor(env);
+        // Skip the walk leg by setting up a transport-only path.
+        TransportEdge edge = new TransportEdge(
+            new WorldPoint(3208, 3207, 0), new WorldPoint(3204, 3207, 2),
+            56230, "Staircase", "Top-floor", 0, 0, "object",
+            new WorldPoint(3208, 3207, 0), 12850, 1, 0L, 0L);
+        x.setPath(new V2Path(List.of(new V2Leg.Transport(edge)), 10));
+
+        env.busy = false;
+        x.tick();
+        assertEquals(V2Executor.Status.FAILED, x.status());
+        assertEquals(V2Executor.FailureReason.TRANSPORT_PLANE_MISMATCH,
+            x.lastFailureReason());
+    }
+
+    /** J. Cross-plane walk candidate guard remains intact for transport
+     *  routes — no walk dispatch should target a tile on a plane the
+     *  player is not currently on. */
+    @Test
+    public void transport_route_walkDispatchPlaneAlwaysMatchesPlayer()
+    {
+        FakeEnv env = new FakeEnv();
+        env.player = new WorldPoint(3204, 3207, 0);
+        env.transportObjects.put(new WorldPoint(3208, 3207, 0),
+            new WorldPoint(3208, 3207, 0));
+        V2Executor x = newExecutor(env);
+        x.setPath(stairRoute());
+
+        for (int i = 0; i < 8; i++)
+        {
+            env.busy = false;
+            x.tick();
+            if (x.status() != V2Executor.Status.RUNNING) break;
+        }
+        for (WorldPoint w : env.walkDispatches)
+        {
+            assertEquals("walk dispatch must match player plane",
+                env.player.getPlane(), w.getPlane());
+        }
+    }
+
+    /** Empty path is IDLE, not FAILED — the failure reason must stay null. */
     @Test
     public void setPath_emptyPath_noFailureReason()
     {
-        // Empty path is IDLE, not FAILED — the failure reason must stay null.
         FakeEnv env = new FakeEnv();
         env.player = new WorldPoint(0, 0, 0);
         V2Executor x = newExecutor(env);
         x.setPath(V2Path.EMPTY);
         assertNull("empty path is IDLE, no reason", x.lastFailureReason());
+    }
+
+    /** Round-2 regression guard: setPath of a transport-bearing route
+     *  must NOT immediately FAIL with TRANSPORT_EXECUTOR_MISSING (the
+     *  round-1 reject path). It enters RUNNING with no failure. */
+    @Test
+    public void setPath_withTransportLeg_acceptedRunning_noTransportExecutorMissing()
+    {
+        FakeEnv env = new FakeEnv();
+        env.player = new WorldPoint(3208, 3217, 0);
+        V2Executor x = newExecutor(env);
+
+        TransportEdge edge = stairs(new WorldPoint(3209, 3217, 0),
+            new WorldPoint(3210, 3220, 2), "Climb-up");
+        V2Path p = new V2Path(List.of(
+            new V2Leg.Walk(0, List.of(new WorldPoint(3208, 3217, 0),
+                                      new WorldPoint(3209, 3217, 0))),
+            new V2Leg.Transport(edge),
+            new V2Leg.Walk(2, List.of(new WorldPoint(3210, 3220, 2)))
+        ), 100);
+        x.setPath(p);
+
+        assertEquals("transport route must enter RUNNING",
+            V2Executor.Status.RUNNING, x.status());
+        assertNull("no failure reason on accepted route", x.lastFailureReason());
     }
 
     @Test

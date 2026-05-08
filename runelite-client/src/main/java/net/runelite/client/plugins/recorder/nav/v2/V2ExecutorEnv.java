@@ -12,6 +12,7 @@ import net.runelite.api.Player;
 import net.runelite.api.WorldView;
 import net.runelite.api.coords.WorldPoint;
 import net.runelite.client.callback.ClientThread;
+import net.runelite.client.plugins.recorder.transport.TransportResolver;
 import net.runelite.client.plugins.recorder.worldmap.MapStore;
 import net.runelite.client.plugins.recorder.worldmap.RegionChunkSnapshot;
 import net.runelite.client.plugins.recorder.worldmap.RegionIds;
@@ -43,6 +44,7 @@ public final class V2ExecutorEnv implements V2Executor.Env
     private final EmptyTileFilter emptyTileFilter;
     private final MinimapClicker minimapClicker;
     private final MapStore mapStore;
+    private final TransportResolver transportResolver;
 
     public V2ExecutorEnv(Client client, ClientThread clientThread,
                          HumanizedInputDispatcher dispatcher,
@@ -56,6 +58,7 @@ public final class V2ExecutorEnv implements V2Executor.Env
         this.emptyTileFilter = emptyTileFilter;
         this.minimapClicker = minimapClicker;
         this.mapStore = mapStore;
+        this.transportResolver = new TransportResolver(client);
     }
 
     @Override
@@ -156,6 +159,53 @@ public final class V2ExecutorEnv implements V2Executor.Env
             if (sx < 0 || sy < 0 || sx >= flags.length || sy >= flags[sx].length) return false;
             return (flags[sx][sy] & net.runelite.api.CollisionDataFlag.BLOCK_MOVEMENT_FULL) == 0;
         }));
+    }
+
+    /** Search the recorded {@code fromTile} first, then the 8-neighbor
+     *  ring (clockwise from north), for a live object whose menu actions
+     *  contain {@code verb}. Returns the matched tile, or null if no
+     *  candidate carries the verb. Marshalled to the client thread —
+     *  scene reads asserted under -ea otherwise. */
+    @Override
+    @Nullable
+    public WorldPoint resolveTransportClickTile(int objectId, String verb,
+                                                WorldPoint fromTile)
+    {
+        if (fromTile == null || verb == null || verb.isBlank()) return null;
+        return onClient(() -> {
+            // 1) Direct hit on fromTile — the standard staircase/ladder case.
+            TransportResolver.Match m = transportResolver.findTransport(fromTile, verb);
+            if (m != null && m.isSuccess()) return fromTile;
+            // 2) 8-neighbor ring — covers WallObject doors / gates whose
+            //    object tile is adjacent to the player's standing tile.
+            int[][] dirs = { {0,1}, {1,0}, {0,-1}, {-1,0},
+                             {1,1}, {1,-1}, {-1,1}, {-1,-1} };
+            for (int[] d : dirs)
+            {
+                WorldPoint near = new WorldPoint(
+                    fromTile.getX() + d[0], fromTile.getY() + d[1], fromTile.getPlane());
+                TransportResolver.Match nm = transportResolver.findTransport(near, verb);
+                if (nm != null && nm.isSuccess()) return near;
+            }
+            log.debug("v2-executor-env: resolveTransportClickTile MISS verb='{}' objectId={} fromTile={}",
+                verb, objectId, fromTile);
+            return null;
+        });
+    }
+
+    @Override
+    public boolean dispatchTransport(WorldPoint clickTile, String verb)
+    {
+        if (clickTile == null || verb == null || verb.isBlank()) return false;
+        if (dispatcher.isBusy()) return false;
+        ActionRequest req = ActionRequest.builder()
+            .kind(ActionRequest.Kind.CLICK_GAME_OBJECT)
+            .channel(ActionRequest.Channel.MOUSE)
+            .tile(clickTile)
+            .verb(verb)
+            .build();
+        dispatcher.dispatch(req);
+        return true;
     }
 
     @Override
