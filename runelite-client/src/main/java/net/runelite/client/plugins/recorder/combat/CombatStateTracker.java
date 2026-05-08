@@ -66,6 +66,14 @@ public final class CombatStateTracker
      *  by {@link #isStolen(int)} to detect "another player is killing our
      *  selected chicken" before we waste 5-15s standing at a corpse. */
     private int engagedByOtherTicks = 0;
+    /** Consecutive ticks where ALL THREE combat-livelihood signals are silent:
+     *  no mutual engagement (chicken not targeting us), no player attack
+     *  animation, and no HP bar visible on the locked NPC. After this counter
+     *  exceeds the threshold passed to {@link #isPhantomCombat(int)}, the
+     *  combat loop bails out — the IN_COMBAT state was entered on a sticky
+     *  {@code Player.getInteracting()} pointer and no actual fight is in
+     *  flight. Reset whenever any one of the three signals returns. */
+    private int phantomTicks = 0;
 
     public CombatStateTracker(int npcIndex)
     {
@@ -73,11 +81,28 @@ public final class CombatStateTracker
     }
 
     /**
-     * Update with a fresh per-tick snapshot. Pass {@code lockedNpc=null} when
-     * the locked NPC is no longer present in the world view (vanished /
-     * despawned). All callers must invoke this on the client thread.
+     * Two-arg overload — equivalent to {@link #observe(NPC, Player, int)} with
+     * {@code playerAnim = -1}. Existing tests and any caller that doesn't have
+     * a fresh animation reading hand at observe time can use this; the
+     * phantom-combat detector only fires when ALL its signals are silent, so
+     * a missing player-anim reading just means "treat anim as silent" and
+     * relies on the other signals (mutual engagement / NPC HP bar) to keep
+     * the counter at zero whenever a real fight is in flight.
      */
     public void observe(@Nullable NPC lockedNpc, @Nullable Player self)
+    {
+        observe(lockedNpc, self, -1);
+    }
+
+    /**
+     * Update with a fresh per-tick snapshot. Pass {@code lockedNpc=null} when
+     * the locked NPC is no longer present in the world view (vanished /
+     * despawned). {@code playerAnim} is the local player's current
+     * {@link Player#getAnimation()} reading (-1 = no animation = idle); used
+     * by the phantom-combat detector to confirm we are actually swinging at
+     * the locked NPC. All callers must invoke this on the client thread.
+     */
+    public void observe(@Nullable NPC lockedNpc, @Nullable Player self, int playerAnim)
     {
         if (dead) return;   // sticky once we've decided
         if (lockedNpc == null)
@@ -163,6 +188,21 @@ public final class CombatStateTracker
         if (hp == 0) zeroHpTicks++;
         else zeroHpTicks = 0;
 
+        // Phantom-combat detector. The combat loop entered IN_COMBAT, but
+        // none of the three positive signals are showing — the engage click
+        // never landed and we're sitting on a sticky Player.getInteracting()
+        // pointer. Increment here; if the counter clears the threshold the
+        // loop releases the lock and re-selects.
+        // -1 from getHealthRatio() means "no HP bar shown right now" — bars
+        // appear only after recent damage and fade after ~5-7s of no damage.
+        // -1 from getAnimation() means "no overlay animation" — i.e. the
+        // player is not mid-swing.
+        boolean noMutual = !chickenTargetingUs;
+        boolean noPlayerAnim = playerAnim == -1;
+        boolean noHpBar = hp == -1;
+        if (noMutual && noPlayerAnim && noHpBar) phantomTicks++;
+        else phantomTicks = 0;
+
         // Death rule: HP bar empty for at least one tick. Drop the
         // everEngaged requirement — same reason as the vanish branch
         // above. If the HP bar shows zero on our locked target index,
@@ -212,6 +252,17 @@ public final class CombatStateTracker
     public boolean isDead()
     {
         return dead;
+    }
+
+    /** True when all three combat-livelihood signals (mutual engagement,
+     *  player attack animation, NPC HP bar) have been silent for more than
+     *  {@code threshold} consecutive ticks AND the NPC is not already
+     *  flagged dead/vanished. The combat loop bails IN_COMBAT on this so
+     *  it doesn't sit on a sticky {@code Player.getInteracting()} pointer
+     *  for ~2 minutes after a phantom engage. */
+    public boolean isPhantomCombat(int threshold)
+    {
+        return !dead && !vanished && phantomTicks > threshold;
     }
 
     public int npcIndex() { return npcIndex; }

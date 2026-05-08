@@ -421,6 +421,12 @@ public class RecorderPlugin extends Plugin
         // window. Symptom: V2_STRICT returning "no route" with persisted
         // region JSON sitting unread on disk.
         worldmapRoot = new File(RuneLite.RUNELITE_DIR, "recorder/worldmap");
+        // Wire on-disk lazy-load so MapStore.snapshotFor() can rehydrate a
+        // region after the LRU evicts it (default cap = 24). Without this
+        // the V2 planner returns NO_ROUTE for any destination region the
+        // player has visited but has since drifted far from — even though
+        // the snapshot is still on disk.
+        worldMapStore.setRootDir(worldmapRoot);
         if (client.getGameState() == GameState.LOGGED_IN)
         {
             triggerWorldMapBootstrap();

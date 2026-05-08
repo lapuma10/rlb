@@ -31,21 +31,66 @@ public final class MapStore
     /** Region IDs that have a published snapshot newer than the last flush. */
     private final java.util.Set<Integer> dirtyRegionIds
         = java.util.concurrent.ConcurrentHashMap.newKeySet();
+    /** Optional disk-backed lazy-load source. When non-null, {@link #snapshotFor}
+     *  attempts a disk read on a memory miss before returning null — required
+     *  so V2 planning can target regions the player has visited before but
+     *  whose in-memory snapshot has been LRU-evicted. */
+    @Nullable private volatile File rootDir;
+    /** Region IDs whose JSON file is known to be missing on disk. Cached to
+     *  avoid re-reading the same nonexistent file every tick. Cleared for
+     *  a region on {@link #publish} (in case the file appears later). */
+    private final java.util.Set<Integer> diskMissCache
+        = java.util.concurrent.ConcurrentHashMap.newKeySet();
 
     public MapStore(WorldMemoryConfig config)
     {
         this.config = config;
     }
 
+    /** Wire the on-disk worldmap root after construction. Called once by
+     *  {@link net.runelite.client.plugins.recorder.RecorderPlugin#startUp}
+     *  so the LRU can lazy-load evicted regions on demand instead of
+     *  reporting "region NOT loaded" the moment the bot walks far enough
+     *  to push the destination region out of the in-memory cap.
+     *
+     *  <p>Live failure that motivated this: ChickenFarmV3 ran combat at
+     *  the pen for 20+ minutes, the player drifted south, the LRU evicted
+     *  the pen region, then V2_STRICT NO_ROUTE'd the next bank→pen plan
+     *  even though the snapshot was on disk and the bot had been *in*
+     *  that region 5 minutes earlier. */
+    public void setRootDir(@Nullable File rootDir)
+    {
+        this.rootDir = rootDir;
+    }
+
     /** Return the current snapshot for {@code regionId}, or null if no
-     *  snapshot has ever been published for it. */
+     *  snapshot has ever been published for it AND no on-disk fallback
+     *  is wired / the on-disk JSON is missing.
+     *
+     *  <p>On a memory miss, attempts a disk read via {@link #loadFromDisk}
+     *  iff {@link #setRootDir} has been called. Repeated disk misses for
+     *  the same regionId are cached so the planner doesn't re-stat the
+     *  filesystem every tick when a region was never persisted. */
     @Nullable
     public RegionChunkSnapshot snapshotFor(int regionId)
     {
         AtomicReference<RegionChunkSnapshot> ref = snapshots.get(regionId);
-        if (ref == null) return null;
-        synchronized (accessLock) { accessOrder.put(regionId, System.nanoTime()); }
-        return ref.get();
+        if (ref != null && ref.get() != null)
+        {
+            synchronized (accessLock) { accessOrder.put(regionId, System.nanoTime()); }
+            return ref.get();
+        }
+        // Memory miss — try disk fallback.
+        File root = this.rootDir;
+        if (root == null) return null;
+        if (diskMissCache.contains(regionId)) return null;
+        if (loadFromDisk(root, regionId))
+        {
+            AtomicReference<RegionChunkSnapshot> reloaded = snapshots.get(regionId);
+            return reloaded == null ? null : reloaded.get();
+        }
+        diskMissCache.add(regionId);
+        return null;
     }
 
     /** Get a builder for an in-progress scrape. If a snapshot already
@@ -81,6 +126,10 @@ public final class MapStore
             regionId, k -> new AtomicReference<>());
         ref.set(snap);
         dirtyRegionIds.add(regionId);
+        // The region is live now — clear any prior disk-miss tag so a
+        // future evict→reload cycle re-tries the JSON.
+        diskMissCache.remove(regionId);
+        synchronized (accessLock) { accessOrder.put(regionId, System.nanoTime()); }
         evictIfOver();
     }
 
@@ -102,10 +151,23 @@ public final class MapStore
      *  installed). */
     public boolean loadFromDisk(File rootDir, int regionId)
     {
+        // Race-safe: if a live publish is already in flight, don't clobber
+        // it with stale disk data. compareAndSet leaves any existing
+        // snapshot untouched.
+        AtomicReference<RegionChunkSnapshot> ref = snapshots.computeIfAbsent(
+            regionId, k -> new AtomicReference<>());
+        if (ref.get() != null)
+        {
+            // Already populated by a concurrent publish or earlier load.
+            synchronized (accessLock) { accessOrder.put(regionId, System.nanoTime()); }
+            return true;
+        }
         RegionChunkSnapshot loaded = MapStoreIO.readRegion(rootDir, regionId);
         if (loaded.tiles().isEmpty()) return false;
-        snapshots.computeIfAbsent(regionId, k -> new AtomicReference<>()).set(loaded);
+        ref.compareAndSet(null, loaded);
+        diskMissCache.remove(regionId);
         synchronized (accessLock) { accessOrder.put(regionId, System.nanoTime()); }
+        evictIfOver();
         return true;
     }
 

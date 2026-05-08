@@ -5,6 +5,8 @@ import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.Supplier;
 import lombok.extern.slf4j.Slf4j;
 import net.runelite.api.Client;
+import net.runelite.api.NPC;
+import net.runelite.api.NPCComposition;
 import net.runelite.api.Player;
 import net.runelite.api.coords.WorldArea;
 import net.runelite.api.coords.WorldPoint;
@@ -22,6 +24,7 @@ import net.runelite.client.plugins.recorder.nav.NavStatus;
 import net.runelite.client.plugins.recorder.nav.Navigator;
 import net.runelite.client.plugins.recorder.nav.NavigatorFactory;
 import net.runelite.client.plugins.recorder.trail.TrailRegistry;
+import net.runelite.client.plugins.recorder.transport.TransportResolver;
 import net.runelite.client.sequence.dispatch.HumanizedInputDispatcher;
 import net.runelite.client.sequence.dispatch.SequenceSleep;
 import net.runelite.client.sequence.internal.ActionRequest;
@@ -433,6 +436,29 @@ public final class ChickenFarmV3Script
         }
         if (combat.state() == ChickenCombatLoop.State.IDLE)
         {
+            // The combat loop aborts after ~36s of failed selections, then
+            // exits to IDLE. If the player drifted outside PEN_AREA during
+            // the previous burst (chicken died at the pen edge, player
+            // followed and got displaced south of the fence), the next
+            // SELECTING tick will face the same camera/aim failure mode
+            // from the same bad spot. Re-anchor first — walk to a random
+            // tile inside the pen — then start combat from a known-good
+            // position.
+            WorldPoint here = onClient(() -> {
+                Player p = client.getLocalPlayer();
+                return p == null ? null : p.getWorldLocation();
+            });
+            if (here != null && !areaContains(PEN_AREA, here))
+            {
+                log.info("v3: combat IDLE with player at {} outside PEN_AREA — re-anchoring", here);
+                if (!recoverIntoPen())
+                {
+                    log.warn("v3: re-anchor into pen failed — aborting");
+                    status.set("re-anchor failed — aborting");
+                    setState(State.ABORTED);
+                    return;
+                }
+            }
             status.set("starting combat");
             combat.start();
         }
@@ -441,6 +467,165 @@ public final class ChickenFarmV3Script
             status.set("combat: " + combat.latestStatus()
                 + " (kills=" + combat.killCount() + ")");
         }
+    }
+
+    /** Walk back into {@link #PEN_AREA} after the combat loop aborted with
+     *  the player drifted outside. Per attempt: scan for a closed gate
+     *  within 3 tiles and open it (no-op when no gate is closed), pick
+     *  a random pen-interior tile, dispatch a
+     *  {@link ActionRequest.Kind#WALK} (the dispatcher handles minimap
+     *  fallback), and poll the player position until they enter the pen.
+     *  The gate scan is what lets us recover when the engine's minimap
+     *  pathfinding stops at a closed gate — without it the same walk
+     *  fails forever.
+     *
+     *  <p>Returns {@code true} once the player is inside the pen,
+     *  {@code false} on overall timeout (caller aborts the script). */
+    boolean recoverIntoPen() throws InterruptedException
+    {
+        final long deadline = System.currentTimeMillis() + 25_000L;
+        int attempts = 0;
+        while (System.currentTimeMillis() < deadline && attempts < 4)
+        {
+            attempts++;
+            WorldPoint here = onClient(() -> {
+                Player p = client.getLocalPlayer();
+                return p == null ? null : p.getWorldLocation();
+            });
+            if (here == null) return false;
+            if (areaContains(PEN_AREA, here))
+            {
+                log.info("v3: recovered into pen at {} (attempt {})", here, attempts);
+                return true;
+            }
+
+            // Aggro short-circuit: if a chicken is currently targeting us,
+            // abandon the recovery walk and let combat.start() adopt the
+            // fight via ChickenCombatLoop.detectActiveChickenCombat. Walking
+            // away from an active aggro just leaves us out-of-pen with damage
+            // incoming and the same chicken pursuing — better to fight it
+            // where we stand and recover after.
+            if (Boolean.TRUE.equals(onClient(this::aChickenIsAttackingUs)))
+            {
+                log.info("v3: re-anchor — chicken aggroed on us at {}, returning so combat can adopt", here);
+                status.set("re-anchor → adopting aggro");
+                return true;
+            }
+
+            // Open any closed gate within reach BEFORE the walk —
+            // TransportResolver.findTransport(tile, "Open") only matches
+            // closed gates (open ones expose "Close"), so this is a no-op
+            // when no gate is closed nearby. Saves a wasted ~6s walk
+            // attempt when we're standing right next to a closed gate.
+            tryOpenNearbyGate(here);
+
+            WorldPoint target = randomPenTile();
+            log.info("v3: re-anchor attempt {} — walking to {} from {}", attempts, target, here);
+            status.set("re-anchor → " + target + " (try " + attempts + ")");
+            ActionRequest walk = ActionRequest.builder()
+                .kind(ActionRequest.Kind.WALK)
+                .channel(ActionRequest.Channel.MOUSE)
+                .tile(target)
+                .build();
+            dispatcher.dispatch(walk);
+            dispatcher.awaitIdle(3000L);
+
+            long until = Math.min(System.currentTimeMillis() + 6_000L, deadline);
+            while (System.currentTimeMillis() < until)
+            {
+                WorldPoint p = onClient(() -> {
+                    Player lp = client.getLocalPlayer();
+                    return lp == null ? null : lp.getWorldLocation();
+                });
+                if (p != null && areaContains(PEN_AREA, p))
+                {
+                    log.info("v3: recovered into pen at {} after walk attempt {}", p, attempts);
+                    return true;
+                }
+                SequenceSleep.sleep(client, 400);
+            }
+        }
+        return false;
+    }
+
+    /** Pick a random tile inside {@link #PEN_AREA}, staying one tile inside
+     *  the bounds so the engine's minimap walk doesn't path us onto the
+     *  fence itself. Visible for tests. */
+    WorldPoint randomPenTile()
+    {
+        // Interior tiles span PEN_AREA + 1 inset on each edge: x in
+        // [getX()+1, getX()+getWidth()-2] (inclusive). Width-2 candidates,
+        // so the random offset is [0, width-3].
+        int interiorW = Math.max(1, PEN_AREA.getWidth() - 2);
+        int interiorH = Math.max(1, PEN_AREA.getHeight() - 2);
+        int xOff = interiorW <= 1 ? 0 : java.util.concurrent.ThreadLocalRandom.current().nextInt(interiorW);
+        int yOff = interiorH <= 1 ? 0 : java.util.concurrent.ThreadLocalRandom.current().nextInt(interiorH);
+        return new WorldPoint(PEN_AREA.getX() + 1 + xOff,
+            PEN_AREA.getY() + 1 + yOff,
+            PEN_AREA.getPlane());
+    }
+
+    /** Client-thread scan: is any "Chicken" NPC currently interacting with
+     *  the local player? Mirrors the loop in
+     *  {@link net.runelite.client.plugins.recorder.combat.ChickenCombatLoop}
+     *  so {@code recoverIntoPen} can see the same aggro the combat loop
+     *  would adopt on its first SELECTING tick. */
+    private Boolean aChickenIsAttackingUs()
+    {
+        Player self = client.getLocalPlayer();
+        if (self == null) return Boolean.FALSE;
+        for (NPC npc : client.getTopLevelWorldView().npcs())
+        {
+            if (npc == null || npc.getInteracting() != self) continue;
+            NPCComposition c = npc.getComposition();
+            String name = c == null ? npc.getName() : c.getName();
+            if (name == null) continue;
+            if (ChickenCombatLoop.CHICKEN_NAME.equalsIgnoreCase(
+                name.replaceAll("<[^>]+>", "").trim()))
+            {
+                return Boolean.TRUE;
+            }
+        }
+        return Boolean.FALSE;
+    }
+
+    /** Look at every tile within 3 of the player for a game object whose
+     *  composition advertises an "Open" verb (i.e. a closed gate / door),
+     *  and dispatch an "Open" click on the first match. Returns true if a
+     *  gate was clicked. The 800ms post-click sleep that gives the engine
+     *  time to play the open animation lives in {@link #recoverIntoPen}. */
+    private boolean tryOpenNearbyGate(WorldPoint here) throws InterruptedException
+    {
+        TransportResolver resolver = new TransportResolver(client);
+        for (int dx = -3; dx <= 3; dx++)
+        {
+            for (int dy = -3; dy <= 3; dy++)
+            {
+                final int x = here.getX() + dx;
+                final int y = here.getY() + dy;
+                final int plane = here.getPlane();
+                TransportResolver.Match m = onClient(() ->
+                    resolver.findTransport(new WorldPoint(x, y, plane), "Open"));
+                if (m != null && m.matchedVerb() != null)
+                {
+                    WorldPoint gateTile = new WorldPoint(x, y, plane);
+                    log.info("v3: re-anchor — opening gate at {} (objectId={})",
+                        gateTile, m.matchedObjectId());
+                    status.set("re-anchor → opening gate");
+                    ActionRequest req = ActionRequest.builder()
+                        .kind(ActionRequest.Kind.CLICK_GAME_OBJECT)
+                        .channel(ActionRequest.Channel.MOUSE)
+                        .tile(gateTile)
+                        .verb("Open")
+                        .build();
+                    dispatcher.dispatch(req);
+                    dispatcher.awaitIdle(3000L);
+                    SequenceSleep.sleep(client, 800);
+                    return true;
+                }
+            }
+        }
+        return false;
     }
 
     /** Stop the combat loop and wait for both the worker thread to exit

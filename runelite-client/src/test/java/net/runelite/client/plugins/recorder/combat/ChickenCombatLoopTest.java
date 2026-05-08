@@ -51,16 +51,13 @@ public class ChickenCombatLoopTest
         CombatDispatcher dispatcher = mock(CombatDispatcher.class);
         when(dispatcher.isBusy()).thenReturn(false);
         when(dispatcher.lastErrorMessage()).thenReturn(null);
-        // Engagement check: pretend the player is interacting with the chicken
-        // immediately. We run the loop via the package-private hooks, not via
-        // start() — start() spawns a thread which would call doEngage which
-        // includes a 5s wait for engagement; we want a synchronous unit test.
-        // Call sequence: (1) doSelect's detectActiveChickenCombat → null
-        // (no stale adoption), (2) doEngage's wait-for-engaged lambda →
-        // chicken (player-side engagement live). preflightEngage no longer
-        // reads self.getInteracting() since we tightened it to require
-        // chicken-side mutual targeting only.
-        when(self.getInteracting()).thenReturn(null, chicken);
+        // We run the loop via the package-private hooks, not via start() —
+        // start() spawns a thread which would call doEngage with a 5s wait
+        // for engagement; we want a synchronous unit test.
+        // Phase 1 (doSelect): self & chicken both un-targeted so
+        // detectActiveChickenCombat falls through to a fresh pick.
+        when(self.getInteracting()).thenReturn(null);
+        when(chicken.getInteracting()).thenReturn(null);
 
         ChickenCombatLoop loop = new ChickenCombatLoop(dispatcher, client, null,
             null,
@@ -72,6 +69,14 @@ public class ChickenCombatLoopTest
         assertNotNull(loop.currentTarget());
         assertEquals(42, loop.currentTarget().npcIndex());
 
+        // Phase 2 (doEngage): pre-flight reads npc.getInteracting() ONCE
+        // and would short-circuit to ALREADY_OURS if it already saw mutual,
+        // skipping the click. Sequence: null (preflight → READY → dispatch)
+        // then self (wait loop sees mutual → IN_COMBAT). doEngage's wait
+        // loop now requires this strict mutual signal (was lenient: accepted
+        // self.getInteracting()==npc alone, which is sticky and caused
+        // 2-minute IN_COMBAT hangs).
+        when(chicken.getInteracting()).thenReturn(null, self);
         loop.doEngage();
         ArgumentCaptor<ActionRequest> cap = ArgumentCaptor.forClass(ActionRequest.class);
         verify(dispatcher, times(1)).dispatch(cap.capture());
@@ -219,6 +224,89 @@ public class ChickenCombatLoopTest
             loop.combatTick(ct, tracker));
         assertEquals(ChickenCombatLoop.State.ENGAGING, loop.state());
         verify(dispatcher, never()).dispatch(any());
+    }
+
+    @Test
+    public void inCombatTick_phantomCombat_releasesLockAndReSelects()
+    {
+        // The doEngage strict-mutual fix gates IN_COMBAT entry on
+        // npc.getInteracting()==self, but the FIRST tracker observe runs
+        // ~600ms later — by then the live pointer may have already cleared.
+        // If self.getInteracting() is still sticky on the chicken AND
+        // chicken-side never confirms in subsequent ticks, the existing
+        // tracker logic suppresses brokenTicks (sticky-self branch keyed off
+        // !chickenEverTargetedUs), so engagement-broken would never fire.
+        // Phantom-combat catches this: 5 ticks of no-mutual + no-anim +
+        // no-HP-bar releases the lock and re-selects.
+        Player self = mock(Player.class);
+        NPC chicken = mockChicken(60, 3231, 3296, 0);
+        Client client = clientWith(self, new WorldPoint(3230, 3296, 0), chicken);
+        CombatDispatcher dispatcher = mock(CombatDispatcher.class);
+        ChickenCombatLoop loop = new ChickenCombatLoop(dispatcher, client, null,
+            null,
+            new NpcSelector(ChickenCombatLoop.CHICKEN_NAME),
+            TargetVisibility.alwaysVisible(), s -> {});
+        loop.setTargetForTesting(new CombatTarget(60, "Chicken", 0));
+        loop.setStateForTesting(ChickenCombatLoop.State.IN_COMBAT);
+        CombatStateTracker tracker = new CombatStateTracker(60);
+        CombatTarget ct = loop.currentTarget();
+
+        // Sticky self-pointer at the chicken (post-engage residue) but the
+        // chicken never targets us back, never gets hit, never plays an
+        // attack animation. This is the exact phantom-IN_COMBAT scenario.
+        when(self.getInteracting()).thenReturn(chicken);
+        when(chicken.getInteracting()).thenReturn(null);
+        when(chicken.getHealthRatio()).thenReturn(-1);
+        when(self.getAnimation()).thenReturn(-1);
+
+        // 6 ticks of phantom signals — phantom threshold is >5, so the 6th
+        // tick is the first that should fire.
+        for (int i = 0; i < 5; i++)
+        {
+            assertFalse("tick " + (i + 1) + " of silence — should not yet fire",
+                loop.combatTick(ct, tracker));
+            assertEquals(ChickenCombatLoop.State.IN_COMBAT, loop.state());
+        }
+        assertTrue("phantom-combat must fire after threshold", loop.combatTick(ct, tracker));
+        assertEquals(ChickenCombatLoop.State.SELECTING, loop.state());
+        assertNull("lock must be released on phantom combat", loop.currentTarget());
+        assertEquals("phantom does NOT credit a kill", 0, loop.killCount());
+        verify(dispatcher, never()).dispatch(any());
+    }
+
+    @Test
+    public void inCombatTick_phantomReset_byPlayerAnimation_doesNotFire()
+    {
+        // If the player swings even once, the phantom counter resets — we ARE
+        // in combat, just between server ticks. Same sticky-self-pointer
+        // setup as the firing test, but a single non-idle animation reading
+        // mid-stretch keeps the counter under the threshold indefinitely.
+        Player self = mock(Player.class);
+        NPC chicken = mockChicken(61, 3231, 3296, 0);
+        Client client = clientWith(self, new WorldPoint(3230, 3296, 0), chicken);
+        CombatDispatcher dispatcher = mock(CombatDispatcher.class);
+        ChickenCombatLoop loop = new ChickenCombatLoop(dispatcher, client, null,
+            null,
+            new NpcSelector(ChickenCombatLoop.CHICKEN_NAME),
+            TargetVisibility.alwaysVisible(), s -> {});
+        loop.setTargetForTesting(new CombatTarget(61, "Chicken", 0));
+        loop.setStateForTesting(ChickenCombatLoop.State.IN_COMBAT);
+        CombatStateTracker tracker = new CombatStateTracker(61);
+        CombatTarget ct = loop.currentTarget();
+
+        when(self.getInteracting()).thenReturn(chicken);
+        when(chicken.getInteracting()).thenReturn(null);
+        when(chicken.getHealthRatio()).thenReturn(-1);
+        // -1, -1, 422 (swing!), -1, -1, -1, -1 — single reset at tick 3.
+        when(self.getAnimation()).thenReturn(-1, -1, 422, -1, -1, -1, -1);
+
+        for (int i = 0; i < 7; i++)
+        {
+            assertFalse("animation reset keeps phantom counter under threshold (tick " + i + ")",
+                loop.combatTick(ct, tracker));
+        }
+        assertEquals(ChickenCombatLoop.State.IN_COMBAT, loop.state());
+        assertNotNull(loop.currentTarget());
     }
 
     @Test

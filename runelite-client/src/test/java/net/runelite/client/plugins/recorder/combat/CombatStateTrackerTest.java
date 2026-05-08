@@ -208,4 +208,91 @@ public class CombatStateTrackerTest
         assertFalse("mutual engagement clears engaged-by-other counter",
             t.isStolen(1));
     }
+
+    @Test
+    public void phantomCombat_firesAfterFiveQuietTicksWithNoSignals()
+    {
+        // No mutual engagement, no player animation, no NPC HP bar — the
+        // engage click never landed but the loop entered IN_COMBAT on a
+        // sticky Player.getInteracting() pointer. After 5 ticks of all-three-
+        // silent, phantom-combat should fire so the loop can release the lock.
+        Player self = mock(Player.class);
+        CombatStateTracker t = new CombatStateTracker(50);
+        // Tick 1: bootstrap with mutual engagement so wasEngaged=true (the
+        // phantom-combat detector requires a live tracker). Player anim and
+        // HP both silent.
+        t.observe(mockNpcWith(50, -1, self), self, -1);
+        // Tick 2-6: all three signals silent. Threshold is >5; verify it
+        // exactly trips at 5 quiet observations after the bootstrap.
+        for (int i = 0; i < 5; i++)
+        {
+            t.observe(mockNpcWith(50, -1, null), self, -1);
+        }
+        assertFalse("threshold exactly 5 quiet ticks does NOT trip > 5", t.isPhantomCombat(5));
+        t.observe(mockNpcWith(50, -1, null), self, -1);
+        assertTrue("6 quiet ticks trips > 5", t.isPhantomCombat(5));
+    }
+
+    @Test
+    public void phantomCombat_resetByChickenInteractingUs()
+    {
+        // 4 quiet ticks accumulate, then chicken targets us — counter resets.
+        Player self = mock(Player.class);
+        CombatStateTracker t = new CombatStateTracker(51);
+        t.observe(mockNpcWith(51, -1, self), self, -1);
+        for (int i = 0; i < 4; i++) t.observe(mockNpcWith(51, -1, null), self, -1);
+        // Chicken targets us — phantomTicks must reset to 0.
+        t.observe(mockNpcWith(51, -1, self), self, -1);
+        // Now feed two more quiet ticks; threshold > 5 should NOT trip even
+        // though we've now seen 4 + 2 = 6 quiet ticks total (counter was reset).
+        t.observe(mockNpcWith(51, -1, null), self, -1);
+        t.observe(mockNpcWith(51, -1, null), self, -1);
+        assertFalse("mutual engagement reset clears phantomTicks", t.isPhantomCombat(5));
+    }
+
+    @Test
+    public void phantomCombat_resetByPlayerAnimation()
+    {
+        // 4 quiet ticks, then a player animation tick — counter resets.
+        Player self = mock(Player.class);
+        CombatStateTracker t = new CombatStateTracker(52);
+        t.observe(mockNpcWith(52, -1, self), self, -1);
+        for (int i = 0; i < 4; i++) t.observe(mockNpcWith(52, -1, null), self, -1);
+        // Player swings — animation != -1 resets.
+        t.observe(mockNpcWith(52, -1, null), self, 422);
+        t.observe(mockNpcWith(52, -1, null), self, -1);
+        t.observe(mockNpcWith(52, -1, null), self, -1);
+        assertFalse("animation resets phantomTicks", t.isPhantomCombat(5));
+    }
+
+    @Test
+    public void phantomCombat_resetByNpcHpVisible()
+    {
+        // 4 quiet ticks, then NPC HP bar appears — counter resets.
+        Player self = mock(Player.class);
+        CombatStateTracker t = new CombatStateTracker(53);
+        t.observe(mockNpcWith(53, -1, self), self, -1);
+        for (int i = 0; i < 4; i++) t.observe(mockNpcWith(53, -1, null), self, -1);
+        // HP bar appears (e.g. damage was just dealt) — hp >= 0 resets.
+        t.observe(mockNpcWith(53, 25, null), self, -1);
+        t.observe(mockNpcWith(53, -1, null), self, -1);
+        t.observe(mockNpcWith(53, -1, null), self, -1);
+        assertFalse("HP bar visibility resets phantomTicks", t.isPhantomCombat(5));
+    }
+
+    @Test
+    public void phantomCombat_doesNotFireAfterDeath()
+    {
+        // Once death is flagged, phantom-combat must stay false — the loop
+        // should transition through KILLED, not get retriggered as phantom.
+        Player self = mock(Player.class);
+        CombatStateTracker t = new CombatStateTracker(54);
+        t.observe(mockNpcWith(54, 30, self), self, -1);
+        // HP zero -> dead.
+        t.observe(mockNpcWith(54, 0, self), self, -1);
+        assertTrue(t.isDead());
+        // Even with ten quiet ticks now, phantom must not fire on a dead NPC.
+        for (int i = 0; i < 10; i++) t.observe(mockNpcWith(54, -1, null), self, -1);
+        assertFalse(t.isPhantomCombat(5));
+    }
 }

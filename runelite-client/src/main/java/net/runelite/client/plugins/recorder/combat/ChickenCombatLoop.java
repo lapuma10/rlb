@@ -118,6 +118,12 @@ public final class ChickenCombatLoop
     );
     /** Engagement-broken threshold (ticks). Spec says "&gt;2 ticks". */
     private static final int BROKEN_THRESHOLD_TICKS = 2;
+    /** Phantom-combat threshold (ticks). After this many consecutive ticks
+     *  with NO mutual engagement, NO player attack animation, and NO NPC HP
+     *  bar showing, abandon the lock and re-select — the engage click never
+     *  actually landed. 5 ticks = ~3s, generous enough to ride out the
+     *  natural one-attack-per-4-ticks combat rhythm without false-positives. */
+    private static final int PHANTOM_THRESHOLD_TICKS = 5;
     /** Kill-steal threshold (ticks). One extra tick of confirmation before
      *  bailing — guards against transient retarget mid-tick while still
      *  reacting in ~1.2s, well before the bot looks like it's standing on
@@ -594,7 +600,14 @@ public final class ChickenCombatLoop
                 if (self == null) return false;
                 NPC npc = findNpcByIndex(ct.npcIndex());
                 if (npc == null) return null; // null = vanished; null literal is "?"
-                if (self.getInteracting() == npc) return true;
+                // Strict mutual: chicken targeting us is the truth-tell.
+                // self.getInteracting() == npc is sticky for 1-2 ticks
+                // (sometimes longer) after a previous fight ended, so
+                // accepting it gates us into IN_COMBAT on a phantom pointer
+                // and we sit there until the sticky reference clears (~2
+                // minutes was observed in the wild). The 5s ENGAGE_TIMEOUT_MS
+                // window covers the rare case where npc-side flips a tick
+                // after self-side; if neither flips, the click didn't take.
                 if (npc.getInteracting() == self) return true;
                 return false;
             });
@@ -659,7 +672,8 @@ public final class ChickenCombatLoop
         // after despawn returns null).
         WorldPoint lockedTile = onClient(() -> {
             NPC locked = findNpcInList(snap.npcs, ct.npcIndex());
-            tracker.observe(locked, snap.self);
+            int playerAnim = snap.self == null ? -1 : snap.self.getAnimation();
+            tracker.observe(locked, snap.self, playerAnim);
             return locked == null ? null : locked.getWorldLocation();
         });
         if (tracker.isDead())
@@ -667,6 +681,20 @@ public final class ChickenCombatLoop
             if (lockedTile != null) lastKillTile.set(lockedTile);
             setStatus("killed " + ct.npcName() + " #" + ct.npcIndex());
             setState(State.KILLED);
+            return true;
+        }
+        if (tracker.isPhantomCombat(PHANTOM_THRESHOLD_TICKS))
+        {
+            // No swing, no HP bar, no mutual interacting for 5+ ticks —
+            // the engage click never actually landed and we're nailed in
+            // place by a sticky Player.getInteracting() pointer. Drop the
+            // lock and re-select; the same NPC is unlikely to engage from
+            // the same camera angle a second time.
+            log.info("phantom combat (>{} ticks no anim/hp/mutual) — releasing lock on chicken #{}",
+                PHANTOM_THRESHOLD_TICKS, ct.npcIndex());
+            target.set(null);
+            setStatus("phantom combat — re-selecting");
+            setState(State.SELECTING);
             return true;
         }
         if (tracker.isStolen(STOLEN_THRESHOLD_TICKS))
