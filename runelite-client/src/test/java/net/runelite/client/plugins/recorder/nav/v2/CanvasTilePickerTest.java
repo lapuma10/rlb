@@ -54,18 +54,23 @@ public class CanvasTilePickerTest
     }
 
     @Test
-    public void pickedDistance_isShortMidOnly_round2()
+    public void pickedDistance_allThreeBucketsActive_longFavored()
     {
-        // Round-2 stabilization: long bucket is gated off by default.
-        // Live testing showed long picks (12-16 tiles) outran the engine's
-        // pathfinder on unfamiliar terrain, producing the "5 forward, 2
-        // back" stall flap. Picks must land in short (2-3) or mid (6-8).
+        // Re-enabled long bucket (post round-2 stabilization). Live "5
+        // forward, 2 back" stall flap was a band-aid for sentinel/water
+        // tiles in the snapshot — the recent sentinel-cost +
+        // replan-on-stall + wall-edge-gate fixes address those at the
+        // root, so long picks are safe again. Long is now the dominant
+        // bucket (60% weight) so the cadence reads human (clicking
+        // 12-16 tiles ahead in clear terrain), with mid (30%) and short
+        // (10%) contributing the corrections that make it look natural
+        // rather than mechanical.
         V2Path path = straightEastPath(40);
         WorldPoint player = new WorldPoint(3208, 3217, 0);
         CanvasTilePicker picker = new CanvasTilePicker();
         int shortHits = 0, midHits = 0, longHits = 0;
         Random rng = new Random(7);
-        for (int i = 0; i < 200; i++)
+        for (int i = 0; i < 400; i++)
         {
             WorldPoint pick = picker.pickNext(path, player, allowAll(), rng);
             assertNotNull(pick);
@@ -76,10 +81,10 @@ public class CanvasTilePickerTest
         }
         assertTrue("short bucket must get sampled (got " + shortHits + ")", shortHits > 5);
         assertTrue("mid bucket must get sampled (got " + midHits + ")", midHits > 5);
-        assertEquals("long bucket must NOT be used in round-2 default mode (got " + longHits + ")",
-            0, longHits);
-        assertEquals("every pick must land in short or mid bucket",
-            200, shortHits + midHits);
+        assertTrue("long bucket must be sampled and dominant (got " + longHits + ")",
+            longHits > shortHits + midHits);
+        assertEquals("every pick must land in some bucket",
+            400, shortHits + midHits + longHits);
     }
 
     @Test

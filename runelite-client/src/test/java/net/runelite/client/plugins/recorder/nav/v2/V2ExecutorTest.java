@@ -1144,6 +1144,87 @@ public class V2ExecutorTest
             x.lastFailureReason());
     }
 
+    /** Wall-edge fallback: gate object whose collision is directional
+     *  ({@code BLOCK_MOVEMENT_NORTH/EAST/SOUTH/WEST}) leaves the
+     *  destination tile {@code BLOCK_MOVEMENT_FULL}-walkable, so the
+     *  static-mismatch trigger never fires. The new fallback scans for an
+     *  openable in the player's 1-ring on stall; if found, dispatches
+     *  Open. Live-observed failure: chicken pen entrance gate at
+     *  (3236, 3295) — not in TransportIndex, snapshot has it walkable
+     *  (gate was open at scrape), live gate is closed. */
+    @Test
+    public void walk_wallEdgeGate_clicksOpen_evenWithoutStaticMismatch()
+    {
+        FakeEnv env = new FakeEnv();
+        V2Path p = eastPath(20);
+        List<WorldPoint> tiles = ((V2Leg.Walk) p.legs().get(0)).tiles();
+        env.player = tiles.get(0);
+        V2Executor x = newExecutor(env);
+        x.setPath(p);
+
+        env.busy = false;
+        x.tick();
+        assertTrue(!env.walkDispatches.isEmpty());
+
+        // Gate object adjacent to the player. NO static collision — both
+        // snapshot and live agree the destination tile is walkable. Only
+        // the wall edge (BLOCK_MOVEMENT_NORTH or similar) is blocking,
+        // which the executor can't see directly.
+        WorldPoint gate = new WorldPoint(env.player.getX() + 1, env.player.getY(), 0);
+        env.openables.put(gate, gate);
+
+        // Stall — player doesn't advance, dispatched walk tile stays
+        // unreached, ticks accumulate past STALL_TICKS.
+        for (int i = 0; i < V2Executor.STALL_TICKS + 1; i++)
+        {
+            env.busy = false;
+            x.tick();
+        }
+
+        assertTrue("wall-edge fallback must dispatch the Open click",
+            !env.openClicks.isEmpty());
+        assertEquals("Open click must target the gate tile we wired",
+            gate, env.openClicks.get(0));
+    }
+
+    /** Wall-edge fallback bound: openable attempts capped per leg so a
+     *  false-positive 1-ring scan match (a closed gate adjacent to but
+     *  not actually blocking the player) doesn't loop forever. After the
+     *  cap, the executor falls through to normal stall handling. */
+    @Test
+    public void walk_wallEdgeGate_attemptsBounded_fallsThroughAfterCap()
+    {
+        FakeEnv env = new FakeEnv();
+        V2Path p = eastPath(20);
+        List<WorldPoint> tiles = ((V2Leg.Walk) p.legs().get(0)).tiles();
+        env.player = tiles.get(0);
+        V2Executor x = newExecutor(env);
+        x.setPath(p);
+
+        env.busy = false;
+        x.tick();
+
+        // Wire an openable that never opens — every cycle re-detects it,
+        // but only MAX_OPENABLE_ATTEMPTS_PER_LEG attempts get dispatched.
+        WorldPoint gate = new WorldPoint(env.player.getX() + 1, env.player.getY(), 0);
+        env.openables.put(gate, gate);
+
+        // Run far past the attempt cap; OPENABLE_TIMEOUT_TICKS times the
+        // attempt cap is the upper bound on how long this could plausibly
+        // chain together.
+        for (int i = 0; i < (V2Executor.MAX_OPENABLE_ATTEMPTS_PER_LEG + 2)
+            * (V2Executor.OPENABLE_TIMEOUT_TICKS + V2Executor.STALL_TICKS + 4); i++)
+        {
+            env.busy = false;
+            x.tick();
+        }
+
+        assertTrue("Open clicks dispatched but bounded by MAX_OPENABLE_ATTEMPTS_PER_LEG",
+            env.openClicks.size() <= V2Executor.MAX_OPENABLE_ATTEMPTS_PER_LEG);
+        assertTrue("at least one Open click must have been dispatched before bounding",
+            env.openClicks.size() >= 1);
+    }
+
     /** D4. Openable blocker recovery: passability flips back walkable
      *  after the Open click → executor resumes the walk leg. */
     @Test

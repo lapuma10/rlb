@@ -237,6 +237,11 @@ public final class V2Executor
     /** Ticks to wait after dispatching an Open verb-click for the
      *  blocked tile's live collision to flip walkable. */
     public static final int OPENABLE_TIMEOUT_TICKS = 8;
+    /** Maximum Open verb-clicks per leg before falling through to normal
+     *  stall handling. Bounds the wall-edge fallback in case the openable
+     *  isn't actually the blocker (false-positive 1-ring scan match) or
+     *  the gate refuses to open (locked, decorative). */
+    public static final int MAX_OPENABLE_ATTEMPTS_PER_LEG = 3;
 
     private static final int FILTER_REJECT_WINDOW = 4;
     private static final double MINIMAP_BIAS_THRESHOLD = 0.5;
@@ -300,6 +305,15 @@ public final class V2Executor
     @Nullable private WorldPoint pendingOpenTile;
     /** Ticks elapsed since the last Open verb-click was dispatched. */
     private int ticksSincePendingOpen;
+    /** True when the pending Open click was triggered by the wall-edge
+     *  fallback rather than a static-collision mismatch. Wall-edge gates
+     *  don't set BLOCK_MOVEMENT_FULL on the blocked tile (only directional
+     *  flags on adjacent edges), so {@code liveCollisionAllows} is always
+     *  true and the polling loop must wait on dispatcher-idle instead. */
+    private boolean pendingOpenIsWallEdge;
+    /** Per-leg counter — number of Open verb-clicks dispatched. Bounded
+     *  by {@link #MAX_OPENABLE_ATTEMPTS_PER_LEG}. */
+    private int openableAttemptsThisLeg;
 
     public V2Executor(Env env, CanvasTilePicker canvasPicker,
                       InvalidationClassifier classifier, Random rng)
@@ -343,6 +357,8 @@ public final class V2Executor
         this.wantsReplanFromHere = false;
         this.pendingOpenTile = null;
         this.ticksSincePendingOpen = 0;
+        this.pendingOpenIsWallEdge = false;
+        this.openableAttemptsThisLeg = 0;
         if (newPath == null || newPath.isEmpty())
         {
             this.status = Status.IDLE;
@@ -590,12 +606,25 @@ public final class V2Executor
         if (pendingOpenTile != null)
         {
             ticksSincePendingOpen++;
-            if (env.liveCollisionAllows(pendingOpenTile))
+            // Wall-edge case: liveCollisionAllows is BLOCK_MOVEMENT_FULL-only
+            // and the wall-edge tile never had that flag set, so it returns
+            // true immediately. Use dispatcher-idle as the resume signal —
+            // the Open verb-click chain is in flight while busy=true; once
+            // it clears, the gate has finished animating and a fresh walk
+            // dispatch will succeed. Static-mismatch case keeps the original
+            // BLOCK_MOVEMENT_FULL flip as the primary signal.
+            boolean liveOK = env.liveCollisionAllows(pendingOpenTile);
+            boolean dispatcherIdle = !env.dispatcherBusy();
+            boolean canResume = pendingOpenIsWallEdge
+                ? (liveOK && dispatcherIdle)
+                : liveOK;
+            if (canResume)
             {
-                log.info("[v2-blocker] passability restored, continuing leg={} tile={}",
-                    legIdx, pendingOpenTile);
+                log.info("[v2-blocker] passability restored, continuing leg={} tile={} mode={}",
+                    legIdx, pendingOpenTile, pendingOpenIsWallEdge ? "wall-edge" : "static-mismatch");
                 pendingOpenTile = null;
                 ticksSincePendingOpen = 0;
+                pendingOpenIsWallEdge = false;
                 lastDispatchedTile = null;
             }
             else if (ticksSincePendingOpen >= OPENABLE_TIMEOUT_TICKS)
@@ -733,20 +762,50 @@ public final class V2Executor
         return status;
     }
 
-    /** Round-2 gate handling. If the last dispatched tile (and the player's
-     *  forward path) is blocked live but the snapshot says walkable, look
-     *  for an Open verb on the 1-ring of that tile. Returns true if an
-     *  Open click was dispatched (caller should not fall into stall
-     *  classification). Returns false to let stall handling proceed. */
+    /** Round-2 gate handling. Two trigger paths:
+     *
+     *  <ol>
+     *    <li><b>Static-collision mismatch</b> — the dispatched tile is
+     *        walkable in the snapshot but {@code BLOCK_MOVEMENT_FULL} is
+     *        live-set. Catches doors / objects that occupy a whole tile.
+     *        Hard-fails if no Open verb is found in the dispatched tile's
+     *        1-ring (the planner picked a tile we can't pass; only a
+     *        replan recovers).</li>
+     *    <li><b>Wall-edge fallback</b> — stalled with no static-mismatch
+     *        but an "Open" verb-bearing object lives in the player's
+     *        1-ring. Catches gates whose collision is directional
+     *        ({@code BLOCK_MOVEMENT_NORTH/EAST/SOUTH/WEST}), which
+     *        {@code liveCollisionAllows} can't see — the tile itself
+     *        stays walkable, only the edge is blocked. Soft-falls through
+     *        to normal stall handling if no openable nearby; bounded by
+     *        {@link #MAX_OPENABLE_ATTEMPTS_PER_LEG} so a false-positive
+     *        scan match (a closed gate adjacent to but not blocking the
+     *        player) doesn't loop forever.</li>
+     *  </ol>
+     *
+     *  Returns true if the call consumed the tick (Open dispatched, or
+     *  hard-failed with status set). Returns false to let stall handling
+     *  proceed.
+     *
+     *  Live-observed failure that motivated the wall-edge path: chicken
+     *  pen entrance gate (id=1560) at (3236, 3295). Not in TransportIndex,
+     *  so V2 plans a WALK leg straight through; live gate is closed; bot
+     *  stalled and the static-mismatch trigger never fired because the
+     *  pen-side tile remained {@code BLOCK_MOVEMENT_FULL}-walkable. */
     private boolean tryHandleOpenableBlocker(WorldPoint here)
     {
         WorldPoint blocked = lastDispatchedTile;
         if (blocked == null) return false;
-        // Check shape: snapshot says walkable, live says blocked → static
-        // collision mismatch, classifier-call would also flag it.
-        if (env.snapshotSaysWalkable(blocked) && !env.liveCollisionAllows(blocked))
+
+        boolean staticMismatch =
+            env.snapshotSaysWalkable(blocked) && !env.liveCollisionAllows(blocked);
+
+        WorldPoint openTile;
+        boolean wallEdge;
+        if (staticMismatch)
         {
-            WorldPoint openTile = env.findOpenableNear(blocked);
+            openTile = env.findOpenableNear(blocked);
+            wallEdge = false;
             if (openTile == null)
             {
                 log.warn("[v2-blocker] failed reason=OPENABLE_BLOCKER_NOT_FOUND blockedEdge={} player={}",
@@ -755,24 +814,44 @@ public final class V2Executor
                 lastFailureReason = FailureReason.OPENABLE_BLOCKER_NOT_FOUND;
                 return true;
             }
-            log.info("[v2-blocker] blocked edge from={} to={} found openable tile={}",
-                here, blocked, openTile);
-            if (env.dispatchOpen(openTile))
-            {
-                log.info("[v2-blocker] clicked Open tile={}", openTile);
-                pendingOpenTile = blocked;
-                ticksSincePendingOpen = 0;
-                lastDispatchedTile = null;   // don't classify this dispatch as a walk-stall
-                ticksSinceProgress = 0;
-                return true;
-            }
-            log.warn("[v2-blocker] failed reason=TRANSPORT_CLICK_FAILED tile={} (dispatcher refused)",
-                openTile);
-            status = Status.FAILED;
-            lastFailureReason = FailureReason.TRANSPORT_CLICK_FAILED;
+        }
+        else
+        {
+            // Wall-edge fallback: scan around the player. The planner had
+            // the tile as walkable so liveCollisionAllows agrees — the
+            // mismatch is on the EDGE, not the tile. We can't see
+            // directional flags from here, so we use openable-presence as
+            // the gate signal.
+            openTile = env.findOpenableNear(here);
+            wallEdge = true;
+            if (openTile == null) return false;   // not gate-shaped; let stall handling run
+        }
+
+        if (openableAttemptsThisLeg >= MAX_OPENABLE_ATTEMPTS_PER_LEG)
+        {
+            log.warn("[v2-blocker] openable attempts exhausted leg={} attempts={} — falling through",
+                legIdx, openableAttemptsThisLeg);
+            return false;
+        }
+
+        log.info("[v2-blocker] {} from={} to={} found openable tile={}",
+            wallEdge ? "wall-edge" : "static-mismatch", here, blocked, openTile);
+        if (env.dispatchOpen(openTile))
+        {
+            log.info("[v2-blocker] clicked Open tile={}", openTile);
+            pendingOpenTile = blocked;
+            ticksSincePendingOpen = 0;
+            pendingOpenIsWallEdge = wallEdge;
+            lastDispatchedTile = null;   // don't classify this dispatch as a walk-stall
+            ticksSinceProgress = 0;
+            openableAttemptsThisLeg++;
             return true;
         }
-        return false;
+        log.warn("[v2-blocker] failed reason=TRANSPORT_CLICK_FAILED tile={} (dispatcher refused)",
+            openTile);
+        status = Status.FAILED;
+        lastFailureReason = FailureReason.TRANSPORT_CLICK_FAILED;
+        return true;
     }
 
     private static int closestIdxOnPath(java.util.List<WorldPoint> tiles, WorldPoint here)
@@ -960,6 +1039,7 @@ public final class V2Executor
         ticksSinceProgress = 0;
         lastDispatchedTile = null;
         progressIdx = -1;   // reset cursor for the next walk leg
+        openableAttemptsThisLeg = 0;
     }
 
     private void advanceTransportLeg()
@@ -974,6 +1054,7 @@ public final class V2Executor
         transportClicked = false;
         ticksSinceTransportClick = 0;
         progressIdx = -1;
+        openableAttemptsThisLeg = 0;
     }
 
     private static int chebyshev(WorldPoint a, WorldPoint b)

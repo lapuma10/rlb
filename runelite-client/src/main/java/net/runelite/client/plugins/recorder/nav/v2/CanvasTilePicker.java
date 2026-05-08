@@ -31,10 +31,15 @@ public final class CanvasTilePicker
     public static final int LONG_MIN = 12;
     public static final int LONG_MAX = 16;
 
-    /** Cumulative bucket weights (must sum to 1.0). */
-    private static final double WEIGHT_SHORT = 0.25;
-    private static final double WEIGHT_MID = 0.50;
-    // long = 1.0 - SHORT - MID = 0.25
+    /** Cumulative bucket weights (must sum to 1.0). Long is favored —
+     *  human players overwhelmingly click 10+ tiles ahead in clear terrain
+     *  (canvas) or use the minimap for longer hops. Short picks model the
+     *  mid-walk corrections (noticing an obstacle, course-correcting),
+     *  mid is the natural fallback when the long range is partially
+     *  filter-rejected. */
+    private static final double WEIGHT_SHORT = 0.10;
+    private static final double WEIGHT_MID = 0.30;
+    // long = 1.0 - SHORT - MID = 0.60
 
     /** Pick the next canvas tile from the path's forward tiles, gated
      *  by {@code filter}. Returns null when every shortlisted candidate
@@ -75,10 +80,14 @@ public final class CanvasTilePicker
      *  <p>Pass {@code -1} to disable the floor (equivalent to the old
      *  closestIndex-only behavior).
      *
-     *  <p>Round-2 stabilization: the long bucket (12–16 tiles) is gated
-     *  off by default — it routinely overshoots the engine's pathfinder
-     *  on unfamiliar terrain, producing the "5 forward, 2 back" stall
-     *  flap. Re-enable later behind a snapshot-reachability gate. */
+     *  <p>Bucket policy: long bucket (12–16) is enabled when the forward
+     *  window is fully scraped (every tile in the long range passes the
+     *  filter). The earlier round-2 disable was a band-aid for stalls
+     *  caused by long picks landing on sentinel/unscraped terrain. With
+     *  the snapshot-reachability gate plus the recent sentinel-cost +
+     *  replan-on-stall + wall-edge-gate fixes, long picks are safe and
+     *  produce a much more natural human-like cadence than the
+     *  short/mid-only mix. */
     public WorldPoint pickNextInTilesAfter(List<WorldPoint> walkTiles, int minIdxExclusive,
                                            WorldPoint player,
                                            Predicate<WorldPoint> filter, Random rng,
@@ -98,25 +107,18 @@ public final class CanvasTilePicker
             return pickInBucket(walkTiles, floor, 0, filter, rng);
         }
 
-        // Round-2: long bucket disabled. Try short, then mid, then any
-        // forward tile that passes the filter. Long-distance picks
-        // produced the worst-case overshoot stalls in live testing.
-        int[] bucketOrder = pickShortMidBucketOrder(rng);
+        // Try buckets in weighted order (long > mid > short). Each call
+        // to pickInBucket already filters per-tile, so a bucket whose
+        // tiles are blacklisted/dirty/missing falls through to the next
+        // bucket. This is the snapshot-reachability gate: long bucket
+        // only "wins" when the long-range tiles pass the filter.
+        int[] bucketOrder = pickBucketOrder(rng);
         for (int b : bucketOrder)
         {
             WorldPoint pick = pickInBucket(walkTiles, floor, b, filter, rng);
             if (pick != null) return pick;
         }
         return null;
-    }
-
-    /** Round-2 bucket order: short + mid only, weighted toward mid.
-     *  Long bucket reserved for a future opt-in path. */
-    private static int[] pickShortMidBucketOrder(Random rng)
-    {
-        // ~33% short, ~67% mid. Either way, both get tried.
-        boolean midFirst = rng.nextDouble() >= 0.33;
-        return midFirst ? new int[] {1, 0} : new int[] {0, 1};
     }
 
     private static List<WorldPoint> collectWalkTiles(V2Path path)
