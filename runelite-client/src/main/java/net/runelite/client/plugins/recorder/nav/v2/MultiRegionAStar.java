@@ -53,19 +53,24 @@ public final class MultiRegionAStar
 
     /** Cost multiplier for a step into a tile not present in the
      *  {@link MapStore} snapshot (region not loaded, or region loaded
-     *  but tile missing). Round-2 stabilization: the planner prefers
-     *  known-walkable paths but treats unknown tiles as crossable at
-     *  5× cost so a route can still be planned through corridors the
-     *  scraper hasn't fully captured yet. The executor walks into the
-     *  unknown; the live scraper fills in tiles as the player moves;
-     *  the next replan completes the route on a now-complete graph.
+     *  but tile missing). The planner prefers known-walkable paths
+     *  by a hair but treats unknown tiles as crossable so a route can
+     *  still be planned through corridors the scraper hasn't fully
+     *  captured yet. The executor walks into the unknown; the live
+     *  scraper fills tiles as the player moves; the next replan
+     *  completes the route on a now-complete graph.
      *
-     *  <p>Live failure that motivated this: bot walked bank → pen
-     *  manually, but region 12850 plane-0 has a y=3239..3263 strip
-     *  with only 1-6 walkable tiles per row (narrow east-Lumbridge
-     *  road). The strict planner couldn't BFS across the gap even
-     *  though the corridor was physically traversable. */
-    static final double UNKNOWN_TILE_COST = 5.0;
+     *  <p>Why so close to 1.0: the Chebyshev heuristic returns 1 per
+     *  step. If unknown costs 5× while the heuristic stays at 1×, A*
+     *  exhaustively floods every reachable known tile (f ≤ 5) before
+     *  popping a single unknown neighbor (f ≥ 5+). For a 75-tile
+     *  cross-plane goal that requires crossing a 25-row unknown gap,
+     *  that flood blows past {@code maxExpandedTiles} and the planner
+     *  returns NO_ROUTE — exactly the live failure that surfaced this.
+     *  A 1.05× cost preserves the "prefer known walkable" tie-break
+     *  per the spec while keeping the heuristic near-admissible so A*
+     *  drives at the goal instead of paving the source region. */
+    static final double UNKNOWN_TILE_COST = 1.05;
     /** Sentinel: walk impossible. Distinct from UNKNOWN_TILE_COST
      *  (allowed-but-expensive) so the caller can drop the neighbor
      *  with a cheap isInfinite check. */

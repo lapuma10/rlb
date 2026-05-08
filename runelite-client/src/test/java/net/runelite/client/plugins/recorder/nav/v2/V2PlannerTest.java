@@ -70,10 +70,20 @@ public class V2PlannerTest
     @Test
     public void plan_unreachable_returnsEmpty_doesNotRecord()
     {
+        // Permissive planner crosses unknown tiles, so "unreachable"
+        // requires KNOWN-blocked tiles surrounding the start. Wall the
+        // start tile in on all 8 sides with BLOCK_MOVEMENT_FULL so no
+        // walkable / unknown step is possible.
         MapStore store = new MapStore(wm);
         int regionId = RegionIds.regionIdFor(3208, 3213);
-        WorldMemoryFixtures.installRegion(store, regionId,
-            List.of(walkable(3208, 3213, 0)));
+        java.util.List<WorldMemoryFixtures.TileSpec> tiles = new java.util.ArrayList<>();
+        tiles.add(walkable(3208, 3213, 0));
+        for (int dx = -1; dx <= 1; dx++)
+            for (int dy = -1; dy <= 1; dy++)
+                if (!(dx == 0 && dy == 0))
+                    tiles.add(WorldMemoryFixtures.withMovement(3208 + dx, 3213 + dy, 0,
+                        net.runelite.api.CollisionDataFlag.BLOCK_MOVEMENT_FULL));
+        WorldMemoryFixtures.installRegion(store, regionId, tiles);
 
         MultiRegionAStar a = new MultiRegionAStar(store, new TransportIndex(), wm);
         RouteHistory history = new RouteHistory();
@@ -81,7 +91,8 @@ public class V2PlannerTest
 
         V2Path p = planner.plan(new WorldPoint(3208, 3213, 0),
             new WorldPoint(3299, 3213, 0), BehaviorMode.VARIED);
-        assertTrue(p.isEmpty());
+        assertTrue("walled-in start has no walkable / unknown neighbours",
+            p.isEmpty());
         assertEquals(0, history.size());
     }
 

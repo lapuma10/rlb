@@ -119,8 +119,8 @@ public class MultiRegionAStarTest
         V2Path path = a.plan(new WorldPoint(3208, 3213, 0), new WorldPoint(3215, 3213, 0));
 
         assertFalse("permissive planner must route across unknown tiles", path.isEmpty());
-        assertTrue("path cost should reflect the UNKNOWN_TILE_COST multiplier",
-            path.totalCost() >= 7);   // 7 unknown steps × 5 = 35; but heuristic + cost rounding
+        assertTrue("path crosses unknown tiles → cost ≥ Chebyshev distance",
+            path.totalCost() >= 7);   // 7 steps min for Chebyshev distance of 7
     }
 
     @Test
