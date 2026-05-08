@@ -59,41 +59,64 @@ public final class CanvasTilePicker
     }
 
     /** Per-leg overload — operates on an explicit tile list (typically
-     *  one walk leg's tiles) instead of flattening the whole path. The
-     *  V2 executor uses this once leg-sequencing is on so candidate
-     *  tiles never span legs / planes. Same bucket / filter semantics
-     *  as {@link #pickNext(V2Path, WorldPoint, Predicate, Random, boolean)}. */
+     *  one walk leg's tiles) instead of flattening the whole path. */
     public WorldPoint pickNextInTiles(List<WorldPoint> walkTiles, WorldPoint player,
                                       Predicate<WorldPoint> filter, Random rng,
                                       boolean variableDistance)
+    {
+        return pickNextInTilesAfter(walkTiles, -1, player, filter, rng, variableDistance);
+    }
+
+    /** Progress-monotonic overload: only considers candidates whose path
+     *  index is strictly greater than {@code minIdxExclusive}. The V2
+     *  executor maintains a per-leg progress cursor and passes it here so
+     *  consecutive picks never regress to a tile already passed.
+     *
+     *  <p>Pass {@code -1} to disable the floor (equivalent to the old
+     *  closestIndex-only behavior).
+     *
+     *  <p>Round-2 stabilization: the long bucket (12–16 tiles) is gated
+     *  off by default — it routinely overshoots the engine's pathfinder
+     *  on unfamiliar terrain, producing the "5 forward, 2 back" stall
+     *  flap. Re-enable later behind a snapshot-reachability gate. */
+    public WorldPoint pickNextInTilesAfter(List<WorldPoint> walkTiles, int minIdxExclusive,
+                                           WorldPoint player,
+                                           Predicate<WorldPoint> filter, Random rng,
+                                           boolean variableDistance)
     {
         if (walkTiles == null || walkTiles.isEmpty()) return null;
         if (player == null || filter == null || rng == null) return null;
 
         int playerIdx = closestIndex(walkTiles, player);
-        // Available forward tiles after the player's projected index.
-        // walkTiles[playerIdx] is "where the player is on the path"; we
-        // want strictly forward of it.
-        int forwardCount = walkTiles.size() - playerIdx - 1;
+        // Floor by progress cursor: never regress past the leg's high-water mark.
+        int floor = Math.max(playerIdx, minIdxExclusive);
+        int forwardCount = walkTiles.size() - floor - 1;
         if (forwardCount <= 0) return null;
 
         if (!variableDistance)
         {
-            // Short-bucket-only path: always pick the nearest valid forward
-            // tile. The filter still applies — entity contamination rules
-            // are independent of the bucket choice.
-            return pickInBucket(walkTiles, playerIdx, 0, filter, rng);
+            return pickInBucket(walkTiles, floor, 0, filter, rng);
         }
 
-        // Try the buckets in weighted-random order, then fall through
-        // to any forward tile if every bucket is empty post-filter.
-        int[] bucketOrder = pickBucketOrder(rng);
+        // Round-2: long bucket disabled. Try short, then mid, then any
+        // forward tile that passes the filter. Long-distance picks
+        // produced the worst-case overshoot stalls in live testing.
+        int[] bucketOrder = pickShortMidBucketOrder(rng);
         for (int b : bucketOrder)
         {
-            WorldPoint pick = pickInBucket(walkTiles, playerIdx, b, filter, rng);
+            WorldPoint pick = pickInBucket(walkTiles, floor, b, filter, rng);
             if (pick != null) return pick;
         }
         return null;
+    }
+
+    /** Round-2 bucket order: short + mid only, weighted toward mid.
+     *  Long bucket reserved for a future opt-in path. */
+    private static int[] pickShortMidBucketOrder(Random rng)
+    {
+        // ~33% short, ~67% mid. Either way, both get tried.
+        boolean midFirst = rng.nextDouble() >= 0.33;
+        return midFirst ? new int[] {1, 0} : new int[] {0, 1};
     }
 
     private static List<WorldPoint> collectWalkTiles(V2Path path)

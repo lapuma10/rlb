@@ -543,7 +543,7 @@ public class RecorderPlugin extends Plugin
             = new net.runelite.client.plugins.recorder.nav.v2.InvalidationClassifier();
         net.runelite.client.plugins.recorder.nav.v2.V2Executor.Env env
             = new net.runelite.client.plugins.recorder.nav.v2.V2ExecutorEnv(
-                client, clientThread, dispatcher, filter, minimap, worldMapStore);
+                client, clientThread, dispatcher, filter, minimap, worldMapStore, transportIndex);
         net.runelite.client.plugins.recorder.nav.v2.V2Executor.Toggles toggles
             = new net.runelite.client.plugins.recorder.nav.v2.V2Executor.Toggles()
         {

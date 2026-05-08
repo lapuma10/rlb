@@ -16,6 +16,8 @@ import net.runelite.client.plugins.recorder.transport.TransportResolver;
 import net.runelite.client.plugins.recorder.worldmap.MapStore;
 import net.runelite.client.plugins.recorder.worldmap.RegionChunkSnapshot;
 import net.runelite.client.plugins.recorder.worldmap.RegionIds;
+import net.runelite.client.plugins.recorder.worldmap.TransportEdge;
+import net.runelite.client.plugins.recorder.worldmap.TransportIndex;
 import net.runelite.client.sequence.dispatch.HumanizedInputDispatcher;
 import net.runelite.client.sequence.internal.ActionRequest;
 
@@ -45,12 +47,23 @@ public final class V2ExecutorEnv implements V2Executor.Env
     private final MinimapClicker minimapClicker;
     private final MapStore mapStore;
     private final TransportResolver transportResolver;
+    @Nullable private final TransportIndex transportIndex;
 
     public V2ExecutorEnv(Client client, ClientThread clientThread,
                          HumanizedInputDispatcher dispatcher,
                          EmptyTileFilter emptyTileFilter,
                          MinimapClicker minimapClicker,
                          MapStore mapStore)
+    {
+        this(client, clientThread, dispatcher, emptyTileFilter, minimapClicker, mapStore, null);
+    }
+
+    public V2ExecutorEnv(Client client, ClientThread clientThread,
+                         HumanizedInputDispatcher dispatcher,
+                         EmptyTileFilter emptyTileFilter,
+                         MinimapClicker minimapClicker,
+                         MapStore mapStore,
+                         @Nullable TransportIndex transportIndex)
     {
         this.client = client;
         this.clientThread = clientThread;
@@ -59,6 +72,7 @@ public final class V2ExecutorEnv implements V2Executor.Env
         this.minimapClicker = minimapClicker;
         this.mapStore = mapStore;
         this.transportResolver = new TransportResolver(client);
+        this.transportIndex = transportIndex;
     }
 
     @Override
@@ -206,6 +220,61 @@ public final class V2ExecutorEnv implements V2Executor.Env
             .build();
         dispatcher.dispatch(req);
         return true;
+    }
+
+    @Override
+    public void correctTransportEdge(int objectId, String verb,
+                                     WorldPoint fromTile,
+                                     WorldPoint plannedToTile,
+                                     WorldPoint actualToTile,
+                                     WorldPoint approachTile,
+                                     int regionId)
+    {
+        if (transportIndex == null)
+        {
+            log.warn("v2-executor-env: correctTransportEdge but no TransportIndex wired — cannot persist correction (objectId={} verb='{}' from={} actualTo={})",
+                objectId, verb, fromTile, actualToTile);
+            return;
+        }
+        TransportEdge corrected = new TransportEdge(
+            fromTile, actualToTile, objectId,
+            "" /* objectName unknown at correction time */, verb,
+            0, 0, "object",
+            approachTile != null ? approachTile : fromTile,
+            regionId,
+            1, System.currentTimeMillis(), 0L);
+        transportIndex.replace(corrected);
+        log.info("v2-executor-env: TransportIndex corrected key={} from={} verb='{}' oldTo={} newTo={}",
+            corrected.key(), fromTile, verb, plannedToTile, actualToTile);
+    }
+
+    @Override
+    @Nullable
+    public WorldPoint findOpenableNear(WorldPoint blockedTile)
+    {
+        if (blockedTile == null) return null;
+        return onClient(() -> {
+            // Try blockedTile itself first, then 1-ring (4 cardinals
+            // before 4 diagonals — wall objects on the canonical side).
+            TransportResolver.Match m = transportResolver.findTransport(blockedTile, "Open");
+            if (m != null && m.isSuccess()) return blockedTile;
+            int[][] dirs = { {0,1}, {1,0}, {0,-1}, {-1,0},
+                             {1,1}, {1,-1}, {-1,1}, {-1,-1} };
+            for (int[] d : dirs)
+            {
+                WorldPoint near = new WorldPoint(
+                    blockedTile.getX() + d[0], blockedTile.getY() + d[1], blockedTile.getPlane());
+                TransportResolver.Match nm = transportResolver.findTransport(near, "Open");
+                if (nm != null && nm.isSuccess()) return near;
+            }
+            return null;
+        });
+    }
+
+    @Override
+    public boolean dispatchOpen(WorldPoint clickTile)
+    {
+        return dispatchTransport(clickTile, "Open");
     }
 
     @Override

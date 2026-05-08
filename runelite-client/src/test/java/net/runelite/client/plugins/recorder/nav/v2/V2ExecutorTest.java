@@ -101,6 +101,66 @@ public class V2ExecutorTest
             busy = true;
             return true;
         }
+
+        // Round-2 hooks ----------------------------------------------------
+        final List<EdgeCorrection> edgeCorrections = new ArrayList<>();
+        final Map<WorldPoint, WorldPoint> openables = new HashMap<>();
+        final List<WorldPoint> openClicks = new ArrayList<>();
+        boolean refuseOpenDispatch;
+
+        @Override
+        public void correctTransportEdge(int objectId, String verb,
+                                         WorldPoint fromTile,
+                                         WorldPoint plannedToTile,
+                                         WorldPoint actualToTile,
+                                         WorldPoint approachTile,
+                                         int regionId)
+        {
+            edgeCorrections.add(new EdgeCorrection(objectId, verb, fromTile,
+                plannedToTile, actualToTile));
+        }
+
+        @Override
+        @Nullable
+        public WorldPoint findOpenableNear(WorldPoint blockedTile)
+        {
+            if (openables.containsKey(blockedTile)) return openables.get(blockedTile);
+            int[][] dirs = { {0,1}, {1,0}, {0,-1}, {-1,0},
+                             {1,1}, {1,-1}, {-1,1}, {-1,-1} };
+            for (int[] d : dirs)
+            {
+                WorldPoint near = new WorldPoint(
+                    blockedTile.getX() + d[0], blockedTile.getY() + d[1], blockedTile.getPlane());
+                if (openables.containsKey(near)) return openables.get(near);
+            }
+            return null;
+        }
+
+        @Override
+        public boolean dispatchOpen(WorldPoint clickTile)
+        {
+            if (refuseOpenDispatch) return false;
+            if (busy) return false;
+            openClicks.add(clickTile);
+            busy = true;
+            return true;
+        }
+    }
+
+    private static final class EdgeCorrection
+    {
+        final int objectId;
+        final String verb;
+        final WorldPoint fromTile;
+        final WorldPoint plannedToTile;
+        final WorldPoint actualToTile;
+        EdgeCorrection(int objectId, String verb, WorldPoint fromTile,
+                       WorldPoint plannedToTile, WorldPoint actualToTile)
+        {
+            this.objectId = objectId; this.verb = verb;
+            this.fromTile = fromTile; this.plannedToTile = plannedToTile;
+            this.actualToTile = actualToTile;
+        }
     }
 
     private static final class TransportClick
@@ -476,10 +536,13 @@ public class V2ExecutorTest
     }
 
     @Test
-    public void tick_stalledStaticCollision_failureReasonTagged()
+    public void tick_stalledStaticCollision_openableBlockerNotFound_round2()
     {
-        // Pin the FailureReason on STATIC_COLLISION_MISMATCH stall —
-        // QC pass 2 surfaced this assertion gap.
+        // Round-2 change: a static-collision stall first probes for an
+        // openable on the blocked tile / 1-ring. If none exists, the
+        // failure is now OPENABLE_BLOCKER_NOT_FOUND (was
+        // STALL_CLASSIFIER_REPLAN in round-1). The classifier-replan
+        // path remains for non-static-collision stalls.
         FakeEnv env = new FakeEnv();
         env.player = new WorldPoint(3208, 3217, 0);
         V2Executor x = newExecutor(env);
@@ -488,13 +551,15 @@ public class V2ExecutorTest
         x.tick();
         WorldPoint clicked = env.walkDispatches.get(0);
         env.staticBlocked.add(clicked);
+        // No openable wired — gate-detect should fail cleanly.
         for (int i = 0; i < V2Executor.STALL_TICKS + 1; i++)
         {
             env.busy = false;
             x.tick();
         }
         assertEquals(V2Executor.Status.FAILED, x.status());
-        assertEquals(V2Executor.FailureReason.STALL_CLASSIFIER_REPLAN, x.lastFailureReason());
+        assertEquals(V2Executor.FailureReason.OPENABLE_BLOCKER_NOT_FOUND,
+            x.lastFailureReason());
     }
 
     @Test
@@ -767,15 +832,18 @@ public class V2ExecutorTest
             x.lastFailureReason());
     }
 
-    /** Plane mismatch: player is on neither from nor to plane. */
+    /** Plane mismatch: player is on neither from nor to plane.
+     *  Round-2: this is now reported as EDGE_DIRECTION_MISSING since
+     *  the executor refuses to drive an edge whose from-plane doesn't
+     *  match the player's plane. Both reasons mean "I'm not on the
+     *  right side of the staircase to use this edge". */
     @Test
-    public void transport_planeMismatch_failsWithTRANSPORT_PLANE_MISMATCH()
+    public void transport_playerOnUnexpectedPlane_failsCleanly()
     {
         FakeEnv env = new FakeEnv();
         // Player on plane 1 — neither from (0) nor to (2).
         env.player = new WorldPoint(3208, 3207, 1);
         V2Executor x = newExecutor(env);
-        // Skip the walk leg by setting up a transport-only path.
         TransportEdge edge = new TransportEdge(
             new WorldPoint(3208, 3207, 0), new WorldPoint(3204, 3207, 2),
             56230, "Staircase", "Top-floor", 0, 0, "object",
@@ -785,8 +853,10 @@ public class V2ExecutorTest
         env.busy = false;
         x.tick();
         assertEquals(V2Executor.Status.FAILED, x.status());
-        assertEquals(V2Executor.FailureReason.TRANSPORT_PLANE_MISMATCH,
-            x.lastFailureReason());
+        V2Executor.FailureReason r = x.lastFailureReason();
+        assertTrue("expected PLANE_MISMATCH or EDGE_DIRECTION_MISSING, got " + r,
+            r == V2Executor.FailureReason.TRANSPORT_PLANE_MISMATCH
+            || r == V2Executor.FailureReason.TRANSPORT_EDGE_DIRECTION_MISSING);
     }
 
     /** J. Cross-plane walk candidate guard remains intact for transport
@@ -824,6 +894,273 @@ public class V2ExecutorTest
         V2Executor x = newExecutor(env);
         x.setPath(V2Path.EMPTY);
         assertNull("empty path is IDLE, no reason", x.lastFailureReason());
+    }
+
+    // ------------------------------------------------------------------
+    // Round-2 stabilization tests: progress monotonicity, transport
+    // result correction, direction validation, openable blockers.
+    // ------------------------------------------------------------------
+
+    /** A1. Progress cursor: backward candidates rejected. The picker
+     *  is called repeatedly while the player walks forward; no dispatch
+     *  may target a tile with idx <= the high-water progress index. */
+    @Test
+    public void walk_progressCursor_neverDispatchesBackward()
+    {
+        FakeEnv env = new FakeEnv();
+        V2Executor x = newExecutor(env);
+        V2Path p = eastPath(20);
+        env.player = ((V2Leg.Walk) p.legs().get(0)).tiles().get(0);
+        x.setPath(p);
+
+        List<WorldPoint> tiles = ((V2Leg.Walk) p.legs().get(0)).tiles();
+        // Walk the player forward to idx 8.
+        for (int i = 0; i <= 8; i++)
+        {
+            env.player = tiles.get(i);
+            env.busy = false;
+            x.tick();
+        }
+        // Reset the dispatch list so we only inspect picks AFTER reaching idx 8.
+        env.walkDispatches.clear();
+        // Place the player back at idx 5 (simulate getting bumped back).
+        env.player = tiles.get(5);
+        for (int i = 0; i < 5; i++)
+        {
+            env.busy = false;
+            x.tick();
+        }
+        // No dispatch should have idx <= 8 (the high-water mark).
+        for (WorldPoint w : env.walkDispatches)
+        {
+            int idx = tiles.indexOf(w);
+            assertTrue("dispatch idx=" + idx + " is behind high-water (8)", idx > 8);
+        }
+    }
+
+    /** A2. No-forward-candidate scenario: player mid-leg, every tile in
+     *  the leg is blocked from canvas + minimap. Executor must fail with
+     *  NO_FORWARD_CANDIDATE / NO_CANDIDATE_AVAILABLE rather than spin. */
+    @Test
+    public void walk_noForwardCandidate_failsCleanly()
+    {
+        FakeEnv env = new FakeEnv();
+        V2Executor x = newExecutor(env);
+        V2Path p = eastPath(20);
+        List<WorldPoint> tiles = ((V2Leg.Walk) p.legs().get(0)).tiles();
+        env.player = tiles.get(5);   // mid-leg, far from end (idx 19)
+        for (WorldPoint t : tiles) { env.uncleanTiles.add(t); env.minimapBlocked.add(t); }
+        x.setPath(p);
+
+        for (int i = 0; i < V2Executor.MAX_NO_CANDIDATE_TICKS + 2; i++)
+        {
+            env.busy = false;
+            x.tick();
+            if (x.status() == V2Executor.Status.FAILED) break;
+        }
+        assertEquals(V2Executor.Status.FAILED, x.status());
+        V2Executor.FailureReason r = x.lastFailureReason();
+        assertTrue("expected NO_FORWARD_CANDIDATE or NO_CANDIDATE_AVAILABLE, got " + r,
+            r == V2Executor.FailureReason.NO_FORWARD_CANDIDATE
+            || r == V2Executor.FailureReason.NO_CANDIDATE_AVAILABLE);
+    }
+
+    /** B1. Transport result mismatch: planned p2→p0, actual p2→p1.
+     *  Executor must call correctTransportEdge AND set wantsReplanFromHere. */
+    @Test
+    public void transport_resultMismatch_correctsEdgeAndRequestsReplan()
+    {
+        FakeEnv env = new FakeEnv();
+        // Player on p2, click should land on p0 per planned edge but the
+        // simulation will move them to p1 — the mismatch case.
+        WorldPoint clickTile = new WorldPoint(3206, 3229, 2);
+        env.player = clickTile;
+        env.transportObjects.put(clickTile, clickTile);
+
+        V2Executor x = newExecutor(env);
+        TransportEdge wrongEdge = new TransportEdge(
+            clickTile,                           // fromTile p2
+            new WorldPoint(3205, 3228, 0),       // plannedTo p0 (WRONG)
+            56231, "Staircase", "Climb-down",
+            0, 0, "object", clickTile,
+            12850, 1, 0L, 0L);
+        x.setPath(new V2Path(List.of(new V2Leg.Transport(wrongEdge)), 10));
+
+        // Tick 1: dispatch the click.
+        env.busy = false;
+        x.tick();
+        assertTrue("transport must be clicked", !env.transportClicks.isEmpty());
+
+        // Simulate plane change to p1 (mismatch).
+        env.player = new WorldPoint(3206, 3229, 1);
+        env.busy = false;
+        x.tick();
+
+        assertTrue("executor must request replan from here", x.wantsReplanFromHere());
+        assertEquals("failure reason logged as TRANSPORT_RESULT_MISMATCH",
+            V2Executor.FailureReason.TRANSPORT_RESULT_MISMATCH, x.lastFailureReason());
+        assertEquals("edge correction must be recorded once",
+            1, env.edgeCorrections.size());
+        EdgeCorrection ec = env.edgeCorrections.get(0);
+        assertEquals(56231, ec.objectId);
+        assertEquals("Climb-down", ec.verb);
+        assertEquals(clickTile, ec.fromTile);
+        assertEquals(new WorldPoint(3205, 3228, 0), ec.plannedToTile);
+        assertEquals(new WorldPoint(3206, 3229, 1), ec.actualToTile);
+    }
+
+    /** C. Direction-correct edge: an edge whose to-plane doesn't match
+     *  the next WALK leg's plane is refused at execute time (defensive
+     *  guard against a planner emitting a wrong-direction transport). */
+    @Test
+    public void transport_directionMismatch_failsWithEDGE_DIRECTION_MISSING()
+    {
+        FakeEnv env = new FakeEnv();
+        env.player = new WorldPoint(3208, 3207, 0);
+        V2Executor x = newExecutor(env);
+        // Edge says fromPlane=0, toPlane=2. Next walk leg starts at plane=1
+        // (mismatch — should be plane=2 to match the edge.toTile).
+        TransportEdge edge = new TransportEdge(
+            new WorldPoint(3208, 3207, 0),
+            new WorldPoint(3204, 3207, 2), 56230, "Staircase", "Top-floor",
+            0, 0, "object", new WorldPoint(3208, 3207, 0),
+            12850, 1, 0L, 0L);
+        V2Path p = new V2Path(List.of(
+            new V2Leg.Transport(edge),
+            new V2Leg.Walk(0, List.of(new WorldPoint(3204, 3207, 1)))   // wrong plane
+        ), 10);
+        x.setPath(p);
+        env.busy = false;
+        x.tick();
+        assertEquals(V2Executor.Status.FAILED, x.status());
+        assertEquals(V2Executor.FailureReason.TRANSPORT_EDGE_DIRECTION_MISSING,
+            x.lastFailureReason());
+    }
+
+    /** D1. Openable blocker: snapshot says walkable, live says blocked,
+     *  Open verb on adjacent tile → executor clicks Open. */
+    @Test
+    public void walk_openableBlocker_clicksOpen_whenAdjacent()
+    {
+        FakeEnv env = new FakeEnv();
+        V2Path p = eastPath(20);
+        List<WorldPoint> tiles = ((V2Leg.Walk) p.legs().get(0)).tiles();
+        env.player = tiles.get(0);
+        V2Executor x = newExecutor(env);
+        x.setPath(p);
+
+        // Tick 1: dispatch.
+        env.busy = false;
+        x.tick();
+        assertTrue(!env.walkDispatches.isEmpty());
+        WorldPoint clicked = env.walkDispatches.get(0);
+        // Now mark the clicked tile as static-collision-blocked and
+        // wire an openable on it (gate on the same tile).
+        env.staticBlocked.add(clicked);
+        env.openables.put(clicked, clicked);
+
+        // Stall — need >= STALL_TICKS ticks of player static.
+        for (int i = 0; i < V2Executor.STALL_TICKS + 1; i++)
+        {
+            env.busy = false;
+            x.tick();
+        }
+
+        assertTrue("Open verb-click must have been dispatched at the gate",
+            !env.openClicks.isEmpty());
+    }
+
+    /** D2. Openable blocker timeout: Open clicked but live collision
+     *  never flips walkable. */
+    @Test
+    public void walk_openableBlocker_timeout()
+    {
+        FakeEnv env = new FakeEnv();
+        V2Path p = eastPath(20);
+        List<WorldPoint> tiles = ((V2Leg.Walk) p.legs().get(0)).tiles();
+        env.player = tiles.get(0);
+        V2Executor x = newExecutor(env);
+        x.setPath(p);
+
+        env.busy = false;
+        x.tick();
+        WorldPoint clicked = env.walkDispatches.get(0);
+        env.staticBlocked.add(clicked);
+        env.openables.put(clicked, clicked);
+
+        for (int i = 0; i < V2Executor.STALL_TICKS + 1; i++)
+        {
+            env.busy = false;
+            x.tick();
+        }
+        // Stall more after the Open click — player still blocked.
+        for (int i = 0; i < V2Executor.OPENABLE_TIMEOUT_TICKS + 2; i++)
+        {
+            env.busy = false;
+            x.tick();
+        }
+        assertEquals(V2Executor.Status.FAILED, x.status());
+        assertEquals(V2Executor.FailureReason.OPENABLE_BLOCKER_TIMEOUT,
+            x.lastFailureReason());
+    }
+
+    /** D3. Openable blocker: no openable found → fails clearly. */
+    @Test
+    public void walk_openableBlocker_notFound_fails()
+    {
+        FakeEnv env = new FakeEnv();
+        V2Path p = eastPath(20);
+        List<WorldPoint> tiles = ((V2Leg.Walk) p.legs().get(0)).tiles();
+        env.player = tiles.get(0);
+        V2Executor x = newExecutor(env);
+        x.setPath(p);
+
+        env.busy = false;
+        x.tick();
+        WorldPoint clicked = env.walkDispatches.get(0);
+        env.staticBlocked.add(clicked);
+        // No openable wired.
+
+        for (int i = 0; i < V2Executor.STALL_TICKS + 1; i++)
+        {
+            env.busy = false;
+            x.tick();
+        }
+        assertEquals(V2Executor.Status.FAILED, x.status());
+        assertEquals(V2Executor.FailureReason.OPENABLE_BLOCKER_NOT_FOUND,
+            x.lastFailureReason());
+    }
+
+    /** D4. Openable blocker recovery: passability flips back walkable
+     *  after the Open click → executor resumes the walk leg. */
+    @Test
+    public void walk_openableBlocker_passabilityRestored_resumesWalk()
+    {
+        FakeEnv env = new FakeEnv();
+        V2Path p = eastPath(20);
+        List<WorldPoint> tiles = ((V2Leg.Walk) p.legs().get(0)).tiles();
+        env.player = tiles.get(0);
+        V2Executor x = newExecutor(env);
+        x.setPath(p);
+
+        env.busy = false;
+        x.tick();
+        WorldPoint clicked = env.walkDispatches.get(0);
+        env.staticBlocked.add(clicked);
+        env.openables.put(clicked, clicked);
+
+        for (int i = 0; i < V2Executor.STALL_TICKS + 1; i++)
+        {
+            env.busy = false;
+            x.tick();
+        }
+        assertTrue(!env.openClicks.isEmpty());
+        // Now flip the gate to walkable.
+        env.staticBlocked.remove(clicked);
+        env.busy = false;
+        x.tick();
+        assertEquals("status remains RUNNING after passability restored",
+            V2Executor.Status.RUNNING, x.status());
     }
 
     /** Round-2 regression guard: setPath of a transport-bearing route

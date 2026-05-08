@@ -38,6 +38,18 @@ public final class TransportIndex
         dirty = true;
     }
 
+    /** Overwrite the edge under {@code edge.key()}. Used by the V2
+     *  executor when live observation reveals the recorded {@code toTile}
+     *  was wrong (e.g. recorded Climb-down p2→p0 but actually p2→p1).
+     *  Unlike {@link #add}, this does NOT preserve existing fields — the
+     *  incoming edge replaces the entry wholesale. */
+    public void replace(TransportEdge edge)
+    {
+        if (edge == null) return;
+        byKey.put(edge.key(), edge);
+        dirty = true;
+    }
+
     /** Returns whether the in-memory state diverged from the last
      *  persisted snapshot, then clears the flag. The {@link
      *  net.runelite.client.plugins.recorder.worldmap.FlushDaemon} uses

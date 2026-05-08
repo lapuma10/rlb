@@ -108,6 +108,36 @@ public final class V2Executor
          *  an explicit channel; round-2 picker is leg-scoped so this
          *  should never fire. */
         FUTURE_LEG_CANDIDATE_REJECTED,
+        /** Round-2 progress invariant: every forward candidate has been
+         *  filtered out and the executor cannot pick a tile strictly
+         *  ahead of the leg's progress cursor. Surfaces a leg whose
+         *  forward tail was entirely entity-contaminated / blacklisted
+         *  / reachable past the end. */
+        NO_FORWARD_CANDIDATE,
+        /** Round-2 transport correction: the verb-click succeeded
+         *  (player plane changed) but the destination plane / tile does
+         *  NOT match the planned edge. The executor self-corrects the
+         *  TransportIndex entry and signals replan-from-here so the
+         *  navigator routes from the player's actual position. The
+         *  Navigator handles this as a transient — does NOT propagate
+         *  FAILED upward unless the replan budget is exhausted. */
+        TRANSPORT_RESULT_MISMATCH,
+        /** Round-2 direction validation: the planner emitted a
+         *  TRANSPORT leg whose {@code fromTile.plane} doesn't match the
+         *  player's plane, or whose {@code toTile.plane} doesn't match
+         *  the next WALK leg's plane. The executor refuses to drive a
+         *  staircase that climbs the wrong way. */
+        TRANSPORT_EDGE_DIRECTION_MISSING,
+        /** Round-2 gate handling: the executor detected a static-collision
+         *  mismatch (snapshot says walkable, live says blocked) AND
+         *  could not find an adjacent object advertising "Open". The
+         *  navigator should replan or fall back. */
+        OPENABLE_BLOCKER_NOT_FOUND,
+        /** Round-2 gate handling: an Open verb-click was dispatched
+         *  but the live collision flag did not flip walkable within
+         *  {@link #OPENABLE_TIMEOUT_TICKS}. Either the click missed
+         *  or the gate is permanently locked. */
+        OPENABLE_BLOCKER_TIMEOUT,
         /** Catch-all — kept for tests that don't care about the
          *  precise enum case. New code paths should pick a more
          *  specific value. */
@@ -154,6 +184,33 @@ public final class V2Executor
          *  WAITING_FOR_TRANSPORT and polls plane change. */
         default boolean dispatchTransport(WorldPoint clickTile, String verb)
         { return false; }
+
+        /** Self-correction hook: live transport actually moved player to
+         *  {@code actualToTile} but the planned edge said
+         *  {@code plannedToTile}. Production rewrites the {@link
+         *  net.runelite.client.plugins.recorder.worldmap.TransportIndex}
+         *  entry under the same key (fromTile + verb + objectId) so the
+         *  next plan uses correct data. Tests record the call. */
+        default void correctTransportEdge(int objectId, String verb,
+                                          WorldPoint fromTile,
+                                          WorldPoint plannedToTile,
+                                          WorldPoint actualToTile,
+                                          WorldPoint approachTile,
+                                          int regionId)
+        { /* default: no-op (tests inject behavior) */ }
+
+        /** Look at {@code blockedTile} and its 1-ring of neighbors for a
+         *  wall/game/decorative/ground object whose menu actions contain
+         *  "Open". Returns the click tile (where to dispatch the Open
+         *  verb-click), or {@code null} when no openable found.
+         *  Mirrors {@link #resolveTransportClickTile} for the gate case. */
+        @Nullable default WorldPoint findOpenableNear(WorldPoint blockedTile)
+        { return null; }
+
+        /** Dispatch a CLICK_GAME_OBJECT with verb "Open" on the resolved
+         *  tile. Returns true if the dispatcher accepted the request. */
+        default boolean dispatchOpen(WorldPoint clickTile)
+        { return false; }
     }
 
     /** Ticks of zero progress before treating a WALK leg as stalled. */
@@ -177,6 +234,9 @@ public final class V2Executor
      *  executor will dispatch the verb-click as soon as the player is
      *  this close. Matches V1's TRANSPORT_ADJACENCY behaviour. */
     public static final int TRANSPORT_APPROACH_CHEBYSHEV = 1;
+    /** Ticks to wait after dispatching an Open verb-click for the
+     *  blocked tile's live collision to flip walkable. */
+    public static final int OPENABLE_TIMEOUT_TICKS = 8;
 
     private static final int FILTER_REJECT_WINDOW = 4;
     private static final double MINIMAP_BIAS_THRESHOLD = 0.5;
@@ -220,6 +280,27 @@ public final class V2Executor
     /** Ticks since the transport click; bounded by {@link #TRANSPORT_TIMEOUT_TICKS}. */
     private int ticksSinceTransportClick;
 
+    /** Round-2 progress cursor: highest leg-tile index the player has
+     *  reached on the current WALK leg. Picker uses this as a strict
+     *  floor — candidates with idx <= progressIdx are rejected so the
+     *  bot never clicks backwards along a leg. {@code -1} = uninitialized
+     *  (recomputed at the next walk-leg tick). */
+    private int progressIdx;
+
+    /** Round-2 replan signal: when set, the navigator should cancel the
+     *  active path and replan from the player's current position before
+     *  surfacing FAILED. Used after {@link FailureReason#TRANSPORT_RESULT_MISMATCH}
+     *  so a wrong-toTile transport edge gets corrected and re-routed
+     *  rather than aborting the script. */
+    private boolean wantsReplanFromHere;
+
+    /** Round-2 gate handling: tile we detected as static-collision-blocked
+     *  and dispatched an Open verb-click for. Cleared once the live
+     *  collision flips walkable or the timeout fires. */
+    @Nullable private WorldPoint pendingOpenTile;
+    /** Ticks elapsed since the last Open verb-click was dispatched. */
+    private int ticksSincePendingOpen;
+
     public V2Executor(Env env, CanvasTilePicker canvasPicker,
                       InvalidationClassifier classifier, Random rng)
     {
@@ -258,16 +339,66 @@ public final class V2Executor
         this.lastFailureReason = null;
         this.transportClicked = false;
         this.ticksSinceTransportClick = 0;
+        this.progressIdx = -1;
+        this.wantsReplanFromHere = false;
+        this.pendingOpenTile = null;
+        this.ticksSincePendingOpen = 0;
         if (newPath == null || newPath.isEmpty())
         {
             this.status = Status.IDLE;
             return;
         }
-        log.info("v2-executor: route accepted legs={} routeId={}",
-            newPath.legs().size(), newPath.routeId());
-        for (int i = 0; i < newPath.legs().size(); i++)
+        logRouteSummary(newPath);
+        this.status = Status.RUNNING;
+    }
+
+    /** Round-2 route summary: dump per-leg shape + plane/region/transport
+     *  inventory + bounding box so a live failure can be diagnosed without
+     *  re-running. Replaces the per-leg block in the previous setPath. */
+    private void logRouteSummary(V2Path p)
+    {
+        int totalTiles = 0;
+        int minX = Integer.MAX_VALUE, minY = Integer.MAX_VALUE;
+        int maxX = Integer.MIN_VALUE, maxY = Integer.MIN_VALUE;
+        java.util.Set<Integer> planes = new java.util.TreeSet<>();
+        java.util.Set<Integer> regions = new java.util.TreeSet<>();
+        int transportCount = 0;
+        java.util.List<WorldPoint> firstTiles = new java.util.ArrayList<>();
+        java.util.List<WorldPoint> lastTiles = new java.util.ArrayList<>();
+        java.util.List<WorldPoint> allTiles = p.allTiles();
+        for (int i = 0; i < Math.min(10, allTiles.size()); i++) firstTiles.add(allTiles.get(i));
+        for (int i = Math.max(0, allTiles.size() - 10); i < allTiles.size(); i++) lastTiles.add(allTiles.get(i));
+        for (V2Leg leg : p.legs())
         {
-            V2Leg leg = newPath.legs().get(i);
+            if (leg instanceof V2Leg.Walk w)
+            {
+                totalTiles += w.tiles().size();
+                regions.add(w.regionId());
+                for (WorldPoint t : w.tiles())
+                {
+                    planes.add(t.getPlane());
+                    if (t.getX() < minX) minX = t.getX();
+                    if (t.getX() > maxX) maxX = t.getX();
+                    if (t.getY() < minY) minY = t.getY();
+                    if (t.getY() > maxY) maxY = t.getY();
+                }
+            }
+            else if (leg instanceof V2Leg.Transport t)
+            {
+                transportCount++;
+                TransportEdge e = t.edge();
+                planes.add(e.fromTile().getPlane());
+                planes.add(e.toTile().getPlane());
+                regions.add(e.regionId());
+            }
+        }
+        log.info("v2-executor: route accepted legs={} routeId={} totalTiles={} planes={} regions={} transports={} bbox=[{},{} → {},{}] cost={}",
+            p.legs().size(), p.routeId(), totalTiles, planes, regions, transportCount,
+            minX, minY, maxX, maxY, p.totalCost());
+        log.info("v2-executor: route firstTiles={} lastTiles={}", firstTiles, lastTiles);
+        for (int i = 0; i < p.legs().size(); i++)
+        {
+            V2Leg leg = p.legs().get(i);
             if (leg instanceof V2Leg.Walk w)
             {
                 log.info("v2-executor: leg={} type=WALK plane={} tiles={} start={} end={}",
@@ -280,7 +411,6 @@ public final class V2Executor
                     i, e.verb(), e.objectId(), e.fromTile(), e.toTile(), e.approachTile());
             }
         }
-        this.status = Status.RUNNING;
     }
 
     public void cancel()
@@ -290,7 +420,18 @@ public final class V2Executor
         this.lastFailureReason = null;
         this.transportClicked = false;
         this.ticksSinceTransportClick = 0;
+        this.progressIdx = -1;
+        this.wantsReplanFromHere = false;
+        this.pendingOpenTile = null;
+        this.ticksSincePendingOpen = 0;
     }
+
+    /** Round-2 replan signal. The Navigator reads this after each tick;
+     *  when {@code true}, it should cancel the active path and replan
+     *  from the player's current world location instead of propagating
+     *  FAILED. The flag clears on the next {@link #setPath} or
+     *  {@link #cancel}. */
+    public boolean wantsReplanFromHere() { return wantsReplanFromHere; }
 
     /** Round-1 stub. Logs a warning and falls through to UNCHANGED. */
     public void setRunMode(RunMode mode)
@@ -321,6 +462,10 @@ public final class V2Executor
     {
         if (path == null || path.isEmpty()) { status = Status.IDLE; return status; }
         if (status != Status.RUNNING) return status;
+        // A replan was requested (transport mismatch) — wait for the
+        // navigator to call setPath / cancel. Don't dispatch on a route
+        // we already know is invalid.
+        if (wantsReplanFromHere) return status;
 
         WorldPoint here = env.playerLoc();
         if (here == null)
@@ -410,16 +555,30 @@ public final class V2Executor
         return status;
     }
 
-    /** Execute one tick on a WALK leg. Candidate tiles are SCOPED to
-     *  this leg only — never flattened across legs/planes. Advances to
-     *  the next leg when the player is at (or within Chebyshev 1 of)
-     *  the leg's end tile. */
+    /** Execute one tick on a WALK leg. Round-2 invariants:
+     *  <ul>
+     *    <li>Per-leg progress cursor — picks must be strictly ahead of
+     *        the high-water idx. No backward clicks.</li>
+     *    <li>Openable-blocker recovery — if a static-collision mismatch
+     *        is detected on the current click target, search the 1-ring
+     *        for an Open verb and click it before falling through to
+     *        stall recovery.</li>
+     *  </ul> */
     private Status executeWalkLeg(WorldPoint here, V2Leg.Walk w)
     {
+        // Recompute / advance the progress cursor. closestIndex is
+        // monotonic-by-max — never regress past a high-water idx, even
+        // if the player gets pushed back by an obstacle / NPC.
+        int closest = closestIdxOnPath(w.tiles(), here);
+        int oldProgress = progressIdx;
+        if (closest > progressIdx) progressIdx = closest;
+        if (progressIdx != oldProgress)
+        {
+            log.info("v2-executor: progress advanced old={} new={} leg={}",
+                oldProgress, progressIdx, legIdx);
+        }
+
         // Walk-leg advance: player has reached the end of this leg.
-        // Use Chebyshev<=1 so an overshoot click that landed one tile
-        // past the end (or a planner that ends a leg one short of a
-        // transport approach) still advances cleanly.
         if (here.getPlane() == w.end().getPlane()
             && chebyshev(here, w.end()) <= 1)
         {
@@ -427,10 +586,40 @@ public final class V2Executor
             return status;
         }
 
+        // If we have a pending Open click, poll for live passability.
+        if (pendingOpenTile != null)
+        {
+            ticksSincePendingOpen++;
+            if (env.liveCollisionAllows(pendingOpenTile))
+            {
+                log.info("[v2-blocker] passability restored, continuing leg={} tile={}",
+                    legIdx, pendingOpenTile);
+                pendingOpenTile = null;
+                ticksSincePendingOpen = 0;
+                lastDispatchedTile = null;
+            }
+            else if (ticksSincePendingOpen >= OPENABLE_TIMEOUT_TICKS)
+            {
+                log.warn("[v2-blocker] failed reason=OPENABLE_BLOCKER_TIMEOUT tile={} ticks={}",
+                    pendingOpenTile, ticksSincePendingOpen);
+                status = Status.FAILED;
+                lastFailureReason = FailureReason.OPENABLE_BLOCKER_TIMEOUT;
+                return status;
+            }
+            else
+            {
+                return status;   // still waiting for the gate to open
+            }
+        }
+
         // Click-in-flight handling.
         if (lastDispatchedTile != null && !here.equals(lastDispatchedTile))
         {
             if (ticksSinceProgress < STALL_TICKS) return status;
+            // Stalled. Before falling into stall classifier, see if the
+            // stall is gate-shaped (snapshot walkable, live blocked, +
+            // openable nearby).
+            if (tryHandleOpenableBlocker(here)) return status;
             if (handleStall(here)) return status;
         }
         else if (here.equals(lastDispatchedTile))
@@ -447,8 +636,25 @@ public final class V2Executor
 
         if (modality == Modality.CANVAS)
         {
-            WorldPoint pick = canvasPicker.pickNextInTiles(w.tiles(), here,
+            WorldPoint pick = canvasPicker.pickNextInTilesAfter(w.tiles(), progressIdx, here,
                 this::canvasFilter, rng, toggles.variableDistance());
+            if (pick != null)
+            {
+                int candidateIdx = w.tiles().indexOf(pick);
+                if (candidateIdx <= progressIdx)
+                {
+                    log.warn("v2-executor: rejected backward candidate idx={} currentIdx={}",
+                        candidateIdx, progressIdx);
+                    pick = null;
+                }
+                else
+                {
+                    int remainingBefore = w.tiles().size() - 1 - progressIdx;
+                    int remainingAfter = w.tiles().size() - 1 - candidateIdx;
+                    log.debug("v2-executor: walk progress leg={} currentIdx={} candidateIdx={} remainingBefore={} remainingAfter={}",
+                        legIdx, progressIdx, candidateIdx, remainingBefore, remainingAfter);
+                }
+            }
             if (!acceptCandidate(pick, here, "canvas"))
             {
                 pick = null;
@@ -476,7 +682,7 @@ public final class V2Executor
             modality = Modality.MINIMAP;
         }
 
-        // MINIMAP modality — current leg only.
+        // MINIMAP modality — current leg only, also progress-monotonic.
         WorldPoint mmTarget = pickMinimapTargetForLeg(here, w);
         if (!acceptCandidate(mmTarget, here, "minimap"))
         {
@@ -489,10 +695,18 @@ public final class V2Executor
             consecutiveNoCandidateTicks++;
             if (consecutiveNoCandidateTicks >= MAX_NO_CANDIDATE_TICKS)
             {
-                log.warn("v2-executor: NO_CANDIDATE_AVAILABLE — both modalities returned null for {} consecutive ticks; FAILED",
+                log.warn("v2-executor: NO_FORWARD_CANDIDATE / NO_CANDIDATE_AVAILABLE — both modalities returned null for {} consecutive ticks; FAILED",
                     consecutiveNoCandidateTicks);
                 status = Status.FAILED;
-                lastFailureReason = FailureReason.NO_CANDIDATE_AVAILABLE;
+                // Distinguish "no forward candidate" (progress cursor hit
+                // the end) from generic "no candidate" (filter rejected
+                // everything). The cursor hitting the end means the leg
+                // is essentially done — leg advance handles that — so
+                // the cursor-overshoot path lands here with all forward
+                // tiles past the cursor BUT none passing the filter.
+                lastFailureReason = (progressIdx >= w.tiles().size() - 1)
+                    ? FailureReason.NO_FORWARD_CANDIDATE
+                    : FailureReason.NO_CANDIDATE_AVAILABLE;
             }
             return status;
         }
@@ -519,40 +733,145 @@ public final class V2Executor
         return status;
     }
 
-    /** Execute one tick on a TRANSPORT leg. Walks to the approach tile
-     *  if needed, dispatches the verb-click on the resolved live object,
-     *  then polls until the player is on the destination plane. */
+    /** Round-2 gate handling. If the last dispatched tile (and the player's
+     *  forward path) is blocked live but the snapshot says walkable, look
+     *  for an Open verb on the 1-ring of that tile. Returns true if an
+     *  Open click was dispatched (caller should not fall into stall
+     *  classification). Returns false to let stall handling proceed. */
+    private boolean tryHandleOpenableBlocker(WorldPoint here)
+    {
+        WorldPoint blocked = lastDispatchedTile;
+        if (blocked == null) return false;
+        // Check shape: snapshot says walkable, live says blocked → static
+        // collision mismatch, classifier-call would also flag it.
+        if (env.snapshotSaysWalkable(blocked) && !env.liveCollisionAllows(blocked))
+        {
+            WorldPoint openTile = env.findOpenableNear(blocked);
+            if (openTile == null)
+            {
+                log.warn("[v2-blocker] failed reason=OPENABLE_BLOCKER_NOT_FOUND blockedEdge={} player={}",
+                    blocked, here);
+                status = Status.FAILED;
+                lastFailureReason = FailureReason.OPENABLE_BLOCKER_NOT_FOUND;
+                return true;
+            }
+            log.info("[v2-blocker] blocked edge from={} to={} found openable tile={}",
+                here, blocked, openTile);
+            if (env.dispatchOpen(openTile))
+            {
+                log.info("[v2-blocker] clicked Open tile={}", openTile);
+                pendingOpenTile = blocked;
+                ticksSincePendingOpen = 0;
+                lastDispatchedTile = null;   // don't classify this dispatch as a walk-stall
+                ticksSinceProgress = 0;
+                return true;
+            }
+            log.warn("[v2-blocker] failed reason=TRANSPORT_CLICK_FAILED tile={} (dispatcher refused)",
+                openTile);
+            status = Status.FAILED;
+            lastFailureReason = FailureReason.TRANSPORT_CLICK_FAILED;
+            return true;
+        }
+        return false;
+    }
+
+    private static int closestIdxOnPath(java.util.List<WorldPoint> tiles, WorldPoint here)
+    {
+        int best = 0;
+        int bestDist = Integer.MAX_VALUE;
+        for (int i = 0; i < tiles.size(); i++)
+        {
+            WorldPoint t = tiles.get(i);
+            int d = chebyshev(t, here)
+                  + (t.getPlane() == here.getPlane() ? 0 : 1000);
+            if (d < bestDist) { bestDist = d; best = i; }
+        }
+        return best;
+    }
+
+    /** Execute one tick on a TRANSPORT leg. Round-2 invariants:
+     *  <ul>
+     *    <li>Direction validation — refuse to drive an edge whose
+     *        from/to planes don't match the player's current plane and
+     *        the next WALK leg's plane.</li>
+     *    <li>Result mismatch correction — if plane changes to a value
+     *        other than {@code edge.toTile().plane}, log
+     *        TRANSPORT_RESULT_MISMATCH, correct the TransportIndex
+     *        entry, and signal {@link #wantsReplanFromHere} so the
+     *        navigator routes from the player's actual position.</li>
+     *  </ul> */
     private Status executeTransportLeg(WorldPoint here, V2Leg.Transport t)
     {
         TransportEdge edge = t.edge();
         WorldPoint expectedTo = edge.toTile();
         WorldPoint approach = edge.approachTile() != null ? edge.approachTile() : edge.fromTile();
 
-        // Success: player reached the destination plane.
-        if (here.getPlane() == expectedTo.getPlane())
+        // Direction validation — refuse the leg if planes don't line up.
+        // Must be done BEFORE the success check so a wrong-direction edge
+        // can't accidentally short-circuit on a same-plane player.
+        Integer nextWalkPlane = nextWalkLegPlane();
+        if (here.getPlane() != edge.fromTile().getPlane() && !transportClicked)
         {
-            log.info("v2-executor: transport success player={} (toPlane={} verb={} objectId={})",
-                here, expectedTo.getPlane(), edge.verb(), edge.objectId());
-            advanceTransportLeg();
-            return status;
-        }
-
-        // Player must be on the from-plane — neither from nor to is the
-        // out-of-band TRANSPORT_PLANE_MISMATCH case.
-        if (here.getPlane() != edge.fromTile().getPlane())
-        {
-            log.warn("v2-executor: transport failed reason=TRANSPORT_PLANE_MISMATCH detail=verb={} objectId={} from.plane={} to.plane={} player.plane={}",
+            // We haven't clicked yet, and the player isn't on the from-plane.
+            // This is direction-mismatch (or stale state from a prior leg).
+            log.warn("v2-executor: transport failed reason=TRANSPORT_EDGE_DIRECTION_MISSING detail=verb={} objectId={} edge.from.plane={} edge.to.plane={} player.plane={} nextWalk.plane={}",
                 edge.verb(), edge.objectId(),
-                edge.fromTile().getPlane(), expectedTo.getPlane(), here.getPlane());
+                edge.fromTile().getPlane(), expectedTo.getPlane(), here.getPlane(),
+                nextWalkPlane);
             status = Status.FAILED;
-            lastFailureReason = FailureReason.TRANSPORT_PLANE_MISMATCH;
+            lastFailureReason = FailureReason.TRANSPORT_EDGE_DIRECTION_MISSING;
+            return status;
+        }
+        if (nextWalkPlane != null && nextWalkPlane != expectedTo.getPlane()
+            && !transportClicked)
+        {
+            log.warn("v2-executor: transport failed reason=TRANSPORT_EDGE_DIRECTION_MISSING detail=verb={} objectId={} edge.to.plane={} nextWalk.plane={}",
+                edge.verb(), edge.objectId(), expectedTo.getPlane(), nextWalkPlane);
+            status = Status.FAILED;
+            lastFailureReason = FailureReason.TRANSPORT_EDGE_DIRECTION_MISSING;
             return status;
         }
 
-        // Click already dispatched — poll plane change with a bounded timeout.
+        // Result evaluation runs only once we've issued the click — the
+        // plane change is the engine's success signal. If we haven't
+        // clicked yet and the player happens to be on the to-plane,
+        // the transport is already done (e.g. interrupted prior run);
+        // advance.
         if (transportClicked)
         {
             ticksSinceTransportClick++;
+
+            // Plane changed away from the from-plane?
+            int fromPlane = edge.fromTile().getPlane();
+            int toPlane = expectedTo.getPlane();
+            if (here.getPlane() == toPlane)
+            {
+                log.info("v2-executor: transport success player={} (toPlane={} verb={} objectId={})",
+                    here, toPlane, edge.verb(), edge.objectId());
+                advanceTransportLeg();
+                return status;
+            }
+            if (here.getPlane() != fromPlane)
+            {
+                // Plane changed but to a DIFFERENT plane than the planned
+                // toTile. Recorded edge is wrong — correct it, replan.
+                log.warn("[v2-transport] result mismatch plannedTo={} actual={}",
+                    expectedTo, here);
+                log.info("[v2-transport] correcting edge from={} verb={} oldTo={} newTo={}",
+                    edge.fromTile(), edge.verb(), expectedTo, here);
+                env.correctTransportEdge(edge.objectId(), edge.verb(),
+                    edge.fromTile(), expectedTo, here, approach, edge.regionId());
+                log.info("v2-executor: replanning from current position after transport correction (player={})",
+                    here);
+                wantsReplanFromHere = true;
+                lastFailureReason = FailureReason.TRANSPORT_RESULT_MISMATCH;
+                // Don't FAIL — leave status RUNNING; navigator will see
+                // wantsReplanFromHere on its next tick and replan from
+                // the player's current position. Until then, tick is a
+                // no-op (early return at the top of the next tick).
+                return status;
+            }
+            // Still on from-plane → waiting.
             log.debug("v2-executor: waiting for transport ({}/{} ticks since click, verb={} objectId={})",
                 ticksSinceTransportClick, TRANSPORT_TIMEOUT_TICKS, edge.verb(), edge.objectId());
             if (ticksSinceTransportClick >= TRANSPORT_TIMEOUT_TICKS)
@@ -565,15 +884,13 @@ public final class V2Executor
             return status;
         }
 
+        // Pre-click branch: player on from-plane, transport not clicked.
         // Need to walk to approach first?
         int distToApproach = chebyshev(here, approach);
         if (distToApproach > TRANSPORT_APPROACH_CHEBYSHEV)
         {
             log.info("v2-executor: leg={} TRANSPORT walking to approach={} dist={} (verb={} objectId={})",
                 legIdx, approach, distToApproach, edge.verb(), edge.objectId());
-            // Don't re-dispatch the same approach tile every tick — let the
-            // walk land. If we stall, the lastDispatchedTile-clear path on
-            // arrival or a stall-driven re-click will try again.
             if (lastDispatchedTile == null
                 || !approach.equals(lastDispatchedTile)
                 || ticksSinceProgress >= STALL_TICKS)
@@ -614,11 +931,23 @@ public final class V2Executor
             legIdx, clickTile, edge.verb(), edge.objectId());
         transportClicked = true;
         ticksSinceTransportClick = 0;
-        // Don't track this dispatch with lastDispatchedTile — the player
-        // won't physically arrive on the object's tile; the success signal
-        // is the plane change which we poll on next ticks.
         lastDispatchedTile = null;
         return status;
+    }
+
+    /** Returns the plane of the next WALK leg after the current TRANSPORT
+     *  leg, or null if the transport is the last leg. Used for direction
+     *  validation. */
+    @Nullable
+    private Integer nextWalkLegPlane()
+    {
+        if (path == null) return null;
+        for (int i = legIdx + 1; i < path.legs().size(); i++)
+        {
+            V2Leg leg = path.legs().get(i);
+            if (leg instanceof V2Leg.Walk w) return w.start().getPlane();
+        }
+        return null;
     }
 
     private void advanceLeg(String tag, WorldPoint endTile)
@@ -630,6 +959,7 @@ public final class V2Executor
         clickRejectsThisLeg = 0;
         ticksSinceProgress = 0;
         lastDispatchedTile = null;
+        progressIdx = -1;   // reset cursor for the next walk leg
     }
 
     private void advanceTransportLeg()
@@ -643,6 +973,7 @@ public final class V2Executor
         lastDispatchedTile = null;
         transportClicked = false;
         ticksSinceTransportClick = 0;
+        progressIdx = -1;
     }
 
     private static int chebyshev(WorldPoint a, WorldPoint b)

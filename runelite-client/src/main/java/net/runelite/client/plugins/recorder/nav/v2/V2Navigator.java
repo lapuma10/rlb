@@ -59,6 +59,10 @@ public final class V2Navigator implements Navigator
          *  executor cause (TRANSPORT_EXECUTOR_MISSING / CATCHUP_EXHAUSTED
          *  / PLAYER_LOC_LOST / …). */
         @Nullable default V2Executor.FailureReason lastFailureReason() { return null; }
+        /** Round-2: returns true when the executor wants the navigator
+         *  to replan from the player's current position (e.g. after a
+         *  TRANSPORT_RESULT_MISMATCH self-correction). */
+        default boolean wantsReplanFromHere() { return false; }
     }
 
     /** Supplier for the player's current world location. Production
@@ -101,6 +105,16 @@ public final class V2Navigator implements Navigator
     @Nullable private WorldPoint activeTarget;
     @Nullable private V2Path activePath;
     @Nullable private FailureReason lastFailureReason;
+    /** Round-2 replan budget: number of executor-driven replans (e.g.
+     *  TRANSPORT_RESULT_MISMATCH) consumed for the active request.
+     *  Bounded by {@link #MAX_REPLANS_PER_REQUEST} so a transport whose
+     *  toTile is wrong doesn't loop forever. Resets when target changes. */
+    private int replansThisRequest;
+    /** One executor-driven replan per request — empirically this is enough
+     *  to absorb a single wrong-toTile correction. If more replans are
+     *  required, the recorded data is too stale and the script should
+     *  fail (or fall back to V1). */
+    public static final int MAX_REPLANS_PER_REQUEST = 1;
 
     public V2Navigator(V2Planner planner, V2Executor executor, PlayerLocSupplier playerLoc)
     {
@@ -147,6 +161,7 @@ public final class V2Navigator implements Navigator
             @Override public void cancel() { executor.cancel(); }
             @Override public V2Executor.Status status() { return executor.status(); }
             @Override public V2Executor.FailureReason lastFailureReason() { return executor.lastFailureReason(); }
+            @Override public boolean wantsReplanFromHere() { return executor.wantsReplanFromHere(); }
         };
     }
 
@@ -180,7 +195,7 @@ public final class V2Navigator implements Navigator
         }
         if (!target.equals(activeTarget))
         {
-            // New (or first) destination — replan.
+            // New (or first) destination — replan and reset budget.
             WorldPoint here = playerLoc.get();
             if (here == null)
             {
@@ -204,8 +219,49 @@ public final class V2Navigator implements Navigator
             activeTarget = target;
             activePath = path;
             lastFailureReason = null;
+            replansThisRequest = 0;
             executor.setPath(path);
         }
+
+        // Round-2 replan signal: executor self-corrected a transport edge
+        // and asks the navigator to replan from the player's actual
+        // position. Bounded by MAX_REPLANS_PER_REQUEST.
+        if (executor.wantsReplanFromHere())
+        {
+            if (replansThisRequest >= MAX_REPLANS_PER_REQUEST)
+            {
+                log.warn("worldmap-v2: replan budget exhausted ({}/{}), surfacing FAILED — exec.reason={}",
+                    replansThisRequest, MAX_REPLANS_PER_REQUEST, executor.lastFailureReason());
+                lastFailureReason = FailureReason.EXECUTOR_FAILED;
+                executor.cancel();
+                return NavStatus.FAILED;
+            }
+            WorldPoint here = playerLoc.get();
+            if (here == null)
+            {
+                log.warn("worldmap-v2: replan-from-here requested but player loc unknown");
+                lastFailureReason = FailureReason.NO_PLAYER_LOC;
+                return NavStatus.FAILED;
+            }
+            V2Path path = planner.plan(here, target, request.mode());
+            if (path == null || path.isEmpty())
+            {
+                log.warn("worldmap-v2: replan-from-here NO_ROUTE from {} to {} — {}",
+                    here, target, diagnoseSafely(here, target));
+                lastFailureReason = FailureReason.NO_ROUTE;
+                executor.cancel();
+                return NavStatus.FAILED;
+            }
+            log.info("worldmap-v2: replan-from-here {} → {} legs={} cost={} routeId={} (replan {}/{})",
+                here, target, path.legs().size(), path.totalCost(), path.routeId(),
+                replansThisRequest + 1, MAX_REPLANS_PER_REQUEST);
+            replansThisRequest++;
+            activePath = path;
+            executor.setPath(path);
+            // Continue to executor.tick() below so the new path drives
+            // immediately, not on the next tick.
+        }
+
         NavStatus s = mapStatus(executor.tick());
         if (s == NavStatus.FAILED)
         {

@@ -54,8 +54,12 @@ public class CanvasTilePickerTest
     }
 
     @Test
-    public void pickedDistance_isWeighted_among_long_mid_short()
+    public void pickedDistance_isShortMidOnly_round2()
     {
+        // Round-2 stabilization: long bucket is gated off by default.
+        // Live testing showed long picks (12-16 tiles) outran the engine's
+        // pathfinder on unfamiliar terrain, producing the "5 forward, 2
+        // back" stall flap. Picks must land in short (2-3) or mid (6-8).
         V2Path path = straightEastPath(40);
         WorldPoint player = new WorldPoint(3208, 3217, 0);
         CanvasTilePicker picker = new CanvasTilePicker();
@@ -72,9 +76,44 @@ public class CanvasTilePickerTest
         }
         assertTrue("short bucket must get sampled (got " + shortHits + ")", shortHits > 5);
         assertTrue("mid bucket must get sampled (got " + midHits + ")", midHits > 5);
-        assertTrue("long bucket must get sampled (got " + longHits + ")", longHits > 5);
-        assertEquals("every pick must land in one of the three buckets",
-            200, shortHits + midHits + longHits);
+        assertEquals("long bucket must NOT be used in round-2 default mode (got " + longHits + ")",
+            0, longHits);
+        assertEquals("every pick must land in short or mid bucket",
+            200, shortHits + midHits);
+    }
+
+    @Test
+    public void pickNextInTilesAfter_rejectsBackwardCandidates()
+    {
+        // Progress cursor: player walks past tile idx 5 to tile idx 10.
+        // closestIndex would say playerIdx=10. With minIdxExclusive=8
+        // (cursor high-water), candidates must be from idx 9..end,
+        // never idx <= 8.
+        V2Path path = straightEastPath(20);
+        List<WorldPoint> tiles = ((V2Leg.Walk) path.legs().get(0)).tiles();
+        WorldPoint player = tiles.get(10);
+        CanvasTilePicker picker = new CanvasTilePicker();
+        Random rng = new Random(31);
+        for (int i = 0; i < 100; i++)
+        {
+            WorldPoint pick = picker.pickNextInTilesAfter(tiles, 8, player, allowAll(), rng, true);
+            if (pick == null) continue;
+            int idx = tiles.indexOf(pick);
+            assertTrue("candidate idx " + idx + " must be > floor (8)", idx > 8);
+        }
+    }
+
+    @Test
+    public void pickNextInTilesAfter_floorAdvancesProgress()
+    {
+        // With floor at the end of the path, no forward candidate exists.
+        V2Path path = straightEastPath(20);
+        List<WorldPoint> tiles = ((V2Leg.Walk) path.legs().get(0)).tiles();
+        WorldPoint player = tiles.get(10);
+        CanvasTilePicker picker = new CanvasTilePicker();
+        WorldPoint pick = picker.pickNextInTilesAfter(tiles, tiles.size() - 1, player,
+            allowAll(), new Random(0), true);
+        assertNull("floor at end → no forward candidate → null", pick);
     }
 
     @Test
