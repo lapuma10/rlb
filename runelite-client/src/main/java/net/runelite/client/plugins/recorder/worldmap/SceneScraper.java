@@ -125,6 +125,17 @@ public final class SceneScraper
                         || sceneY >= flags[sceneX].length) continue;
 
                     int movement = flags[sceneX][sceneY];
+                    // Skip the engine's "off-scene" sentinel (0x00ffffff —
+                    // every block bit set). The scraper sees this for tiles
+                    // inside the scrape window but outside the actively-
+                    // loaded scene chunks (the engine returns it for any
+                    // tile whose collision data isn't truly resident). If
+                    // we wrote it, the planner would treat those tiles as
+                    // hard walls, blocking corridors the bot can actually
+                    // traverse — exactly the live failure that surfaced
+                    // this. Leaving the prior tile data (or absence) lets
+                    // the planner treat unknown tiles as crossable instead.
+                    if (movement == 0x00ffffff) continue;
                     builder.setTile(worldX, worldY, plane, movement);
                 }
 

@@ -184,8 +184,8 @@ public final class MultiRegionAStar
 
         if (!found || !gScore.containsKey(goalKey))
         {
-            log.debug("multi-region-astar: no path {}→{} (expanded={})",
-                from, to, expanded);
+            log.warn("multi-region-astar: no path {}→{} (expanded={}, gScore.size={}, hitCap={})",
+                from, to, expanded, gScore.size(), expanded >= config.maxExpandedTiles);
             return V2Path.EMPTY;
         }
         return reconstruct(from, to, walkParent, transportParent,
@@ -316,6 +316,13 @@ public final class MultiRegionAStar
         RegionChunkSnapshot.TileEntry destTile = destSnap.tile(nx, ny, plane);
         if (destTile == null) return UNKNOWN_TILE_COST;
         int destFlags = destTile.movement;
+        // Engine's "off-scene" sentinel — collision data for a tile
+        // inside the scrape window but outside the truly-loaded scene
+        // chunks. The scraper now skips writing it (see SceneScraper)
+        // but historical snapshots have it baked in; treat as unknown
+        // so the planner can route through corridors the bot can
+        // actually traverse.
+        if (destFlags == 0x00ffffff) return UNKNOWN_TILE_COST;
 
         int xFlags = CollisionDataFlag.BLOCK_MOVEMENT_FULL;
         int yFlags = CollisionDataFlag.BLOCK_MOVEMENT_FULL;
