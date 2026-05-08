@@ -37,10 +37,16 @@ import net.runelite.client.plugins.recorder.worldmap.WorldMemoryConfig;
  *        selection is the responsibility of the top-K layer.</li>
  *  </ul>
  *
- *  <p>Heuristic: Chebyshev distance in (x, y) ignoring plane. Admissible
- *  for 8-direction movement and stays admissible across plane changes
- *  because plane traversal is free in Chebyshev terms (real cost is
- *  paid by the transport edge). */
+ *  <p>Heuristic: Chebyshev distance in (x, y) plus
+ *  {@link #TRANSPORT_BASE_COST} when source and goal are on different
+ *  planes. Admissible for 8-direction movement: any cross-plane path
+ *  must traverse at least one transport edge of cost
+ *  {@code TRANSPORT_BASE_COST}, so the plane term is a valid lower
+ *  bound on the inevitable transport cost. The added term is critical
+ *  for cross-plane queries — without it A* would treat same-plane
+ *  walking as cost-equivalent to (transport + destination-plane walk)
+ *  and flood the source plane until {@link
+ *  WorldMemoryConfig#maxExpandedTiles} is exhausted. */
 @Slf4j
 public final class MultiRegionAStar
 {

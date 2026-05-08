@@ -124,6 +124,52 @@ public class MultiRegionAStarTest
     }
 
     @Test
+    public void plan_crossPlaneSparseSource_routesViaTransport_doesNotFloodSourcePlane()
+    {
+        // Regression for the live failure that prompted the plane-aware
+        // heuristic. Setup: start on plane 2 with sparse source-plane
+        // data (forces unknown-tile walks at UNKNOWN_TILE_COST≈1.0).
+        // Goal far north on plane 0. A single staircase transport
+        // (Bottom-floor) is the only cross-plane edge.
+        //
+        // Without the plane-aware heuristic, A* sees same-plane walking
+        // as cost-equivalent to (transport + destination-plane walk),
+        // floods plane 2 outward, and exhausts maxExpandedTiles
+        // returning EMPTY. With the plane-aware h, A* correctly prefers
+        // transport descendants and finds the goal in bounded expansion.
+        MapStore store = new MapStore(wm);
+        int regionId = RegionIds.regionIdFor(3208, 3220);
+        java.util.List<WorldMemoryFixtures.TileSpec> tiles = new java.util.ArrayList<>();
+        // Start tile + a sparse plane-2 walkable corridor to the staircase
+        // approach — leave the rest of plane 2 entirely unknown.
+        tiles.add(walkable(3208, 3220, 2));
+        for (int y = 3221; y <= 3229; y++) tiles.add(walkable(3206, y, 2));
+        // Plane-0 corridor from staircase exit to goal.
+        for (int y = 3228; y <= 3294; y++) tiles.add(walkable(3205, y, 0));
+        for (int x = 3206; x <= 3235; x++) tiles.add(walkable(x, 3294, 0));
+        tiles.add(walkable(3235, 3295, 0));
+        WorldMemoryFixtures.installRegion(store, regionId, tiles);
+
+        TransportIndex idx = new TransportIndex();
+        idx.add(new TransportEdge(
+            new WorldPoint(3206, 3229, 2),
+            new WorldPoint(3205, 3228, 0),
+            56231, "Staircase", "Bottom-floor",
+            0, 0, "object",
+            new WorldPoint(3206, 3229, 2),
+            regionId, 1, 0L, 0L));
+
+        MultiRegionAStar a = new MultiRegionAStar(store, idx, wm);
+        V2Path path = a.plan(new WorldPoint(3208, 3220, 2), new WorldPoint(3235, 3295, 0));
+
+        assertFalse("cross-plane plan with sparse source plane must succeed",
+            path.isEmpty());
+        boolean hasTransport = path.legs().stream().anyMatch(l -> l instanceof V2Leg.Transport);
+        assertTrue("path must use the staircase transport, not flood plane 2",
+            hasTransport);
+    }
+
+    @Test
     public void plan_blockedTilesRespected_eachStepPrefersKnownWalkable()
     {
         // Permissive mode still respects collision flags on known tiles.
