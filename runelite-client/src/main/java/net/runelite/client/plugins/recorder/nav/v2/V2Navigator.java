@@ -110,11 +110,16 @@ public final class V2Navigator implements Navigator
      *  Bounded by {@link #MAX_REPLANS_PER_REQUEST} so a transport whose
      *  toTile is wrong doesn't loop forever. Resets when target changes. */
     private int replansThisRequest;
-    /** One executor-driven replan per request — empirically this is enough
-     *  to absorb a single wrong-toTile correction. If more replans are
-     *  required, the recorded data is too stale and the script should
-     *  fail (or fall back to V1). */
-    public static final int MAX_REPLANS_PER_REQUEST = 1;
+    /** Executor-driven replans per request. Bumped 1 → 3 after live
+     *  bank↔pen testing: a single misrecorded {@code toTile} (e.g.
+     *  "Climb-down p2→p0" actually goes p2→p1) commonly cascades into
+     *  a second misrecording on the next floor (p1→p0 via "Climb-up"
+     *  that actually goes p1→p2), and the bot needs at least two
+     *  replans to self-heal both edges before a third replan picks the
+     *  correct route. 3 leaves headroom for one transport graph that's
+     *  fully corrupted; if more replans are needed, the recorded data
+     *  is too stale and the script should fail loudly. */
+    public static final int MAX_REPLANS_PER_REQUEST = 3;
 
     public V2Navigator(V2Planner planner, V2Executor executor, PlayerLocSupplier playerLoc)
     {
