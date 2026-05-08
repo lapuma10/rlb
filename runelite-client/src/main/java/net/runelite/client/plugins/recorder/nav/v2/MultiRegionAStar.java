@@ -51,6 +51,26 @@ public final class MultiRegionAStar
      *  value; tune as data warrants. */
     static final int TRANSPORT_BASE_COST = 2;
 
+    /** Cost multiplier for a step into a tile not present in the
+     *  {@link MapStore} snapshot (region not loaded, or region loaded
+     *  but tile missing). Round-2 stabilization: the planner prefers
+     *  known-walkable paths but treats unknown tiles as crossable at
+     *  5× cost so a route can still be planned through corridors the
+     *  scraper hasn't fully captured yet. The executor walks into the
+     *  unknown; the live scraper fills in tiles as the player moves;
+     *  the next replan completes the route on a now-complete graph.
+     *
+     *  <p>Live failure that motivated this: bot walked bank → pen
+     *  manually, but region 12850 plane-0 has a y=3239..3263 strip
+     *  with only 1-6 walkable tiles per row (narrow east-Lumbridge
+     *  road). The strict planner couldn't BFS across the gap even
+     *  though the corridor was physically traversable. */
+    static final double UNKNOWN_TILE_COST = 5.0;
+    /** Sentinel: walk impossible. Distinct from UNKNOWN_TILE_COST
+     *  (allowed-but-expensive) so the caller can drop the neighbor
+     *  with a cheap isInfinite check. */
+    private static final double BLOCKED_COST = Double.POSITIVE_INFINITY;
+
     private final MapStore mapStore;
     private final TransportIndex transports;
     private final WorldMemoryConfig config;
@@ -113,12 +133,13 @@ public final class MultiRegionAStar
             for (int i = 0; i < 8; i++)
             {
                 int nx = x + DX[i], ny = y + DY[i];
-                if (!canWalk(x, y, plane, DX[i], DY[i])) continue;
+                double baseCost = walkCost(x, y, plane, DX[i], DY[i]);
+                if (Double.isInfinite(baseCost)) continue;
                 long nk = pack(nx, ny, plane);
-                double cost = 1.0;
+                double cost = baseCost;
                 if (noise > 0 && rng != null)
                 {
-                    cost = 1.0 + (rng.nextDouble() * 2 - 1) * noise;
+                    cost *= 1.0 + (rng.nextDouble() * 2 - 1) * noise;
                 }
                 Double pen = edgePenalties.get(walkEdgeKey(x, y, plane, nx, ny));
                 if (pen != null) cost *= pen;
@@ -250,21 +271,30 @@ public final class MultiRegionAStar
         return "W|" + ax + "," + ay + "|" + bx + "," + by + "|p" + plane;
     }
 
-    /** Cross-region-aware {@code canTravel}. Looks the destination tile
-     *  up via the {@link MapStore} so a region boundary doesn't block
-     *  expansion when the neighbour's snapshot is loaded. */
-    private boolean canWalk(int x, int y, int plane, int dx, int dy)
+    /** Cross-region-aware step cost. Returns:
+     *  <ul>
+     *    <li>{@code 1.0} — known walkable (snapshot has tile, no
+     *        block flags blocking the step)</li>
+     *    <li>{@link #UNKNOWN_TILE_COST} — region or tile missing from
+     *        the snapshot. Treated as crossable so the planner can
+     *        produce a path through partially-scraped corridors; the
+     *        executor handles the inevitable static-collision /
+     *        openable-blocker cases at run time.</li>
+     *    <li>{@link #BLOCKED_COST} — destination tile is in the
+     *        snapshot and its collision flags forbid the step.</li>
+     *  </ul> */
+    private double walkCost(int x, int y, int plane, int dx, int dy)
     {
         dx = Integer.signum(dx);
         dy = Integer.signum(dy);
-        if (dx == 0 && dy == 0) return true;
+        if (dx == 0 && dy == 0) return BLOCKED_COST;
 
         int nx = x + dx, ny = y + dy;
         int destRegion = RegionIds.regionIdFor(nx, ny);
         RegionChunkSnapshot destSnap = mapStore.snapshotFor(destRegion);
-        if (destSnap == null) return false;
+        if (destSnap == null) return UNKNOWN_TILE_COST;
         RegionChunkSnapshot.TileEntry destTile = destSnap.tile(nx, ny, plane);
-        if (destTile == null) return false;
+        if (destTile == null) return UNKNOWN_TILE_COST;
         int destFlags = destTile.movement;
 
         int xFlags = CollisionDataFlag.BLOCK_MOVEMENT_FULL;
@@ -281,10 +311,10 @@ public final class MultiRegionAStar
         if (dx > 0 && dy < 0) xyFlags |= CollisionDataFlag.BLOCK_MOVEMENT_NORTH_WEST;
         if (dx > 0 && dy > 0) xyFlags |= CollisionDataFlag.BLOCK_MOVEMENT_SOUTH_WEST;
 
-        if (dx != 0 && (destFlags & xFlags) != 0) return false;
-        if (dy != 0 && (destFlags & yFlags) != 0) return false;
-        if (dx != 0 && dy != 0 && (destFlags & xyFlags) != 0) return false;
-        return true;
+        if (dx != 0 && (destFlags & xFlags) != 0) return BLOCKED_COST;
+        if (dy != 0 && (destFlags & yFlags) != 0) return BLOCKED_COST;
+        if (dx != 0 && dy != 0 && (destFlags & xyFlags) != 0) return BLOCKED_COST;
+        return 1.0;
     }
 
     private static long pack(WorldPoint p)

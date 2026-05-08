@@ -99,26 +99,59 @@ public class MultiRegionAStarTest
     }
 
     @Test
-    public void plan_destinationUnreachable_returnsEmpty()
+    public void plan_unknownTilesAcrossGap_routesAtPenaltyCost()
     {
+        // Round-2 stabilization: when intermediate tiles aren't in the
+        // snapshot, the planner crosses them at UNKNOWN_TILE_COST instead
+        // of returning empty. The bot drives the partial plan; the
+        // scraper fills in tiles as the player walks; the next replan
+        // completes on a now-complete graph. Live failure that motivated
+        // this: bank → pen route had a y=3239..3263 strip with sparse
+        // snapshot data; strict planner NO_ROUTE'd, executor never moved.
         MapStore store = new MapStore(wm);
         int regionId = RegionIds.regionIdFor(3208, 3213);
+        // Only the start + goal tiles are in the snapshot — the 6 tiles
+        // between them are unknown.
         WorldMemoryFixtures.installRegion(store, regionId,
-            List.of(walkable(3208, 3213, 0)));
+            List.of(walkable(3208, 3213, 0), walkable(3215, 3213, 0)));
 
         MultiRegionAStar a = new MultiRegionAStar(store, new TransportIndex(), wm);
         V2Path path = a.plan(new WorldPoint(3208, 3213, 0), new WorldPoint(3215, 3213, 0));
 
-        assertTrue("unreachable destination → empty path", path.isEmpty());
+        assertFalse("permissive planner must route across unknown tiles", path.isEmpty());
+        assertTrue("path cost should reflect the UNKNOWN_TILE_COST multiplier",
+            path.totalCost() >= 7);   // 7 unknown steps × 5 = 35; but heuristic + cost rounding
     }
 
     @Test
-    public void plan_noSnapshotForRegion_returnsEmpty()
+    public void plan_blockedTilesRespected_eachStepPrefersKnownWalkable()
     {
+        // Permissive mode still respects collision flags on known tiles.
+        // Path from (3208,3213,0) → (3211,3213,0):
+        //   (3209,3213) is BLOCK_MOVEMENT_FULL — must not be stepped on
+        //   (3209,3214) is walkable — alternate northern route
+        // Planner must produce a non-empty path that avoids (3209,3213).
         MapStore store = new MapStore(wm);
+        int regionId = RegionIds.regionIdFor(3208, 3213);
+        java.util.List<WorldMemoryFixtures.TileSpec> tiles = new java.util.ArrayList<>();
+        tiles.add(walkable(3208, 3213, 0));
+        tiles.add(walkable(3210, 3213, 0));
+        tiles.add(walkable(3211, 3213, 0));
+        tiles.add(walkable(3209, 3214, 0));   // alternate path
+        tiles.add(walkable(3210, 3214, 0));
+        // The blocked tile (with collision flags forbidding movement).
+        tiles.add(WorldMemoryFixtures.withMovement(3209, 3213, 0,
+            net.runelite.api.CollisionDataFlag.BLOCK_MOVEMENT_FULL));
+        WorldMemoryFixtures.installRegion(store, regionId, tiles);
+
         MultiRegionAStar a = new MultiRegionAStar(store, new TransportIndex(), wm);
-        V2Path path = a.plan(new WorldPoint(3208, 3213, 0), new WorldPoint(3212, 3213, 0));
-        assertTrue(path.isEmpty());
+        V2Path path = a.plan(new WorldPoint(3208, 3213, 0), new WorldPoint(3211, 3213, 0));
+
+        assertFalse("alternate northern route should be planable", path.isEmpty());
+        boolean steppedOnBlocked = path.allTiles().stream()
+            .anyMatch(t -> t.getX() == 3209 && t.getY() == 3213 && t.getPlane() == 0);
+        assertFalse("plan must not step on the BLOCK_MOVEMENT_FULL tile",
+            steppedOnBlocked);
     }
 
     @Test

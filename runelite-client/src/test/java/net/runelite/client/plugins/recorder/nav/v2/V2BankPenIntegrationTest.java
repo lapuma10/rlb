@@ -161,16 +161,20 @@ public class V2BankPenIntegrationTest
     }
 
     @Test
-    public void v2Strict_bankToPen_missingCorridorGap_fails()
+    public void v2Strict_bankToPen_missingCorridorGap_routesViaUnknownTiles()
     {
+        // Round-2 stabilization: a snapshot gap (no tiles between two
+        // walkable patches) is no longer a hard NO_ROUTE. The planner
+        // crosses unknown tiles at penalty cost; the executor walks
+        // into them and the live scraper fills in data as the player
+        // moves. Replan completes the route on a now-complete graph.
         MapStore s = new MapStore(new WorldMemoryConfig());
         TransportIndex t = new TransportIndex();
-        // Two disjoint patches — no tiles bridge x=3220..3225, so the
-        // planner can't build a connected route.
         seedTiles(s, rect(3204, 3216, 3220, 3296));
         seedTiles(s, rect(3225, 3270, 3240, 3296));
         V2Path path = planner(s, t).plan(BANK, PEN_NORTH, BehaviorMode.VARIED);
-        assertTrue("missing corridor gap → empty path", path.isEmpty());
+        assertFalse("permissive planner must route across the snapshot gap",
+            path.isEmpty());
     }
 
     @Test
