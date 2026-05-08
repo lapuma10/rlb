@@ -445,10 +445,30 @@ public class RecorderPlugin extends Plugin
         // reject window) that shouldn't bleed across independent walks.
         net.runelite.client.plugins.recorder.nav.v2.RouteHistory v2RouteHistory
             = new net.runelite.client.plugins.recorder.nav.v2.RouteHistory();
+        // Trail-bias adapter: V2Planner asks for a trail's tile sequence
+        // by name, gets back the recorded WorldPoints (or null when the
+        // trail isn't on disk). Steers A* toward the V1-recorded route
+        // for known destinations while keeping V2's adaptability when
+        // those tiles are blocked at runtime.
+        java.util.function.Function<String, java.util.List<net.runelite.api.coords.WorldPoint>>
+            v2TrailTilesByName = name -> {
+                if (name == null || name.isBlank()) return null;
+                net.runelite.client.plugins.recorder.trail.Trail t = trailRegistry.byName(name);
+                if (t == null) return null;
+                java.util.List<net.runelite.api.coords.WorldPoint> tiles = new java.util.ArrayList<>();
+                for (var ev : t.events())
+                {
+                    if (ev instanceof net.runelite.client.plugins.recorder.trail.TrailEvent.Tile tile)
+                    {
+                        tiles.add(tile.tile());
+                    }
+                }
+                return tiles;
+            };
         net.runelite.client.plugins.recorder.nav.v2.V2Planner sharedV2Planner
             = new net.runelite.client.plugins.recorder.nav.v2.V2Planner(
                 worldMapStore, transportIndex, wmConfig, v2RouteHistory,
-                config::enableV2RouteVariation);
+                config::enableV2RouteVariation, v2TrailTilesByName);
 
         // Chicken farm V3 — Navigator-driven outer FSM. Each script that
         // opts into V2 carries its own dispatcher (no busy-flag contention)

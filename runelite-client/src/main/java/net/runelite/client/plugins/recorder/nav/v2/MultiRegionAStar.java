@@ -83,6 +83,14 @@ public final class MultiRegionAStar
      *  available. The executor's stall handling + replan recovers if
      *  a sentinel tile turns out to be water/wall mid-route. */
     static final double SENTINEL_TILE_COST = 3.0;
+
+    /** Multiplier on walk-edge cost when stepping into a tile recorded
+     *  in the request's V1 trail. Halving makes A* prefer corridors that
+     *  hit trail tiles even when the cost-optimal off-trail path is
+     *  comparable — gives V2 V1's natural-looking routes for known
+     *  destinations while keeping A*'s ability to deviate around live
+     *  obstacles (NPCs, closed gates) the trail can't anticipate. */
+    static final double TRAIL_PREFERENCE_MULTIPLIER = 0.5;
     /** Sentinel: walk impossible. Distinct from UNKNOWN_TILE_COST
      *  (allowed-but-expensive) so the caller can drop the neighbor
      *  with a cheap isInfinite check. */
@@ -118,6 +126,27 @@ public final class MultiRegionAStar
      *  walks and {@link TransportEdge#key} for transports). */
     public V2Path plan(WorldPoint from, WorldPoint to, double noise,
                        Map<String, Double> edgePenalties, @Nullable Random rng)
+    {
+        return plan(from, to, noise, edgePenalties, rng, Collections.emptySet());
+    }
+
+    /** Trail-bias variant: walk edges whose destination tile is in
+     *  {@code preferredDestKeys} get their cost halved. Used to steer A*
+     *  toward a recorded V1 trail when one exists for the request, while
+     *  still allowing deviation when the trail's tiles are blocked
+     *  (NPCs, transient obstacles). The bias is applied to the
+     *  destination tile (not the edge) so any approach into a trail tile
+     *  benefits — that's enough to make an A* with admissible heuristic
+     *  prefer corridors that hit trail tiles, even when the cost-optimal
+     *  off-trail path is similar in raw distance. Live observation that
+     *  motivated this: V2 found a 110-tile path through the Lumbridge
+     *  castle SE corner that loops around the outer wall (cost-optimal,
+     *  visually awkward); V1's recorded trail goes via the y=3219
+     *  corridor — both walkable, but only the trail-biased route looks
+     *  player-natural. */
+    public V2Path plan(WorldPoint from, WorldPoint to, double noise,
+                       Map<String, Double> edgePenalties, @Nullable Random rng,
+                       Set<Long> preferredDestKeys)
     {
         if (from == null || to == null) return V2Path.EMPTY;
         long startKey = pack(from);
@@ -160,6 +189,10 @@ public final class MultiRegionAStar
                 }
                 Double pen = edgePenalties.get(walkEdgeKey(x, y, plane, nx, ny));
                 if (pen != null) cost *= pen;
+                if (!preferredDestKeys.isEmpty() && preferredDestKeys.contains(pack(nx, ny, plane)))
+                {
+                    cost *= TRAIL_PREFERENCE_MULTIPLIER;
+                }
                 double tentative = gNow + cost;
                 Double existing = gScore.get(nk);
                 if (existing == null || tentative < existing)

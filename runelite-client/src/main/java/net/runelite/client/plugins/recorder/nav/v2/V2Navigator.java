@@ -42,6 +42,16 @@ public final class V2Navigator implements Navigator
     public interface PlannerHook
     {
         V2Path plan(WorldPoint from, WorldPoint to, BehaviorMode mode);
+        /** Trail-bias overload: when {@code trailName} resolves to a
+         *  recorded V1 trail, the planner steers A* toward the trail's
+         *  recorded tiles. Default delegates to the unbiased
+         *  {@link #plan(WorldPoint, WorldPoint, BehaviorMode)} so test
+         *  hooks that don't care about trails keep working. */
+        default V2Path plan(WorldPoint from, WorldPoint to, BehaviorMode mode,
+                            @Nullable String trailName)
+        {
+            return plan(from, to, mode);
+        }
         default String diagnose(WorldPoint from, WorldPoint to) { return "(no diagnostic available)"; }
     }
 
@@ -138,6 +148,9 @@ public final class V2Navigator implements Navigator
         {
             @Override public V2Path plan(WorldPoint from, WorldPoint to, BehaviorMode mode)
             { return planner.plan(from, to, mode); }
+            @Override public V2Path plan(WorldPoint from, WorldPoint to, BehaviorMode mode,
+                                         @Nullable String trailName)
+            { return planner.plan(from, to, mode, trailName); }
             @Override public String diagnose(WorldPoint from, WorldPoint to)
             { return planner.diagnose(from, to); }
         };
@@ -208,7 +221,7 @@ public final class V2Navigator implements Navigator
                 lastFailureReason = FailureReason.NO_PLAYER_LOC;
                 return NavStatus.FAILED;
             }
-            V2Path path = planner.plan(here, target, request.mode());
+            V2Path path = planner.plan(here, target, request.mode(), request.trailName());
             if (path == null || path.isEmpty())
             {
                 log.warn("worldmap-v2: NO_ROUTE from {} to {} — {}",
@@ -219,8 +232,9 @@ public final class V2Navigator implements Navigator
                 lastFailureReason = FailureReason.NO_ROUTE;
                 return NavStatus.FAILED;
             }
-            log.info("worldmap-v2: plan {} → {} legs={} cost={} routeId={}",
-                here, target, path.legs().size(), path.totalCost(), path.routeId());
+            log.info("worldmap-v2: plan {} → {} legs={} cost={} routeId={} trail={}",
+                here, target, path.legs().size(), path.totalCost(), path.routeId(),
+                request.trailName() == null ? "none" : request.trailName());
             activeTarget = target;
             activePath = path;
             lastFailureReason = null;
@@ -248,7 +262,7 @@ public final class V2Navigator implements Navigator
                 lastFailureReason = FailureReason.NO_PLAYER_LOC;
                 return NavStatus.FAILED;
             }
-            V2Path path = planner.plan(here, target, request.mode());
+            V2Path path = planner.plan(here, target, request.mode(), request.trailName());
             if (path == null || path.isEmpty())
             {
                 log.warn("worldmap-v2: replan-from-here NO_ROUTE from {} to {} — {}",
@@ -257,9 +271,10 @@ public final class V2Navigator implements Navigator
                 executor.cancel();
                 return NavStatus.FAILED;
             }
-            log.info("worldmap-v2: replan-from-here {} → {} legs={} cost={} routeId={} (replan {}/{})",
+            log.info("worldmap-v2: replan-from-here {} → {} legs={} cost={} routeId={} (replan {}/{}) trail={}",
                 here, target, path.legs().size(), path.totalCost(), path.routeId(),
-                replansThisRequest + 1, MAX_REPLANS_PER_REQUEST);
+                replansThisRequest + 1, MAX_REPLANS_PER_REQUEST,
+                request.trailName() == null ? "none" : request.trailName());
             replansThisRequest++;
             activePath = path;
             executor.setPath(path);
