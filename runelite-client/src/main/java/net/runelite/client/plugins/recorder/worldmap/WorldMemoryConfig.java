@@ -10,22 +10,27 @@ public final class WorldMemoryConfig
     public final int scrapeEveryNTicks = 2;
 
     /** Window radius around player to scrape (window is 2R+1 wide).
-     *  Bumped from 9 → 25 after the live bank↔pen failure: at radius
-     *  9 the scraper only captures tiles within ~9 of the bot's
-     *  exact path, so a corridor walked once leaves huge gaps in
-     *  region snapshots. The OSRS loaded scene is 104×104 tiles
-     *  (~52 either side); 25 captures a 51×51 = 2601-tile window per
-     *  tick — well within the loaded scene and well within the 2 ms
-     *  scrape budget on modern hardware. Future bump to ~52 once
-     *  the scrape budget is widened to match. */
-    public final int scrapeWindowRadius = 25;
+     *  Bumped 9 → 25 → 52 after live bank↔pen testing. The OSRS loaded
+     *  scene is 104×104 tiles, so radius 52 captures EXACTLY the
+     *  engine-loaded scene every scrape — no tile the engine has
+     *  loaded is left out. Live failure that motivated the final bump:
+     *  bot walked bank → pen, captured a narrow strip along its path,
+     *  but the planner's known-walkable cone preferred a 110-tile
+     *  bridge/church detour over the 75-tile direct corridor because
+     *  the direct corridor still had unknown gaps the 25-tile window
+     *  didn't reach.  At radius 52 a single trip captures the full
+     *  surrounding ~10000-tile area; the planner can pick straight
+     *  routes from then on. */
+    public final int scrapeWindowRadius = 52;
 
     /** Per-tick scrape budget. If a scrape would exceed this in nanos,
-     *  skip and log; lastScrapedAt does NOT advance. Bumped from 2 ms
-     *  → 8 ms to accommodate the wider scrape window (radius 25 ⇒ 2601
-     *  cells × 4 planes ≈ 10k array reads + ~5k builder writes per
-     *  tick). 8 ms is 1.3% of an OSRS tick (600 ms) — comfortable. */
-    public final long scrapeBudgetNanos = 8_000_000;  // 8 ms
+     *  skip and log; lastScrapedAt does NOT advance. Bumped 2 ms →
+     *  8 ms → 20 ms to accommodate the full-scene scrape window
+     *  (radius 52 ⇒ 105×105 = 11025 cells × 4 planes ≈ 44k array
+     *  reads + ~20k builder writes per tick). With scrapeEveryNTicks=2
+     *  this is 20 ms every 1.2 s = 1.7 % CPU — well under the budget
+     *  for an OSRS tick and lossless on modern hardware. */
+    public final long scrapeBudgetNanos = 20_000_000;  // 20 ms
 
     /** Flush dirty chunks every N seconds. */
     public final int flushEverySeconds = 30;
