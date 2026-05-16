@@ -5,21 +5,20 @@ and license information.
 
 ## Skretzo — shortest-path RuneLite plugin
 
-We vendor the global tile collision snapshot from the open-source RuneLite
-shortest-path plugin by Skretzo.
+We vendor the global tile collision snapshot and the transport-link
+TSV data from the open-source RuneLite shortest-path plugin by
+Skretzo.
 
-| Field         | Value                                                        |
-|---------------|--------------------------------------------------------------|
-| Project       | shortest-path                                                |
-| Author        | Skretzo                                                      |
-| Repository    | https://github.com/Skretzo/shortest-path                     |
-| License       | BSD-2-Clause                                                 |
-| Bundled file  | `runelite-client/src/main/resources/nav/collision/collision-map.zip` |
-| Manifest      | `runelite-client/src/main/resources/nav/collision/MANIFEST.md`        |
-
-Skretzo's transport TSVs (under `src/main/resources/transports/`) will be vendored
-in Lane 4 to `runelite-client/src/main/resources/nav/transports/` under
-the same license.
+| Field         | Value                                                                  |
+|---------------|------------------------------------------------------------------------|
+| Project       | shortest-path                                                          |
+| Author        | Skretzo                                                                |
+| Repository    | https://github.com/Skretzo/shortest-path                               |
+| License       | BSD-2-Clause                                                           |
+| Collision data| `runelite-client/src/main/resources/nav/collision/collision-map.zip`   |
+| Transport TSVs| `runelite-client/src/main/resources/nav/transports/*.tsv`              |
+| Manifests     | `runelite-client/src/main/resources/nav/collision/MANIFEST.md`         |
+|               | `runelite-client/src/main/resources/nav/transports/MANIFEST.md`        |
 
 Note: spec §9 originally proposed `runelite/nav/...` paths, but the
 `runelite-gradle-plugin`'s `IndexTask` iterates `runelite/*` and
