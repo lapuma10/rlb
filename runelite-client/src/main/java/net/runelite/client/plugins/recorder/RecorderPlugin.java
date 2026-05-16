@@ -499,14 +499,6 @@ public class RecorderPlugin extends Plugin
         panel.setInspectionDumper(inspectionDumper,
             net.runelite.client.plugins.recorder.worldmap.WorldMapMinimapOverlay::clearActiveRoute);
 
-        // Phase 8 readiness service — shared across the panel buttons.
-        // Built once here so it can sit beside V2Planner and read live
-        // world memory without any per-script wiring.
-        net.runelite.client.plugins.recorder.nav.v2.RouteReadiness routeReadiness =
-            new net.runelite.client.plugins.recorder.nav.v2.RouteReadiness(
-                worldMapStore, transportIndex, sharedV2Planner);
-        panel.setRouteReadiness(routeReadiness);
-
         BufferedImage icon = ImageUtil.loadImageResource(getClass(), "/util/reset.png");
         navButton = NavigationButton.builder()
             .tooltip("Recorder")

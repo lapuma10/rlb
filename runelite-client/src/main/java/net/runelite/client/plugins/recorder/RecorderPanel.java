@@ -159,15 +159,12 @@ public final class RecorderPanel extends PluginPanel
     private RouteOverlay routeOverlay;
     private net.runelite.client.plugins.recorder.inspector.ClickInspector clickInspector;
     private net.runelite.client.plugins.recorder.worldmap.InspectionDumper inspectionDumper;
-    private net.runelite.client.plugins.recorder.nav.v2.RouteReadiness routeReadiness;
     private Runnable v2OverlayClearAction;
     private final JButton v2DumpRegionBtn = new JButton("Dump current region");
     private final JButton v2DumpNearbyBtn = new JButton("Dump nearby regions");
     private final JButton v2DumpTransportsBtn = new JButton("Dump transport graph");
     private final JButton v2DumpEntitiesBtn = new JButton("Dump entity sightings");
     private final JButton v2PlanAToBBtn = new JButton("Plan A→B");
-    private final JButton v2ReadinessBtn = new JButton("Check V2 readiness (A→B)");
-    private final JButton v2DumpCorridorBtn = new JButton("Dump corridor (A→B)");
     private final JButton v2ClearOverlayRouteBtn = new JButton("Clear debug overlay route");
     private final JTextField v2PlanFromField = new JTextField(10);
     private final JTextField v2PlanToField = new JTextField(10);
@@ -1347,8 +1344,6 @@ public final class RecorderPanel extends PluginPanel
         p.add(presetRow);
 
         p.add(v2PlanAToBBtn);
-        p.add(v2ReadinessBtn);
-        p.add(v2DumpCorridorBtn);
 
         p.add(Box.createVerticalStrut(8));
         p.add(v2ClearOverlayRouteBtn);
@@ -1472,74 +1467,6 @@ public final class RecorderPanel extends PluginPanel
         v2PlanToField.setText(preset.to().getX() + "," + preset.to().getY()
             + "," + preset.to().getPlane());
         v2InspectStatusLabel.setText("<html>Preset \"" + preset.label() + "\" applied.</html>");
-    }
-
-    private void onV2Readiness()
-    {
-        if (routeReadiness == null || inspectionDumper == null) return;
-        WorldPoint from = parseWorldPoint(v2PlanFromField.getText());
-        WorldPoint to = parseWorldPoint(v2PlanToField.getText());
-        if (from == null || to == null)
-        {
-            v2InspectStatusLabel.setText("Readiness: enter x,y,plane in From and To");
-            return;
-        }
-        // Use the selected preset's label if From/To match it; otherwise
-        // synthesize one from the coordinates.
-        RoutePreset selected = (RoutePreset) v2PresetCombo.getSelectedItem();
-        String label = (selected != null && selected.from().equals(from) && selected.to().equals(to))
-            ? selected.label() : "custom";
-        Thread t = new Thread(() ->
-        {
-            String msg;
-            try
-            {
-                java.io.File out = inspectionDumper.dumpReadiness(routeReadiness, from, to, label);
-                net.runelite.client.plugins.recorder.nav.v2.RouteReadiness.Report rep
-                    = routeReadiness.check(from, to);
-                msg = "Readiness " + label + " " + rep.summary()
-                    + " → " + out.getAbsolutePath();
-            }
-            catch (RuntimeException ex)
-            {
-                msg = "Readiness " + label + " failed: " + ex.getMessage();
-            }
-            final String finalMsg = msg;
-            SwingUtilities.invokeLater(() ->
-                v2InspectStatusLabel.setText("<html>" + finalMsg + "</html>"));
-        }, "v2-readiness");
-        t.setDaemon(true);
-        t.start();
-    }
-
-    private void onV2DumpCorridor()
-    {
-        if (routeReadiness == null || inspectionDumper == null) return;
-        WorldPoint from = parseWorldPoint(v2PlanFromField.getText());
-        WorldPoint to = parseWorldPoint(v2PlanToField.getText());
-        if (from == null || to == null)
-        {
-            v2InspectStatusLabel.setText("Corridor dump: enter x,y,plane in From and To");
-            return;
-        }
-        Thread t = new Thread(() ->
-        {
-            String msg;
-            try
-            {
-                java.io.File out = inspectionDumper.dumpCorridor(routeReadiness, from, to);
-                msg = "Corridor dump → " + out.getAbsolutePath();
-            }
-            catch (RuntimeException ex)
-            {
-                msg = "Corridor dump failed: " + ex.getMessage();
-            }
-            final String finalMsg = msg;
-            SwingUtilities.invokeLater(() ->
-                v2InspectStatusLabel.setText("<html>" + finalMsg + "</html>"));
-        }, "v2-corridor-dump");
-        t.setDaemon(true);
-        t.start();
     }
 
     /** Run a dump on a worker thread; update the status label on the EDT
@@ -2574,21 +2501,9 @@ public final class RecorderPanel extends PluginPanel
             v2DumpTransportsBtn.addActionListener(e -> onV2DumpTransports());
             v2DumpEntitiesBtn.addActionListener(e -> onV2DumpEntities());
             v2PlanAToBBtn.addActionListener(e -> onV2PlanAToB());
-            v2ReadinessBtn.addActionListener(e -> onV2Readiness());
-            v2DumpCorridorBtn.addActionListener(e -> onV2DumpCorridor());
             v2PresetApplyBtn.addActionListener(e -> onV2ApplyPreset());
             v2ClearOverlayRouteBtn.addActionListener(e -> onV2ClearOverlayRoute());
         }
-    }
-
-    /** Wire the V2 readiness service. The plugin constructs a single
-     *  {@link net.runelite.client.plugins.recorder.nav.v2.RouteReadiness}
-     *  alongside V2Planner and hands it here. The panel uses it for the
-     *  "Check V2 readiness" + "Dump corridor" buttons; if it is never
-     *  wired, those buttons fail with a status-label message. */
-    public void setRouteReadiness(net.runelite.client.plugins.recorder.nav.v2.RouteReadiness readiness)
-    {
-        this.routeReadiness = readiness;
     }
 
     private void onCookV2Start()

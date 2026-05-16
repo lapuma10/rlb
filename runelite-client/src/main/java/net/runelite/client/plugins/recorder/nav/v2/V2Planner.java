@@ -164,9 +164,9 @@ public final class V2Planner
     }
 
     /** Deterministic shortest-path plan, ignoring the variation flag and
-     *  RouteHistory. Used by diagnostics ({@link RouteReadiness}) so the
-     *  yes/no answer is stable across calls regardless of the user's
-     *  variation setting. Production routing still goes through
+     *  RouteHistory. Used by diagnostics so the yes/no answer is stable
+     *  across calls regardless of the user's variation setting. Production
+     *  routing still goes through
      *  {@link #plan(WorldPoint, WorldPoint, BehaviorMode)}. */
     public V2Path planDeterministic(WorldPoint from, WorldPoint to)
     {

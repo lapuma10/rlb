@@ -196,19 +196,12 @@ public class V2BankPenIntegrationTest
         seedTiles(s, tiles);
 
         V2Path path = planner(s, t).plan(BANK, PEN_NORTH, BehaviorMode.VARIED);
-        // Diagonal walls at edges may still allow path; readiness reports
-        // collision detail. We assert at least the readiness break reason
-        // is informative.
-        RouteReadiness r = new RouteReadiness(s, t, planner(s, t));
-        RouteReadiness.Report rep = r.check(BANK, PEN_NORTH);
-        if (path.isEmpty())
-        {
-            assertTrue("readiness must surface a collision-or-unknown reason",
-                rep.firstBreakReason() == RouteReadiness.BreakReason.COLLISION_BLOCKED
-                || rep.firstBreakReason() == RouteReadiness.BreakReason.DIAGONAL_BLOCKED
-                || rep.firstBreakReason() == RouteReadiness.BreakReason.UNKNOWN_TILE);
-        }
-        else
+        // RouteReadiness diagnostic was removed per spec §8 THROW — the new
+        // engine surfaces these concerns via WorldSnapshotBuilder + TilePredicate
+        // evaluation. This test now asserts on the planner output directly:
+        // when the corridor is blocked the planner must either return empty
+        // OR route a plane-0 detour without dispatching off-plane.
+        if (!path.isEmpty())
         {
             // Even when a diagonal squeeze works, executor must not pick off-plane.
             for (V2Leg leg : path.legs())
