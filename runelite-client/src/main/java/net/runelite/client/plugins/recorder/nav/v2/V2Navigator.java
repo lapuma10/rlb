@@ -71,11 +71,11 @@ public final class V2Navigator implements Navigator
         @Nullable default V2Executor.FailureReason lastFailureReason() { return null; }
 
         /** Lane 5 plan Task 5 — typed-result view of the most recent
-         *  {@link #tick()}. Replaces the prior boolean
-         *  {@code wantsReplanFromHere()} flag with a typed
-         *  {@link ExecutorTickResult} carrying replan reasons, transport
-         *  correction requests, and the trace id. Default returns null
-         *  for test hooks that haven't migrated. */
+         *  {@link #tick()}. Replaces the prior boolean replan-from-here
+         *  flag (removed) with a typed {@link ExecutorTickResult}
+         *  carrying replan reasons, transport correction requests, and
+         *  the trace id. Default returns null for test hooks that
+         *  haven't migrated. */
         @Nullable default ExecutorTickResult tickResult() { return null; }
     }
 

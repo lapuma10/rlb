@@ -6,10 +6,10 @@ import net.runelite.api.coords.WorldPoint;
  *  emitted by the executor when it observes a transport-state-mismatch.
  *
  *  <p>This replaces the previous flow where {@code V2Executor} called
- *  {@code env.correctTransportEdge(...)} directly (and set
- *  {@code wantsReplanFromHere}). Mid-route mutation of the transport
- *  table by the executor is a spec violation (§7 rule "Transport data
- *  is never mutated by executor"). Instead:
+ *  {@code env.correctTransportEdge(...)} directly (and set a now-removed
+ *  replan-from-here boolean). Mid-route mutation of the transport table
+ *  by the executor is a spec violation (§7 rule "Transport data is
+ *  never mutated by executor"). Instead:
  *
  *  <ol>
  *    <li>Executor emits {@code TransportCorrectionRequest} via

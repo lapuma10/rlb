@@ -49,11 +49,16 @@ public class V2NavigatorTest
         int tickCount;
         int cancelCount;
         V2Executor.Status nextStatus = V2Executor.Status.IDLE;
+        @Nullable net.runelite.client.plugins.recorder.nav.v2.ExecutorTickResult nextTickResult;
 
         @Override public void setPath(V2Path p) { setPathArg = p; }
         @Override public V2Executor.Status tick() { tickCount++; return nextStatus; }
-        @Override public void cancel() { cancelCount++; nextStatus = V2Executor.Status.IDLE; }
+        @Override public void cancel() { cancelCount++; nextStatus = V2Executor.Status.IDLE; nextTickResult = null; }
         @Override public V2Executor.Status status() { return nextStatus; }
+        @Override
+        @Nullable
+        public net.runelite.client.plugins.recorder.nav.v2.ExecutorTickResult tickResult()
+        { return nextTickResult; }
     }
 
     private static V2Navigator.PlayerLocSupplier locSupplier(WorldPoint p)
@@ -253,5 +258,137 @@ public class V2NavigatorTest
         executor.nextStatus = V2Executor.Status.ARRIVED;
         nav.tick(NavRequest.toPoint(THERE, BehaviorMode.VARIED));
         assertFalse("arrived navigator drops busy", nav.isBusy());
+    }
+
+    // ─────────────────────────────────────────────────────────────────
+    // Lane 5 plan Task 5: typed-result consumption tests.
+    // ─────────────────────────────────────────────────────────────────
+
+    private static net.runelite.client.plugins.recorder.nav.v2.ExecutorTickResult needsReplan(
+        net.runelite.client.plugins.recorder.nav.v2.ReplanReason r)
+    {
+        return net.runelite.client.plugins.recorder.nav.v2.executor.ExecutorTickResultImpl.builder()
+            .result(net.runelite.client.plugins.recorder.nav.v2.ExecutorResult.NEEDS_REPLAN)
+            .replanReason(r)
+            .debugTraceId("test-trace")
+            .build();
+    }
+
+    @Test
+    public void navigator_executorReturnsNeedsReplan_invokesPlannerOnce() throws InterruptedException
+    {
+        FakePlanner planner = new FakePlanner();
+        FakeExecutor executor = new FakeExecutor();
+        executor.nextStatus = V2Executor.Status.RUNNING;
+        V2Navigator nav = new V2Navigator(planner, executor, locSupplier(HERE));
+
+        // First tick: plans once.
+        nav.tick(NavRequest.toPoint(THERE, BehaviorMode.VARIED));
+        assertEquals(1, planner.callCount);
+
+        // Set up tick-result that says NEEDS_REPLAN.
+        executor.nextTickResult = needsReplan(
+            net.runelite.client.plugins.recorder.nav.v2.ReplanReason.NO_LOCAL_WALKABLE_TILE);
+
+        // Second tick: navigator sees NEEDS_REPLAN and re-plans.
+        nav.tick(NavRequest.toPoint(THERE, BehaviorMode.VARIED));
+        assertEquals("navigator replanned once after NEEDS_REPLAN",
+            2, planner.callCount);
+    }
+
+    @Test
+    public void navigator_replanBudgetExhausted_returnsFailed() throws InterruptedException
+    {
+        FakePlanner planner = new FakePlanner();
+        FakeExecutor executor = new FakeExecutor();
+        executor.nextStatus = V2Executor.Status.RUNNING;
+        V2Navigator nav = new V2Navigator(planner, executor, locSupplier(HERE));
+        NavRequest req = NavRequest.toPoint(THERE, BehaviorMode.VARIED);
+
+        // First tick — initial plan.
+        nav.tick(req);
+
+        // Run replans up to budget. Each subsequent tick has NEEDS_REPLAN.
+        for (int i = 0; i < V2Navigator.MAX_REPLANS_PER_REQUEST; i++)
+        {
+            executor.nextTickResult = needsReplan(
+                net.runelite.client.plugins.recorder.nav.v2.ReplanReason.NO_LOCAL_WALKABLE_TILE);
+            nav.tick(req);
+        }
+        // One more tick: budget exhausted → FAILED.
+        executor.nextTickResult = needsReplan(
+            net.runelite.client.plugins.recorder.nav.v2.ReplanReason.NO_LOCAL_WALKABLE_TILE);
+        NavStatus s = nav.tick(req);
+        assertEquals("budget exhausted → FAILED", NavStatus.FAILED, s);
+    }
+
+    @Test
+    public void navigator_executorReturnsPathCompleted_returnsArrived() throws InterruptedException
+    {
+        // ExecutorResult.PATH_COMPLETED maps via Status.ARRIVED to NavStatus.ARRIVED.
+        FakePlanner planner = new FakePlanner();
+        FakeExecutor executor = new FakeExecutor();
+        executor.nextStatus = V2Executor.Status.ARRIVED;
+        executor.nextTickResult = net.runelite.client.plugins.recorder.nav.v2.executor
+            .ExecutorTickResultImpl.builder()
+            .result(net.runelite.client.plugins.recorder.nav.v2.ExecutorResult.PATH_COMPLETED)
+            .debugTraceId("test-trace")
+            .build();
+        V2Navigator nav = new V2Navigator(planner, executor, locSupplier(HERE));
+        NavStatus s = nav.tick(NavRequest.toPoint(THERE, BehaviorMode.VARIED));
+        assertEquals(NavStatus.ARRIVED, s);
+    }
+
+    @Test
+    public void navigator_appliesTransportCorrectionRequest() throws InterruptedException
+    {
+        // When ExecutorTickResult carries a TransportCorrectionRequest, the
+        // navigator invokes its installed TransportCorrectionSink.
+        FakePlanner planner = new FakePlanner();
+        FakeExecutor executor = new FakeExecutor();
+        executor.nextStatus = V2Executor.Status.RUNNING;
+        V2Navigator nav = new V2Navigator(planner, executor, locSupplier(HERE));
+
+        java.util.concurrent.atomic.AtomicInteger applyCalls = new java.util.concurrent.atomic.AtomicInteger();
+        nav.setTransportCorrectionSink(req -> applyCalls.incrementAndGet());
+
+        nav.tick(NavRequest.toPoint(THERE, BehaviorMode.VARIED));
+
+        // Inject an ExecutorTickResult with a TransportCorrectionRequest.
+        net.runelite.client.plugins.recorder.nav.v2.TransportCorrectionRequest req =
+            new net.runelite.client.plugins.recorder.nav.v2.TransportCorrectionRequest()
+            {
+                @Override public WorldPoint plannedTo() { return new WorldPoint(1, 2, 0); }
+                @Override public WorldPoint actualTo() { return new WorldPoint(1, 2, 1); }
+                @Override
+                public net.runelite.client.plugins.recorder.nav.v2.TransportLeg edge()
+                {
+                    return new net.runelite.client.plugins.recorder.nav.v2.TransportLeg()
+                    {
+                        @Override public WorldPoint from() { return new WorldPoint(1, 2, 0); }
+                        @Override public WorldPoint to() { return new WorldPoint(1, 2, 1); }
+                        @Override public net.runelite.client.plugins.recorder.nav.v2.TransportType type()
+                        { return net.runelite.client.plugins.recorder.nav.v2.TransportType.OBJECT_VERB; }
+                        @Override public java.util.Optional<Integer> objectId()
+                        { return java.util.Optional.of(42); }
+                        @Override public java.util.Optional<String> action()
+                        { return java.util.Optional.of("Climb"); }
+                    };
+                }
+                @Override
+                public net.runelite.client.plugins.recorder.nav.v2.ReplanReason inferredReason()
+                { return net.runelite.client.plugins.recorder.nav.v2.ReplanReason.TRANSPORT_UNAVAILABLE; }
+            };
+        executor.nextTickResult = net.runelite.client.plugins.recorder.nav.v2.executor
+            .ExecutorTickResultImpl.builder()
+            .result(net.runelite.client.plugins.recorder.nav.v2.ExecutorResult.NEEDS_REPLAN)
+            .replanReason(net.runelite.client.plugins.recorder.nav.v2.ReplanReason.TRANSPORT_UNAVAILABLE)
+            .transportCorrection(req)
+            .debugTraceId("test-trace")
+            .build();
+        nav.tick(NavRequest.toPoint(THERE, BehaviorMode.VARIED));
+
+        assertEquals("navigator invokes the correction sink once",
+            1, applyCalls.get());
     }
 }

@@ -325,10 +325,10 @@ public final class V2Executor
     private int progressIdx;
 
     /** Lane 5 plan Task 4 — typed replan signal. Replaces the prior
-     *  {@code wantsReplanFromHere} boolean. When non-null, the navigator
-     *  sees a {@link ExecutorResult#NEEDS_REPLAN} via {@link #tickResult}
-     *  and decides whether to replan. The flag clears on
-     *  {@link #setPath} / {@link #cancel}. */
+     *  cross-layer replan-from-here boolean (removed). When non-null,
+     *  the navigator sees a {@link ExecutorResult#NEEDS_REPLAN} via
+     *  {@link #tickResult} and decides whether to replan. The reason
+     *  clears on {@link #setPath} / {@link #cancel}. */
     @Nullable private net.runelite.client.plugins.recorder.nav.v2.ReplanReason pendingReplanReason;
 
     /** Lane 5 plan Task 6 — typed transport-correction emission. The
@@ -493,7 +493,7 @@ public final class V2Executor
     /** Lane 5 plan Task 4: typed-result view of the most recent
      *  {@link #tick()} call. The navigator reads this to decide
      *  whether to continue / replan / fail. Replaces the prior
-     *  {@code wantsReplanFromHere()} boolean + side-channel
+     *  cross-layer replan-from-here boolean (removed) + the side-channel
      *  {@link #lastFailureReason()} access.
      *
      *  <p>Always non-null. Carries a trace id (Lane 6 correlation),
