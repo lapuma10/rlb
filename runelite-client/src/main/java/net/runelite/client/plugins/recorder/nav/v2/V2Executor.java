@@ -211,6 +211,36 @@ public final class V2Executor
          *  tile. Returns true if the dispatcher accepted the request. */
         default boolean dispatchOpen(WorldPoint clickTile)
         { return false; }
+
+        /** Lane 5 plan Task 1: collapse all per-tick reads into one
+         *  client-thread marshal. Production impl ({@link V2ExecutorEnv})
+         *  marshals once and reads {@code playerLoc}, candidate-tile
+         *  filter pass, live collision, dynamic-entity occupancy,
+         *  snapshot walkability, and minimap reachability in one go.
+         *
+         *  <p>Default delegates back to the individual methods (1 wait
+         *  each) for envs that haven't migrated. Tests can override to
+         *  count the bundled-read invocation count. */
+        default TickReadOut snapshotForTick(@Nullable WorldPoint candidateTile)
+        {
+            WorldPoint p = playerLoc();
+            boolean clean = candidateTile == null || isPlausiblyClean(candidateTile);
+            boolean live = candidateTile == null || liveCollisionAllows(candidateTile);
+            boolean dyn = candidateTile != null && dynamicEntityOnTile(candidateTile);
+            boolean snap = candidateTile == null || snapshotSaysWalkable(candidateTile);
+            boolean mm = candidateTile == null || canMinimapClick(candidateTile);
+            return new TickReadOut(p, clean, live, dyn, snap, mm);
+        }
+
+        /** Immutable bundle of per-tick state reads. Built once per
+         *  {@link V2Executor#tick()} call from {@link #snapshotForTick}. */
+        record TickReadOut(
+            @Nullable WorldPoint playerLoc,
+            boolean candidateClean,
+            boolean liveCollisionAllows,
+            boolean dynamicEntityOnTile,
+            boolean snapshotSaysWalkable,
+            boolean canMinimapClick) {}
     }
 
     /** Ticks of zero progress before treating a WALK leg as stalled. */
