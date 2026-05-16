@@ -51,7 +51,13 @@ public final class WorldSnapshotBuilder
 
     /** Builds a snapshot from already-captured pieces. Used by tests and
      *  by callers that already hold the client thread (e.g. a planner
-     *  that pre-captures its inputs). Does NOT touch {@link Client}. */
+     *  that pre-captures its inputs). Does NOT touch {@link Client}.
+     *
+     *  <p>Calls {@link #fromComponents(CollisionView, Set, Set, Object,
+     *  PredicateRegistry, long, WorldPoint)} with a null player position.
+     *  This entry remains compatible with pre-integration tests; new
+     *  callers (Lane 4 planner / integration) should pass the player
+     *  position via the 7-arg overload. */
     public static WorldSnapshot fromComponents(
         CollisionView view,
         Set<WorldPoint> actorTiles,
@@ -59,6 +65,24 @@ public final class WorldSnapshotBuilder
         @Nullable Object transports,
         PredicateRegistry predicates,
         long capturedAtMs)
+    {
+        return fromComponents(view, actorTiles, objectTiles, transports,
+            predicates, capturedAtMs, /*playerPosition*/ null);
+    }
+
+    /** 7-arg overload that includes the player position. Integration
+     *  callers (Lane 4 {@code WaypointPlanner}, Lane 5 {@code V2Navigator})
+     *  use this entry so the planner can read {@link
+     *  WorldSnapshot#playerPosition()} without taking a separate
+     *  {@code start} parameter. */
+    public static WorldSnapshot fromComponents(
+        CollisionView view,
+        Set<WorldPoint> actorTiles,
+        Set<WorldPoint> objectTiles,
+        @Nullable Object transports,
+        PredicateRegistry predicates,
+        long capturedAtMs,
+        @Nullable WorldPoint playerPosition)
     {
         if (view == null) throw new IllegalArgumentException("view");
         if (actorTiles == null) throw new IllegalArgumentException("actorTiles");
@@ -70,7 +94,8 @@ public final class WorldSnapshotBuilder
             Collections.unmodifiableSet(new HashSet<>(objectTiles)),
             transports,
             predicates,
-            capturedAtMs);
+            capturedAtMs,
+            playerPosition);
     }
 
     /** Full capture on the client thread. If the caller is not the client
@@ -182,13 +207,23 @@ public final class WorldSnapshotBuilder
         // and live overlay disagree.
         Set<WorldPoint> objectTiles = Set.of();
 
+        // Capture the live player position. Null if the player isn't on
+        // a loaded scene (e.g., login flow in progress); planner converts
+        // null → REGION_NOT_LOADED replan reason.
+        WorldPoint playerPosition = null;
+        if (client.getLocalPlayer() != null)
+        {
+            playerPosition = client.getLocalPlayer().getWorldLocation();
+        }
+
         return new WorldSnapshotImpl(
             view,
             Collections.unmodifiableSet(actorTiles),
             Collections.unmodifiableSet(new HashSet<>(objectTiles)),
             transports,
             predicates,
-            System.currentTimeMillis());
+            System.currentTimeMillis(),
+            playerPosition);
     }
 
     /** Concrete implementation of {@link WorldSnapshot}. Package-private. */
@@ -200,6 +235,7 @@ public final class WorldSnapshotBuilder
         @Nullable private final Object transports;
         private final PredicateRegistry predicates;
         private final long capturedAtMs;
+        @Nullable private final WorldPoint playerPosition;
 
         WorldSnapshotImpl(
             CollisionView view,
@@ -209,12 +245,26 @@ public final class WorldSnapshotBuilder
             PredicateRegistry predicates,
             long capturedAtMs)
         {
+            this(view, actorTiles, objectTiles, transports, predicates,
+                capturedAtMs, /*playerPosition*/ null);
+        }
+
+        WorldSnapshotImpl(
+            CollisionView view,
+            Set<WorldPoint> actorTiles,
+            Set<WorldPoint> objectTiles,
+            @Nullable Object transports,
+            PredicateRegistry predicates,
+            long capturedAtMs,
+            @Nullable WorldPoint playerPosition)
+        {
             this.view = view;
             this.actorTiles = actorTiles;
             this.objectTiles = objectTiles;
             this.transports = transports;
             this.predicates = predicates;
             this.capturedAtMs = capturedAtMs;
+            this.playerPosition = playerPosition;
         }
 
         @Override
@@ -257,6 +307,13 @@ public final class WorldSnapshotBuilder
         public long capturedAtMs()
         {
             return capturedAtMs;
+        }
+
+        @Override
+        @Nullable
+        public WorldPoint playerPosition()
+        {
+            return playerPosition;
         }
 
         /** Helper for tests + log: indicate whether the player is on a

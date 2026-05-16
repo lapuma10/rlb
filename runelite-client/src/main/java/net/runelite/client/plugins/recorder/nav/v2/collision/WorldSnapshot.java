@@ -59,4 +59,21 @@ public interface WorldSnapshot
      *  diagnostic correlation; consumers should NOT use this as a
      *  cache key. */
     long capturedAtMs();
+
+    /** Player's {@link WorldPoint} at snapshot capture. Used by
+     *  {@code WaypointPlanner} to seed routing from the live position
+     *  without taking a separate {@code start} parameter.
+     *
+     *  <p>Returns {@code null} if the player was not in a loaded scene
+     *  at capture time (e.g., logging in, world hop in progress). The
+     *  planner translates this to {@link
+     *  net.runelite.client.plugins.recorder.nav.v2.transport.ReplanReason#REGION_NOT_LOADED}.
+     *
+     *  <p>Added at integration per spec §3 — the original §3 used a
+     *  separate {@code start} parameter on {@code WaypointPlanner.plan},
+     *  but spec §3 §11 left placement open. The snapshot owns it
+     *  because the player's position is part of the immutable world
+     *  state captured for one plan call. */
+    @javax.annotation.Nullable
+    WorldPoint playerPosition();
 }
