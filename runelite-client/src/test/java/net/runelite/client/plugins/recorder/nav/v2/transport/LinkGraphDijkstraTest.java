@@ -5,9 +5,9 @@ import java.util.List;
 import java.util.Optional;
 import net.runelite.api.coords.WorldPoint;
 import net.runelite.client.plugins.recorder.nav.NavRequest;
-import net.runelite.client.plugins.recorder.nav.v2.planner.spi.NavigationContext;
-import net.runelite.client.plugins.recorder.nav.v2.planner.spi.PlayerState;
-import net.runelite.client.plugins.recorder.nav.v2.planner.spi.WorldSnapshot;
+import net.runelite.client.plugins.recorder.nav.v2.collision.PlayerState;
+import net.runelite.client.plugins.recorder.nav.v2.collision.WorldSnapshot;
+import net.runelite.client.plugins.recorder.nav.v2.predicate.NavigationContext;
 import org.junit.Test;
 
 import static org.junit.Assert.*;

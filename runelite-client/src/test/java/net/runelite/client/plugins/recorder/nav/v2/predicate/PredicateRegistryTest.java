@@ -19,9 +19,9 @@ public class PredicateRegistryTest
     {
         return new PathContext()
         {
-            @Override public Object navigation() { return null; }
-            @Override public Optional<Object> currentPath() { return Optional.empty(); }
-            @Override public Optional<Object> currentWaypoint() { return Optional.empty(); }
+            @Override public NavigationContext navigation() { return null; }
+            @Override public Optional<net.runelite.client.plugins.recorder.nav.v2.transport.V2Path> currentPath() { return Optional.empty(); }
+            @Override public Optional<net.runelite.client.plugins.recorder.nav.v2.transport.Waypoint> currentWaypoint() { return Optional.empty(); }
             @Override public long routeSeed() { return 42; }
         };
     }

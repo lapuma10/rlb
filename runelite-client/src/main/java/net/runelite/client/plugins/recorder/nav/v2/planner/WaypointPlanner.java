@@ -5,15 +5,15 @@ import java.util.Collections;
 import java.util.List;
 import net.runelite.api.coords.WorldPoint;
 import net.runelite.client.plugins.recorder.nav.NavRequest;
-import net.runelite.client.plugins.recorder.nav.v2.planner.spi.BfsConfig;
-import net.runelite.client.plugins.recorder.nav.v2.planner.spi.NavigationContext;
-import net.runelite.client.plugins.recorder.nav.v2.planner.spi.PathContext;
-import net.runelite.client.plugins.recorder.nav.v2.planner.spi.PlaneTransition;
-import net.runelite.client.plugins.recorder.nav.v2.planner.spi.PlayerState;
-import net.runelite.client.plugins.recorder.nav.v2.planner.spi.RouteValidator;
-import net.runelite.client.plugins.recorder.nav.v2.planner.spi.SkretzoBfsKernel;
-import net.runelite.client.plugins.recorder.nav.v2.planner.spi.TilePredicate;
-import net.runelite.client.plugins.recorder.nav.v2.planner.spi.WorldSnapshot;
+import net.runelite.client.plugins.recorder.nav.v2.bfs.BfsConfig;
+import net.runelite.client.plugins.recorder.nav.v2.bfs.PlaneTransition;
+import net.runelite.client.plugins.recorder.nav.v2.bfs.RouteValidator;
+import net.runelite.client.plugins.recorder.nav.v2.bfs.SkretzoBfsKernel;
+import net.runelite.client.plugins.recorder.nav.v2.bfs.TilePredicate;
+import net.runelite.client.plugins.recorder.nav.v2.collision.PlayerState;
+import net.runelite.client.plugins.recorder.nav.v2.collision.WorldSnapshot;
+import net.runelite.client.plugins.recorder.nav.v2.predicate.NavigationContext;
+import net.runelite.client.plugins.recorder.nav.v2.predicate.PathContext;
 import net.runelite.client.plugins.recorder.nav.v2.transport.LinkGraphDijkstra;
 import net.runelite.client.plugins.recorder.nav.v2.transport.PathStep;
 import net.runelite.client.plugins.recorder.nav.v2.transport.ReplanReason;
@@ -54,6 +54,8 @@ import org.slf4j.LoggerFactory;
  *        validator rejected the compressed path.</li>
  *    <li>{@link ReplanReason#EXECUTOR_TIMEOUT} — a BFS leg hit the
  *        expansion budget.</li>
+ *    <li>{@link ReplanReason#REGION_NOT_LOADED} — snapshot has no
+ *        player position (off-scene state).</li>
  *  </ul>
  *
  *  <p>Threading: pure compute. Runs on the caller's thread (typically
@@ -66,39 +68,28 @@ public final class WaypointPlanner
 
 	private WaypointPlanner() {}
 
-	/** Spec §3 signature: {@code plan(NavigationRequest, WorldSnapshot,
-	 *  BfsConfig) → V2Path}. {@link PlayerState} is reached via the
-	 *  built {@link NavigationContext}, not as a separate parameter.
-	 *
-	 *  <p>{@code req.to()} drives the target tile. If {@code req.to()}
-	 *  is null (entity-only request), the planner currently returns
-	 *  a failed path with {@link ReplanReason#TARGET_UNREACHABLE} —
-	 *  entity resolution is Lane 5's job (V2Navigator resolves
-	 *  EntityRef → WorldPoint before calling the planner). */
+	/** Spec §3 signature. {@code start} is read from
+	 *  {@link WorldSnapshot#playerPosition()} — Lane 4 manifest concern
+	 *  #5 closed at integration by adding {@code playerPosition()} to
+	 *  the snapshot interface (see commit history). */
 	public static V2Path plan(NavRequest req, WorldSnapshot snap, BfsConfig cfg)
 	{
 		if (req == null) throw new IllegalArgumentException("req null");
 		if (snap == null) throw new IllegalArgumentException("snap null");
 		if (cfg == null) cfg = BfsConfig.defaults();
 
-		WorldPoint target = req.to();
-		if (target == null)
+		WorldPoint start = snap.playerPosition();
+		if (start == null)
 		{
-			log.warn("[nav-v2.planner] no target tile in request; returning TARGET_UNREACHABLE");
-			return V2PathImpl.failed(ReplanReason.TARGET_UNREACHABLE);
+			log.info("[nav-v2.planner] snapshot has no playerPosition; REGION_NOT_LOADED");
+			return V2PathImpl.failed(ReplanReason.REGION_NOT_LOADED);
 		}
-		// The planner needs a start tile. Per Lane 2's snapshot, the
-		// player position is captured in PlayerState (varbits / etc).
-		// Lane 5 will pass start as part of the NavigationRequest at
-		// integration; for now we accept the start tile being absent
-		// from NavRequest and require the caller to supply it via the
-		// overload below.
-		return plan(req, /*start*/ null, snap, cfg);
+		return plan(req, start, snap, cfg);
 	}
 
-	/** Internal entry that accepts an explicit start tile. Lane 5
-	 *  callers use this; the standard 3-arg entry resolves to this
-	 *  with start = null (rejected). */
+	/** 4-arg overload accepting an explicit start tile. Used by callers
+	 *  that already know the start and don't want to round-trip through
+	 *  {@link WorldSnapshot#playerPosition()} — e.g. replay tests. */
 	public static V2Path plan(NavRequest req, WorldPoint start, WorldSnapshot snap, BfsConfig cfg)
 	{
 		if (req == null) throw new IllegalArgumentException("req null");
@@ -107,33 +98,46 @@ public final class WaypointPlanner
 		WorldPoint target = req.to();
 		if (target == null)
 		{
+			log.warn("[nav-v2.planner] no target tile in request; returning TARGET_UNREACHABLE");
 			return V2PathImpl.failed(ReplanReason.TARGET_UNREACHABLE);
 		}
 		if (start == null)
 		{
-			return V2PathImpl.failed(ReplanReason.TARGET_UNREACHABLE);
+			return V2PathImpl.failed(ReplanReason.REGION_NOT_LOADED);
 		}
 
-		// Build navigation + path context. PlayerState comes from the
-		// snapshot — Lane 2 captures it alongside the world snapshot.
+		// Build navigation + path context. PlayerState comes via PlayerStateBuilder
+		// at integration; for now we stub when absent.
 		PlayerState player = extractPlayerStateOrNull(snap);
 		if (player == null)
 		{
-			// Without a player state we can't evaluate transport
-			// requirements. Lane 5 always supplies this at integration;
-			// for now we still attempt to plan (no requirement-gated
-			// transports will pass the filter).
 			player = stubPlayerState();
 		}
 		NavigationContext navCtx = new NavigationContextImpl(snap, player, req);
 		PathContext pathCtx = PathContextImpl.planEntry(navCtx, cfg.routeSeed());
 
-		TransportTable table = snap.transports();
-		if (table == null)
+		Object transportObj = snap.transports();
+		TransportTable table;
+		if (transportObj instanceof TransportTable)
 		{
-			log.warn("[nav-v2.planner] snapshot has no TransportTable; routing without transports");
+			table = (TransportTable) transportObj;
+		}
+		else
+		{
+			if (transportObj != null)
+			{
+				log.warn("[nav-v2.planner] snapshot.transports() returned {} (not TransportTable); routing without transports",
+					transportObj.getClass().getName());
+			}
 			table = new TransportTable(Collections.emptyList(), 0);
 		}
+
+		// Lane 2's WorldSnapshot exposes Lane 3's narrow CollisionView
+		// interface directly (single method `flagsAt`). The concrete
+		// Lane 2 CollisionView class implements that interface, so the
+		// snapshot's view is passed straight through.
+		final net.runelite.client.plugins.recorder.nav.v2.bfs.CollisionView bfsView =
+			snap.collisionView();
 
 		// Step 1: high-level skeleton.
 		LinkGraphDijkstra.SkeletonResult skel =
@@ -183,7 +187,7 @@ public final class WaypointPlanner
 				// BFS leg from prevTile to walkTo; append to the current
 				// walk-leg accumulator.
 				SkretzoBfsKernel.BfsResult res = SkretzoBfsKernel.plan(
-					snap.collisionView(), prevTile, walkTo, cfg,
+					bfsView, prevTile, walkTo, cfg,
 					(TilePredicate) null, pathCtx);
 				if (res.status() != SkretzoBfsKernel.Status.PATH_FOUND)
 				{
@@ -240,7 +244,7 @@ public final class WaypointPlanner
 
 		// Step 3: validator over the flat tile sequence.
 		RouteValidator.ValidationResult vr = RouteValidator.validate(
-			flatTileSequence, snap.collisionView(),
+			flatTileSequence, bfsView,
 			(TilePredicate) null,
 			planeJumps, pathCtx);
 		if (!vr.ok())
@@ -258,15 +262,12 @@ public final class WaypointPlanner
 		return V2PathImpl.of(steps);
 	}
 
-	/** Extract a {@link PlayerState} from the snapshot. Lane 2's
-	 *  WorldSnapshot returns predicates() as Object; some
-	 *  implementations may also expose the player state via a hidden
-	 *  field. Lane 4 falls back to a stub when unavailable. */
+	/** Extract a {@link PlayerState} from the snapshot. The snapshot
+	 *  doesn't yet expose a {@code player()} accessor; integration adds
+	 *  one when the navigator builds the snapshot. Until then this
+	 *  returns null and the caller stubs. */
 	private static PlayerState extractPlayerStateOrNull(WorldSnapshot snap)
 	{
-		// Lane 2's canonical snapshot doesn't yet expose a
-		// player() accessor; integration will. For now, return null and
-		// let the caller stub.
 		return null;
 	}
 

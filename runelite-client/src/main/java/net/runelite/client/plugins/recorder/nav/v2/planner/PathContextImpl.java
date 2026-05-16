@@ -1,8 +1,8 @@
 package net.runelite.client.plugins.recorder.nav.v2.planner;
 
 import java.util.Optional;
-import net.runelite.client.plugins.recorder.nav.v2.planner.spi.NavigationContext;
-import net.runelite.client.plugins.recorder.nav.v2.planner.spi.PathContext;
+import net.runelite.client.plugins.recorder.nav.v2.predicate.NavigationContext;
+import net.runelite.client.plugins.recorder.nav.v2.predicate.PathContext;
 import net.runelite.client.plugins.recorder.nav.v2.transport.V2Path;
 import net.runelite.client.plugins.recorder.nav.v2.transport.Waypoint;
 
@@ -10,11 +10,11 @@ import net.runelite.client.plugins.recorder.nav.v2.transport.Waypoint;
  *
  *  <p>Carries the {@link NavigationContext} plus optional
  *  plan-in-progress state ({@link #currentPath}, {@link #currentWaypoint})
- *  used by {@link net.runelite.client.plugins.recorder.nav.v2.planner.spi.TilePredicate}
+ *  used by {@link net.runelite.client.plugins.recorder.nav.v2.predicate.TilePredicate}
  *  instances during BFS expansion and executor tile-pick.
  *
  *  <p>{@link #routeSeed} is derived from
- *  {@link net.runelite.client.plugins.recorder.nav.v2.planner.spi.BfsConfig#routeSeed}
+ *  {@link net.runelite.client.plugins.recorder.nav.v2.bfs.BfsConfig#routeSeed}
  *  so the predicate's view of the seed matches the BFS kernel's,
  *  keeping deterministic-replay possible.
  *

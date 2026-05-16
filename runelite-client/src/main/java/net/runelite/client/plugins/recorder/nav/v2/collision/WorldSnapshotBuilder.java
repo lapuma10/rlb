@@ -274,7 +274,7 @@ public final class WorldSnapshotBuilder
         }
 
         @Override
-        public CollisionView collisionView()
+        public net.runelite.client.plugins.recorder.nav.v2.bfs.CollisionView collisionView()
         {
             return view;
         }

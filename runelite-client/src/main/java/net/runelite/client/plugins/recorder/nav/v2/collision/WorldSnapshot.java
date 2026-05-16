@@ -33,8 +33,14 @@ public interface WorldSnapshot
 
     /** Read-only view of the {@link CollisionView} used at
      *  construction. The BFS kernel (Lane 3) consumes this directly
-     *  for the hot path. */
-    CollisionView collisionView();
+     *  for the hot path.
+     *
+     *  <p>Return type is the narrow Lane 3 interface
+     *  ({@code nav.v2.bfs.CollisionView}) — Lane 2's concrete
+     *  {@code CollisionView} class implements it. Lane 4 / Lane 5
+     *  consume only {@code flagsAt(WorldPoint)} on the hot path; test
+     *  fixtures can supply a simple lambda matching this interface. */
+    net.runelite.client.plugins.recorder.nav.v2.bfs.CollisionView collisionView();
 
     /** Tiles that are blocked because a movement-blocking actor stands
      *  on them. Empty set if no actors block movement.

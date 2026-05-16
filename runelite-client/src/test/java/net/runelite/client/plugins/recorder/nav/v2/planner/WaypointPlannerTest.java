@@ -9,10 +9,10 @@ import net.runelite.api.CollisionDataFlag;
 import net.runelite.api.coords.WorldPoint;
 import net.runelite.client.plugins.recorder.nav.BehaviorMode;
 import net.runelite.client.plugins.recorder.nav.NavRequest;
-import net.runelite.client.plugins.recorder.nav.v2.planner.spi.BfsConfig;
-import net.runelite.client.plugins.recorder.nav.v2.planner.spi.CollisionFlags;
-import net.runelite.client.plugins.recorder.nav.v2.planner.spi.CollisionView;
-import net.runelite.client.plugins.recorder.nav.v2.planner.spi.WorldSnapshot;
+import net.runelite.client.plugins.recorder.nav.v2.bfs.BfsConfig;
+import net.runelite.client.plugins.recorder.nav.v2.collision.CollisionFlags;
+import net.runelite.client.plugins.recorder.nav.v2.collision.CollisionView;
+import net.runelite.client.plugins.recorder.nav.v2.collision.WorldSnapshot;
 import net.runelite.client.plugins.recorder.nav.v2.transport.PathStep;
 import net.runelite.client.plugins.recorder.nav.v2.transport.ReplanReason;
 import net.runelite.client.plugins.recorder.nav.v2.transport.TransportLink;
@@ -30,9 +30,12 @@ import static org.junit.Assert.*;
 
 public class WaypointPlannerTest
 {
-	/** Fixture collision: open by default (flagsAt = 0); blockers can
-	 *  be added via {@link #block} for spot-blocking. */
-	static final class FixtureCollision implements CollisionView
+	/** Fixture collision view: implements Lane 3's narrow
+	 *  {@link net.runelite.client.plugins.recorder.nav.v2.bfs.CollisionView}
+	 *  interface (single method {@code flagsAt}). Open by default
+	 *  (flagsAt = 0); blockers added via {@link #block} for spot-blocking. */
+	static final class FixtureCollision
+		implements net.runelite.client.plugins.recorder.nav.v2.bfs.CollisionView
 	{
 		private final Map<Long, Integer> flags = new HashMap<>();
 
@@ -48,18 +51,24 @@ public class WaypointPlannerTest
 		}
 	}
 
-	/** Fixture WorldSnapshot wrapping the collision + transport table. */
-	static WorldSnapshot fixtureSnap(CollisionView cv, TransportTable table)
+	/** Fixture WorldSnapshot wrapping the collision + transport table.
+	 *  Returns the Lane 3 narrow CollisionView interface directly — both
+	 *  Lane 4 WaypointPlanner and Lane 3 BFS consume that interface. */
+	static WorldSnapshot fixtureSnap(
+		net.runelite.client.plugins.recorder.nav.v2.bfs.CollisionView cv,
+		TransportTable table)
 	{
 		return new WorldSnapshot()
 		{
-			@Override public CollisionFlags collisionAt(WorldPoint p) { return new CollisionFlags(cv.flagsAt(p)); }
-			@Override public CollisionView collisionView() { return cv; }
+			@Override public CollisionFlags collisionAt(WorldPoint p)
+			{ return new CollisionFlags(cv.flagsAt(p), CollisionView.Source.GLOBAL_SNAPSHOT, p); }
+			@Override public net.runelite.client.plugins.recorder.nav.v2.bfs.CollisionView collisionView() { return cv; }
 			@Override public Set<WorldPoint> blockingActorTiles() { return Set.of(); }
 			@Override public Set<WorldPoint> blockingObjectTiles() { return Set.of(); }
 			@Override public TransportTable transports() { return table; }
-			@Override public Object predicates() { return null; }
+			@Override public net.runelite.client.plugins.recorder.nav.v2.predicate.PredicateRegistry predicates() { return null; }
 			@Override public long capturedAtMs() { return 0L; }
+			@Override public WorldPoint playerPosition() { return null; }
 		};
 	}
 
@@ -213,7 +222,10 @@ public class WaypointPlannerTest
 		NavRequest req = NavRequest.toPoint(new WorldPoint(3200, 3200, 0), BehaviorMode.VARIED);
 		V2Path path = WaypointPlanner.plan(req, /*start*/ null, fixtureSnap(cv, table), BfsConfig.defaults());
 		assertTrue(path.isFailed());
-		assertEquals(ReplanReason.TARGET_UNREACHABLE, path.failureReason().orElseThrow());
+		// Integration: null start now maps to REGION_NOT_LOADED (the
+		// snapshot's playerPosition() was null). Before integration this
+		// was TARGET_UNREACHABLE.
+		assertEquals(ReplanReason.REGION_NOT_LOADED, path.failureReason().orElseThrow());
 	}
 
 	@Test

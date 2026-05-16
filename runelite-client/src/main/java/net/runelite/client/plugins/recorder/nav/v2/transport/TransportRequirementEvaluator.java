@@ -6,8 +6,8 @@ import java.util.List;
 import java.util.Locale;
 import net.runelite.api.ItemContainer;
 import net.runelite.api.Skill;
-import net.runelite.client.plugins.recorder.nav.v2.planner.spi.NavigationContext;
-import net.runelite.client.plugins.recorder.nav.v2.planner.spi.PlayerState;
+import net.runelite.client.plugins.recorder.nav.v2.collision.PlayerState;
+import net.runelite.client.plugins.recorder.nav.v2.predicate.NavigationContext;
 
 /** Composable builders for {@link TransportRequirement} instances.
  *

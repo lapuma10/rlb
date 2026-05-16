@@ -1,15 +1,12 @@
 package net.runelite.client.plugins.recorder.nav.v2.transport;
 
-import net.runelite.client.plugins.recorder.nav.v2.planner.spi.NavigationContext;
+import net.runelite.client.plugins.recorder.nav.v2.predicate.NavigationContext;
 
 /** Spec §3 contract: a gate that must be satisfied before the
  *  planner considers a {@link TransportLink} usable.
  *
- *  <p><b>Local mock note</b>: this interface is the spec §3
- *  {@code TransportRequirement} contract. Lane 1 owns the shape;
- *  Lane 4 ships builder instances in
- *  {@link TransportRequirementEvaluator}. Integration consolidates
- *  this with the canonical Lane 1 location.
+ *  <p>Per spec §3 Lane 1 owns the interface shape; Lane 4 ships
+ *  builder instances in {@link TransportRequirementEvaluator}.
  *
  *  <p>Contract:
  *  <ul>

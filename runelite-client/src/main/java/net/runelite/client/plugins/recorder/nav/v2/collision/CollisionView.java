@@ -15,9 +15,15 @@ import net.runelite.api.coords.WorldPoint;
  *  exposed for debug output ({@link #source(WorldPoint)}, used by
  *  Lane 6 traces and by {@link #describeTile(WorldPoint)}).
  *
+ *  <p>Implements Lane 3's narrow {@code nav.v2.bfs.CollisionView}
+ *  interface so the BFS kernel + RouteValidator can consume Lane 2's
+ *  concrete view directly. The narrow interface has only
+ *  {@code flagsAt(WorldPoint)}; this class satisfies it.
+ *
  *  <p>This class is part of the Lane 2 deliverable for the
  *  observation-aware navigation engine (spec §4 Lane 2). */
 public final class CollisionView
+    implements net.runelite.client.plugins.recorder.nav.v2.bfs.CollisionView
 {
     public enum Source { LIVE_OVERLAY, GLOBAL_SNAPSHOT, OUT_OF_RANGE }
 

@@ -4,11 +4,11 @@ import java.util.Set;
 import net.runelite.api.coords.WorldPoint;
 import net.runelite.client.plugins.recorder.nav.BehaviorMode;
 import net.runelite.client.plugins.recorder.nav.NavRequest;
-import net.runelite.client.plugins.recorder.nav.v2.planner.spi.CollisionFlags;
-import net.runelite.client.plugins.recorder.nav.v2.planner.spi.CollisionView;
-import net.runelite.client.plugins.recorder.nav.v2.planner.spi.NavigationContext;
-import net.runelite.client.plugins.recorder.nav.v2.planner.spi.PlayerState;
-import net.runelite.client.plugins.recorder.nav.v2.planner.spi.WorldSnapshot;
+import net.runelite.client.plugins.recorder.nav.v2.collision.CollisionFlags;
+import net.runelite.client.plugins.recorder.nav.v2.collision.CollisionView;
+import net.runelite.client.plugins.recorder.nav.v2.collision.PlayerState;
+import net.runelite.client.plugins.recorder.nav.v2.collision.WorldSnapshot;
+import net.runelite.client.plugins.recorder.nav.v2.predicate.NavigationContext;
 import net.runelite.client.plugins.recorder.nav.v2.transport.TransportTable;
 import net.runelite.client.plugins.recorder.nav.v2.transport.Waypoint;
 import net.runelite.client.plugins.recorder.nav.v2.transport.WaypointType;
@@ -22,16 +22,18 @@ public class PathContextImplTest
 	{
 		return new WorldSnapshot()
 		{
-			@Override public CollisionFlags collisionAt(WorldPoint p) { return new CollisionFlags(0); }
-			@Override public CollisionView collisionView() { return p -> 0; }
+			@Override public CollisionFlags collisionAt(WorldPoint p)
+			{ return new CollisionFlags(0, CollisionView.Source.GLOBAL_SNAPSHOT, p); }
+			@Override public net.runelite.client.plugins.recorder.nav.v2.bfs.CollisionView collisionView() { return p -> 0; }
 			@Override public Set<WorldPoint> blockingActorTiles() { return Set.of(); }
 			@Override public Set<WorldPoint> blockingObjectTiles() { return Set.of(); }
 			@Override public TransportTable transports()
 			{
 				return new TransportTable(java.util.Collections.emptyList(), 0);
 			}
-			@Override public Object predicates() { return null; }
+			@Override public net.runelite.client.plugins.recorder.nav.v2.predicate.PredicateRegistry predicates() { return null; }
 			@Override public long capturedAtMs() { return 0L; }
+			@Override public WorldPoint playerPosition() { return null; }
 		};
 	}
 

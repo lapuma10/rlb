@@ -10,7 +10,7 @@ import java.util.Objects;
 import java.util.PriorityQueue;
 import java.util.Set;
 import net.runelite.api.coords.WorldPoint;
-import net.runelite.client.plugins.recorder.nav.v2.planner.spi.NavigationContext;
+import net.runelite.client.plugins.recorder.nav.v2.predicate.NavigationContext;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
