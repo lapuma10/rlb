@@ -1,0 +1,62 @@
+package net.runelite.client.plugins.recorder.nav.v2.collision;
+
+import java.util.Set;
+import net.runelite.api.coords.WorldPoint;
+import net.runelite.client.plugins.recorder.nav.v2.predicate.PredicateRegistry;
+
+/** Immutable world-state snapshot used by the planner for one
+ *  {@code plan(...)} call.
+ *
+ *  <p>This is the contract interface from spec §3 — Lane 1 owns the
+ *  shape, Lane 2 owns the implementation file location (here in
+ *  {@code nav/v2/collision/} because Lane 2 constructs instances via
+ *  {@link WorldSnapshotBuilder}). Downstream lanes import this
+ *  interface and consume the snapshot read-only.
+ *
+ *  <p>Once built, every accessor returns the same data for the
+ *  lifetime of the instance. The implementation copies arrays
+ *  defensively at construction so external mutation of the underlying
+ *  client state is invisible to consumers. This is what gives the
+ *  planner a stable view to plan against.
+ *
+ *  <p>{@code transports()} is typed as {@link Object} for now: Lane 4
+ *  owns the {@code TransportTable} interface and will tighten this
+ *  return type when its file lands (cross-lane edit approved via
+ *  coordination per spec §11). Consumers will need to cast until then.
+ *  This is documented as a known limitation in {@code lane2-manifest.md}. */
+public interface WorldSnapshot
+{
+    /** Returns the merged collision flags for {@code p}. Live overlay
+     *  wins inside the loaded scene; global snapshot is the fallback;
+     *  both miss → flags reflect {@code BLOCK_MOVEMENT_FULL}. */
+    CollisionFlags collisionAt(WorldPoint p);
+
+    /** Read-only view of the {@link CollisionView} used at
+     *  construction. The BFS kernel (Lane 3) consumes this directly
+     *  for the hot path. */
+    CollisionView collisionView();
+
+    /** Tiles that are blocked because a movement-blocking actor stands
+     *  on them. Empty set if no actors block movement.
+     *  Immutable — backed by {@code Collections.unmodifiableSet}. */
+    Set<WorldPoint> blockingActorTiles();
+
+    /** Tiles blocked by movement-blocking dynamic objects. Immutable. */
+    Set<WorldPoint> blockingObjectTiles();
+
+    /** The transport table consulted by the planner.
+     *
+     *  <p>Typed {@link Object} until Lane 4 ships its {@code
+     *  TransportTable} interface; consumers cast/Optional.cast. Lane 4
+     *  will tighten this via a coordinated cross-lane edit. */
+    Object transports();
+
+    /** The predicate registry consulted by both the BFS kernel and
+     *  the executor when scoring tile choice. */
+    PredicateRegistry predicates();
+
+    /** Wall-clock instant the snapshot was captured. Used for
+     *  diagnostic correlation; consumers should NOT use this as a
+     *  cache key. */
+    long capturedAtMs();
+}
