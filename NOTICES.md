@@ -14,12 +14,17 @@ shortest-path plugin by Skretzo.
 | Author        | Skretzo                                                      |
 | Repository    | https://github.com/Skretzo/shortest-path                     |
 | License       | BSD-2-Clause                                                 |
-| Bundled file  | `runelite-client/src/main/resources/runelite/nav/collision/collision-map.zip` |
-| Manifest      | `runelite-client/src/main/resources/runelite/nav/collision/MANIFEST.md`        |
+| Bundled file  | `runelite-client/src/main/resources/nav/collision/collision-map.zip` |
+| Manifest      | `runelite-client/src/main/resources/nav/collision/MANIFEST.md`        |
 
 Skretzo's transport TSVs (under `src/main/resources/transports/`) will be vendored
-in Lane 4 to `runelite-client/src/main/resources/runelite/nav/transports/` under
+in Lane 4 to `runelite-client/src/main/resources/nav/transports/` under
 the same license.
+
+Note: spec §9 originally proposed `runelite/nav/...` paths, but the
+`runelite-gradle-plugin`'s `IndexTask` iterates `runelite/*` and
+`parseInt`s every subdirectory name. Top-level `/nav/` resource paths
+avoid that build-task conflict.
 
 Refresh procedure: see the per-resource MANIFEST files.
 
