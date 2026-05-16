@@ -24,7 +24,14 @@
 - `runelite-client/src/main/java/net/runelite/client/plugins/recorder/nav/v2/V2Path.java` (rename interface methods to match §3 locked contract: `steps()` returning `List<PathStep>`)
 - `runelite-client/src/main/java/net/runelite/client/plugins/recorder/nav/v2/V2Leg.java` (may rename or replace — read first to assess)
 
-**Create (new):**
+**Create (new — interface files; Lane 5 owns these since they live in flat `nav/v2/`):**
+- `runelite-client/src/main/java/net/runelite/client/plugins/recorder/nav/v2/PathStep.java` (sealed interface per spec §3; permits `WalkStep` + `TransportStep`)
+- `runelite-client/src/main/java/net/runelite/client/plugins/recorder/nav/v2/WalkStep.java`
+- `runelite-client/src/main/java/net/runelite/client/plugins/recorder/nav/v2/TransportStep.java`
+- `runelite-client/src/main/java/net/runelite/client/plugins/recorder/nav/v2/ExecutorTickResult.java` (interface per spec §3; Lane 5 owns since produced by `V2Executor`)
+- `runelite-client/src/main/java/net/runelite/client/plugins/recorder/nav/v2/TransportCorrectionRequest.java` (NEW typed callback for invalidation flow — replaces direct executor→TransportTable mutation; see Task 6 for interface shape)
+
+**Create (new — impls):**
 - `runelite-client/src/main/java/net/runelite/client/plugins/recorder/nav/v2/executor/SidestepResolver.java`
 - `runelite-client/src/main/java/net/runelite/client/plugins/recorder/nav/v2/executor/ExecutorTickResultImpl.java`
 - `runelite-client/src/main/java/net/runelite/client/plugins/recorder/nav/v2/executor/PathStepCursor.java` (cursor that tracks current `PathStep` index within `V2Path`)
@@ -41,20 +48,45 @@
 
 **Files**: `V2ExecutorEnv.java`, `executor/OnClientLatchBudgetTest.java`.
 
-Behavior: Read current `V2Executor.tick(...)` and enumerate all `V2ExecutorEnv.onClient(...)` call-sites. Target: collapse from 4-6 latch waits per executor tick to ≤2/tick. Strategy:
-- Batch related reads into a single `onClient(...)` block returning a small value-type (e.g. `TickReadOut` containing `playerLoc + isPlausiblyClean + liveCollisionAllows + dynamicEntityOnTile` for the current candidate tile, in one marshalled call).
-- Move static reads (`PixelResolver.canMinimapClick()`) out of `onClient` where they don't need client-thread.
+Behavior: Read current `V2Executor.tick(...)` and enumerate all `V2ExecutorEnv.onClient(...)` call-sites (verified 8 call-sites in current `V2ExecutorEnv`). Audit + reduce; **target ≤3 latch waits per executor tick (relaxed from the spec's ≤2 after QC review identified ≤2 as unachievable while preserving conditional dispatch logic). Document the final budget in `lane5-manifest.md`.**
+
+Strategy: collapse all per-tick *reads* into ONE `onClient(...)` marshalled call returning a `TickReadOut` record. Writes (dispatches) keep their own `onClient` per dispatch type but are mutually-exclusive in a given tick (walk OR minimap OR transport, never multiple).
+
+**Explicit new Env method** (locked in this task — Task 4 imports this; do NOT alter the Env interface from Task 4):
+
+```java
+interface Env {
+  TickReadOut snapshotForTick(WorldPoint candidateTile);
+  // One client-thread marshal. Collapses:
+  //   playerLoc, isPlausiblyClean(candidateTile), liveCollisionAllows(candidateTile),
+  //   dynamicEntityOnTile(candidateTile), snapshotSaysWalkable(candidateTile),
+  //   canMinimapClick() (if it requires client-thread per inspection; otherwise move out).
+  // Returns immutable record.
+
+  // ... existing dispatch methods preserved (dispatchWalk, dispatchMinimap, dispatchTransport, dispatchOpen)
+}
+
+record TickReadOut(
+  WorldPoint playerLoc,
+  boolean candidateClean,
+  boolean liveCollisionAllows,
+  boolean dynamicEntityOnTile,
+  boolean snapshotSaysWalkable,
+  boolean canMinimapClick
+) {}
+```
 
 Add instrumentation: `V2ExecutorEnv` exposes `onClientCallsThisTick()` for testing. Reset per tick boundary.
 
 Tests:
-- `onClient_per_tick_normalWaypoint_atMost2Calls`.
-- `onClient_per_tick_transportLeg_atMost2Calls`.
-- `onClient_per_tick_stalled_atMost2Calls`.
+- `onClient_per_tick_normalWaypoint_atMost3Calls`.
+- `onClient_per_tick_transportLeg_atMost3Calls`.
+- `onClient_per_tick_stalled_atMost3Calls`.
+- `snapshotForTick_collapsesAllReadsIntoOneClientCall`.
 
 Run: `./gradlew :client:test --tests "*OnClientLatchBudgetTest"`
 
-Commit: `perf(nav-engine,lane5): collapse onClient latch budget to <=2/tick`
+Commit: `perf(nav-engine,lane5): collapse onClient latch budget to <=3/tick via TickReadOut`
 
 ---
 
@@ -62,7 +94,9 @@ Commit: `perf(nav-engine,lane5): collapse onClient latch budget to <=2/tick`
 
 **Files**: `V2Path.java`, `executor/PathStepCursor.java`, `executor/PathStepCursorTest.java`.
 
-Behavior: Update `V2Path` interface to match §3 locked contract: methods `steps() → List<PathStep>`, `id() → PathId`, `planEpochMs()`. Remove the separate `waypoints()` + `transports()` lists. `PathStep` is sealed with `WalkStep` + `TransportStep` permitted subtypes (these interfaces live in §3).
+Behavior: Update `V2Path` interface (existing flat file `nav/v2/V2Path.java`) to match §3 locked contract: methods `steps() → List<PathStep>`, `id() → PathId`, `planEpochMs()`. Remove the separate `waypoints()` + `transports()` lists, and remove the old `legs() → List<V2Leg>` interface (or repurpose `V2Leg` as the impl class for `WalkStep` if cleaner — read the existing `V2Leg.java` first; the `V2Leg.Walk` / `V2Leg.Transport` sealed pattern there is structurally close to what we want, just renamed).
+
+**Create the three new sealed-interface files** (per file-structure list at top of this plan): `PathStep.java` (sealed, permits `WalkStep` + `TransportStep`), `WalkStep.java` (non-sealed, has `waypoint()`), `TransportStep.java` (non-sealed, has `transport()`). These live in flat `nav/v2/` per spec §3.
 
 Build `PathStepCursor`: tracks current index within `V2Path.steps()`; methods `current()`, `advance()`, `peek(int offset)`, `remainingSteps()`. Replaces the executor's `legIdx` integer-only tracking.
 
@@ -167,7 +201,20 @@ Behavior: `InvalidationClassifier` currently classifies executor click failures 
 - Keep the classification logic (named verb + transport-state-mismatch + dynamic-blocker + unknown).
 - The blacklist becomes a `TilePredicate` exposed via `PredicateRegistry.register("invalidation-blacklist", ...)`.
 - Transient penalties become time-decaying entries in the blacklist predicate (decay over N ticks per existing convention).
-- Transport-state-mismatch failures emit a `TransportTable.replace(...)` request via a typed callback to `V2Navigator`, NOT directly from the executor. Navigator decides whether to apply the correction and whether to replan.
+- Transport-state-mismatch failures emit a typed `TransportCorrectionRequest` via the `ExecutorTickResult` (or a side-channel field on it) to `V2Navigator`. The executor NEVER mutates `TransportTable` directly. Navigator decides whether to apply the correction (via `TransportTable.replace(...)`) and whether to replan.
+
+**TransportCorrectionRequest interface shape** (Lane 5 owns the file, Lane 4's `TransportTable.replace(...)` accepts the corrected `TransportLink` derived from it):
+
+```java
+public interface TransportCorrectionRequest {
+  WorldPoint plannedTo();
+  WorldPoint actualTo();
+  TransportLeg edge();          // the leg whose 'to' was wrong
+  ReplanReason inferredReason();
+}
+```
+
+**Reconcile with Lane 4 Task 3** (`replace_invokedFromExecutor_throwsOrLogsForbidden`): Lane 4's assertion is "executor must not call `replace(...)` directly." Lane 5's flow goes executor → `ExecutorTickResult` → V2Navigator → `TransportTable.replace(...)`. The assertion in Lane 4 should test the executor specifically — Lane 4 plan Task 3 stays correct; Lane 5 Task 5 (V2Navigator) gains permission to call `replace(...)` when given a `TransportCorrectionRequest`.
 
 Tests:
 - `classifier_dynamicBlocker_addsTransientPenaltyToBlacklist`.

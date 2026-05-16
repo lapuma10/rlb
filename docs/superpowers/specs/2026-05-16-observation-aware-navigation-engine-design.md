@@ -374,8 +374,16 @@ If invalid > 0, log per-row reason. **Loud failure on parse errors** — silent 
   - `nav/v2/V2ExecutorEnv.java`
   - `nav/v2/V2Navigator.java`
   - `nav/v2/InvalidationClassifier.java`
-- **Owns** (new files):
+- **Owns** (new interface files in flat `nav/v2/`):
+  - `nav/v2/PathStep.java` (sealed, permits `WalkStep` + `TransportStep`)
+  - `nav/v2/WalkStep.java`
+  - `nav/v2/TransportStep.java`
+  - `nav/v2/ExecutorTickResult.java` (interface)
+  - `nav/v2/TransportCorrectionRequest.java` (typed callback replacing direct executor→TransportTable mutation)
+- **Owns** (new impl files in subpackage):
   - `nav/v2/executor/SidestepResolver.java`
+  - `nav/v2/executor/ExecutorTickResultImpl.java`
+  - `nav/v2/executor/PathStepCursor.java`
 - **Owns** (tests): mirror
 
 **Requirements**:

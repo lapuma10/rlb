@@ -39,8 +39,9 @@ Lane 4 (Transport + Planner)            depends on Lane 2 (WorldSnapshot) + Lane
 
 - **Phase 0 — SPEC LOCKED** (commit 674e5b744). Lanes 2–6 may now dispatch.
 - **Phase 1 — parallel**: Lane 2, Lane 3, Lane 5, Lane 6 dispatch concurrently against the locked contracts. Each branch off `master` into a per-lane worktree.
-- **Phase 2 — Lane 4**: dispatch once Lane 2 and Lane 3 have shipped at least stubs (interfaces + first test passing). Lane 4 may begin earlier with mocks if the lane agent prefers.
-- **Phase 3 — acceptance gate**: Lane 6 runs the 9 acceptance tests against integrated lanes. Blocks merge to `master` until all 9 pass.
+- **Phase 2 — Lane 4**: dispatch once Lane 2 has handed off Tasks 5–6 (compilable `WorldSnapshot` + `PlayerState`) AND Lane 3 has handed off Tasks 2–3 (compilable `SkretzoBfsKernel` + `RouteValidator`). Both manifests must exist before Lane 4 starts. Lane 4 may stub before that point at the agent's discretion but should not branch off `master` until both manifests land.
+- **Phase 2.7 — smoke test (NEW per QC R4 mitigation)**: As soon as Lanes 2, 3, 4, 5 have integrated their hand-offs, Lane 6 runs *Tests 1, 3, 4 only* against the integrated build. If any smoke test fails, surface the responsible lane immediately. Do NOT proceed to Phase 3 (full acceptance) until smokes pass. This prevents Test 8's bank↔pen failure from masking compounded bugs from multiple lanes.
+- **Phase 3 — acceptance gate**: Lane 6 runs all 9 acceptance tests against integrated lanes. Tests 1, 3, 4, 5, 6, 7, 9 are automated. **Tests 2 (cross-region live) and 8 (bank↔pen 10-cycle) require manual bot-runner sessions** — they are explicitly *manual gates*. Blocks merge to `master` until all 9 pass.
 - **Phase 4 — default flip**: `enableWaypointPlanner` config flag flipped to ON; old V2 planner accessible via config only for emergency rollback.
 
 ---

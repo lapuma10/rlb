@@ -25,6 +25,7 @@
 - `runelite-client/src/main/java/net/runelite/client/plugins/recorder/nav/v2/planner/NavigationContextImpl.java`
 - `runelite-client/src/main/java/net/runelite/client/plugins/recorder/nav/v2/planner/PathContextImpl.java`
 - `runelite-client/src/main/java/net/runelite/client/plugins/recorder/nav/v2/planner/WaypointPlanner.java`
+- `runelite-client/src/main/java/net/runelite/client/plugins/recorder/nav/v2/planner/V2PathImpl.java` (concrete `V2Path` implementation; interface owned by Lane 5)
 - `runelite-client/src/main/java/net/runelite/client/plugins/recorder/nav/v2/planner/PathCompressor.java`
 
 **Create (resources):**
@@ -105,7 +106,7 @@ Tests:
 - `startup_loadsAllTsvFiles_logsStats`.
 - `linksFrom_returnsExpectedLinks`.
 - `appendLiveLink_appearsInLinksFrom`.
-- `replace_invokedFromExecutor_throwsOrLogsForbidden` — anti-mutation guard.
+- `replace_invokedFromExecutor_throwsOrLogsForbidden` — anti-mutation guard. **Specifically tests that direct executor → `TransportTable.replace(...)` is forbidden. `V2Navigator` IS permitted to call `replace(...)` when given a `TransportCorrectionRequest` (Lane 5 type); test both paths.**
 
 Run: `./gradlew :client:test --tests "*TransportTableTest"`
 
@@ -182,9 +183,11 @@ Commit: `feat(nav-engine,lane4): NavigationContextImpl + PathContextImpl`
 
 ## Task 7 — WaypointPlanner
 
-**Files**: `planner/WaypointPlanner.java`, `WaypointPlannerTest.java`.
+**Files**: `planner/WaypointPlanner.java`, `planner/V2PathImpl.java`, `WaypointPlannerTest.java`.
 
-Behavior: The orchestrator. `plan(NavRequest req, WorldSnapshot snap, PlayerState ps, BfsConfig cfg) → V2Path`. Algorithm:
+Behavior: The orchestrator. **`plan(NavigationRequest req, WorldSnapshot snap, BfsConfig cfg) → V2Path`** (per spec §3 — `PlayerState` is reached via `NavigationContext` built from `WorldSnapshot`, NOT passed as a separate parameter). `V2PathImpl` is the concrete `V2Path` implementation Lane 4 ships (interface lives in flat `nav/v2/V2Path.java`, owned by Lane 5; impl lives here because Lane 4 constructs instances).
+
+Algorithm:
 1. Build `NavigationContext` from inputs.
 2. `LinkGraphDijkstra.findRouteSkeleton(ctx, req.from, req.to)`.
 3. For each skeleton node pair:

@@ -180,6 +180,8 @@ Behavior: Holds an ordered list of named `TilePredicate`. Methods:
 - `boolean accepts(WorldPoint tile, PathContext ctx)` — all-must-accept; short-circuits on first reject.
 - `Optional<String> firstRejectorOf(WorldPoint tile, PathContext ctx)` — debug aid; Lane 6 uses this in route traces.
 - Predicates that throw are treated as REJECT and logged at WARN (conservative per spec).
+- **`addTileCondition(WorldPoint tile, boolean allow)`** — script-friendly thin wrapper. Registers an auto-named predicate that returns `allow` for `tile`, accepts all others. Used by spec §6 Test 6 acceptance test. Name format: `script-tile-cond-<UUID>`. Returns the generated name so the script can `unregister(...)` it later.
+- **`addTileCondition(WorldPoint tile, TilePredicate predicate)`** — overload: wraps a custom predicate scoped to a single tile.
 
 Tests:
 - `accepts_allTrue_returnsTrue`.
@@ -187,6 +189,9 @@ Tests:
 - `firstRejectorOf_returnsCorrectName`.
 - `register_duplicateName_throws`.
 - `predicate_throwsException_treatsAsRejectedAndLogs` — verify log line emitted at WARN.
+- `addTileCondition_disallowedTile_rejectedByAccepts`.
+- `addTileCondition_returnsGeneratedName_allowsUnregister`.
+- `addTileCondition_overload_customPredicateScopedToTile`.
 
 Run: `./gradlew :client:test --tests "*PredicateRegistryTest"`
 
