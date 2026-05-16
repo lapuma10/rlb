@@ -69,10 +69,14 @@ public final class V2Navigator implements Navigator
          *  executor cause (TRANSPORT_EXECUTOR_MISSING / CATCHUP_EXHAUSTED
          *  / PLAYER_LOC_LOST / …). */
         @Nullable default V2Executor.FailureReason lastFailureReason() { return null; }
-        /** Round-2: returns true when the executor wants the navigator
-         *  to replan from the player's current position (e.g. after a
-         *  TRANSPORT_RESULT_MISMATCH self-correction). */
-        default boolean wantsReplanFromHere() { return false; }
+
+        /** Lane 5 plan Task 5 — typed-result view of the most recent
+         *  {@link #tick()}. Replaces the prior boolean replan-from-here
+         *  flag (removed) with a typed {@link ExecutorTickResult}
+         *  carrying replan reasons, transport correction requests, and
+         *  the trace id. Default returns null for test hooks that
+         *  haven't migrated. */
+        @Nullable default ExecutorTickResult tickResult() { return null; }
     }
 
     /** Supplier for the player's current world location. Production
@@ -179,8 +183,29 @@ public final class V2Navigator implements Navigator
             @Override public void cancel() { executor.cancel(); }
             @Override public V2Executor.Status status() { return executor.status(); }
             @Override public V2Executor.FailureReason lastFailureReason() { return executor.lastFailureReason(); }
-            @Override public boolean wantsReplanFromHere() { return executor.wantsReplanFromHere(); }
+            @Override public ExecutorTickResult tickResult() { return executor.tickResult(); }
         };
+    }
+
+    /** Lane 5 plan Task 6 hook — production navigator applies a typed
+     *  {@link TransportCorrectionRequest} by delegating to the transport
+     *  store. Tests inject a recorder; production wires to
+     *  {@code V2ExecutorEnv.correctTransportEdge(...)} indirectly via
+     *  the navigator (NOT the executor). When null, corrections are
+     *  observed but not persisted (replan only). */
+    public interface TransportCorrectionSink
+    {
+        void apply(TransportCorrectionRequest req);
+    }
+
+    @Nullable private TransportCorrectionSink correctionSink;
+
+    /** Wire a transport-correction sink. Production callers supply a
+     *  sink that delegates to {@code V2ExecutorEnv.correctTransportEdge(...)}.
+     *  Tests can inject a recorder. */
+    public void setTransportCorrectionSink(@Nullable TransportCorrectionSink sink)
+    {
+        this.correctionSink = sink;
     }
 
     /** Tagged reason for the most recent FAILED transition. {@code null}
@@ -242,15 +267,35 @@ public final class V2Navigator implements Navigator
             executor.setPath(path);
         }
 
-        // Round-2 replan signal: executor self-corrected a transport edge
-        // and asks the navigator to replan from the player's actual
-        // position. Bounded by MAX_REPLANS_PER_REQUEST.
-        if (executor.wantsReplanFromHere())
+        // Lane 5 plan Task 5: typed replan signal via ExecutorTickResult.
+        // The executor sets ExecutorResult.NEEDS_REPLAN via tickResult()
+        // when a transport mismatch / catch-up exhaustion needs a fresh
+        // plan from current player position. Apply any queued transport
+        // correction, then replan within MAX_REPLANS_PER_REQUEST budget.
+        ExecutorTickResult priorTick = executor.tickResult();
+        if (priorTick != null && priorTick.result() == ExecutorResult.NEEDS_REPLAN)
         {
+            // Apply any typed transport correction request via the
+            // installed sink (navigator owns transport-table mutation,
+            // not the executor).
+            priorTick.transportCorrection().ifPresent(req -> {
+                if (correctionSink != null)
+                {
+                    log.info("worldmap-v2: applying TransportCorrectionRequest plannedTo={} actualTo={}",
+                        req.plannedTo(), req.actualTo());
+                    correctionSink.apply(req);
+                }
+                else
+                {
+                    log.warn("worldmap-v2: TransportCorrectionRequest received but no sink wired plannedTo={} actualTo={}",
+                        req.plannedTo(), req.actualTo());
+                }
+            });
             if (replansThisRequest >= MAX_REPLANS_PER_REQUEST)
             {
-                log.warn("worldmap-v2: replan budget exhausted ({}/{}), surfacing FAILED — exec.reason={}",
-                    replansThisRequest, MAX_REPLANS_PER_REQUEST, executor.lastFailureReason());
+                log.warn("worldmap-v2: replan budget exhausted ({}/{}), surfacing FAILED — exec.reason={} replanReason={}",
+                    replansThisRequest, MAX_REPLANS_PER_REQUEST,
+                    executor.lastFailureReason(), priorTick.replanReason().orElse(null));
                 lastFailureReason = FailureReason.EXECUTOR_FAILED;
                 executor.cancel();
                 return NavStatus.FAILED;
@@ -271,10 +316,11 @@ public final class V2Navigator implements Navigator
                 executor.cancel();
                 return NavStatus.FAILED;
             }
-            log.info("worldmap-v2: replan-from-here {} → {} legs={} cost={} routeId={} (replan {}/{}) trail={}",
+            log.info("worldmap-v2: replan-from-here {} → {} legs={} cost={} routeId={} (replan {}/{}) trail={} reason={}",
                 here, target, path.legs().size(), path.totalCost(), path.routeId(),
                 replansThisRequest + 1, MAX_REPLANS_PER_REQUEST,
-                request.trailName() == null ? "none" : request.trailName());
+                request.trailName() == null ? "none" : request.trailName(),
+                priorTick.replanReason().orElse(null));
             replansThisRequest++;
             activePath = path;
             executor.setPath(path);

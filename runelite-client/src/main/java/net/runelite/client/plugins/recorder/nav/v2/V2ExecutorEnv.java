@@ -49,6 +49,14 @@ public final class V2ExecutorEnv implements V2Executor.Env
     private final TransportResolver transportResolver;
     @Nullable private final TransportIndex transportIndex;
 
+    /** Lane 5 plan Task 1: per-tick instrumentation. Increments every
+     *  time {@link #onClient} runs a marshal (regardless of whether the
+     *  call comes from {@link #snapshotForTick} or a dispatch path).
+     *  {@link V2Executor} calls {@link #resetOnClientCallsThisTick} at
+     *  tick entry. Tests read this to assert <=3/tick budget. */
+    private final java.util.concurrent.atomic.AtomicInteger onClientCallsThisTick =
+        new java.util.concurrent.atomic.AtomicInteger();
+
     public V2ExecutorEnv(Client client, ClientThread clientThread,
                          HumanizedInputDispatcher dispatcher,
                          EmptyTileFilter emptyTileFilter,
@@ -301,6 +309,98 @@ public final class V2ExecutorEnv implements V2Executor.Env
         }));
     }
 
+    /** Lane 5 plan Task 1: collapse all per-tick reads into ONE
+     *  client-thread marshal. Combines {@code playerLoc},
+     *  candidate-tile filter, live-collision, dynamic-entity,
+     *  snapshot-walkability, and minimap-reachability into a single
+     *  {@code onClient(...)} latch wait. This drops the per-tick budget
+     *  from 4–6 to 1–2 marshal waits (1 read + possibly 1 dispatch). */
+    @Override
+    public V2Executor.Env.TickReadOut snapshotForTick(@Nullable WorldPoint candidateTile)
+    {
+        V2Executor.Env.TickReadOut result = onClient(() -> {
+            Player self = client.getLocalPlayer();
+            WorldPoint here = self == null ? null : self.getWorldLocation();
+
+            boolean clean = true, live = true, dyn = false, snap = true, mm = true;
+            if (candidateTile != null)
+            {
+                clean = emptyTileFilter.isPlausiblyClean(candidateTile);
+                live = liveCollisionAllowsInternal(candidateTile);
+                dyn = dynamicEntityOnTileInternal(candidateTile);
+                snap = snapshotSaysWalkableInternal(candidateTile);
+                mm = minimapClicker.canClick(candidateTile);
+            }
+            return new V2Executor.Env.TickReadOut(here, clean, live, dyn, snap, mm);
+        });
+        if (result == null)
+        {
+            // Marshal failed (timeout / shutdown). Return conservative
+            // defaults so the executor treats this tick as "no data,
+            // do nothing" without crashing.
+            return new V2Executor.Env.TickReadOut(null, false, false, false, false, false);
+        }
+        return result;
+    }
+
+    /** snapshot/live/dynamic helpers usable inline on the client thread
+     *  (no extra marshal). Used by {@link #snapshotForTick} so all six
+     *  reads share one latch wait. */
+    private boolean snapshotSaysWalkableInternal(WorldPoint tile)
+    {
+        if (tile == null) return false;
+        int regionId = RegionIds.regionIdFor(tile.getX(), tile.getY());
+        RegionChunkSnapshot snap = mapStore.snapshotFor(regionId);
+        if (snap == null) return false;
+        return snap.isStandableLocal(tile.getX(), tile.getY(), tile.getPlane());
+    }
+
+    private boolean liveCollisionAllowsInternal(WorldPoint tile)
+    {
+        if (tile == null) return false;
+        WorldView wv = client.getTopLevelWorldView();
+        if (wv == null) return false;
+        CollisionData[] maps = wv.getCollisionMaps();
+        if (maps == null) return false;
+        int plane = tile.getPlane();
+        if (plane < 0 || plane >= maps.length) return false;
+        CollisionData cd = maps[plane];
+        if (cd == null) return false;
+        int[][] flags = cd.getFlags();
+        if (flags == null) return false;
+        int sx = tile.getX() - wv.getBaseX();
+        int sy = tile.getY() - wv.getBaseY();
+        if (sx < 0 || sy < 0 || sx >= flags.length || sy >= flags[sx].length) return false;
+        return (flags[sx][sy] & net.runelite.api.CollisionDataFlag.BLOCK_MOVEMENT_FULL) == 0;
+    }
+
+    private boolean dynamicEntityOnTileInternal(WorldPoint tile)
+    {
+        if (tile == null) return false;
+        WorldView wv = client.getTopLevelWorldView();
+        if (wv == null) return false;
+        try
+        {
+            for (NPC npc : wv.npcs())
+            {
+                if (npc == null) continue;
+                WorldPoint loc = npc.getWorldLocation();
+                if (loc != null && loc.equals(tile)) return true;
+            }
+        }
+        catch (Throwable th)
+        {
+            log.debug("dynamicEntityOnTile: npc iteration threw", th);
+        }
+        return false;
+    }
+
+    /** Test/Lane-6 hook: number of {@code onClient} marshals performed
+     *  on the current tick. {@link V2Executor#tick()} calls
+     *  {@link #resetOnClientCallsThisTick()} at entry. */
+    public int onClientCallsThisTick() { return onClientCallsThisTick.get(); }
+    public void resetOnClientCallsThisTick() { onClientCallsThisTick.set(0); }
+
     /** Synchronous client-thread read with a bounded wait. The caller
      *  (V2Executor) tolerates a null return as "try again next tick",
      *  so a missed deadline collapses to a one-tick no-op rather than
@@ -313,6 +413,7 @@ public final class V2ExecutorEnv implements V2Executor.Env
     @Nullable
     private <T> T onClient(Supplier<T> sup)
     {
+        onClientCallsThisTick.incrementAndGet();
         // Fast path: if the caller is already on the client thread, run
         // the supplier directly. Without this guard, a future caller
         // that lands on the client thread (e.g. a Sequence engine

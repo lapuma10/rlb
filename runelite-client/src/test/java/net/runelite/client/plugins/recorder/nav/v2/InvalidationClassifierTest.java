@@ -143,4 +143,78 @@ public class InvalidationClassifierTest
         assertNotNull(cls);
         assertEquals(InvalidationClassifier.FailureClass.UNKNOWN_FAILURE, cls);
     }
+
+    // ─────────────────────────────────────────────────────────────────
+    // Lane 5 plan Task 6: predicate-provider + correction-request shape.
+    // ─────────────────────────────────────────────────────────────────
+
+    @Test
+    public void asTilePredicate_blacklistedTile_returnsFalse()
+    {
+        InvalidationClassifier c = new InvalidationClassifier();
+        c.blacklistTile(TILE);
+        java.util.function.Predicate<WorldPoint> pred = c.asTilePredicate();
+        assertFalse("blacklisted tile must be rejected by the predicate",
+            pred.test(TILE));
+        assertTrue("non-blacklisted tile must be accepted",
+            pred.test(new WorldPoint(3209, 3217, 0)));
+    }
+
+    @Test
+    public void asTilePredicate_dynamicBlocker_addsTransientPenaltyToBlacklist()
+    {
+        // Lane 5 plan Task 6 — dynamic blocker adds a transient penalty.
+        // The predicate must reject the tile while the penalty is live.
+        InvalidationClassifier c = new InvalidationClassifier();
+        c.classify(dynamicBlocker(TILE));
+        java.util.function.Predicate<WorldPoint> pred = c.asTilePredicate();
+        assertFalse("dynamic-blocker tile must be rejected by the predicate",
+            pred.test(TILE));
+    }
+
+    @Test
+    public void asTilePredicate_nullTile_returnsFalse()
+    {
+        InvalidationClassifier c = new InvalidationClassifier();
+        java.util.function.Predicate<WorldPoint> pred = c.asTilePredicate();
+        assertFalse(pred.test(null));
+    }
+
+    @Test
+    public void buildCorrectionRequest_returnsTypedRequest()
+    {
+        // Lane 5 plan Task 6: classifier builds a typed
+        // TransportCorrectionRequest the executor surfaces via tickResult.
+        TransportEdge edge = sampleEdge();
+        WorldPoint plannedTo = new WorldPoint(3208, 3218, 0);
+        WorldPoint actualTo = new WorldPoint(3208, 3219, 1);
+        net.runelite.client.plugins.recorder.nav.v2.TransportCorrectionRequest req =
+            InvalidationClassifier.buildCorrectionRequest(
+                edge, plannedTo, actualTo, edge.fromTile());
+        assertNotNull(req);
+        assertEquals(plannedTo, req.plannedTo());
+        assertEquals(actualTo, req.actualTo());
+        assertNotNull(req.edge());
+        assertEquals(edge.fromTile(), req.edge().from());
+        assertEquals(edge.toTile(), req.edge().to());
+        assertEquals("Open", req.edge().action().orElse(null));
+        assertEquals(1530, req.edge().objectId().orElseThrow().intValue());
+        assertEquals(
+            net.runelite.client.plugins.recorder.nav.v2.ReplanReason.TRANSPORT_UNAVAILABLE,
+            req.inferredReason());
+    }
+
+    @Test
+    public void buildCorrectionRequest_isPureBuilder_noSideEffects()
+    {
+        // The builder must NOT mutate the classifier's blacklist or any
+        // transport store. It's a pure factory called by the executor.
+        InvalidationClassifier c = new InvalidationClassifier();
+        TransportEdge edge = sampleEdge();
+        InvalidationClassifier.buildCorrectionRequest(
+            edge, new WorldPoint(1, 2, 0), new WorldPoint(1, 2, 1), edge.fromTile());
+        assertEquals(0, c.failureCount(edge.fromTile()));
+        assertFalse(c.isBlacklisted(edge.fromTile()));
+        assertFalse(c.isTransportStale(edge.key()));
+    }
 }

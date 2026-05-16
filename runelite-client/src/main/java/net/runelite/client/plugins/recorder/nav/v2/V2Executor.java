@@ -1,9 +1,11 @@
 package net.runelite.client.plugins.recorder.nav.v2;
 
 import java.util.Random;
+import java.util.UUID;
 import javax.annotation.Nullable;
 import lombok.extern.slf4j.Slf4j;
 import net.runelite.api.coords.WorldPoint;
+import net.runelite.client.plugins.recorder.nav.v2.executor.ExecutorTickResultImpl;
 import net.runelite.client.plugins.recorder.worldmap.TransportEdge;
 
 /** Per-tick state machine that turns a {@link V2Path} into walk-clicks,
@@ -211,6 +213,36 @@ public final class V2Executor
          *  tile. Returns true if the dispatcher accepted the request. */
         default boolean dispatchOpen(WorldPoint clickTile)
         { return false; }
+
+        /** Lane 5 plan Task 1: collapse all per-tick reads into one
+         *  client-thread marshal. Production impl ({@link V2ExecutorEnv})
+         *  marshals once and reads {@code playerLoc}, candidate-tile
+         *  filter pass, live collision, dynamic-entity occupancy,
+         *  snapshot walkability, and minimap reachability in one go.
+         *
+         *  <p>Default delegates back to the individual methods (1 wait
+         *  each) for envs that haven't migrated. Tests can override to
+         *  count the bundled-read invocation count. */
+        default TickReadOut snapshotForTick(@Nullable WorldPoint candidateTile)
+        {
+            WorldPoint p = playerLoc();
+            boolean clean = candidateTile == null || isPlausiblyClean(candidateTile);
+            boolean live = candidateTile == null || liveCollisionAllows(candidateTile);
+            boolean dyn = candidateTile != null && dynamicEntityOnTile(candidateTile);
+            boolean snap = candidateTile == null || snapshotSaysWalkable(candidateTile);
+            boolean mm = candidateTile == null || canMinimapClick(candidateTile);
+            return new TickReadOut(p, clean, live, dyn, snap, mm);
+        }
+
+        /** Immutable bundle of per-tick state reads. Built once per
+         *  {@link V2Executor#tick()} call from {@link #snapshotForTick}. */
+        record TickReadOut(
+            @Nullable WorldPoint playerLoc,
+            boolean candidateClean,
+            boolean liveCollisionAllows,
+            boolean dynamicEntityOnTile,
+            boolean snapshotSaysWalkable,
+            boolean canMinimapClick) {}
     }
 
     /** Ticks of zero progress before treating a WALK leg as stalled. */
@@ -292,12 +324,26 @@ public final class V2Executor
      *  (recomputed at the next walk-leg tick). */
     private int progressIdx;
 
-    /** Round-2 replan signal: when set, the navigator should cancel the
-     *  active path and replan from the player's current position before
-     *  surfacing FAILED. Used after {@link FailureReason#TRANSPORT_RESULT_MISMATCH}
-     *  so a wrong-toTile transport edge gets corrected and re-routed
-     *  rather than aborting the script. */
-    private boolean wantsReplanFromHere;
+    /** Lane 5 plan Task 4 — typed replan signal. Replaces the prior
+     *  cross-layer replan-from-here boolean (removed). When non-null,
+     *  the navigator sees a {@link ExecutorResult#NEEDS_REPLAN} via
+     *  {@link #tickResult} and decides whether to replan. The reason
+     *  clears on {@link #setPath} / {@link #cancel}. */
+    @Nullable private net.runelite.client.plugins.recorder.nav.v2.ReplanReason pendingReplanReason;
+
+    /** Lane 5 plan Task 6 — typed transport-correction emission. The
+     *  executor MUST NOT call the env's
+     *  {@code correctTransportEdge(...)} directly (spec §7 rule
+     *  "Transport data is never mutated by executor"). Instead, the
+     *  executor records the typed request here; {@link #tickResult()}
+     *  surfaces it to the navigator, which applies the correction. */
+    @Nullable private net.runelite.client.plugins.recorder.nav.v2.TransportCorrectionRequest
+        pendingTransportCorrection;
+
+    /** Lane 5 plan Task 4 — trace id stamped on the current tick's
+     *  log lines and surfaced via {@link ExecutorTickResult#debugTraceId}.
+     *  Lane 6's RouteTraceRecorder groups per-tick logs by it. */
+    private String currentTraceId = "";
 
     /** Round-2 gate handling: tile we detected as static-collision-blocked
      *  and dispatched an Open verb-click for. Cleared once the live
@@ -354,7 +400,8 @@ public final class V2Executor
         this.transportClicked = false;
         this.ticksSinceTransportClick = 0;
         this.progressIdx = -1;
-        this.wantsReplanFromHere = false;
+        this.pendingReplanReason = null;
+        this.pendingTransportCorrection = null;
         this.pendingOpenTile = null;
         this.ticksSincePendingOpen = 0;
         this.pendingOpenIsWallEdge = false;
@@ -437,17 +484,131 @@ public final class V2Executor
         this.transportClicked = false;
         this.ticksSinceTransportClick = 0;
         this.progressIdx = -1;
-        this.wantsReplanFromHere = false;
+        this.pendingReplanReason = null;
+        this.pendingTransportCorrection = null;
         this.pendingOpenTile = null;
         this.ticksSincePendingOpen = 0;
     }
 
-    /** Round-2 replan signal. The Navigator reads this after each tick;
-     *  when {@code true}, it should cancel the active path and replan
-     *  from the player's current world location instead of propagating
-     *  FAILED. The flag clears on the next {@link #setPath} or
-     *  {@link #cancel}. */
-    public boolean wantsReplanFromHere() { return wantsReplanFromHere; }
+    /** Lane 5 plan Task 4: typed-result view of the most recent
+     *  {@link #tick()} call. The navigator reads this to decide
+     *  whether to continue / replan / fail. Replaces the prior
+     *  cross-layer replan-from-here boolean (removed) + the side-channel
+     *  {@link #lastFailureReason()} access.
+     *
+     *  <p>Always non-null. Carries a trace id (Lane 6 correlation),
+     *  optional replan reason, optional transport correction request,
+     *  and the current player / waypoint / transport context. */
+    public ExecutorTickResult tickResult()
+    {
+        // Map Status + pending fields into typed result.
+        ExecutorResult er;
+        switch (status)
+        {
+            case ARRIVED: er = ExecutorResult.PATH_COMPLETED; break;
+            case FAILED:  er = (pendingReplanReason != null)
+                ? ExecutorResult.NEEDS_REPLAN
+                : ExecutorResult.FAILED;
+                break;
+            case IDLE:    er = (path == null || path.isEmpty())
+                ? ExecutorResult.PATH_COMPLETED
+                : ExecutorResult.IN_PROGRESS;
+                break;
+            case RUNNING:
+            default: er = (pendingReplanReason != null)
+                ? ExecutorResult.NEEDS_REPLAN
+                : ExecutorResult.IN_PROGRESS;
+                break;
+        }
+        Waypoint cur = currentLegWaypoint();
+        TransportLeg curLeg = currentLegTransport();
+        return ExecutorTickResultImpl.builder()
+            .result(er)
+            .replanReason(pendingReplanReason)
+            .playerAt(lastPlayerLoc)
+            .currentWaypoint(cur)
+            .currentTransport(curLeg)
+            .debugTraceId(currentTraceId.isEmpty() ? UUID.randomUUID().toString() : currentTraceId)
+            .transportCorrection(pendingTransportCorrection)
+            .build();
+    }
+
+    /** Spec §3 typed-step view of the current leg as a {@link Waypoint}. */
+    @Nullable
+    private Waypoint currentLegWaypoint()
+    {
+        if (path == null || path.isEmpty() || legIdx >= path.legs().size()) return null;
+        V2Leg leg = path.legs().get(legIdx);
+        if (leg instanceof V2Leg.Walk w)
+        {
+            WorldPoint end = w.end();
+            return new Waypoint()
+            {
+                @Override public WorldPoint target() { return end; }
+                @Override public int toleranceRadius() { return 1; }
+                @Override public WaypointType type() { return WaypointType.WALK; }
+            };
+        }
+        return null;
+    }
+
+    /** Spec §3 typed-step view of the current leg as a {@link TransportLeg}. */
+    @Nullable
+    private TransportLeg currentLegTransport()
+    {
+        if (path == null || path.isEmpty() || legIdx >= path.legs().size()) return null;
+        V2Leg leg = path.legs().get(legIdx);
+        if (leg instanceof V2Leg.Transport t)
+        {
+            TransportEdge e = t.edge();
+            WorldPoint approachTile = e.approachTile() != null ? e.approachTile() : e.fromTile();
+            int regionId = e.regionId();
+            return new TransportLeg()
+            {
+                @Override public WorldPoint from() { return e.fromTile(); }
+                @Override public WorldPoint to() { return e.toTile(); }
+                @Override public TransportType type() { return TransportType.OBJECT_VERB; }
+                @Override public java.util.Optional<Integer> objectId()
+                { return java.util.Optional.of(e.objectId()); }
+                @Override public java.util.Optional<String> action()
+                { return java.util.Optional.ofNullable(e.verb()); }
+                @Override public WorldPoint approach() { return approachTile; }
+                @Override public int regionId() { return regionId; }
+            };
+        }
+        return null;
+    }
+
+    /** Lane 5 plan Task 6 — build a typed {@link TransportCorrectionRequest}
+     *  for the executor to surface via {@link #tickResult()}. The
+     *  navigator inspects + applies the correction; the executor never
+     *  mutates transport state directly. */
+    private static TransportCorrectionRequest buildCorrectionRequest(
+        TransportEdge edge, WorldPoint plannedTo, WorldPoint actualTo, WorldPoint approach)
+    {
+        int regionId = edge.regionId();
+        WorldPoint app = approach;
+        TransportLeg leg = new TransportLeg()
+        {
+            @Override public WorldPoint from() { return edge.fromTile(); }
+            @Override public WorldPoint to() { return edge.toTile(); }
+            @Override public TransportType type() { return TransportType.OBJECT_VERB; }
+            @Override public java.util.Optional<Integer> objectId()
+            { return java.util.Optional.of(edge.objectId()); }
+            @Override public java.util.Optional<String> action()
+            { return java.util.Optional.ofNullable(edge.verb()); }
+            @Override public WorldPoint approach() { return app; }
+            @Override public int regionId() { return regionId; }
+        };
+        return new TransportCorrectionRequest()
+        {
+            @Override public WorldPoint plannedTo() { return plannedTo; }
+            @Override public WorldPoint actualTo() { return actualTo; }
+            @Override public TransportLeg edge() { return leg; }
+            @Override public ReplanReason inferredReason()
+            { return ReplanReason.TRANSPORT_UNAVAILABLE; }
+        };
+    }
 
     /** Round-1 stub. Logs a warning and falls through to UNCHANGED. */
     public void setRunMode(RunMode mode)
@@ -476,12 +637,16 @@ public final class V2Executor
     /** Drive one tick of execution. */
     public Status tick()
     {
+        // Lane 5 plan Task 4: per-tick trace id for Lane 6 log correlation.
+        // Generated once at tick entry; consumed by tickResult() at end.
+        this.currentTraceId = UUID.randomUUID().toString();
+
         if (path == null || path.isEmpty()) { status = Status.IDLE; return status; }
         if (status != Status.RUNNING) return status;
         // A replan was requested (transport mismatch) — wait for the
         // navigator to call setPath / cancel. Don't dispatch on a route
         // we already know is invalid.
-        if (wantsReplanFromHere) return status;
+        if (pendingReplanReason != null) return status;
 
         WorldPoint here = env.playerLoc();
         if (here == null)
@@ -875,9 +1040,12 @@ public final class V2Executor
      *        the next WALK leg's plane.</li>
      *    <li>Result mismatch correction — if plane changes to a value
      *        other than {@code edge.toTile().plane}, log
-     *        TRANSPORT_RESULT_MISMATCH, correct the TransportIndex
-     *        entry, and signal {@link #wantsReplanFromHere} so the
-     *        navigator routes from the player's actual position.</li>
+     *        TRANSPORT_RESULT_MISMATCH, emit a typed
+     *        {@link TransportCorrectionRequest} via {@link #tickResult()},
+     *        and set a {@link ReplanReason} so the navigator (NOT the
+     *        executor) applies the correction and replans from the
+     *        player's actual position. The executor does not mutate
+     *        the transport table directly (spec §7).</li>
      *  </ul> */
     private Status executeTransportLeg(WorldPoint here, V2Leg.Transport t)
     {
@@ -933,21 +1101,23 @@ public final class V2Executor
             if (here.getPlane() != fromPlane)
             {
                 // Plane changed but to a DIFFERENT plane than the planned
-                // toTile. Recorded edge is wrong — correct it, replan.
-                log.warn("[v2-transport] result mismatch plannedTo={} actual={}",
-                    expectedTo, here);
-                log.info("[v2-transport] correcting edge from={} verb={} oldTo={} newTo={}",
+                // toTile. Recorded edge is wrong. Lane 5 plan Task 6:
+                // emit a typed TransportCorrectionRequest via
+                // tickResult() — the navigator (NOT the executor)
+                // applies the correction and replans. The executor
+                // MUST NOT mutate the transport table directly (spec §7).
+                log.warn("[v2-transport] result mismatch plannedTo={} actual={} traceId={}",
+                    expectedTo, here, currentTraceId);
+                log.info("[v2-transport] emitting TransportCorrectionRequest from={} verb={} oldTo={} newTo={}",
                     edge.fromTile(), edge.verb(), expectedTo, here);
-                env.correctTransportEdge(edge.objectId(), edge.verb(),
-                    edge.fromTile(), expectedTo, here, approach, edge.regionId());
-                log.info("v2-executor: replanning from current position after transport correction (player={})",
-                    here);
-                wantsReplanFromHere = true;
+                pendingTransportCorrection = buildCorrectionRequest(edge, expectedTo, here, approach);
+                pendingReplanReason = ReplanReason.TRANSPORT_UNAVAILABLE;
                 lastFailureReason = FailureReason.TRANSPORT_RESULT_MISMATCH;
                 // Don't FAIL — leave status RUNNING; navigator will see
-                // wantsReplanFromHere on its next tick and replan from
-                // the player's current position. Until then, tick is a
-                // no-op (early return at the top of the next tick).
+                // ExecutorResult.NEEDS_REPLAN on its next tick and apply
+                // the correction + replan from the player's current
+                // position. Until then, tick is a no-op (early return
+                // at the top of the next tick).
                 return status;
             }
             // Still on from-plane → waiting.
@@ -1140,13 +1310,14 @@ public final class V2Executor
         // 80%+ of bank → pen route, stalled on a single water/sentinel
         // tile near the destination, gave up despite the rest of the
         // route being walkable.
-        log.warn("v2-executor: stall recovery exhausted after {} catch-up click(s) on {} — requesting replan",
-            catchupClicksThisLeg, lastDispatchedTile);
+        log.warn("v2-executor: stall recovery exhausted after {} catch-up click(s) on {} — requesting replan traceId={}",
+            catchupClicksThisLeg, lastDispatchedTile, currentTraceId);
         if (lastDispatchedTile != null) classifier.blacklistTile(lastDispatchedTile);
-        wantsReplanFromHere = true;
+        pendingReplanReason = ReplanReason.NO_LOCAL_WALKABLE_TILE;
         lastFailureReason = FailureReason.CATCHUP_EXHAUSTED;
         // Don't FAIL — leave status RUNNING so the navigator picks up
-        // wantsReplanFromHere and replans within its budget.
+        // ExecutorResult.NEEDS_REPLAN (via tickResult()) and replans
+        // within its budget.
         return true;
     }
 

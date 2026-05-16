@@ -13,6 +13,7 @@ import net.runelite.client.plugins.recorder.worldmap.TransportEdge;
 import org.junit.Test;
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertNotEquals;
+import static org.junit.Assert.assertNotNull;
 import static org.junit.Assert.assertNull;
 import static org.junit.Assert.assertSame;
 import static org.junit.Assert.assertTrue;
@@ -323,8 +324,9 @@ public class V2ExecutorTest
     @Test
     public void tick_catchupExhausted_signalsReplanInsteadOfFail()
     {
-        // Round-2 stabilization: stall recovery exhaustion no longer
-        // FAILs the script — it sets wantsReplanFromHere() so the
+        // Round-2 stabilization (Lane 5 plan Task 4 — typed result):
+        // stall recovery exhaustion no longer FAILs the script — it
+        // surfaces ExecutorResult.NEEDS_REPLAN via tickResult() so the
         // navigator can blacklist the bad tile and replan within its
         // budget. Live observation: bot reached 80% of bank → pen,
         // stalled on a single sentinel tile, gave up despite the rest
@@ -342,8 +344,9 @@ public class V2ExecutorTest
         }
         assertEquals("status remains RUNNING; navigator handles replan",
             V2Executor.Status.RUNNING, x.status());
-        assertTrue("wantsReplanFromHere set so navigator can replan",
-            x.wantsReplanFromHere());
+        assertEquals("typed result is NEEDS_REPLAN so navigator can replan",
+            net.runelite.client.plugins.recorder.nav.v2.ExecutorResult.NEEDS_REPLAN,
+            x.tickResult().result());
         assertEquals("failure reason still tagged CATCHUP_EXHAUSTED for diagnostics",
             V2Executor.FailureReason.CATCHUP_EXHAUSTED, x.lastFailureReason());
     }
@@ -588,7 +591,8 @@ public class V2ExecutorTest
             x.tick();
         }
         assertEquals(V2Executor.Status.RUNNING, x.status());
-        assertTrue(x.wantsReplanFromHere());
+        assertEquals(net.runelite.client.plugins.recorder.nav.v2.ExecutorResult.NEEDS_REPLAN,
+            x.tickResult().result());
         assertEquals(V2Executor.FailureReason.CATCHUP_EXHAUSTED, x.lastFailureReason());
     }
 
@@ -978,8 +982,62 @@ public class V2ExecutorTest
             || r == V2Executor.FailureReason.NO_CANDIDATE_AVAILABLE);
     }
 
+    /** Lane 5 plan Task 4 + 6 — assertion fixture: across an entire
+     *  transport-mismatch scenario, the executor must NEVER call
+     *  env.correctTransportEdge(...) directly. The typed
+     *  TransportCorrectionRequest goes through ExecutorTickResult to
+     *  the navigator (the only layer permitted to mutate transport
+     *  state per spec §7). */
+    @Test
+    public void tick_neverEditsTransportTable_acrossMismatchScenario()
+    {
+        FakeEnv env = new FakeEnv();
+        WorldPoint clickTile = new WorldPoint(3206, 3229, 2);
+        env.player = clickTile;
+        env.transportObjects.put(clickTile, clickTile);
+
+        V2Executor x = newExecutor(env);
+        TransportEdge wrongEdge = new TransportEdge(
+            clickTile, new WorldPoint(3205, 3228, 0),
+            56231, "Staircase", "Climb-down",
+            0, 0, "object", clickTile, 12850, 1, 0L, 0L);
+        x.setPath(new V2Path(List.of(new V2Leg.Transport(wrongEdge)), 10));
+
+        // Drive the mismatch flow.
+        env.busy = false;
+        x.tick();
+        env.player = new WorldPoint(3206, 3229, 1);
+        env.busy = false;
+        x.tick();
+
+        // The executor must NOT have called env.correctTransportEdge.
+        assertEquals("executor must NEVER mutate the transport store directly (spec §7)",
+            0, env.edgeCorrections.size());
+        // Instead it surfaces a typed TransportCorrectionRequest.
+        assertTrue("typed correction emitted",
+            x.tickResult().transportCorrection().isPresent());
+    }
+
+    @Test
+    public void tick_emitsDebugTraceId_nonNullNonEmpty()
+    {
+        FakeEnv env = new FakeEnv();
+        env.player = new WorldPoint(3208, 3217, 0);
+        V2Executor x = newExecutor(env);
+        x.setPath(eastPath(20));
+        x.tick();
+        net.runelite.client.plugins.recorder.nav.v2.ExecutorTickResult r = x.tickResult();
+        assertNotNull(r);
+        assertNotNull("debugTraceId must be non-null", r.debugTraceId());
+        assertTrue("debugTraceId must be non-empty (Lane 6 correlation)",
+            !r.debugTraceId().isEmpty());
+    }
+
     /** B1. Transport result mismatch: planned p2→p0, actual p2→p1.
-     *  Executor must call correctTransportEdge AND set wantsReplanFromHere. */
+     *  Lane 5 plan Task 6: executor emits a typed
+     *  TransportCorrectionRequest via tickResult() and sets
+     *  ExecutorResult.NEEDS_REPLAN. The executor MUST NOT call
+     *  env.correctTransportEdge directly (spec §7). */
     @Test
     public void transport_resultMismatch_correctsEdgeAndRequestsReplan()
     {
@@ -1009,17 +1067,26 @@ public class V2ExecutorTest
         env.busy = false;
         x.tick();
 
-        assertTrue("executor must request replan from here", x.wantsReplanFromHere());
+        // Lane 5 plan Task 6: executor emits a typed
+        // TransportCorrectionRequest via tickResult() — does NOT
+        // mutate the transport store directly (spec §7).
+        net.runelite.client.plugins.recorder.nav.v2.ExecutorTickResult result = x.tickResult();
+        assertEquals("typed result is NEEDS_REPLAN",
+            net.runelite.client.plugins.recorder.nav.v2.ExecutorResult.NEEDS_REPLAN,
+            result.result());
+        assertTrue("TransportCorrectionRequest emitted",
+            result.transportCorrection().isPresent());
         assertEquals("failure reason logged as TRANSPORT_RESULT_MISMATCH",
             V2Executor.FailureReason.TRANSPORT_RESULT_MISMATCH, x.lastFailureReason());
-        assertEquals("edge correction must be recorded once",
-            1, env.edgeCorrections.size());
-        EdgeCorrection ec = env.edgeCorrections.get(0);
-        assertEquals(56231, ec.objectId);
-        assertEquals("Climb-down", ec.verb);
-        assertEquals(clickTile, ec.fromTile);
-        assertEquals(new WorldPoint(3205, 3228, 0), ec.plannedToTile);
-        assertEquals(new WorldPoint(3206, 3229, 1), ec.actualToTile);
+        assertEquals("executor must NOT mutate the transport store directly",
+            0, env.edgeCorrections.size());
+        net.runelite.client.plugins.recorder.nav.v2.TransportCorrectionRequest req =
+            result.transportCorrection().get();
+        assertEquals(56231, req.edge().objectId().orElseThrow().intValue());
+        assertEquals("Climb-down", req.edge().action().orElseThrow());
+        assertEquals(clickTile, req.edge().from());
+        assertEquals(new WorldPoint(3205, 3228, 0), req.plannedTo());
+        assertEquals(new WorldPoint(3206, 3229, 1), req.actualTo());
     }
 
     /** C. Direction-correct edge: an edge whose to-plane doesn't match

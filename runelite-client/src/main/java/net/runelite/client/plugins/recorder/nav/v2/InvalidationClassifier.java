@@ -11,7 +11,24 @@ import net.runelite.client.plugins.recorder.worldmap.TransportEdge;
 
 /** Typed classification of failed clicks plus session-local recovery
  *  state (failure counts, blacklist, transient penalties, stale
- *  transports). Per spec section "Snapshot invalidation":
+ *  transports).
+ *
+ *  <p>Lane 5 plan Task 6 — folded as a {@code TilePredicate} provider.
+ *  {@link #asTilePredicate()} exposes the blacklist + transient
+ *  penalty state as a {@code Predicate<WorldPoint>} that the executor
+ *  (and Lane 4's planner) can register with Lane 2's
+ *  {@code PredicateRegistry} as "invalidation-blacklist". The same
+ *  classification entry points feed both the predicate (planner-side
+ *  avoidance) and the executor's sidestep filter.
+ *
+ *  <p>Transport-state-mismatch failures emit a typed
+ *  {@link TransportCorrectionRequest} via
+ *  {@link #buildCorrectionRequest(TransportEdge, WorldPoint, WorldPoint, WorldPoint)}
+ *  for the executor to surface through its tickResult — the executor
+ *  MUST NOT call {@code env.correctTransportEdge(...)} directly
+ *  (spec §7 "Transport data is never mutated by executor").
+ *
+ *  <p>Per spec section "Snapshot invalidation":
  *
  *  <ul>
  *    <li>{@link FailureClass#STATIC_COLLISION_MISMATCH} — snapshot
@@ -176,5 +193,53 @@ public final class InvalidationClassifier
         failureCounts.clear();
         blacklist.clear();
         transientPenalties.clear();
+    }
+
+    /** Lane 5 plan Task 6: expose the blacklist + transient penalty
+     *  state as a {@code Predicate<WorldPoint>} that returns {@code
+     *  true} when the tile is acceptable (NOT blacklisted, NOT under a
+     *  transient penalty). The executor uses this as one of its
+     *  composed predicates; Lane 4's planner can register it with the
+     *  {@code PredicateRegistry} under the key
+     *  {@code "invalidation-blacklist"}. */
+    public java.util.function.Predicate<WorldPoint> asTilePredicate()
+    {
+        return tile -> tile != null
+            && !isBlacklisted(tile)
+            && !hasTransientPenalty(tile);
+    }
+
+    /** Lane 5 plan Task 6: build a typed
+     *  {@link TransportCorrectionRequest} for a transport-state-mismatch
+     *  failure. The executor calls this and surfaces the result via
+     *  its {@code tickResult()} — the navigator (NOT the executor)
+     *  applies the correction. Spec §7 rule "Transport data is never
+     *  mutated by executor" — this method is a pure builder, no side
+     *  effects. */
+    public static TransportCorrectionRequest buildCorrectionRequest(
+        TransportEdge edge, WorldPoint plannedTo, WorldPoint actualTo, WorldPoint approach)
+    {
+        final WorldPoint app = approach != null ? approach : edge.fromTile();
+        final int regionId = edge.regionId();
+        TransportLeg leg = new TransportLeg()
+        {
+            @Override public WorldPoint from() { return edge.fromTile(); }
+            @Override public WorldPoint to() { return edge.toTile(); }
+            @Override public TransportType type() { return TransportType.OBJECT_VERB; }
+            @Override public java.util.Optional<Integer> objectId()
+            { return java.util.Optional.of(edge.objectId()); }
+            @Override public java.util.Optional<String> action()
+            { return java.util.Optional.ofNullable(edge.verb()); }
+            @Override public WorldPoint approach() { return app; }
+            @Override public int regionId() { return regionId; }
+        };
+        return new TransportCorrectionRequest()
+        {
+            @Override public WorldPoint plannedTo() { return plannedTo; }
+            @Override public WorldPoint actualTo() { return actualTo; }
+            @Override public TransportLeg edge() { return leg; }
+            @Override public ReplanReason inferredReason()
+            { return ReplanReason.TRANSPORT_UNAVAILABLE; }
+        };
     }
 }
