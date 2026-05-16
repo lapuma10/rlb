@@ -323,8 +323,9 @@ public class V2ExecutorTest
     @Test
     public void tick_catchupExhausted_signalsReplanInsteadOfFail()
     {
-        // Round-2 stabilization: stall recovery exhaustion no longer
-        // FAILs the script — it sets wantsReplanFromHere() so the
+        // Round-2 stabilization (Lane 5 plan Task 4 — typed result):
+        // stall recovery exhaustion no longer FAILs the script — it
+        // surfaces ExecutorResult.NEEDS_REPLAN via tickResult() so the
         // navigator can blacklist the bad tile and replan within its
         // budget. Live observation: bot reached 80% of bank → pen,
         // stalled on a single sentinel tile, gave up despite the rest
@@ -342,8 +343,9 @@ public class V2ExecutorTest
         }
         assertEquals("status remains RUNNING; navigator handles replan",
             V2Executor.Status.RUNNING, x.status());
-        assertTrue("wantsReplanFromHere set so navigator can replan",
-            x.wantsReplanFromHere());
+        assertEquals("typed result is NEEDS_REPLAN so navigator can replan",
+            net.runelite.client.plugins.recorder.nav.v2.ExecutorResult.NEEDS_REPLAN,
+            x.tickResult().result());
         assertEquals("failure reason still tagged CATCHUP_EXHAUSTED for diagnostics",
             V2Executor.FailureReason.CATCHUP_EXHAUSTED, x.lastFailureReason());
     }
@@ -588,7 +590,8 @@ public class V2ExecutorTest
             x.tick();
         }
         assertEquals(V2Executor.Status.RUNNING, x.status());
-        assertTrue(x.wantsReplanFromHere());
+        assertEquals(net.runelite.client.plugins.recorder.nav.v2.ExecutorResult.NEEDS_REPLAN,
+            x.tickResult().result());
         assertEquals(V2Executor.FailureReason.CATCHUP_EXHAUSTED, x.lastFailureReason());
     }
 
@@ -979,7 +982,10 @@ public class V2ExecutorTest
     }
 
     /** B1. Transport result mismatch: planned p2→p0, actual p2→p1.
-     *  Executor must call correctTransportEdge AND set wantsReplanFromHere. */
+     *  Lane 5 plan Task 6: executor emits a typed
+     *  TransportCorrectionRequest via tickResult() and sets
+     *  ExecutorResult.NEEDS_REPLAN. The executor MUST NOT call
+     *  env.correctTransportEdge directly (spec §7). */
     @Test
     public void transport_resultMismatch_correctsEdgeAndRequestsReplan()
     {
@@ -1009,17 +1015,26 @@ public class V2ExecutorTest
         env.busy = false;
         x.tick();
 
-        assertTrue("executor must request replan from here", x.wantsReplanFromHere());
+        // Lane 5 plan Task 6: executor emits a typed
+        // TransportCorrectionRequest via tickResult() — does NOT
+        // mutate the transport store directly (spec §7).
+        net.runelite.client.plugins.recorder.nav.v2.ExecutorTickResult result = x.tickResult();
+        assertEquals("typed result is NEEDS_REPLAN",
+            net.runelite.client.plugins.recorder.nav.v2.ExecutorResult.NEEDS_REPLAN,
+            result.result());
+        assertTrue("TransportCorrectionRequest emitted",
+            result.transportCorrection().isPresent());
         assertEquals("failure reason logged as TRANSPORT_RESULT_MISMATCH",
             V2Executor.FailureReason.TRANSPORT_RESULT_MISMATCH, x.lastFailureReason());
-        assertEquals("edge correction must be recorded once",
-            1, env.edgeCorrections.size());
-        EdgeCorrection ec = env.edgeCorrections.get(0);
-        assertEquals(56231, ec.objectId);
-        assertEquals("Climb-down", ec.verb);
-        assertEquals(clickTile, ec.fromTile);
-        assertEquals(new WorldPoint(3205, 3228, 0), ec.plannedToTile);
-        assertEquals(new WorldPoint(3206, 3229, 1), ec.actualToTile);
+        assertEquals("executor must NOT mutate the transport store directly",
+            0, env.edgeCorrections.size());
+        net.runelite.client.plugins.recorder.nav.v2.TransportCorrectionRequest req =
+            result.transportCorrection().get();
+        assertEquals(56231, req.edge().objectId().orElseThrow().intValue());
+        assertEquals("Climb-down", req.edge().action().orElseThrow());
+        assertEquals(clickTile, req.edge().from());
+        assertEquals(new WorldPoint(3205, 3228, 0), req.plannedTo());
+        assertEquals(new WorldPoint(3206, 3229, 1), req.actualTo());
     }
 
     /** C. Direction-correct edge: an edge whose to-plane doesn't match
