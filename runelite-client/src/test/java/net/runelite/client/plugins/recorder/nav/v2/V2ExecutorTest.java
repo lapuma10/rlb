@@ -13,6 +13,7 @@ import net.runelite.client.plugins.recorder.worldmap.TransportEdge;
 import org.junit.Test;
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertNotEquals;
+import static org.junit.Assert.assertNotNull;
 import static org.junit.Assert.assertNull;
 import static org.junit.Assert.assertSame;
 import static org.junit.Assert.assertTrue;
@@ -979,6 +980,57 @@ public class V2ExecutorTest
         assertTrue("expected NO_FORWARD_CANDIDATE or NO_CANDIDATE_AVAILABLE, got " + r,
             r == V2Executor.FailureReason.NO_FORWARD_CANDIDATE
             || r == V2Executor.FailureReason.NO_CANDIDATE_AVAILABLE);
+    }
+
+    /** Lane 5 plan Task 4 + 6 — assertion fixture: across an entire
+     *  transport-mismatch scenario, the executor must NEVER call
+     *  env.correctTransportEdge(...) directly. The typed
+     *  TransportCorrectionRequest goes through ExecutorTickResult to
+     *  the navigator (the only layer permitted to mutate transport
+     *  state per spec §7). */
+    @Test
+    public void tick_neverEditsTransportTable_acrossMismatchScenario()
+    {
+        FakeEnv env = new FakeEnv();
+        WorldPoint clickTile = new WorldPoint(3206, 3229, 2);
+        env.player = clickTile;
+        env.transportObjects.put(clickTile, clickTile);
+
+        V2Executor x = newExecutor(env);
+        TransportEdge wrongEdge = new TransportEdge(
+            clickTile, new WorldPoint(3205, 3228, 0),
+            56231, "Staircase", "Climb-down",
+            0, 0, "object", clickTile, 12850, 1, 0L, 0L);
+        x.setPath(new V2Path(List.of(new V2Leg.Transport(wrongEdge)), 10));
+
+        // Drive the mismatch flow.
+        env.busy = false;
+        x.tick();
+        env.player = new WorldPoint(3206, 3229, 1);
+        env.busy = false;
+        x.tick();
+
+        // The executor must NOT have called env.correctTransportEdge.
+        assertEquals("executor must NEVER mutate the transport store directly (spec §7)",
+            0, env.edgeCorrections.size());
+        // Instead it surfaces a typed TransportCorrectionRequest.
+        assertTrue("typed correction emitted",
+            x.tickResult().transportCorrection().isPresent());
+    }
+
+    @Test
+    public void tick_emitsDebugTraceId_nonNullNonEmpty()
+    {
+        FakeEnv env = new FakeEnv();
+        env.player = new WorldPoint(3208, 3217, 0);
+        V2Executor x = newExecutor(env);
+        x.setPath(eastPath(20));
+        x.tick();
+        net.runelite.client.plugins.recorder.nav.v2.ExecutorTickResult r = x.tickResult();
+        assertNotNull(r);
+        assertNotNull("debugTraceId must be non-null", r.debugTraceId());
+        assertTrue("debugTraceId must be non-empty (Lane 6 correlation)",
+            !r.debugTraceId().isEmpty());
     }
 
     /** B1. Transport result mismatch: planned p2→p0, actual p2→p1.
