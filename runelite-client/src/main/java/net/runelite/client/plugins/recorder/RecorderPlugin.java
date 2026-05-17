@@ -537,12 +537,12 @@ public class RecorderPlugin extends Plugin
                         = net.runelite.client.plugins.recorder.nav.v2.collision
                             .ConnectivityComponents.fromSnapshot(snapForPrecompute);
                     v2Components = c;
-                    log.info("nav-engine: ConnectivityComponents ready — {} components in {} ms",
+                    log.info("[nav-v2.components] ready — {} components in {} ms",
                         c.componentCount(), (System.nanoTime() - t0) / 1_000_000);
                 }
                 catch (Throwable t)
                 {
-                    log.error("nav-engine: ConnectivityComponents precompute FAILED: {}",
+                    log.error("[nav-v2.components] precompute FAILED: {}",
                         t.toString(), t);
                 }
             }, "nav-v2-components-precompute");

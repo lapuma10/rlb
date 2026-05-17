@@ -147,6 +147,25 @@ public class ConnectivityComponentsTest
     }
 
     @Test
+    public void componentCount_matchesIndependentEnumeration()
+    {
+        // Build a 5×5 region with TWO walkable rectangles separated
+        // by a fully-blocked wall row. Assert componentCount() == 2
+        // (one component per rectangle).
+        boolean[][][] walkable = new boolean[1][64][64];
+        for (int x = 0; x <= 4; x++)
+            for (int y = 0; y <= 4; y++)
+            {
+                if (y == 2) continue;  // wall row
+                walkable[0][x][y] = true;
+            }
+        GlobalCollisionSnapshot snap = GlobalCollisionSnapshot.forTestingWalkable(RX, RY, walkable);
+        ConnectivityComponents cc = ConnectivityComponents.fromSnapshot(snap);
+        assertEquals("two disjoint walkable regions ⇒ componentCount == 2",
+            2, cc.componentCount());
+    }
+
+    @Test
     public void canMove_kernelAllows_impliesSameComponent()
     {
         // Drift-prevention invariant: if the BFS kernel allows a one-step

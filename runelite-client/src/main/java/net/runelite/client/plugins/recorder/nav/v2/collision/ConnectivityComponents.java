@@ -40,13 +40,25 @@ import org.slf4j.LoggerFactory;
  *  {@code docs/superpowers/specs/2026-05-17-collision-aware-dijkstra-design.md}
  *  §4 "Live-overlay-passable / static-blocked" for the rationale.
  *
- *  <p>Thread-safety: immutable after {@link #fromSnapshot} returns. */
+ *  <p>Thread-safety: immutable after {@link #fromSnapshot} returns.
+ *  Safe publication via {@code volatile} on the holder side relies on
+ *  the final-field semantics of {@link #regions} and {@link RegionComponents}'s
+ *  {@code final} fields (JLS §17.5): once the instance reference is
+ *  obtained through a volatile read, the per-region {@code int[]}
+ *  contents are guaranteed to be fully populated.
+ *
+ *  <p>TODO(nav-v2): measure live heap during flood-fill against the
+ *  spec's 38 MB worst-case estimate so we can pack to {@code short[]}
+ *  or RLE-per-region if it bites in practice. */
 public final class ConnectivityComponents
 {
     private static final Logger log = LoggerFactory.getLogger(ConnectivityComponents.class);
 
     private static final int REGION_SIZE = Constants.REGION_SIZE;
     private static final int TILES_PER_PLANE = REGION_SIZE * REGION_SIZE;
+    /** OSRS supports planes 0..3. {@link GlobalCollisionSnapshot} stores
+     *  per-region {@code FlagMap}s whose plane count is bounded by 4. */
+    private static final int MAX_PLANES = 4;
 
     /** Per-region component IDs.
      *
@@ -92,14 +104,15 @@ public final class ConnectivityComponents
             int ry = (regionKey >>> 16) & 0xFFFF;
             int baseX = rx * REGION_SIZE;
             int baseY = ry * REGION_SIZE;
-            // Probe planeCount by checking isLoaded at the four planes.
+            // Probe planeCount by checking isLoaded at each plane.
             // GlobalCollisionSnapshot encodes per-region plane count
             // implicitly via the FlagMap; we re-derive it here without
-            // reaching into private state.
+            // reaching into private state. Use the (int,int,int)
+            // overload to avoid allocating a WorldPoint per plane probe.
             int planeCount = 0;
-            for (int p = 0; p < 4; p++)
+            for (int p = 0; p < MAX_PLANES; p++)
             {
-                if (snap.isLoaded(new WorldPoint(baseX, baseY, p)))
+                if (snap.isLoaded(baseX, baseY, p))
                 {
                     planeCount = p + 1;
                 }
@@ -139,7 +152,11 @@ public final class ConnectivityComponents
      *  {@link SkretzoBfsKernel#canMove} step rule. Writes 1-based
      *  component IDs into the per-region storage. Crosses region
      *  boundaries transparently — the staticView routes lookups to the
-     *  correct neighbour FlagMap. */
+     *  correct neighbour FlagMap.
+     *
+     *  <p>Queue holds tiles as packed longs ({@code (x &lt;&lt; 32) | (y &amp; 0xFFFFFFFFL)})
+     *  to avoid allocating a {@code long[]} per pushed neighbour
+     *  (~80M small-array allocations over the full bundled map). */
     private static void floodFill(CollisionView staticView,
                                   Map<Integer, RegionComponents> out,
                                   int seedX, int seedY, int plane,
@@ -148,29 +165,36 @@ public final class ConnectivityComponents
         final int[] dxs = {-1, 1, 0, 0, -1, 1, -1, 1};
         final int[] dys = {0, 0, -1, 1, -1, -1, 1, 1};
 
-        Deque<long[]> queue = new ArrayDeque<>();
+        Deque<Long> queue = new ArrayDeque<>();
         setComponent(out, seedX, seedY, plane, componentId);
-        queue.add(new long[]{seedX, seedY});
+        queue.add(pack(seedX, seedY));
 
         while (!queue.isEmpty())
         {
-            long[] head = queue.poll();
-            int x = (int) head[0];
-            int y = (int) head[1];
+            long head = queue.poll();
+            int x = (int) (head >> 32);
+            int y = (int) head;
             for (int i = 0; i < 8; i++)
             {
                 int dx = dxs[i];
                 int dy = dys[i];
                 int nx = x + dx;
                 int ny = y + dy;
+                // Snapshot-bounds check first (cheap region-map lookup,
+                // no allocation); skips edge-of-snapshot tiles without
+                // calling canMove for them.
+                if (!isInSnapshot(out, nx, ny, plane)) continue;
+                if (readComponent(out, nx, ny, plane) != 0) continue;  // already labelled
                 if (!SkretzoBfsKernel.canMove(staticView, x, y, plane, dx, dy)) continue;
-                int existing = readComponent(out, nx, ny, plane);
-                if (existing != 0) continue;  // already labelled (or out-of-snapshot)
-                if (!isInSnapshot(out, nx, ny, plane)) continue;  // edge of snapshot
                 setComponent(out, nx, ny, plane, componentId);
-                queue.add(new long[]{nx, ny});
+                queue.add(pack(nx, ny));
             }
         }
+    }
+
+    private static long pack(int x, int y)
+    {
+        return ((long) x << 32) | (y & 0xFFFFFFFFL);
     }
 
     private static boolean isWalkable(CollisionView view, int wx, int wy, int plane)

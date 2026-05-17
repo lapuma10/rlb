@@ -82,7 +82,16 @@ public final class WaypointPlannerShim implements V2Navigator.PlannerHook
     /** 6-arg constructor — accepts a supplier for the precomputed
      *  connectivity-components map. The supplier is invoked once per
      *  {@code plan(...)} call via {@code WorldSnapshotBuilder.fromClient}
-     *  at mint time and stored on the resulting snapshot. */
+     *  at mint time and stored on the resulting snapshot.
+     *
+     *  <p>Why a {@code Supplier} instead of a direct reference: the
+     *  shim is constructed inside {@code RecorderPlugin.startUp}, but
+     *  the {@code ConnectivityComponents} precompute runs on a daemon
+     *  thread that hasn't completed yet at that point. A direct
+     *  reference would capture {@code null} permanently. The supplier
+     *  re-reads the plugin's volatile holder each time it's invoked
+     *  (which is at most once per snapshot mint), so the shim sees
+     *  the latest value without re-construction. */
     public WaypointPlannerShim(Client client,
                                ClientThread clientThread,
                                GlobalCollisionSnapshot global,
