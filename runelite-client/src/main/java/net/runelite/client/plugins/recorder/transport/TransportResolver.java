@@ -170,9 +170,15 @@ public final class TransportResolver
             }
             String[] actions = def.getActions();
             if (actions == null) return null;
+            String objName = def.getName();
             for (String a : actions)
             {
-                if (a != null && VerbMatcher.matches(verb, a)) return a;
+                if (a == null) continue;
+                if (VerbMatcher.matches(verb, a)) return a;
+                // Skretzo TSV stores verb as "<action> <objectName>" (e.g. "Climb-up Staircase");
+                // OSRS actions array contains only the verb ("Climb-up"). Try composite form.
+                if (objName != null && !objName.isEmpty()
+                    && VerbMatcher.matches(verb, a + " " + objName)) return a;
             }
         }
         catch (Throwable th) { /* ignore — some object IDs have no def */ }

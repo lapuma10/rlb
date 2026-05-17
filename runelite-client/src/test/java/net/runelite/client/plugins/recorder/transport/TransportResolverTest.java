@@ -101,6 +101,42 @@ public class TransportResolverTest
     }
 
     @Test
+    public void matchesSkretzoCompositeVerbAgainstGameObject()
+    {
+        // Skretzo TSV: verb = "Climb-up Staircase 16671"; OSRS action = "Climb-up", name = "Staircase"
+        Client client = mock(Client.class);
+        WorldView wv = mock(WorldView.class);
+        Scene scene = mock(Scene.class);
+        when(client.getTopLevelWorldView()).thenReturn(wv);
+        when(wv.getScene()).thenReturn(scene);
+        when(wv.getBaseX()).thenReturn(3200);
+        when(wv.getBaseY()).thenReturn(3200);
+
+        Tile[][][] tiles = new Tile[2][104][104];
+        Tile tile = mock(Tile.class);
+        GameObject go = mock(GameObject.class);
+        when(go.getId()).thenReturn(16671);
+        when(tile.getWallObject()).thenReturn(null);
+        when(tile.getGameObjects()).thenReturn(new GameObject[]{go});
+        // sceneX = 3206-3200 = 6, sceneY = 3229-3200 = 29
+        tiles[0][6][29] = tile;
+        when(scene.getTiles()).thenReturn(tiles);
+
+        ObjectComposition comp = mock(ObjectComposition.class);
+        when(comp.getActions()).thenReturn(new String[]{"Climb-up", null, null, null, null});
+        when(comp.getName()).thenReturn("Staircase");
+        when(comp.getImpostorIds()).thenReturn(null);
+        when(client.getObjectDefinition(16671)).thenReturn(comp);
+
+        TransportResolver tr = new TransportResolver(client);
+        TransportResolver.Match m = tr.findTransport(new WorldPoint(3206, 3229, 0), "Climb-up Staircase");
+        assertTrue(m.isSuccess());
+        assertNotNull(m.gameObject());
+        assertEquals(16671, m.matchedObjectId());
+        assertEquals("Climb-up", m.matchedVerb());
+    }
+
+    @Test
     public void findAnyTransportPicksFirstKnownVerb()
     {
         // Mock a tile holding a WallObject whose composition advertises "Open".
