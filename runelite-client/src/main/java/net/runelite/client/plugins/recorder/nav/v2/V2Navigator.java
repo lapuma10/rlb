@@ -174,6 +174,19 @@ public final class V2Navigator implements Navigator
         this.entityIndex = entityIndex;
     }
 
+    /** Production factory for wiring a custom {@link PlannerHook} (e.g.
+     *  {@code WaypointPlannerShim}) with the standard {@link V2Executor}.
+     *  Used by {@code RecorderPlugin} once the new planner shim is
+     *  built. The hook composes the existing executor seam via
+     *  {@link #hookFor(V2Executor)}. */
+    public static V2Navigator withPlannerHook(PlannerHook plannerHook,
+                                              V2Executor executor,
+                                              PlayerLocSupplier playerLoc,
+                                              @Nullable EntityIndex entityIndex)
+    {
+        return new V2Navigator(plannerHook, hookFor(executor), playerLoc, entityIndex);
+    }
+
     private static ExecutorHook hookFor(V2Executor executor)
     {
         return new ExecutorHook()

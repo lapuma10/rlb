@@ -470,13 +470,63 @@ public class RecorderPlugin extends Plugin
                 worldMapStore, transportIndex, wmConfig, v2RouteHistory,
                 config::enableV2RouteVariation, v2TrailTilesByName);
 
+        // New observation-aware engine (spec 2026-05-16). The legacy
+        // V2Planner above is constructed but the V2Navigator below is
+        // wired to WaypointPlannerShim, which uses Skretzo's bundled
+        // collision data + transport TSVs through Lane 4's
+        // WaypointPlanner. The sharedV2Planner instance is preserved
+        // for InspectionDumper (line 491) until the legacy planner is
+        // fully retired per spec §8 THROW.
+        net.runelite.client.plugins.recorder.nav.v2.collision.GlobalCollisionSnapshot
+            sharedGlobalSnapshot;
+        try
+        {
+            sharedGlobalSnapshot = net.runelite.client.plugins.recorder.nav.v2.collision
+                .GlobalCollisionSnapshot.fromBundledResource();
+            log.info("nav-engine: loaded global collision snapshot version {}",
+                sharedGlobalSnapshot.mapVersion());
+        }
+        catch (Throwable th)
+        {
+            log.error("nav-engine: GlobalCollisionSnapshot.fromBundledResource() FAILED: {}",
+                th.toString(), th);
+            sharedGlobalSnapshot = null;
+        }
+        net.runelite.client.plugins.recorder.nav.v2.transport.TransportTable sharedTransportTable;
+        try
+        {
+            sharedTransportTable = net.runelite.client.plugins.recorder.nav.v2.transport
+                .TransportTable.loadDefaults();
+        }
+        catch (Throwable th)
+        {
+            log.error("nav-engine: TransportTable.loadDefaults() FAILED: {}", th.toString(), th);
+            sharedTransportTable = null;
+        }
+        net.runelite.client.plugins.recorder.nav.v2.predicate.PredicateRegistry sharedPredicates
+            = new net.runelite.client.plugins.recorder.nav.v2.predicate.PredicateRegistry();
+
         // Chicken farm V3 — Navigator-driven outer FSM. Each script that
         // opts into V2 carries its own dispatcher (no busy-flag contention)
         // and its own executor (independent recovery state).
         HumanizedInputDispatcher v3Dispatcher = new HumanizedInputDispatcher(client, clientThread);
         TrailWalker v3Walker = new TrailWalker(client, clientThread, v3Dispatcher);
-        net.runelite.client.plugins.recorder.nav.v2.V2Navigator v3V2Nav =
-            buildV2Navigator(v3Dispatcher, sharedV2Planner);
+        net.runelite.client.plugins.recorder.nav.v2.V2Navigator v3V2Nav;
+        if (sharedGlobalSnapshot != null && sharedTransportTable != null)
+        {
+            net.runelite.client.plugins.recorder.nav.v2.planner.WaypointPlannerShim shim
+                = new net.runelite.client.plugins.recorder.nav.v2.planner.WaypointPlannerShim(
+                    client, clientThread, sharedGlobalSnapshot, sharedTransportTable,
+                    sharedPredicates);
+            v3V2Nav = buildV2NavigatorWithHook(v3Dispatcher, shim);
+            log.info("nav-engine: V2Navigator wired to WaypointPlannerShim (new observation-aware engine)");
+        }
+        else
+        {
+            // Fallback to legacy V2Planner if Skretzo data couldn't load.
+            v3V2Nav = buildV2Navigator(v3Dispatcher, sharedV2Planner);
+            log.warn("nav-engine: falling back to legacy V2Planner — Skretzo data missing");
+        }
         NavigatorFactory v3NavFactory = new NavigatorFactory(config, v3Walker, trailRegistry, v3V2Nav);
         net.runelite.client.plugins.recorder.scripts.ChickenFarmV3Script chickenFarmV3 =
             new net.runelite.client.plugins.recorder.scripts.ChickenFarmV3Script(
@@ -574,6 +624,41 @@ public class RecorderPlugin extends Plugin
                 env, picker, classifier, new java.util.Random(), toggles);
         return new net.runelite.client.plugins.recorder.nav.v2.V2Navigator(
             planner, executor, () -> playerLocOnClientThread(), worldEntityIndex);
+    }
+
+    /** Same shape as {@link #buildV2Navigator(HumanizedInputDispatcher,
+     *  net.runelite.client.plugins.recorder.nav.v2.V2Planner)} but accepts
+     *  a {@link net.runelite.client.plugins.recorder.nav.v2.V2Navigator.PlannerHook}
+     *  directly so the new {@code WaypointPlannerShim} can be wired
+     *  without going through {@code V2Planner}. */
+    private net.runelite.client.plugins.recorder.nav.v2.V2Navigator buildV2NavigatorWithHook(
+        HumanizedInputDispatcher dispatcher,
+        net.runelite.client.plugins.recorder.nav.v2.V2Navigator.PlannerHook plannerHook)
+    {
+        net.runelite.client.plugins.recorder.nav.v2.EmptyTileFilter filter
+            = new net.runelite.client.plugins.recorder.nav.v2.EmptyTileFilter(client);
+        net.runelite.client.plugins.recorder.nav.v2.MinimapClicker minimap
+            = new net.runelite.client.plugins.recorder.nav.v2.MinimapClicker(
+                client, dispatcher.pixelResolver(), dispatcher);
+        net.runelite.client.plugins.recorder.nav.v2.CanvasTilePicker picker
+            = new net.runelite.client.plugins.recorder.nav.v2.CanvasTilePicker();
+        net.runelite.client.plugins.recorder.nav.v2.InvalidationClassifier classifier
+            = new net.runelite.client.plugins.recorder.nav.v2.InvalidationClassifier();
+        net.runelite.client.plugins.recorder.nav.v2.V2Executor.Env env
+            = new net.runelite.client.plugins.recorder.nav.v2.V2ExecutorEnv(
+                client, clientThread, dispatcher, filter, minimap, worldMapStore, transportIndex);
+        net.runelite.client.plugins.recorder.nav.v2.V2Executor.Toggles toggles
+            = new net.runelite.client.plugins.recorder.nav.v2.V2Executor.Toggles()
+        {
+            @Override public boolean variableDistance() { return config.enableV2VariableDistance(); }
+            @Override public boolean minimapModality() { return config.enableV2MinimapModality(); }
+            @Override public boolean catchupClicks() { return config.enableV2CatchupClicks(); }
+        };
+        net.runelite.client.plugins.recorder.nav.v2.V2Executor executor
+            = new net.runelite.client.plugins.recorder.nav.v2.V2Executor(
+                env, picker, classifier, new java.util.Random(), toggles);
+        return net.runelite.client.plugins.recorder.nav.v2.V2Navigator.withPlannerHook(
+            plannerHook, executor, () -> playerLocOnClientThread(), worldEntityIndex);
     }
 
     /** Synchronous client-thread read of the local player's world
