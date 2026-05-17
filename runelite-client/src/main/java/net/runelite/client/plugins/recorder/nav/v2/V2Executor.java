@@ -876,6 +876,36 @@ public final class V2Executor
             return status;
         }
 
+        // Early-advance to overlapping transport. When the walk-leg's end
+        // tile equals the next transport's from-tile (typical for stairs /
+        // ladders / trapdoors where the player stands ON the object's
+        // tile to click it), dispatching a WALK to that last tile hits
+        // the staircase / ladder mesh — engine fires the transport's verb
+        // ("Climb-up Staircase") instead of "Walk here", strict-walk
+        // aborts, executor blacklists the staircase tile and the route
+        // is dead. Advance to the TRANSPORT leg now; handleTransportLeg
+        // does its own walk-closer logic if the player isn't yet adjacent,
+        // and dispatches CLICK_GAME_OBJECT (which hits the object's hull,
+        // not the underlying floor pixel) once they are. 12 tile Chebyshev
+        // matches the transport-leg's own MAX_TRANSPORT_CLICK_DISTANCE
+        // gate so we don't advance from too far away.
+        if (legIdx + 1 < path.legs().size())
+        {
+            V2Leg nextLeg = path.legs().get(legIdx + 1);
+            if (nextLeg instanceof V2Leg.Transport tr
+                && tr.edge() != null
+                && tr.edge().fromTile() != null
+                && tr.edge().fromTile().equals(w.end())
+                && here.getPlane() == w.end().getPlane()
+                && chebyshev(here, w.end()) <= 12)
+            {
+                log.info("v2-executor: early-advance WALK→TRANSPORT — walk-end={} == transport.from, player dist={}",
+                    w.end(), chebyshev(here, w.end()));
+                advanceLeg("WALK (early-advance to overlapping transport)", w.end());
+                return status;
+            }
+        }
+
         // Pan the camera so the destination is up-and-off-axis from the
         // player. Cheap when the heading hasn't shifted enough to matter
         // — see {@link #maybeRerotateForWalkLeg} for the threshold logic.
