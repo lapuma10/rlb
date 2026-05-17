@@ -104,9 +104,12 @@ public final class GlobalCollisionSnapshot
      *  bits are derived at lookup time from the neighbour's bits, so
      *  no explicit storage needed here.
      *
-     *  <p>Visible (package-private) for use in tests only — do NOT
-     *  call from production code; loading the bundled zip is what
-     *  production wants. */
+     *  <p>Public visibility is needed so cross-package tests
+     *  (specifically tests in {@code nav.v2.transport}) can build
+     *  collision fixtures without going through the zip pipeline.
+     *  Despite the {@code public} modifier this method is for TEST
+     *  USE ONLY — production code should call {@link
+     *  #fromBundledResource()}. */
     public static GlobalCollisionSnapshot forTestingWalkable(int regionX, int regionY, boolean[][][] walkable)
     {
         int planeCount = walkable.length;
