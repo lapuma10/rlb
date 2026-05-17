@@ -167,8 +167,14 @@ public final class SkretzoBfsKernel
 
 	/** Returns true iff a single step from (x,y) by (dx,dy) is allowed by
 	 *  collision flags. Cardinal-first; diagonals require both cardinal
-	 *  half-steps to be unblocked (pillar / corner rule). */
-	static boolean canMove(CollisionView collision, int x, int y, int plane, int dx, int dy)
+	 *  half-steps to be unblocked (pillar / corner rule).
+	 *
+	 *  <p>Public for reuse by {@link
+	 *  net.runelite.client.plugins.recorder.nav.v2.collision.ConnectivityComponents}
+	 *  — the components flood-fill must use the same step rule the BFS
+	 *  applies at runtime, otherwise Dijkstra's component filter and
+	 *  BFS's walk check could disagree. One source of truth lives here. */
+	public static boolean canMove(CollisionView collision, int x, int y, int plane, int dx, int dy)
 	{
 		if (dx == 0 && dy == 0) return false;
 		int nx = x + dx;

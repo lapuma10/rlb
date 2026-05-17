@@ -91,6 +91,76 @@ public final class GlobalCollisionSnapshot
         return loadFromStream(zipStream, version);
     }
 
+    /** Test-only factory that builds a single-region snapshot from a
+     *  3D walkability grid. Encodes Skretzo's binary format inline so
+     *  unit tests can produce deterministic, hand-crafted collision
+     *  fixtures without going through the zip pipeline.
+     *
+     *  <p>{@code walkable[plane][x_local][y_local]} where {@code x_local}
+     *  and {@code y_local} are 0..63 within the region; tiles outside
+     *  the array bounds default to blocked. Per Skretzo's convention,
+     *  the encoded N-bit is true iff both the current tile and the
+     *  northern neighbour are walkable; same logic for E. South/west
+     *  bits are derived at lookup time from the neighbour's bits, so
+     *  no explicit storage needed here.
+     *
+     *  <p>Visible (package-private) for use in tests only — do NOT
+     *  call from production code; loading the bundled zip is what
+     *  production wants. */
+    static GlobalCollisionSnapshot forTestingWalkable(int regionX, int regionY, boolean[][][] walkable)
+    {
+        int planeCount = walkable.length;
+        // Skretzo's encoding: BitSet with bit position
+        //   (plane * 64 * 64 + y * 64 + x) * 2 + flag
+        // where flag=0 is N, flag=1 is E.
+        int totalBits = planeCount * REGION_SIZE * REGION_SIZE * 2;
+        java.util.BitSet bits = new java.util.BitSet(totalBits);
+        for (int p = 0; p < planeCount; p++)
+        {
+            boolean[][] plane = walkable[p];
+            if (plane == null) continue;
+            int planeXMax = plane.length;
+            for (int x = 0; x < REGION_SIZE; x++)
+            {
+                if (x >= planeXMax) break;
+                boolean[] col = plane[x];
+                if (col == null) continue;
+                int planeYMax = col.length;
+                for (int y = 0; y < REGION_SIZE; y++)
+                {
+                    if (y >= planeYMax) break;
+                    if (!col[y]) continue;  // blocked → no N/E
+                    // N bit: walkable iff (x, y+1) is also walkable
+                    boolean n = (y + 1 < REGION_SIZE) && (y + 1 < planeYMax) && col[y + 1];
+                    // E bit: walkable iff (x+1, y) is also walkable
+                    boolean e = false;
+                    if (x + 1 < REGION_SIZE && x + 1 < planeXMax)
+                    {
+                        boolean[] colE = plane[x + 1];
+                        e = colE != null && y < colE.length && colE[y];
+                    }
+                    int base = (p * REGION_SIZE * REGION_SIZE + y * REGION_SIZE + x) * 2;
+                    if (n) bits.set(base);
+                    if (e) bits.set(base + 1);
+                }
+            }
+        }
+        byte[] bytes = bits.toByteArray();
+        // BitSet.toByteArray may truncate trailing-zero bytes; pad up to the
+        // expected length so FlagMap recovers the right plane count.
+        int expectedBytes = (totalBits + 7) / 8;
+        if (bytes.length < expectedBytes)
+        {
+            byte[] padded = new byte[expectedBytes];
+            System.arraycopy(bytes, 0, padded, 0, bytes.length);
+            bytes = padded;
+        }
+        FlagMap fm = new FlagMap(regionX, regionY, bytes);
+        Map<Integer, FlagMap> regions = new HashMap<>();
+        regions.put(packRegion(regionX, regionY), fm);
+        return new GlobalCollisionSnapshot(Map.copyOf(regions), "testing");
+    }
+
     /** Visible for testing — supports loading from arbitrary streams. */
     static GlobalCollisionSnapshot loadFromStream(InputStream zipStream, String version)
     {
@@ -181,6 +251,15 @@ public final class GlobalCollisionSnapshot
         // from the four cardinal bits, per Skretzo's ne/nw/se/sw formulas.
 
         return flags;
+    }
+
+    /** Set of region keys (packed regionX | regionY << 16) for which this
+     *  snapshot has FlagMap data. Enumerated by
+     *  {@link ConnectivityComponents#fromSnapshot} to scope its flood-fill
+     *  to the exact set of loaded regions. */
+    public java.util.Set<Integer> loadedRegionKeys()
+    {
+        return java.util.Collections.unmodifiableSet(regions.keySet());
     }
 
     /** True iff the region containing {@code p} is loaded in this snapshot. */
