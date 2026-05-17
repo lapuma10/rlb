@@ -73,6 +73,16 @@ public final class TrailWalker
      *  the click to be considered still making progress. */
     public static final long PROGRESS_TIMEOUT_MS = 4_000;
 
+    /** Hard ceiling on "no progress toward pick" before we force a re-pick
+     *  regardless of whether the player is technically still moving. Catches
+     *  the failure mode where the player oscillates near an unreachable tile
+     *  (NPC on the target, fence corner, dropped item blocking) — each tiny
+     *  shuffle resets {@code sinceMove}, the click stays "recent enough" by
+     *  the normal stale gate, and the walker silently waits until the player
+     *  fully stops. Without this ceiling that wait can be 40+ seconds; the
+     *  bot then dies at the 15s STUCK timer with no useful diagnostic. */
+    public static final long NO_PROGRESS_FORCE_REPICK_MS = 8_000;
+
     /** Maximum Chebyshev distance the engine's minimap walk-click reliably
      *  routes. Picks beyond this are out of range. */
     static final int MAX_HOP_TILES = 16;
@@ -93,9 +103,18 @@ public final class TrailWalker
     static final int ROTATION_LOOKAHEAD_TILES = 6;
 
     /** Heading-shift threshold (yaw units) that triggers a mid-leg
-     *  re-rotation. 171 units ≈ 30° — straight-ish corridors don't
-     *  churn, but a sharp turn into a new street does. */
-    static final int ROTATION_HEADING_THRESHOLD_UNITS = 171;
+     *  re-rotation. 342 units ≈ 60° — only fires on real turns, not
+     *  the gentle 20-30° drift of a corridor. Each rotation blocks the
+     *  walker tick for ~0.5-2 s while it animates, so firing on small
+     *  shifts piles up "client laggy" symptoms even though OSRS itself
+     *  is fine.
+     *
+     *  <p>If rotations feel <b>too sluggish to track the path</b> (camera
+     *  stays facing the wrong way through obvious turns), <b>lower</b>
+     *  this — 256 ≈ 45° or 171 ≈ 30°. If rotations feel <b>too frequent
+     *  / laggy</b>, <b>raise</b> it — 512 ≈ 90° fires only on hard
+     *  cardinal turns. */
+    static final int ROTATION_HEADING_THRESHOLD_UNITS = 342;
 
     private final Client client;
     private final ClientThread clientThread;
@@ -473,6 +492,23 @@ public final class TrailWalker
         return pickAheadTile(leg, player, rng, MAX_HOP_TILES);
     }
 
+    /** The last tile of {@code leg} on {@code plane}, or null if {@code leg}
+     *  has no tile on that plane. Used as the goal anchor for goal-aware
+     *  BFS validation: the corridor picker rejects sidesteps that
+     *  increase BFS distance to this tile. */
+    @Nullable
+    private static WorldPoint legEnd(Leg.Walk leg, int plane)
+    {
+        if (leg == null) return null;
+        List<WorldPoint> tiles = leg.tiles();
+        for (int i = tiles.size() - 1; i >= 0; i--)
+        {
+            WorldPoint t = tiles.get(i);
+            if (t.getPlane() == plane) return t;
+        }
+        return null;
+    }
+
     /** Choose a tile inside {@code leg} ahead of the player, capping the
      *  forward search at {@code maxHopTiles} Chebyshev distance. Callers
      *  pass a reduced cap when the player has stalled — picking a tile
@@ -709,7 +745,15 @@ public final class TrailWalker
         boolean stillWalking = sinceMove < STILL_THRESHOLD_MS;
         boolean recentClick = sinceClick < RECLICK_AFTER_MS;
         boolean recentProgress = lastWalkPick != null && sinceProgress < PROGRESS_TIMEOUT_MS;
-        boolean staleClick = !recentClick && !stillWalking && !recentProgress;
+        // Standard stale: click is old, player has stopped, and dist hasn't
+        // improved. Catches "engine gave up routing".
+        // Long-no-progress override: even if the player is technically still
+        // shuffling (so `stillWalking` stays true), force a re-pick once the
+        // distance to our chosen tile hasn't improved in NO_PROGRESS_FORCE_REPICK_MS.
+        // This catches "player oscillates near an unreachable tile" — the
+        // failure mode that previously caused 40-second silences in the log.
+        boolean longNoProgress = sinceProgress >= NO_PROGRESS_FORCE_REPICK_MS;
+        boolean staleClick = !recentClick && (longNoProgress || (!stillWalking && !recentProgress));
         if (!legChanged && !reachedPrevPick && !staleClick)
         {
             return Status.IN_PROGRESS;
@@ -818,6 +862,27 @@ public final class TrailWalker
         });
         final int centerlineDist = reach == null ? -1 : reach.distance(originalPick);
 
+        // Goal-aware BFS — BFS from the leg's goal tile (where this walk
+        // leg ends, i.e. at or next to the next transport). Lets us reject
+        // sidesteps that look fine by player-distance but are a long detour
+        // *to the goal* — the classic cow-pen failure: a sidestep just
+        // inside the open pen gate is close to the player AND close to the
+        // recorded tile, but reaching the chicken-pen / castle stairs
+        // (the actual goal) from inside the cow pen requires exiting and
+        // going around — much further by BFS than the equivalent
+        // outside-the-pen sidestep.
+        final WorldPoint legGoal = legEnd(leg, pos.getPlane());
+        final int goalDepthBudget = legGoal == null ? 0
+            : Math.max(Reachability.DEFAULT_DEPTH,
+                Math.min(96, chebyshev(pos, legGoal) + 16));
+        final ReachabilityMap goalReach = (legGoal == null) ? null : onClient(() -> {
+            WorldView wv = client == null ? null : client.getTopLevelWorldView();
+            if (wv == null) return null;
+            return Reachability.compute(wv, legGoal, goalDepthBudget);
+        });
+        final int centerlineGoalDist = (goalReach == null || legGoal == null)
+            ? -1 : goalReach.distance(originalPick);
+
         Predicate<WorldPoint> compoundProbe = candidate -> {
             if (walkableProbe != null && !walkableProbe.test(candidate)) return false;
             if (reach == null) return true;            // can't validate (no client/wv), allow
@@ -828,7 +893,19 @@ public final class TrailWalker
             // pick required a 20+ hop detour, and we couldn't tell.
             if (centerlineDist < 0) return false;
             if (!reach.isReachable(candidate)) return false;
-            return reach.distance(candidate) <= centerlineDist + 1;
+            if (reach.distance(candidate) > centerlineDist + 1) return false;
+            // Goal-distance gate: reject sidesteps that take us further
+            // from the leg's goal than the recorded tile. Tolerance of 1
+            // covers BFS tie ordering, NOT a meaningful detour. Skips the
+            // gate when goalReach is unusable so we don't block on a
+            // missing BFS map (e.g. across-plane goals).
+            if (goalReach != null && centerlineGoalDist >= 0)
+            {
+                int candidateGoalDist = goalReach.distance(candidate);
+                if (candidateGoalDist < 0) return false;
+                if (candidateGoalDist > centerlineGoalDist + 1) return false;
+            }
+            return true;
         };
 
         Optional<WorldPoint> candidate = pickCorridorTile(
