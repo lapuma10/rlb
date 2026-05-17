@@ -14,11 +14,13 @@ import net.runelite.api.DecorativeObject;
 import net.runelite.api.GameObject;
 import net.runelite.api.GroundObject;
 import net.runelite.api.ObjectComposition;
+import net.runelite.api.Perspective;
 import net.runelite.api.Player;
 import net.runelite.api.Scene;
 import net.runelite.api.Tile;
 import net.runelite.api.WallObject;
 import net.runelite.api.WorldView;
+import net.runelite.api.coords.LocalPoint;
 import net.runelite.api.coords.WorldPoint;
 import net.runelite.client.plugins.recorder.RecorderConfig;
 import net.runelite.client.ui.overlay.Overlay;
@@ -56,8 +58,14 @@ public final class ObjectDebugOverlay extends Overlay
     private static final Color DECORATIVE_FILL = new Color(255,  80, 220,  35);
     private static final Color GROUND_LINE     = new Color(255, 150,  60, 220);
     private static final Color GROUND_FILL     = new Color(255, 150,  60,  35);
+    /** Faint stroke around the underlying tile poly so you can see the
+     *  "stand-on-this-tile" footprint behind the 3D model hull. The hull
+     *  alone often misses the floor patch at the base of stairs/ladders —
+     *  that patch is what TILE_POLY strategy uses as a click target. */
+    private static final Color TILE_OUTLINE    = new Color(255, 255, 255,  70);
     private static final Color LABEL_BG        = new Color(  0,   0,   0, 180);
     private static final BasicStroke STROKE    = new BasicStroke(1.6f);
+    private static final BasicStroke STROKE_TILE = new BasicStroke(0.8f);
 
     /** Tile radius scanned around the player. 15 ≈ a screenful, keeps the
      *  per-frame object iteration cheap. */
@@ -113,13 +121,22 @@ public final class ObjectDebugOverlay extends Overlay
                 Tile t = col[sy];
                 if (t == null) continue;
 
+                // Anchor tile poly — the floor patch beneath any object on
+                // this tile. HULL strategy targets the 3D model; if that
+                // hull misses the floor (typical for stairs), TILE_POLY
+                // strategy uses this poly. Painting it makes the
+                // "uncovered patch" issue visible.
+                Polygon tilePoly = computeTilePoly(wv, wx, wy, plane);
+
                 WallObject wall = t.getWallObject();
                 if (wall != null)
                 {
                     String action = firstAction(wall.getId());
                     if (action != null)
                     {
-                        drawHull(g, wall.getConvexHull(), WALL_FILL, WALL_LINE, action);
+                        String lbl = action + " #" + wall.getId() + " W";
+                        drawTileOutline(g, tilePoly);
+                        drawHull(g, wall.getConvexHull(), WALL_FILL, WALL_LINE, lbl);
                         drawHull(g, wall.getConvexHull2(), WALL_FILL, WALL_LINE, null);
                     }
                 }
@@ -138,7 +155,9 @@ public final class ObjectDebugOverlay extends Overlay
                         String action = firstAction(go.getId());
                         if (action != null)
                         {
-                            drawHull(g, go.getConvexHull(), GAME_FILL, GAME_LINE, action);
+                            String lbl = action + " #" + go.getId() + " G";
+                            drawTileOutline(g, tilePoly);
+                            drawHull(g, go.getConvexHull(), GAME_FILL, GAME_LINE, lbl);
                         }
                     }
                 }
@@ -148,7 +167,8 @@ public final class ObjectDebugOverlay extends Overlay
                     String action = firstAction(deco.getId());
                     if (action != null)
                     {
-                        drawHull(g, deco.getConvexHull(), DECORATIVE_FILL, DECORATIVE_LINE, action);
+                        String lbl = action + " #" + deco.getId() + " D";
+                        drawHull(g, deco.getConvexHull(), DECORATIVE_FILL, DECORATIVE_LINE, lbl);
                         drawHull(g, deco.getConvexHull2(), DECORATIVE_FILL, DECORATIVE_LINE, null);
                     }
                 }
@@ -158,7 +178,8 @@ public final class ObjectDebugOverlay extends Overlay
                     String action = firstAction(gnd.getId());
                     if (action != null)
                     {
-                        drawHull(g, gnd.getConvexHull(), GROUND_FILL, GROUND_LINE, action);
+                        String lbl = action + " #" + gnd.getId() + " R";
+                        drawHull(g, gnd.getConvexHull(), GROUND_FILL, GROUND_LINE, lbl);
                     }
                 }
             }
@@ -231,5 +252,23 @@ public final class ObjectDebugOverlay extends Overlay
     {
         if (s instanceof Polygon p) return p;
         return null;
+    }
+
+    @Nullable
+    private Polygon computeTilePoly(WorldView wv, int wx, int wy, int plane)
+    {
+        LocalPoint lp = LocalPoint.fromWorld(wv, new WorldPoint(wx, wy, plane));
+        if (lp == null) return null;
+        return Perspective.getCanvasTilePoly(client, lp);
+    }
+
+    private void drawTileOutline(Graphics2D g, @Nullable Polygon tilePoly)
+    {
+        if (tilePoly == null) return;
+        Stroke prev = g.getStroke();
+        g.setStroke(STROKE_TILE);
+        g.setColor(TILE_OUTLINE);
+        g.drawPolygon(tilePoly);
+        g.setStroke(prev);
     }
 }

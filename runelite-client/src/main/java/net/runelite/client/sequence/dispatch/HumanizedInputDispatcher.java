@@ -249,7 +249,11 @@ public class HumanizedInputDispatcher implements InputDispatcher
                 return;
             }
         }
-        Integer desired = onClient(() -> {
+        // Read player tile, compute base yaw + chebyshev distance to
+        // target in ONE client-thread marshal. The chebyshev value is
+        // what {@link #pickPitchForDistance} uses to decide how steep
+        // a vertical tilt the camera should land at.
+        RotationInput rotIn = onClient(() -> {
             var local = client.getLocalPlayer();
             if (local == null || local.getWorldLocation() == null) return null;
             WorldPoint here = local.getWorldLocation();
@@ -257,42 +261,100 @@ public class HumanizedInputDispatcher implements InputDispatcher
             int dy = target.getY() - here.getY();
             if (dx == 0 && dy == 0) return null;
             double angle = Math.atan2(-dx, -dy);
-            return ((int) Math.round(angle * 2048.0 / (2 * Math.PI))) & 0x7FF;
+            int yaw = ((int) Math.round(angle * 2048.0 / (2 * Math.PI))) & 0x7FF;
+            int cheb = Math.max(Math.abs(dx), Math.abs(dy));
+            return new RotationInput(yaw, cheb);
         });
-        if (desired == null) return;
-        // Jitter the final yaw so we don't land bolt-centred on every
-        // rotation. ±150 yaw units ≈ ±26°: enough to leave the target
-        // visibly off-axis but still well inside the viewport.
-        int jitter = rng.nextInt(301) - 150;
-        desired = (desired + jitter + 2048) & 0x7FF;
-        Integer current = onClient(() -> client.getCameraYawTarget() & 0x7FF);
-        if (current == null) return;
-        int signedDiff = ((desired - current + 1024 + 2048) % 2048) - 1024;
-        if (Math.abs(signedDiff) < YAW_TOLERANCE) return;
+        if (rotIn == null) return;
+        // Signed offset 40°–120° (228–683 yaw units), CW or CCW. The
+        // camera should never land bolt-centred on the target — a real
+        // player rotates so the destination is off-axis but well in
+        // view. Wider than a small jitter so the character visibly
+        // walks "up the screen" at an angle, never head-on or directly
+        // away from the camera.
+        int sign = rng.nextBoolean() ? 1 : -1;
+        int jitterMag = ROTATION_OFFSET_MIN_UNITS
+            + rng.nextInt(ROTATION_OFFSET_MAX_UNITS - ROTATION_OFFSET_MIN_UNITS + 1);
+        final int desiredYaw = (rotIn.baseYaw() + sign * jitterMag + 2048) & 0x7FF;
 
-        // Total drag duration scales mildly with the rotation magnitude —
-        // 90° rotations should feel slower than 30° ones. Floor 500ms so
-        // even small rotations don't snap; cap 1500ms so 180° doesn't
-        // become tedious.
-        int magnitude = Math.abs(signedDiff);
-        int totalMs = clampInt(500 + magnitude * 2, 500, 1500);
-        int stepMs = 25 + rng.nextInt(15);   // 25..40ms per update
-        int steps = Math.max(8, totalMs / stepMs);
-        log.debug("rotate camera: yaw {} → {} (Δ={}, {}ms over {} steps)",
-            current, desired, signedDiff, totalMs, steps);
-        final int from = current;
+        // Pitch target picked from target distance (or null when the
+        // ROTATE_USE_PITCH toggle is off). Lower JAU = camera tilted
+        // up / horizon flatter; higher = top-down. Far targets pick
+        // PITCH_FAR so the player can see them on the horizon; close
+        // targets pick PITCH_CLOSE so the model isn't sliced off by
+        // the screen edge.
+        final Integer desiredPitch = ROTATE_USE_PITCH
+            ? pickPitchForDistance(rotIn.chebyshev())
+            : null;
+
+        // Read current yaw target + actual pitch in ONE marshal so the
+        // step loop's deltas are off the same snapshot.
+        CameraState curState = onClient(() -> new CameraState(
+            client.getCameraYawTarget() & 0x7FF,
+            client.getCameraPitch()));
+        if (curState == null) return;
+        int yawSignedDiff = ((desiredYaw - curState.yaw() + 1024 + 2048) % 2048) - 1024;
+        final boolean yawNeedsMove = Math.abs(yawSignedDiff) >= YAW_TOLERANCE;
+        int pitchSignedDiff = desiredPitch != null ? desiredPitch - curState.pitch() : 0;
+        final boolean pitchNeedsMove = desiredPitch != null
+            && Math.abs(pitchSignedDiff) >= PITCH_TOLERANCE;
+        if (!yawNeedsMove && !pitchNeedsMove) return;
+
+        // OSRS arrow-key cadence: constant angular velocity, no easing.
+        // {@code setCameraYawTarget} updates the rendered yaw on the
+        // next frame — it doesn't interpolate by itself — so a real
+        // animation needs us to walk the target from current → final in
+        // small steps. Same applies to pitch. Step count is sized to
+        // whichever axis has more travel so both axes finish together.
+        int yawMag = yawNeedsMove ? Math.abs(yawSignedDiff) : 0;
+        int pitchMag = pitchNeedsMove ? Math.abs(pitchSignedDiff) : 0;
+        int totalMs = Math.max(yawMag, pitchMag) * MS_PER_YAW_UNIT;
+        int stepMs = ROTATION_STEP_MS;
+        int steps = Math.max(MIN_ROTATION_STEPS, totalMs / stepMs);
+        log.debug("rotate camera: yaw {} → {} (Δ={}, jitter={}{}), pitch {} → {} (Δ={}, cheb={}), {}ms over {} steps",
+            curState.yaw(), desiredYaw, yawSignedDiff, sign > 0 ? "+" : "-", jitterMag,
+            curState.pitch(), desiredPitch, pitchSignedDiff, rotIn.chebyshev(),
+            totalMs, steps);
+        final int yawFrom = curState.yaw();
+        final int yawDiff = yawSignedDiff;
+        final int pitchFrom = curState.pitch();
+        final int pitchDiff = pitchSignedDiff;
         for (int i = 1; i <= steps; i++)
         {
-            double linear = (double) i / steps;
-            double t = linear * linear * (3 - 2 * linear);   // smoothstep
-            final int interim = (from + (int) Math.round(signedDiff * t) + 2048) & 0x7FF;
+            double t = (double) i / steps;
+            final int interimYaw = yawNeedsMove
+                ? (yawFrom + (int) Math.round(yawDiff * t) + 2048) & 0x7FF
+                : yawFrom;
+            final int interimPitch = pitchNeedsMove
+                ? clampInt(pitchFrom + (int) Math.round(pitchDiff * t), PITCH_MIN, PITCH_MAX)
+                : pitchFrom;
             try
             {
-                onClient(() -> { client.setCameraYawTarget(interim); return null; });
+                onClient(() -> {
+                    if (yawNeedsMove) client.setCameraYawTarget(interimYaw);
+                    if (pitchNeedsMove) client.setCameraPitchTarget(interimPitch);
+                    return null;
+                });
             }
             catch (Throwable ignored) { /* best-effort */ }
             SequenceSleep.sleep(client, stepMs);
         }
+    }
+
+    /** Choose a target camera pitch based on chebyshev distance from
+     *  player to target. Closer targets get a steeper (more top-down)
+     *  pitch so the model isn't clipped at the screen edge; far targets
+     *  get a flatter pitch so the player can see them at all. ±{@link
+     *  #PITCH_JITTER} of randomness avoids landing on the same pitch
+     *  every rotation. */
+    private int pickPitchForDistance(int chebyshev)
+    {
+        int base;
+        if (chebyshev <= PITCH_CHEBYSHEV_CLOSE_MAX) base = PITCH_CLOSE;
+        else if (chebyshev <= PITCH_CHEBYSHEV_MID_MAX) base = PITCH_MID;
+        else base = PITCH_FAR;
+        int jitter = rng.nextInt(PITCH_JITTER * 2 + 1) - PITCH_JITTER;
+        return clampInt(base + jitter, PITCH_MIN, PITCH_MAX);
     }
 
     private static int clampInt(int v, int lo, int hi)
@@ -333,6 +395,54 @@ public class HumanizedInputDispatcher implements InputDispatcher
     /** Don't bother rotating for headings within ~22° of current yaw —
      *  the small adjustment looks twitchy. */
     private static final int YAW_TOLERANCE = 128;
+
+    /** Minimum random offset applied to the rotation target so the
+     *  destination never sits dead-centre. 228 units ≈ 40°. */
+    private static final int ROTATION_OFFSET_MIN_UNITS = 228;
+
+    /** Maximum random offset applied to the rotation target. 683 units
+     *  ≈ 120° — beyond this the target would be near-perpendicular or
+     *  behind, defeating the point of rotating toward it. */
+    private static final int ROTATION_OFFSET_MAX_UNITS = 683;
+
+    /** Linear rotation cadence: ms per yaw unit. 2 ms × 2048 units ≈
+     *  4.1 s for a full 360°, matching OSRS arrow-key pan speed at
+     *  default {@code cameraSpeed=1.0} (≈90°/s). */
+    private static final int MS_PER_YAW_UNIT = 2;
+
+    /** Frame interval between rotation steps. 25 ms ≈ 40 fps — high
+     *  enough that consecutive interim yaws blend into smooth motion,
+     *  low enough not to saturate the client thread with marshals on a
+     *  long rotation. Fixed (not jittered) so the cadence is uniform. */
+    private static final int ROTATION_STEP_MS = 25;
+
+    /** Floor on step count so very small rotations don't snap. 8 steps
+     *  × 25 ms = 200 ms minimum motion duration even for a 30° turn. */
+    private static final int MIN_ROTATION_STEPS = 8;
+
+    /** Master toggle for adding camera pitch (up/down tilt) to
+     *  {@link #rotateCameraToward}. Flip to {@code false} to revert to
+     *  yaw-only side-to-side rotation if the pitch behaviour ever
+     *  causes regressions (the rest of the rotation logic is unaffected). */
+    private static final boolean ROTATE_USE_PITCH = true;
+
+    /** Pitch values are in JAU (1024 = full revolution). Lower numeric
+     *  pitch = camera tilted up (more level with horizon, sees further
+     *  out). Higher = more top-down (camera looks straight down at
+     *  player). Defaults stay inside normal OSRS player limits so the
+     *  Camera plugin's {@code relaxCameraPitch} toggle is not required. */
+    private static final int PITCH_FAR   = 200;   // distant target → flatter, see further
+    private static final int PITCH_MID   = 245;   // close to OSRS in-game default
+    private static final int PITCH_CLOSE = 320;   // close target → more top-down
+    private static final int PITCH_JITTER = 30;   // ±30 JAU random per rotation
+    private static final int PITCH_MIN   = 128;
+    private static final int PITCH_MAX   = 383;
+    /** Skip pitch motion when actual pitch is already within this many
+     *  JAU of the desired target — avoids twitchy micro-tilts. */
+    private static final int PITCH_TOLERANCE = 40;
+    /** Chebyshev distance bands used by {@link #pickPitchForDistance}. */
+    private static final int PITCH_CHEBYSHEV_CLOSE_MAX = 4;
+    private static final int PITCH_CHEBYSHEV_MID_MAX   = 12;
 
     /** Probability of a post-action park, by action kind. Walking and
      *  long-tap actions park more often (the user's hand naturally drops);
@@ -627,33 +737,52 @@ public class HumanizedInputDispatcher implements InputDispatcher
         // Phase 3 — long humanized cursor move toward the rough target.
         moveCursorTo(aim.preAim().getX(), aim.preAim().getY());
 
-        // Phase 4 — pre-click settle (the human "did I get the right one"
-        // beat). This is the LAST big delay before the press.
-        SequenceSleep.sleep(client, 180 + rng.nextInt(220));   // 180..400ms
+        // Phase 4 — pre-click settle. Attack verb on NPCs that walk every
+        // tick (chickens, ducks, sheep) gets a tighter 60–140ms window:
+        // every ~250ms of settle on top of phase-3 cursor travel hands the
+        // target another step of headstart, so by the time we press we've
+        // committed to the tile they were standing on a tick ago.
+        int phase4Floor = attackVerb ? 60 : 180;
+        int phase4Span  = attackVerb ? 80 : 220;
+        SequenceSleep.sleep(client, phase4Floor + rng.nextInt(phase4Span));
 
-        // Phase 5 — re-resolve the click pixel using the model convex hull.
-        // This is the freshest possible measurement; the press lands within
-        // ~100ms of this point.
-        Point clickPixel = onClient(() -> {
+        // Phase 5 — re-resolve against the live NPC: world tile AND model
+        // hull. The hull projection already reflects the NPC's current 3D
+        // position, but logging the tile change separately surfaces "the
+        // chicken moved during our aim" in traces, and keeps the world
+        // tile available for downstream prediction work.
+        AimRefresh refresh = onClient(() -> {
             NPC npc = findNpc(npcIndex);
-            return npc == null ? null : resolver.resolveNpc(npc);
+            if (npc == null) return null;
+            return new AimRefresh(npc.getWorldLocation(), resolver.resolveNpc(npc));
         });
-        if (clickPixel == null)
+        if (refresh == null || refresh.clickPixel() == null)
         {
             lastError.set("npc " + npcIndex + " disappeared during aim");
             return;
         }
+        Point clickPixel = refresh.clickPixel();
+        if (refresh.world() != null && aim.world() != null
+            && !refresh.world().equals(aim.world()))
+        {
+            log.debug("npc {} moved during aim: {} → {}",
+                npcIndex, aim.world(), refresh.world());
+        }
 
-        // Phase 6 — small final aim adjustment ONLY if the fresh pixel is
-        // meaningfully off the pre-aim. Sub-5px deltas don't need a move
-        // (real cursors don't micro-correct that finely).
+        // Phase 6 — final aim adjustment if the fresh pixel is off the
+        // pre-aim. Tighter threshold for attack verb (2px instead of 4px)
+        // so a 1-tile drift always triggers a fresh aim — chickens are
+        // small enough that the hull center moves > 2px on any step.
         int dx = clickPixel.getX() - aim.preAim().getX();
         int dy = clickPixel.getY() - aim.preAim().getY();
-        if (dx * dx + dy * dy > 16)   // > ~4px
+        int reaimThresholdSq = attackVerb ? 4 : 16;   // 2px² vs 4px²
+        if (dx * dx + dy * dy > reaimThresholdSq)
         {
             moveCursorTo(clickPixel.getX(), clickPixel.getY());
         }
-        SequenceSleep.sleep(client, 40 + rng.nextInt(40));     // 40..80ms final settle
+        int phase6Floor = attackVerb ? 20 : 40;
+        int phase6Span  = attackVerb ? 20 : 40;
+        SequenceSleep.sleep(client, phase6Floor + rng.nextInt(phase6Span));
 
         Boolean claimedByOther = attackVerb
             ? onClient(() -> isNpcClaimedByOtherPlayer(npcIndex))
@@ -736,6 +865,23 @@ public class HumanizedInputDispatcher implements InputDispatcher
      *  camera-rotate step; {@code preAim} is the rough cursor target for
      *  the long humanized move. Final click pixel is re-resolved later. */
     private record NpcAim(@javax.annotation.Nullable WorldPoint world, Point preAim) {}
+
+    /** Refreshed NPC aim — captured right before the press. {@code world}
+     *  is the NPC's current tile (may differ from {@link NpcAim#world()}
+     *  if it stepped during phases 3–4); {@code clickPixel} is the fresh
+     *  model-hull projection. */
+    private record AimRefresh(@javax.annotation.Nullable WorldPoint world,
+                              @javax.annotation.Nullable Point clickPixel) {}
+
+    /** Inputs to {@link #rotateCameraToward} computed in a single
+     *  client-thread marshal: base yaw to the target (pre-jitter) and
+     *  chebyshev distance from player to target (drives pitch). */
+    private record RotationInput(int baseYaw, int chebyshev) {}
+
+    /** Camera snapshot read in a single marshal — current yaw target
+     *  (so we can size the rotation step count) and actual pitch (so
+     *  pitch motion deltas are computed off the same point in time). */
+    private record CameraState(int yaw, int pitch) {}
 
     private boolean isNpcClaimedByOtherPlayer(int npcIndex)
     {
@@ -1320,7 +1466,16 @@ public class HumanizedInputDispatcher implements InputDispatcher
                 : client.getMenu().getMenuEntries();
             if (entries == null || entries.length == 0) return false;
             MenuEntry top = entries[entries.length - 1];
-            return VerbMatcher.matches(verb, top.getOption());
+            String opt = top.getOption();
+            if (VerbMatcher.matches(verb, opt)) return true;
+            // Composite fallback — Skretzo's TSV stores some verbs as the
+            // full menu line ("Climb-up Staircase") but the engine splits
+            // option ("Climb-up") and target ("<col=ffff>Staircase").
+            String tgt = top.getTarget();
+            if (tgt == null || tgt.isEmpty()) return false;
+            String tgtClean = tgt.replaceAll("<[^>]+>", "").trim();
+            if (tgtClean.isEmpty()) return false;
+            return VerbMatcher.matches(verb, opt + " " + tgtClean);
         }
         catch (Throwable th) { return false; }
     }
@@ -1372,7 +1527,20 @@ public class HumanizedInputDispatcher implements InputDispatcher
     @javax.annotation.Nullable
     private MenuRow findMenuRow(String verb)
     {
-        return findMenuRow(e -> VerbMatcher.matches(verb, e.getOption()));
+        // Bare-vs-composite verb match. Skretzo's TSV stores some verbs as
+        // the full menu line ("Climb-up Staircase") but the engine's
+        // MenuEntry splits option ("Climb-up") and target ("<col=ffff>Staircase").
+        // Try the bare option first, fall back to "<option> <target>" with
+        // RuneLite colour tags stripped. Same fix shape as TransportResolver.matchedAction.
+        return findMenuRow(e -> {
+            String opt = e.getOption();
+            if (VerbMatcher.matches(verb, opt)) return true;
+            String tgt = e.getTarget();
+            if (tgt == null || tgt.isEmpty()) return false;
+            String tgtClean = tgt.replaceAll("<[^>]+>", "").trim();
+            if (tgtClean.isEmpty()) return false;
+            return VerbMatcher.matches(verb, opt + " " + tgtClean);
+        });
     }
 
     /** As {@link #findMenuRow(String)} but with a custom entry predicate.
