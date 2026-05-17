@@ -8,6 +8,7 @@ import java.awt.Polygon;
 import java.awt.Stroke;
 import javax.annotation.Nullable;
 import net.runelite.api.Client;
+import net.runelite.api.Point;
 import net.runelite.api.CollisionData;
 import net.runelite.api.CollisionDataFlag;
 import net.runelite.api.Perspective;
@@ -39,8 +40,11 @@ public final class CollisionDebugOverlay extends Overlay
     private static final Color WALKABLE_FILL = new Color( 60, 220, 100, 28);
     private static final Color FULL_BLOCK    = new Color(220,  40,  40, 120);
     private static final Color EDGE_BLOCK    = new Color(255,  50,  50, 230);
-    private static final BasicStroke STROKE_EDGE = new BasicStroke(2f);
-    private static final BasicStroke STROKE_THIN = new BasicStroke(1f);
+    private static final Color HOVER_OUTLINE = new Color(255, 255,  60, 255);
+    private static final Color LABEL_BG      = new Color(  0,   0,   0, 200);
+    private static final BasicStroke STROKE_EDGE  = new BasicStroke(2f);
+    private static final BasicStroke STROKE_THIN  = new BasicStroke(1f);
+    private static final BasicStroke STROKE_HOVER = new BasicStroke(2.4f);
 
     /** Render radius around the player (Chebyshev). 30 tiles ≈ visible
      *  canvas + a small buffer; covers the 16-tile minimap reach and a
@@ -86,6 +90,10 @@ public final class CollisionDebugOverlay extends Overlay
         int wSize = flags.length;
         int hSize = wSize > 0 ? flags[0].length : 0;
 
+        Point mouse = client.getMouseCanvasPosition();
+        Polygon hoverPoly = null;
+        WorldPoint hoverWp = null;
+        int hoverFlags = 0;
         Stroke prev = g.getStroke();
         for (int dx = -RENDER_RADIUS_TILES; dx <= RENDER_RADIUS_TILES; dx++)
         {
@@ -100,6 +108,13 @@ public final class CollisionDebugOverlay extends Overlay
                 WorldPoint wp = new WorldPoint(wx, wy, plane);
                 Polygon poly = tilePoly(wp);
                 if (poly == null) continue;
+                if (mouse != null && mouse.getX() >= 0 && mouse.getY() >= 0
+                    && poly.contains(mouse.getX(), mouse.getY()))
+                {
+                    hoverPoly = poly;
+                    hoverWp = wp;
+                    hoverFlags = f;
+                }
 
                 boolean full = (f & CollisionDataFlag.BLOCK_MOVEMENT_FULL) != 0;
                 if (full)
@@ -152,6 +167,21 @@ public final class CollisionDebugOverlay extends Overlay
                     }
                 }
             }
+        }
+        if (hoverPoly != null && hoverWp != null)
+        {
+            g.setStroke(STROKE_HOVER);
+            g.setColor(HOVER_OUTLINE);
+            g.drawPolygon(hoverPoly);
+            String label = "(" + hoverWp.getX() + ", " + hoverWp.getY() + ", p=" + hoverWp.getPlane() + ") f=0x"
+                + Integer.toHexString(hoverFlags);
+            int lx = mouse.getX() + 12;
+            int ly = mouse.getY() - 6;
+            int lw = g.getFontMetrics().stringWidth(label) + 6;
+            g.setColor(LABEL_BG);
+            g.fillRect(lx - 2, ly - 12, lw, 15);
+            g.setColor(Color.WHITE);
+            g.drawString(label, lx + 1, ly - 1);
         }
         g.setStroke(prev);
         return null;
