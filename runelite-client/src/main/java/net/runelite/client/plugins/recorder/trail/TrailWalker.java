@@ -1210,7 +1210,7 @@ public final class TrailWalker
     }
 
     @Nullable
-    private WorldPoint readPlayerTile()
+    public WorldPoint readPlayerTile()
     {
         return onClient(() -> {
             Player self = client.getLocalPlayer();
