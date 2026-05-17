@@ -128,6 +128,13 @@ public final class InvalidationClassifier
             result = FailureClass.DYNAMIC_BLOCKER;
             transientPenalties.put(ctx.clickedTile(), System.currentTimeMillis());
             log.debug("classifier: dynamic blocker at {} — transient penalty", ctx.clickedTile());
+            // Dynamic blockers (NPCs that will move) MUST NOT contribute to
+            // the permanent failure counter — the transient penalty TTL
+            // covers the retry window. Without this early return, an NPC
+            // standing on a critical tile (e.g. the Lumbridge staircase
+            // Man-guard on (3206,3229,p=0)) blacklists the tile after 2
+            // failures and the bot can never finish that leg of the route.
+            return result;
         }
         else
         {
@@ -160,6 +167,17 @@ public final class InvalidationClassifier
     {
         if (tile == null) return;
         blacklist.add(tile);
+    }
+
+    /** Mark a tile with a transient penalty (TTL {@link #DYNAMIC_PENALTY_TTL_MS})
+     *  without permanently blacklisting. Used when the dispatcher rejected a
+     *  click because of a dynamic entity (NPC, player) on the tile — the
+     *  entity will move, so we want to retry after a short cooldown, not
+     *  kill the tile for the route. */
+    public void markTransient(WorldPoint tile)
+    {
+        if (tile == null) return;
+        transientPenalties.put(tile, System.currentTimeMillis());
     }
 
     /** True if the tile has a non-expired transient penalty. */

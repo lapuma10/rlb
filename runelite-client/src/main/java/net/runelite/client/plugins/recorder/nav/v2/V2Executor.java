@@ -689,14 +689,78 @@ public final class V2Executor
         // Strict-walk rejection handling — only meaningful for walk-leg
         // dispatches. Transport verb-clicks have their own success channel
         // (resolveTransportClickTile + plane change).
+        //
+        // Three possible causes for a reject; each gets a different recovery:
+        //   (1) Openable on the tile (door / gate the planner walked through
+        //       because Skretzo data doesn't model it). Dispatch Open instead
+        //       of blacklisting — the door will then open and the tile
+        //       becomes passable.
+        //   (2) Dynamic entity (NPC, player) standing on the tile. Apply
+        //       transient penalty only; the entity will move shortly.
+        //       Permanent blacklist would kill a tile the planner needs
+        //       (e.g. the Lumbridge staircase tile with a guard standing on
+        //       it).
+        //   (3) Anything else (tree overlay, ground item with bad menu
+        //       resolution, etc.) — permanent blacklist as before.
         if (!(currentLeg instanceof V2Leg.Transport))
         {
             String lastErr = env.lastDispatchError();
             if (lastErr != null && lastDispatchedTile != null && !lastDispatchWasMinimap)
             {
+                WorldPoint rejectedTile = lastDispatchedTile;
+
+                // (1) Try to open if there's an openable at or adjacent to
+                //     the rejected tile. This is the executor-side analog of
+                //     `tryHandleOpenableBlocker` but triggered from a click
+                //     reject instead of a movement stall, so it catches doors
+                //     the planner walked through (no transport leg in plan).
+                WorldPoint openTile = env.findOpenableNear(rejectedTile);
+                if (openTile != null
+                    && openableAttemptsThisLeg < MAX_OPENABLE_ATTEMPTS_PER_LEG
+                    && env.dispatchOpen(openTile))
+                {
+                    log.info("[v2-blocker] strict-walk reject at {} → openable found at {}, dispatched Open (leg={} attempts={}/{})",
+                        rejectedTile, openTile, legIdx,
+                        openableAttemptsThisLeg + 1, MAX_OPENABLE_ATTEMPTS_PER_LEG);
+                    pendingOpenTile = rejectedTile;
+                    ticksSincePendingOpen = 0;
+                    pendingOpenIsWallEdge = false;
+                    lastDispatchedTile = null;
+                    ticksSinceProgress = 0;
+                    openableAttemptsThisLeg++;
+                    return status;
+                }
+
+                // (2) Dynamic entity on the tile — transient penalty only.
+                //     The strict-walk pre-check aborts on menus like
+                //     'Attack Man (level-2)' when an NPC is standing on the
+                //     destination tile. The NPC moves; the tile becomes
+                //     walkable seconds later. Permanently blacklisting
+                //     would corner the planner if the tile is on a critical
+                //     bottleneck (staircase, doorway).
+                if (env.dynamicEntityOnTile(rejectedTile))
+                {
+                    log.info("v2-executor: strict-walk reject at {} — \"{}\"; NPC on tile, transient penalty only",
+                        rejectedTile, lastErr);
+                    classifier.markTransient(rejectedTile);
+                    clickRejectsThisLeg++;
+                    lastDispatchedTile = null;
+                    ticksSinceProgress = 0;
+                    if (clickRejectsThisLeg >= MAX_CLICK_REJECTS_PER_LEG)
+                    {
+                        log.warn("v2-executor: UNSAFE_CANVAS_CLICK_EXHAUSTED — FAILED after {} consecutive rejections",
+                            clickRejectsThisLeg);
+                        status = Status.FAILED;
+                        lastFailureReason = FailureReason.UNSAFE_CANVAS_CLICK_EXHAUSTED;
+                        return status;
+                    }
+                    return status;
+                }
+
+                // (3) Default — permanent blacklist.
                 log.info("v2-executor: UNSAFE_CANVAS_CLICK at {} — \"{}\"; blacklisting + picking different tile (rejects this leg: {}/{})",
-                    lastDispatchedTile, lastErr, clickRejectsThisLeg + 1, MAX_CLICK_REJECTS_PER_LEG);
-                classifier.blacklistTile(lastDispatchedTile);
+                    rejectedTile, lastErr, clickRejectsThisLeg + 1, MAX_CLICK_REJECTS_PER_LEG);
+                classifier.blacklistTile(rejectedTile);
                 clickRejectsThisLeg++;
                 lastDispatchedTile = null;
                 ticksSinceProgress = 0;
