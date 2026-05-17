@@ -176,6 +176,16 @@ public class RecorderPlugin extends Plugin
     /** Root for persisted region/entity/transport JSON. Set in startUp;
      *  read by both the FlushDaemon and the bootstrap path. */
     private File worldmapRoot;
+
+    /** Precomputed connectivity components for static collision. Built
+     *  on a background daemon thread during startUp; null until that
+     *  finishes (~1-2s). Read by {@link WaypointPlannerShim} via a
+     *  Supplier — see the architect-pinned mint-time resolution rule
+     *  in {@code WorldSnapshotBuilder.captureOnClientThread}.
+     *  Single-writer (the daemon thread), many-reader (snapshot mint
+     *  on the client thread); {@code volatile} is the right primitive. */
+    private volatile net.runelite.client.plugins.recorder.nav.v2.collision.ConnectivityComponents
+        v2Components;
     /** Once-per-plugin-startup guard: the disk bootstrap should run
      *  exactly once after the first LOGGED_IN event so subsequent
      *  log-out / log-in cycles don't overwrite warm in-memory state
@@ -504,6 +514,41 @@ public class RecorderPlugin extends Plugin
                 th.toString(), th);
             sharedGlobalSnapshot = null;
         }
+
+        // Connectivity-components precompute: ~1-2s flood-fill over
+        // every loaded region in the global snapshot. Runs on a
+        // dedicated daemon thread so plugin startUp doesn't block.
+        // Result lands in the volatile v2Components field; the planner
+        // shim reads it via Supplier and stores the captured reference
+        // on each WorldSnapshot at mint time. Dijkstra is collision-
+        // blind during the precompute window and switches over once
+        // the field is non-null. See spec
+        // docs/superpowers/specs/2026-05-17-collision-aware-dijkstra-design.md
+        if (sharedGlobalSnapshot != null)
+        {
+            final net.runelite.client.plugins.recorder.nav.v2.collision.GlobalCollisionSnapshot
+                snapForPrecompute = sharedGlobalSnapshot;
+            Thread componentsThread = new Thread(() ->
+            {
+                long t0 = System.nanoTime();
+                try
+                {
+                    net.runelite.client.plugins.recorder.nav.v2.collision.ConnectivityComponents c
+                        = net.runelite.client.plugins.recorder.nav.v2.collision
+                            .ConnectivityComponents.fromSnapshot(snapForPrecompute);
+                    v2Components = c;
+                    log.info("nav-engine: ConnectivityComponents ready — {} components in {} ms",
+                        c.componentCount(), (System.nanoTime() - t0) / 1_000_000);
+                }
+                catch (Throwable t)
+                {
+                    log.error("nav-engine: ConnectivityComponents precompute FAILED: {}",
+                        t.toString(), t);
+                }
+            }, "nav-v2-components-precompute");
+            componentsThread.setDaemon(true);
+            componentsThread.start();
+        }
         net.runelite.client.plugins.recorder.nav.v2.transport.TransportTable sharedTransportTable;
         try
         {
@@ -529,7 +574,8 @@ public class RecorderPlugin extends Plugin
             net.runelite.client.plugins.recorder.nav.v2.planner.WaypointPlannerShim shim
                 = new net.runelite.client.plugins.recorder.nav.v2.planner.WaypointPlannerShim(
                     client, clientThread, sharedGlobalSnapshot, sharedTransportTable,
-                    sharedPredicates);
+                    sharedPredicates,
+                    () -> this.v2Components);
             v3V2Nav = buildV2NavigatorWithHook(v3Dispatcher, shim);
             log.info("nav-engine: V2Navigator wired to WaypointPlannerShim (new observation-aware engine)");
         }

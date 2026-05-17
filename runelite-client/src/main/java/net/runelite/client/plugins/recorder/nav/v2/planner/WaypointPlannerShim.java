@@ -60,18 +60,44 @@ public final class WaypointPlannerShim implements V2Navigator.PlannerHook
     private final GlobalCollisionSnapshot global;
     private final TransportTable transportTable;
     private final PredicateRegistry predicates;
+    /** Holder of the precomputed component map. May resolve to null
+     *  during the precompute window at plugin start — Dijkstra runs
+     *  collision-blind in that case (status-quo). */
+    @Nullable
+    private final java.util.function.Supplier<
+        net.runelite.client.plugins.recorder.nav.v2.collision.ConnectivityComponents>
+        componentsSupplier;
 
+    /** 5-arg constructor — preserves pre-collision-aware-Dijkstra
+     *  behaviour by passing a null components supplier. */
     public WaypointPlannerShim(Client client,
                                ClientThread clientThread,
                                GlobalCollisionSnapshot global,
                                TransportTable transportTable,
                                PredicateRegistry predicates)
     {
+        this(client, clientThread, global, transportTable, predicates, /*supplier*/ null);
+    }
+
+    /** 6-arg constructor — accepts a supplier for the precomputed
+     *  connectivity-components map. The supplier is invoked once per
+     *  {@code plan(...)} call via {@code WorldSnapshotBuilder.fromClient}
+     *  at mint time and stored on the resulting snapshot. */
+    public WaypointPlannerShim(Client client,
+                               ClientThread clientThread,
+                               GlobalCollisionSnapshot global,
+                               TransportTable transportTable,
+                               PredicateRegistry predicates,
+                               @Nullable java.util.function.Supplier<
+                                   net.runelite.client.plugins.recorder.nav.v2.collision.ConnectivityComponents>
+                                   componentsSupplier)
+    {
         this.client = client;
         this.clientThread = clientThread;
         this.global = global;
         this.transportTable = transportTable;
         this.predicates = predicates;
+        this.componentsSupplier = componentsSupplier;
     }
 
     @Override
@@ -94,7 +120,8 @@ public final class WaypointPlannerShim implements V2Navigator.PlannerHook
         {
             snap = WorldSnapshotBuilder.fromClient(
                 client, clientThread, global, transportTable, predicates,
-                WorldSnapshotBuilder.BlockingActorPolicy.NONE);
+                WorldSnapshotBuilder.BlockingActorPolicy.NONE,
+                componentsSupplier);
         }
         catch (Throwable th)
         {
