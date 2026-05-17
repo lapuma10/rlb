@@ -731,25 +731,42 @@ public final class TrailWalker
 
         Random rng = ThreadLocalRandom.current();
 
-        // v2: snapshot a Reachability map from the player and compose
+        // v3: snapshot a Reachability map from the player and compose
         // the existing walkableProbe with two BFS gates — candidate
         // must be in the visited set, and its hop-distance must be
         // within `centerlineDist + 1` (no detours). Tolerance of 1
-        // absorbs BFS-vs-server tile-ordering quirks. Snapshot is
-        // cheap (~256 expansions at depth 16) and runs on the client
-        // thread because canTravelInDirection reads collision flags
-        // from the loaded scene.
+        // absorbs BFS-vs-server tile-ordering quirks.
+        //
+        // Adaptive depth (2026-05-17): the BFS depth scales with the
+        // Euclidean distance to the original pick so the centerline IS
+        // visited even when walking it requires a detour (around a
+        // bridge rail, through a doorway, around a castle wall). A
+        // fixed depth=16 was insufficient for picks 10-15 tiles ahead
+        // where the actual walking distance balloons to 20+ hops around
+        // obstacles — `centerlineDist` came back -1, the conservative
+        // gate fell through to "allow all reachable candidates", and
+        // the sidestep landed on a tile that required walking around
+        // the obstacle. Cap at 48 to keep the cost bounded
+        // (~2300 expansions worst case).
+        final int depthBudget = Math.max(
+            Reachability.DEFAULT_DEPTH,
+            Math.min(48, chebyshev(pos, originalPick) * 2 + 4));
         final ReachabilityMap reach = onClient(() -> {
             WorldView wv = client == null ? null : client.getTopLevelWorldView();
             if (wv == null) return null;
-            return Reachability.compute(wv, pos);
+            return Reachability.compute(wv, pos, depthBudget);
         });
         final int centerlineDist = reach == null ? -1 : reach.distance(originalPick);
 
         Predicate<WorldPoint> compoundProbe = candidate -> {
             if (walkableProbe != null && !walkableProbe.test(candidate)) return false;
-            if (reach == null) return true;            // can't validate, allow
-            if (centerlineDist < 0) return true;       // centerline itself off-BFS, allow
+            if (reach == null) return true;            // can't validate (no client/wv), allow
+            // Conservative when can't validate: if centerline is off-BFS
+            // even at the bumped depth, refuse to sidestep. Returning
+            // true here previously caused the "walks around the bridge
+            // rail" bug — the candidate looked reachable but the original
+            // pick required a 20+ hop detour, and we couldn't tell.
+            if (centerlineDist < 0) return false;
             if (!reach.isReachable(candidate)) return false;
             return reach.distance(candidate) <= centerlineDist + 1;
         };
