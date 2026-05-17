@@ -1,0 +1,13 @@
+# Local additions to Skretzo's transport graph.
+# Same format as transports.tsv:
+#   originX originY originPlane <TAB> destX destY destPlane <TAB> menuOption menuTarget objectID <TAB> Skills <TAB> Items <TAB> Quests <TAB> Varbits <TAB> VarPlayers <TAB> Duration <TAB> Display info
+#
+# Add rows here when the collision-debug overlay shows V2's BFS hitting a
+# wall that has a real, openable gate/door in-game without a corresponding
+# entry in Skretzo's bundled data. Keep rows alphabetically grouped by area.
+
+# Lumbridge chicken pen — south gate (object 1560). Skretzo's upstream
+# data doesn't include this gate, so V2's BFS treats the pen as
+# fenced-in and can't plan pen→bank routes.
+3236 3296 0	3236 3295 0	Open Gate 1560						1
+3236 3295 0	3236 3296 0	Open Gate 1560						1

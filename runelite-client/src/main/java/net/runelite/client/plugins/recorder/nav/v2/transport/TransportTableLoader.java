@@ -62,7 +62,14 @@ public final class TransportTableLoader
 		"fairy_rings.tsv",
 		"spirit_trees.tsv",
 		"teleportation_items.tsv",
-		"teleportation_spells.tsv"
+		"teleportation_spells.tsv",
+		// Local overrides — transports Skretzo's upstream data doesn't
+		// model (e.g. the Lumbridge chicken pen gate). Loaded last and
+		// merged into the same TransportTable; same TSV format as
+		// transports.tsv. Add rows here when the collision-debug overlay
+		// shows V2 hitting a wall that has a real gate/door in-game
+		// without a corresponding entry.
+		"transports-overrides.tsv"
 	));
 
 	private TransportTableLoader() {}
