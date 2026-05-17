@@ -746,11 +746,15 @@ public final class TrailWalker
         // obstacles — `centerlineDist` came back -1, the conservative
         // gate fell through to "allow all reachable candidates", and
         // the sidestep landed on a tile that required walking around
-        // the obstacle. Cap at 48 to keep the cost bounded
-        // (~2300 expansions worst case).
+        // the obstacle. Cap at 64 — that's ~the chebyshev radius to the
+        // 104×104 loaded scene edge from a centered player (~52) plus
+        // a small buffer. BFS naturally halts at the scene boundary
+        // (canTravelInDirection fails outside loaded collision data),
+        // so the cap is the working limit, not a wasteful bound. ~4100
+        // expansions worst case — still sub-millisecond on client thread.
         final int depthBudget = Math.max(
             Reachability.DEFAULT_DEPTH,
-            Math.min(48, chebyshev(pos, originalPick) * 2 + 4));
+            Math.min(64, chebyshev(pos, originalPick) * 2 + 4));
         final ReachabilityMap reach = onClient(() -> {
             WorldView wv = client == null ? null : client.getTopLevelWorldView();
             if (wv == null) return null;
