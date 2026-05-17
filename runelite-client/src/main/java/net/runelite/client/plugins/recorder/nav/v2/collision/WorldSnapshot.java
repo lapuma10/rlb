@@ -102,4 +102,22 @@ public interface WorldSnapshot
      *  override to return the captured state. */
     @javax.annotation.Nullable
     default PlayerState player() { return null; }
+
+    /** The precomputed connectivity components for static collision,
+     *  captured at snapshot mint time. Used by {@code
+     *  net.runelite.client.plugins.recorder.nav.v2.transport.LinkGraphDijkstra}
+     *  to filter walk edges by component equality — eliminating routes
+     *  that Dijkstra would commit to but BFS would later reject.
+     *
+     *  <p>Returns {@code null} during the precompute window at plugin
+     *  start (typically the first ~1-2 seconds) and in test fixtures
+     *  that don't supply a components reference. When {@code null},
+     *  Dijkstra runs collision-blind (the pre-2026-05-17 behaviour),
+     *  preserving compatibility.
+     *
+     *  <p>Architect pin: the reference is resolved once at snapshot
+     *  mint and stored on the impl — calling this method on the same
+     *  snapshot always returns the same reference (or always null). */
+    @javax.annotation.Nullable
+    default ConnectivityComponents components() { return null; }
 }

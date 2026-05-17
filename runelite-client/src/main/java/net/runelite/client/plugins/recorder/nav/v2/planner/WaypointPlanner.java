@@ -160,8 +160,14 @@ public final class WaypointPlanner
 			snap.collisionView();
 
 		// Step 1: high-level skeleton.
+		// Pass snap.components() through so Dijkstra's walk-edge filter
+		// rejects cross-component walks BFS would later prove infeasible
+		// (the pen-fence failure mode). Null during the precompute window
+		// at plugin start — Dijkstra falls back to collision-blind walks
+		// in that case, matching pre-2026-05-17 behaviour.
 		LinkGraphDijkstra.SkeletonResult skel =
-			LinkGraphDijkstra.findRouteSkeleton(navCtx, table, start, target);
+			LinkGraphDijkstra.findRouteSkeleton(navCtx, table, start, target,
+				snap.components());
 		if (skel.status() == LinkGraphDijkstra.Status.UNREACHABLE)
 		{
 			log.info("[nav-v2.planner] skeleton unreachable {} → {} ({})", start, target,

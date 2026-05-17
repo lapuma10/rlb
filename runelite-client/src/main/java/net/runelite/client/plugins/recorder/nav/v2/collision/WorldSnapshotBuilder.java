@@ -3,6 +3,7 @@ package net.runelite.client.plugins.recorder.nav.v2.collision;
 import java.util.Collections;
 import java.util.HashSet;
 import java.util.Set;
+import java.util.function.Supplier;
 import javax.annotation.Nullable;
 import lombok.extern.slf4j.Slf4j;
 import net.runelite.api.Client;
@@ -84,6 +85,23 @@ public final class WorldSnapshotBuilder
         long capturedAtMs,
         @Nullable WorldPoint playerPosition)
     {
+        return fromComponents(view, actorTiles, objectTiles, transports, predicates,
+            capturedAtMs, playerPosition, /*components*/ null);
+    }
+
+    /** 8-arg overload that includes connectivity components. Used by
+     *  the collision-aware-Dijkstra regression tests to construct a
+     *  snapshot pre-loaded with a precomputed component map. */
+    public static WorldSnapshot fromComponents(
+        CollisionView view,
+        Set<WorldPoint> actorTiles,
+        Set<WorldPoint> objectTiles,
+        @Nullable Object transports,
+        PredicateRegistry predicates,
+        long capturedAtMs,
+        @Nullable WorldPoint playerPosition,
+        @Nullable ConnectivityComponents components)
+    {
         if (view == null) throw new IllegalArgumentException("view");
         if (actorTiles == null) throw new IllegalArgumentException("actorTiles");
         if (objectTiles == null) throw new IllegalArgumentException("objectTiles");
@@ -95,12 +113,19 @@ public final class WorldSnapshotBuilder
             transports,
             predicates,
             capturedAtMs,
-            playerPosition);
+            playerPosition,
+            /*player*/ null,
+            components);
     }
 
     /** Full capture on the client thread. If the caller is not the client
      *  thread, marshalls via {@link ClientThread#invoke(Runnable)} and
-     *  blocks until the snapshot is built. */
+     *  blocks until the snapshot is built.
+     *
+     *  <p>6-arg overload — preserves pre-collision-aware-Dijkstra
+     *  behaviour by passing a null components supplier. New
+     *  integration callers (e.g. plugin start-up) should use the 7-arg
+     *  overload to supply a components reference. */
     public static WorldSnapshot fromClient(
         Client client,
         ClientThread clientThread,
@@ -108,6 +133,26 @@ public final class WorldSnapshotBuilder
         @Nullable Object transports,
         PredicateRegistry predicates,
         BlockingActorPolicy actorPolicy)
+    {
+        return fromClient(client, clientThread, global, transports, predicates,
+            actorPolicy, /*componentsSupplier*/ null);
+    }
+
+    /** Full capture on the client thread, with an optional supplier for
+     *  the {@link ConnectivityComponents} reference. The supplier is
+     *  invoked EXACTLY ONCE at mint time on the client thread; the
+     *  resolved reference (possibly null during precompute) is stored
+     *  on the immutable {@link WorldSnapshot} impl. Architect-pinned
+     *  semantics: a single snapshot never sees the components flip
+     *  from null to non-null on subsequent reads. */
+    public static WorldSnapshot fromClient(
+        Client client,
+        ClientThread clientThread,
+        GlobalCollisionSnapshot global,
+        @Nullable Object transports,
+        PredicateRegistry predicates,
+        BlockingActorPolicy actorPolicy,
+        @Nullable Supplier<ConnectivityComponents> componentsSupplier)
     {
         if (client == null) throw new IllegalArgumentException("client");
         if (clientThread == null) throw new IllegalArgumentException("clientThread");
@@ -117,7 +162,8 @@ public final class WorldSnapshotBuilder
 
         if (client.isClientThread())
         {
-            return captureOnClientThread(client, clientThread, global, transports, predicates, policy);
+            return captureOnClientThread(client, clientThread, global, transports, predicates, policy,
+                componentsSupplier);
         }
 
         // Off-client marshall — block until the runnable executes.
@@ -129,7 +175,8 @@ public final class WorldSnapshotBuilder
         {
             try
             {
-                result[0] = captureOnClientThread(client, clientThread, global, transports, predicates, policy);
+                result[0] = captureOnClientThread(client, clientThread, global, transports, predicates, policy,
+                    componentsSupplier);
             }
             catch (Throwable t)
             {
@@ -166,14 +213,19 @@ public final class WorldSnapshotBuilder
      *  {@code clientThread} marshaller is forwarded to
      *  {@link PlayerStateBuilder} so subsequent lazy varbit/varplayer
      *  reads can re-marshal from worker threads after the snapshot
-     *  leaves the client thread. */
+     *  leaves the client thread.
+     *
+     *  <p>{@code componentsSupplier} is resolved exactly once here and
+     *  the result (possibly null) is stored on the impl, per the
+     *  architect-pinned mint-time-resolution rule. */
     private static WorldSnapshot captureOnClientThread(
         Client client,
         @Nullable ClientThread clientThread,
         GlobalCollisionSnapshot global,
         @Nullable Object transports,
         PredicateRegistry predicates,
-        BlockingActorPolicy policy)
+        BlockingActorPolicy policy,
+        @Nullable Supplier<ConnectivityComponents> componentsSupplier)
     {
         assert client.isClientThread() : "captureOnClientThread off client thread";
 
@@ -226,6 +278,14 @@ public final class WorldSnapshotBuilder
         // is the only caller on the production path.
         PlayerState player = PlayerStateBuilder.fromClient(client, clientThread);
 
+        // Resolve the components reference once here. Architect-pin: the
+        // immutable snapshot stores this value; subsequent reads of
+        // snap.components() return the stored reference, never re-read
+        // the supplier or any external holder.
+        ConnectivityComponents components = (componentsSupplier == null)
+            ? null
+            : componentsSupplier.get();
+
         return new WorldSnapshotImpl(
             view,
             Collections.unmodifiableSet(actorTiles),
@@ -234,7 +294,8 @@ public final class WorldSnapshotBuilder
             predicates,
             System.currentTimeMillis(),
             playerPosition,
-            player);
+            player,
+            components);
     }
 
     /** Concrete implementation of {@link WorldSnapshot}. Package-private. */
@@ -248,6 +309,7 @@ public final class WorldSnapshotBuilder
         private final long capturedAtMs;
         @Nullable private final WorldPoint playerPosition;
         @Nullable private final PlayerState player;
+        @Nullable private final ConnectivityComponents components;
 
         WorldSnapshotImpl(
             CollisionView view,
@@ -258,7 +320,8 @@ public final class WorldSnapshotBuilder
             long capturedAtMs)
         {
             this(view, actorTiles, objectTiles, transports, predicates,
-                capturedAtMs, /*playerPosition*/ null, /*player*/ null);
+                capturedAtMs, /*playerPosition*/ null, /*player*/ null,
+                /*components*/ null);
         }
 
         WorldSnapshotImpl(
@@ -271,7 +334,7 @@ public final class WorldSnapshotBuilder
             @Nullable WorldPoint playerPosition)
         {
             this(view, actorTiles, objectTiles, transports, predicates,
-                capturedAtMs, playerPosition, /*player*/ null);
+                capturedAtMs, playerPosition, /*player*/ null, /*components*/ null);
         }
 
         WorldSnapshotImpl(
@@ -284,6 +347,21 @@ public final class WorldSnapshotBuilder
             @Nullable WorldPoint playerPosition,
             @Nullable PlayerState player)
         {
+            this(view, actorTiles, objectTiles, transports, predicates,
+                capturedAtMs, playerPosition, player, /*components*/ null);
+        }
+
+        WorldSnapshotImpl(
+            CollisionView view,
+            Set<WorldPoint> actorTiles,
+            Set<WorldPoint> objectTiles,
+            @Nullable Object transports,
+            PredicateRegistry predicates,
+            long capturedAtMs,
+            @Nullable WorldPoint playerPosition,
+            @Nullable PlayerState player,
+            @Nullable ConnectivityComponents components)
+        {
             this.view = view;
             this.actorTiles = actorTiles;
             this.objectTiles = objectTiles;
@@ -292,6 +370,7 @@ public final class WorldSnapshotBuilder
             this.capturedAtMs = capturedAtMs;
             this.playerPosition = playerPosition;
             this.player = player;
+            this.components = components;
         }
 
         @Override
@@ -348,6 +427,13 @@ public final class WorldSnapshotBuilder
         public PlayerState player()
         {
             return player;
+        }
+
+        @Override
+        @Nullable
+        public ConnectivityComponents components()
+        {
+            return components;
         }
 
         /** Helper for tests + log: indicate whether the player is on a
