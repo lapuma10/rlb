@@ -85,6 +85,18 @@ public final class TrailWalker
      *  range; radius 3 is allowed for testing but should not be the default. */
     static final int MAX_CORRIDOR_RADIUS = 3;
 
+    /** Tiles ahead of the player to aim the camera at during mid-leg
+     *  rotations. ~6 tiles ≈ one visible screen of forward travel —
+     *  far enough that the rotation target doesn't whip around with
+     *  each step, close enough that the camera tracks corridors and
+     *  bends instead of staring at the leg's distant endpoint. */
+    static final int ROTATION_LOOKAHEAD_TILES = 6;
+
+    /** Heading-shift threshold (yaw units) that triggers a mid-leg
+     *  re-rotation. 171 units ≈ 30° — straight-ish corridors don't
+     *  churn, but a sharp turn into a new street does. */
+    static final int ROTATION_HEADING_THRESHOLD_UNITS = 171;
+
     private final Client client;
     private final ClientThread clientThread;
     private final HumanizedInputDispatcher dispatcher;
@@ -153,6 +165,13 @@ public final class TrailWalker
      *  ticks pass during it). */
     private boolean rotatedThisLeg;
 
+    /** Last lookahead tile we rotated the camera toward during a WALK
+     *  leg, and the un-jittered yaw that pointed at it. Used by
+     *  {@link #maybeRerotateForWalkLeg} to skip rotations that would
+     *  only shift the camera by a few degrees. */
+    @Nullable private WorldPoint lastRotationLookahead;
+    private int lastRotationBaseYaw;
+
     /** v2 route state — see {@link #walkRoute(Route)}. {@code activeRoute}
      *  is the route the caller most recently asked us to walk;
      *  {@code activeRoutePath} is the {@link TrailPath} compiled from
@@ -201,6 +220,8 @@ public final class TrailWalker
         lastProgressMs = System.currentTimeMillis();
         transportVerbMissingTicks = 0;
         rotatedThisLeg = false;
+        lastRotationLookahead = null;
+        lastRotationBaseYaw = 0;
         // Note: activeRoute / activeRoutePath / lastPickedTrail are NOT
         // reset here. reset() runs on path swap inside tick(); leaving
         // route state alone lets walkRoute manage its own lifecycle.
@@ -445,8 +466,19 @@ public final class TrailWalker
         return false;
     }
 
-    /** Choose a tile inside {@code leg} that is ahead of the player. */
+    /** Choose a tile inside {@code leg} that is ahead of the player.
+     *  Convenience wrapper using the default {@link #MAX_HOP_TILES} cap. */
     static WorldPoint pickAheadTile(Leg.Walk leg, WorldPoint player, Random rng)
+    {
+        return pickAheadTile(leg, player, rng, MAX_HOP_TILES);
+    }
+
+    /** Choose a tile inside {@code leg} ahead of the player, capping the
+     *  forward search at {@code maxHopTiles} Chebyshev distance. Callers
+     *  pass a reduced cap when the player has stalled — picking a tile
+     *  16 tiles ahead of a stuck player just produces a click that lands
+     *  off the minimap and times out. */
+    static WorldPoint pickAheadTile(Leg.Walk leg, WorldPoint player, Random rng, int maxHopTiles)
     {
         List<WorldPoint> tiles = leg.tiles();
         int closestIdx = -1;
@@ -472,7 +504,7 @@ public final class TrailWalker
         {
             WorldPoint t = tiles.get(i);
             int d = chebyshev(player, t);
-            if (d > MAX_HOP_TILES) break;
+            if (d > maxHopTiles) break;
             farthestIdx = i;
         }
 
@@ -614,7 +646,11 @@ public final class TrailWalker
 
         Leg active = path.legs().get(legIdx);
         Status s;
-        if (active instanceof Leg.Walk wl) s = handleWalkLeg(wl, pos, now);
+        if (active instanceof Leg.Walk wl)
+        {
+            maybeRerotateForWalkLeg(wl, pos);
+            s = handleWalkLeg(wl, pos, now);
+        }
         else if (active instanceof Leg.Transport tr) s = handleTransportLeg(tr, pos, now);
         else s = Status.ERROR;
 
@@ -679,7 +715,27 @@ public final class TrailWalker
             return Status.IN_PROGRESS;
         }
 
-        WorldPoint originalPick = pickAheadTile(leg, pos, ThreadLocalRandom.current());
+        // Stall-aware hop cap. When the player isn't moving toward our
+        // previous pick, picking a tile 16 tiles ahead is pointless — the
+        // engine never reaches it and the click pixel ends up at the
+        // minimap radius (or off it entirely, logged as "not resolvable").
+        // Halve the hop on a brief stall; quarter it on a long stall so
+        // the next pick is a few tiles in front of the player, in the
+        // direction of travel, where the engine can actually route.
+        final int effectiveHop;
+        if (sinceMove >= 6_000L)
+        {
+            effectiveHop = Math.max(4, MAX_HOP_TILES / 4);
+        }
+        else if (sinceMove >= STILL_THRESHOLD_MS)
+        {
+            effectiveHop = Math.max(6, MAX_HOP_TILES / 2);
+        }
+        else
+        {
+            effectiveHop = MAX_HOP_TILES;
+        }
+        WorldPoint originalPick = pickAheadTile(leg, pos, ThreadLocalRandom.current(), effectiveHop);
         WorldPoint pick = maybeApplyCorridorPick(leg, pos, originalPick);
         WorldPoint legEnd = leg.tiles().get(leg.tiles().size() - 1);
 
@@ -844,16 +900,103 @@ public final class TrailWalker
     private void rotateCameraToActiveLeg()
     {
         if (currentPath == null || legIdx >= currentPath.size()) return;
-        WorldPoint focus = legFocusTile(currentPath.legs().get(legIdx));
-        if (focus == null) return;
+        Leg leg = currentPath.legs().get(legIdx);
+        // WALK legs use per-tick {@link #maybeRerotateForWalkLeg} so the
+        // camera tracks the player as they advance through the leg, not
+        // only at the moment the leg activates. TRANSPORT legs face a
+        // single object — rotate once on activation so the upcoming
+        // verb click lands on a tile that's actually on-screen.
+        if (!(leg instanceof Leg.Transport tr)) return;
         try
         {
-            dispatcher.rotateCameraToward(focus);
+            // force=true: don't skip if the transport tile is already
+            // comfortably visible — the rotation also brings the
+            // approach corridor into view, which the visibility check
+            // doesn't model.
+            dispatcher.rotateCameraToward(tr.tile(), true);
         }
         catch (Throwable t)
         {
             log.debug("camera rotate failed", t);
         }
+    }
+
+    /** Mid-leg camera tracking for WALK legs. Picks a tile a few steps
+     *  ahead of the player along the current leg and rotates the camera
+     *  toward it. The base yaw (pre-jitter) is remembered so that
+     *  subsequent ticks skip the rotation unless the intended heading
+     *  has shifted by more than {@link #ROTATION_HEADING_THRESHOLD_UNITS}
+     *  — corridors and gentle bends don't trigger churn, but a sharp
+     *  turn does. */
+    private void maybeRerotateForWalkLeg(Leg.Walk leg, WorldPoint pos)
+        throws InterruptedException
+    {
+        WorldPoint lookahead = legLookaheadTile(leg, pos, ROTATION_LOOKAHEAD_TILES);
+        if (lookahead == null || lookahead.equals(pos)) return;
+
+        int dx = lookahead.getX() - pos.getX();
+        int dy = lookahead.getY() - pos.getY();
+        if (dx == 0 && dy == 0) return;
+        double angle = Math.atan2(-dx, -dy);
+        int baseYaw = ((int) Math.round(angle * 2048.0 / (2 * Math.PI))) & 0x7FF;
+
+        if (lastRotationLookahead != null)
+        {
+            int diff = ((baseYaw - lastRotationBaseYaw + 1024 + 2048) % 2048) - 1024;
+            if (Math.abs(diff) < ROTATION_HEADING_THRESHOLD_UNITS) return;
+        }
+
+        log.debug("trail-walker: mid-leg rotate (leg {}, pos {}, lookahead {}, baseYaw {})",
+            legIdx, pos, lookahead, baseYaw);
+        try
+        {
+            // force=true: ignore the "already visible" shortcut. We want
+            // the camera tracking heading even when the lookahead tile
+            // happens to be on screen, so the character keeps walking
+            // up the screen instead of drifting sideways.
+            dispatcher.rotateCameraToward(lookahead, true);
+            lastRotationLookahead = lookahead;
+            lastRotationBaseYaw = baseYaw;
+        }
+        catch (InterruptedException ie)
+        {
+            throw ie;
+        }
+        catch (Throwable t)
+        {
+            log.debug("trail-walker: mid-leg rotation failed", t);
+        }
+    }
+
+    /** Returns the tile {@code lookahead} steps ahead of the player
+     *  inside the leg's tile list, clamped to the leg's last tile. The
+     *  player's nearest leg-tile is found by chebyshev distance — they
+     *  may not be standing exactly on a recorded tile (corridor
+     *  walking, server-side pathfinding) but the closest match is good
+     *  enough for camera-heading purposes. Returns null only for empty
+     *  legs / no same-plane tiles. */
+    @Nullable
+    private static WorldPoint legLookaheadTile(Leg.Walk leg, WorldPoint pos, int lookahead)
+    {
+        List<WorldPoint> tiles = leg.tiles();
+        if (tiles.isEmpty()) return null;
+
+        int closestIdx = -1;
+        int bestDist = Integer.MAX_VALUE;
+        for (int i = 0; i < tiles.size(); i++)
+        {
+            WorldPoint t = tiles.get(i);
+            if (t.getPlane() != pos.getPlane()) continue;
+            int d = chebyshev(pos, t);
+            if (d < bestDist)
+            {
+                bestDist = d;
+                closestIdx = i;
+            }
+        }
+        if (closestIdx < 0) return null;
+        int targetIdx = Math.min(closestIdx + lookahead, tiles.size() - 1);
+        return tiles.get(targetIdx);
     }
 
     private boolean tryAdvanceToReachableTransport(WorldPoint pos, long now)
@@ -1249,11 +1392,4 @@ public final class TrailWalker
         return ref.get();
     }
 
-    @Nullable
-    private static WorldPoint legFocusTile(Leg leg)
-    {
-        if (leg instanceof Leg.Walk w) return w.tiles().get(w.tiles().size() - 1);
-        if (leg instanceof Leg.Transport t) return t.tile();
-        return null;
-    }
 }
