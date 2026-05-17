@@ -86,6 +86,7 @@ import net.runelite.client.plugins.recorder.debug.TileMarker;
 import net.runelite.client.plugins.recorder.hotkey.HotkeyHandler;
 import net.runelite.client.plugins.recorder.mining.MiningLoop;
 import net.runelite.client.plugins.recorder.session.SessionDirectory;
+import net.runelite.client.plugins.recorder.nav.v2.V2PathOverlay;
 import net.runelite.client.plugins.recorder.trail.TrailOverlay;
 import net.runelite.client.plugins.recorder.transport.RouteOverlay;
 import net.runelite.client.sequence.dispatch.HumanizedInputDispatcher;
@@ -142,6 +143,7 @@ public class RecorderPlugin extends Plugin
     private ChickenOverlay chickenOverlay;
     private RouteOverlay routeOverlay;
     private TrailOverlay trailOverlay;
+    private V2PathOverlay v2PathOverlay;
     private net.runelite.client.plugins.recorder.worldmap.WorldMapMinimapOverlay worldMapMinimapOverlay;
     private TileMarker tileMarker;
     private ChickenCombatLoop chickenLoop;
@@ -213,6 +215,7 @@ public class RecorderPlugin extends Plugin
         // overlay via static publish helpers, so this single instance
         // visualises whichever script is currently driving the walker.
         trailOverlay = new TrailOverlay(client, config);
+        v2PathOverlay = new V2PathOverlay(client, config);
         panel.setTransportResolver(new TransportResolver(client));
         tileMarker = new TileMarker(client);
         panel.setDebugOverlay(debugOverlay);
@@ -226,6 +229,7 @@ public class RecorderPlugin extends Plugin
         overlayManager.add(chickenOverlay);
         overlayManager.add(routeOverlay);
         overlayManager.add(trailOverlay);
+        overlayManager.add(v2PathOverlay);
         overlayManager.add(hudOverlay);
 
         // Wire login assistant. We construct a fresh dispatcher here for
@@ -742,6 +746,7 @@ public class RecorderPlugin extends Plugin
         if (chickenOverlay != null) overlayManager.remove(chickenOverlay);
         if (routeOverlay != null) overlayManager.remove(routeOverlay);
         if (trailOverlay != null) { overlayManager.remove(trailOverlay); trailOverlay.detach(); }
+        if (v2PathOverlay != null) { overlayManager.remove(v2PathOverlay); v2PathOverlay.detach(); }
         if (worldMapMinimapOverlay != null)
         {
             overlayManager.remove(worldMapMinimapOverlay);

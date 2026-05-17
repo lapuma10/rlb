@@ -214,6 +214,16 @@ public final class V2Executor
         default boolean dispatchOpen(WorldPoint clickTile)
         { return false; }
 
+        /** Rotate the camera toward {@code target}, so the character
+         *  visibly walks "up the screen" as it advances through a leg.
+         *  Non-throwing wrapper around
+         *  {@link net.runelite.client.sequence.dispatch.HumanizedInputDispatcher#rotateCameraToward};
+         *  on interruption the impl restores the thread's interrupt
+         *  flag and returns. Default no-ops so test envs don't need
+         *  to wire a rotation seam unless they're asserting on it. */
+        default void rotateCameraToward(WorldPoint target, boolean force)
+        { /* default: no-op (tests inject behaviour) */ }
+
         /** Lane 5 plan Task 1: collapse all per-tick reads into one
          *  client-thread marshal. Production impl ({@link V2ExecutorEnv})
          *  marshals once and reads {@code playerLoc}, candidate-tile
@@ -274,6 +284,27 @@ public final class V2Executor
      *  isn't actually the blocker (false-positive 1-ring scan match) or
      *  the gate refuses to open (locked, decorative). */
     public static final int MAX_OPENABLE_ATTEMPTS_PER_LEG = 3;
+
+    /** Tiles ahead of the player to aim the camera at during mid-leg
+     *  rotation. ~6 tiles ≈ one visible screen of forward travel —
+     *  far enough that the rotation target doesn't whip around with
+     *  each step, close enough that the camera tracks corridors and
+     *  bends instead of staring at the leg's distant endpoint. */
+    public static final int ROTATION_LOOKAHEAD_TILES = 6;
+
+    /** Heading-shift threshold (yaw units) that triggers a mid-leg
+     *  re-rotation. 342 units ≈ 60° — only fires on real turns, not
+     *  the gentle 20-30° drift of a corridor. Each rotation blocks the
+     *  walker tick for ~0.5-2 s while it animates, so firing on small
+     *  shifts piles up "client laggy" symptoms even though OSRS itself
+     *  is fine.
+     *
+     *  <p>If rotations feel <b>too sluggish to track the path</b> (camera
+     *  stays facing the wrong way through obvious turns), <b>lower</b>
+     *  this — 256 ≈ 45° or 171 ≈ 30°. If rotations feel <b>too frequent
+     *  / laggy</b>, <b>raise</b> it — 512 ≈ 90° fires only on hard
+     *  cardinal turns. */
+    public static final int ROTATION_HEADING_THRESHOLD_UNITS = 342;
 
     private static final int FILTER_REJECT_WINDOW = 4;
     private static final double MINIMAP_BIAS_THRESHOLD = 0.5;
@@ -361,6 +392,13 @@ public final class V2Executor
      *  by {@link #MAX_OPENABLE_ATTEMPTS_PER_LEG}. */
     private int openableAttemptsThisLeg;
 
+    /** Last lookahead tile we rotated the camera toward, and the
+     *  un-jittered yaw that pointed at it. Used by
+     *  {@link #maybeRerotateForWalkLeg} to skip rotations that would
+     *  only shift the camera by a few degrees. */
+    @Nullable private WorldPoint lastRotationLookahead;
+    private int lastRotationBaseYaw;
+
     public V2Executor(Env env, CanvasTilePicker canvasPicker,
                       InvalidationClassifier classifier, Random rng)
     {
@@ -383,6 +421,8 @@ public final class V2Executor
     public void setPath(V2Path newPath)
     {
         this.path = newPath;
+        V2PathOverlay.publishActivePath(newPath);
+        V2PathOverlay.publishProgress(0, -1);
         this.legIdx = 0;
         this.catchupClicksThisLeg = 0;
         this.clickRejectsThisLeg = 0;
@@ -406,6 +446,8 @@ public final class V2Executor
         this.ticksSincePendingOpen = 0;
         this.pendingOpenIsWallEdge = false;
         this.openableAttemptsThisLeg = 0;
+        this.lastRotationLookahead = null;
+        this.lastRotationBaseYaw = 0;
         if (newPath == null || newPath.isEmpty())
         {
             this.status = Status.IDLE;
@@ -488,6 +530,8 @@ public final class V2Executor
         this.pendingTransportCorrection = null;
         this.pendingOpenTile = null;
         this.ticksSincePendingOpen = 0;
+        this.lastRotationLookahead = null;
+        this.lastRotationBaseYaw = 0;
     }
 
     /** Lane 5 plan Task 4: typed-result view of the most recent
@@ -821,6 +865,7 @@ public final class V2Executor
         {
             log.info("v2-executor: progress advanced old={} new={} leg={}",
                 oldProgress, progressIdx, legIdx);
+            V2PathOverlay.publishProgress(legIdx, progressIdx);
         }
 
         // Walk-leg advance: player has reached the end of this leg.
@@ -830,6 +875,11 @@ public final class V2Executor
             advanceLeg("WALK", w.end());
             return status;
         }
+
+        // Pan the camera so the destination is up-and-off-axis from the
+        // player. Cheap when the heading hasn't shifted enough to matter
+        // — see {@link #maybeRerotateForWalkLeg} for the threshold logic.
+        maybeRerotateForWalkLeg(here, w);
 
         // If we have a pending Open click, poll for live passability.
         if (pendingOpenTile != null)
@@ -1081,6 +1131,46 @@ public final class V2Executor
         status = Status.FAILED;
         lastFailureReason = FailureReason.TRANSPORT_CLICK_FAILED;
         return true;
+    }
+
+    /** Mid-leg camera tracking for WALK legs. Picks the tile {@link
+     *  #ROTATION_LOOKAHEAD_TILES} steps ahead of the player along the
+     *  leg and rotates the camera toward it. The base yaw (pre-jitter)
+     *  is remembered so that subsequent ticks skip the rotation unless
+     *  the intended heading has shifted by more than
+     *  {@link #ROTATION_HEADING_THRESHOLD_UNITS} — corridors and gentle
+     *  bends don't trigger churn, but a sharp turn does. */
+    private void maybeRerotateForWalkLeg(WorldPoint here, V2Leg.Walk leg)
+    {
+        java.util.List<WorldPoint> tiles = leg.tiles();
+        if (tiles.isEmpty()) return;
+        int closest = closestIdxOnPath(tiles, here);
+        if (closest < 0) return;
+        int targetIdx = Math.min(closest + ROTATION_LOOKAHEAD_TILES, tiles.size() - 1);
+        WorldPoint lookahead = tiles.get(targetIdx);
+        if (lookahead.equals(here)) return;
+
+        int dx = lookahead.getX() - here.getX();
+        int dy = lookahead.getY() - here.getY();
+        if (dx == 0 && dy == 0) return;
+        double angle = Math.atan2(-dx, -dy);
+        int baseYaw = ((int) Math.round(angle * 2048.0 / (2 * Math.PI))) & 0x7FF;
+
+        if (lastRotationLookahead != null)
+        {
+            int diff = ((baseYaw - lastRotationBaseYaw + 1024 + 2048) % 2048) - 1024;
+            if (Math.abs(diff) < ROTATION_HEADING_THRESHOLD_UNITS) return;
+        }
+
+        log.debug("v2-executor: mid-leg rotate (leg={} pos={} lookahead={} baseYaw={})",
+            legIdx, here, lookahead, baseYaw);
+        // force=true: ignore the dispatcher's "already visible" shortcut
+        // — the camera should track the path even when the lookahead
+        // tile happens to be on screen, so the character keeps walking
+        // up the screen instead of drifting sideways.
+        env.rotateCameraToward(lookahead, true);
+        lastRotationLookahead = lookahead;
+        lastRotationBaseYaw = baseYaw;
     }
 
     private static int closestIdxOnPath(java.util.List<WorldPoint> tiles, WorldPoint here)

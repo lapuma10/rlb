@@ -133,6 +133,18 @@ public interface RecorderConfig extends Config
 		return false;
 	}
 
+	@ConfigItem(
+		keyName = "v2PathOverlay",
+		name = "Show V2 path overlay",
+		description = "When on, the active V2 (worldmap-v2) planned route is drawn on the world. Walk-leg tiles are coloured per leg, transport tiles are outlined in magenta with their verb label, and the player's current progress along the route is shown.",
+		section = trailOverlaySection,
+		position = 1
+	)
+	default boolean v2PathOverlay()
+	{
+		return true;
+	}
+
 	@ConfigSection(
 		name = "Chicken overlay",
 		description = "Debug overlay that highlights chickens by selector eligibility. Closest eligible chicken (= what the combat loop would pick next) gets a brighter colour and a thicker outline.",
