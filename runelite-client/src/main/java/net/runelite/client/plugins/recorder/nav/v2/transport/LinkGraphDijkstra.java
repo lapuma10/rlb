@@ -9,7 +9,9 @@ import java.util.Map;
 import java.util.Objects;
 import java.util.PriorityQueue;
 import java.util.Set;
+import javax.annotation.Nullable;
 import net.runelite.api.coords.WorldPoint;
+import net.runelite.client.plugins.recorder.nav.v2.collision.ConnectivityComponents;
 import net.runelite.client.plugins.recorder.nav.v2.predicate.NavigationContext;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -123,9 +125,36 @@ public final class LinkGraphDijkstra
 	 *  transport-traversals).
 	 *
 	 *  <p>When {@code from.equals(to)}, returns a trivial 1-node walk
-	 *  skeleton. */
+	 *  skeleton.
+	 *
+	 *  <p>4-arg overload — equivalent to passing {@code components = null}.
+	 *  Walk edges are added between every same-plane node pair (the
+	 *  pre-2026-05-17 "collision-blind" behaviour). Preserved so
+	 *  existing tests / call sites without a {@link ConnectivityComponents}
+	 *  precompute don't change behaviour. */
 	public static SkeletonResult findRouteSkeleton(NavigationContext ctx, TransportTable table,
 												   WorldPoint from, WorldPoint to)
+	{
+		return findRouteSkeleton(ctx, table, from, to, null);
+	}
+
+	/** Run Dijkstra with an optional component filter on walk edges.
+	 *
+	 *  <p>When {@code components} is non-null, a walk edge between
+	 *  same-plane nodes A and B is only added when
+	 *  {@code components.sameComponent(A, B)} returns true. Nodes that
+	 *  are in different components in static collision space cannot
+	 *  be connected by walking; Dijkstra is forced to bridge them
+	 *  via an explicit transport. Eliminates the failure mode where
+	 *  Dijkstra picks an abstract walk BFS can't actually traverse
+	 *  (e.g. crossing a fenced enclosure without using its gate).
+	 *
+	 *  <p>When {@code components} is null, behaviour matches the
+	 *  4-arg overload (collision-blind walk edges, status-quo
+	 *  pre-2026-05-17). */
+	public static SkeletonResult findRouteSkeleton(NavigationContext ctx, TransportTable table,
+												   WorldPoint from, WorldPoint to,
+												   @Nullable ConnectivityComponents components)
 	{
 		if (from == null || to == null)
 		{
@@ -197,6 +226,14 @@ public final class LinkGraphDijkstra
 				if (i == j) continue;
 				WorldPoint b = nodes.get(j);
 				if (a.getPlane() != b.getPlane()) continue;
+				// Collision-aware filter: tiles in different connectivity
+				// components cannot be reached by walking in static
+				// collision space, so we refuse to add a walk edge that
+				// BFS would later prove infeasible. Skipping the edge
+				// forces Dijkstra to bridge the gap via an explicit
+				// transport (gate/door/stair) — exactly what was
+				// missing in the pen→bank failure mode.
+				if (components != null && !components.sameComponent(a, b)) continue;
 				int cost = chebyshev(a, b);
 				adj.get(a).add(Edge.walk(b, cost));
 			}

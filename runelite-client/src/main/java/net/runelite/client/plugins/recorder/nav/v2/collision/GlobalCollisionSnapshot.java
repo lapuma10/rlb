@@ -107,7 +107,7 @@ public final class GlobalCollisionSnapshot
      *  <p>Visible (package-private) for use in tests only — do NOT
      *  call from production code; loading the bundled zip is what
      *  production wants. */
-    static GlobalCollisionSnapshot forTestingWalkable(int regionX, int regionY, boolean[][][] walkable)
+    public static GlobalCollisionSnapshot forTestingWalkable(int regionX, int regionY, boolean[][][] walkable)
     {
         int planeCount = walkable.length;
         // Skretzo's encoding: BitSet with bit position
