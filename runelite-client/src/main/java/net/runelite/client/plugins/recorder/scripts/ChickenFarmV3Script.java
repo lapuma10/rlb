@@ -83,6 +83,23 @@ public final class ChickenFarmV3Script
     private final AtomicReference<Thread> worker = new AtomicReference<>();
     private long lastBankActionAtMs;
 
+    // ──── Debug toggles ────
+    // Read by the corresponding tick* methods to short-circuit phases
+    // for walk-testing without running a full bot cycle. The panel's
+    // debug box exposes these; they have no effect on normal Start.
+    private final AtomicBoolean skipCombat = new AtomicBoolean(false);
+    private final AtomicBoolean skipBanking = new AtomicBoolean(false);
+    /** When true, after ARRIVED in any walk leg the script transitions
+     *  to IDLE instead of starting the next phase. Useful for "I just
+     *  want to test the bank→pen walk in isolation" — flip on, click
+     *  Walk → Pen, watch it walk, watch it stop on arrival. */
+    private final AtomicBoolean stopAfterArrival = new AtomicBoolean(false);
+    /** Phase override for the next start(). Null = decideResume()
+     *  picks normally. Setting this lets the debug buttons jump
+     *  directly into a specific phase (OUTBOUND or RETURN) without
+     *  waiting for resume detection to figure out where the player is. */
+    private final AtomicReference<State> forceStartState = new AtomicReference<>(null);
+
     public ChickenFarmV3Script(Client client, ClientThread clientThread,
                                HumanizedInputDispatcher dispatcher,
                                TrailRegistry registry,
@@ -129,6 +146,31 @@ public final class ChickenFarmV3Script
         return trainingPlan;
     }
 
+    // ──── Debug accessors ────
+    public boolean isSkipCombat() { return skipCombat.get(); }
+    public void setSkipCombat(boolean v) { skipCombat.set(v); }
+    public boolean isSkipBanking() { return skipBanking.get(); }
+    public void setSkipBanking(boolean v) { skipBanking.set(v); }
+    public boolean isStopAfterArrival() { return stopAfterArrival.get(); }
+    public void setStopAfterArrival(boolean v) { stopAfterArrival.set(v); }
+
+    /** Start the script forced into {@link State#OUTBOUND} on the first
+     *  tick. Used by the panel's "Walk → Pen" debug button to bypass
+     *  decideResume() and skip the normal phase-detection logic. */
+    public void startForcedOutbound()
+    {
+        forceStartState.set(State.OUTBOUND);
+        start();
+    }
+
+    /** Start forced into {@link State#RETURN}. Mirror of
+     *  {@link #startForcedOutbound} for the "Walk → Bank" debug button. */
+    public void startForcedReturn()
+    {
+        forceStartState.set(State.RETURN);
+        start();
+    }
+
     public void start()
     {
         if (!running.compareAndSet(false, true)) return;
@@ -164,8 +206,10 @@ public final class ChickenFarmV3Script
         {
             trainingSession.start(trainingPlan);
         }
-        State decided = decideResume();
-        log.info("v3: resume → {} (status: {})", decided, status.get());
+        State forced = forceStartState.getAndSet(null);
+        State decided = forced != null ? forced : decideResume();
+        log.info("v3: resume → {} (status: {}) {}", decided, status.get(),
+            forced != null ? "[debug forced]" : "");
         setState(decided);
         if (decided == State.IDLE || decided == State.ABORTED)
         {
@@ -322,6 +366,29 @@ public final class ChickenFarmV3Script
         {
             case ARRIVED:
                 nav.cancel();
+                if (stopAfterArrival.get())
+                {
+                    log.info("v3: ARRIVED on {} — debug stopAfterArrival on, going IDLE",
+                        outbound ? "OUTBOUND" : "RETURN");
+                    status.set("walk-test complete (" + (outbound ? "→ pen" : "→ bank") + ")");
+                    setState(State.IDLE);
+                    running.set(false);
+                    break;
+                }
+                if (outbound && skipCombat.get())
+                {
+                    log.info("v3: ARRIVED on OUTBOUND — debug skipCombat on, looping back to RETURN");
+                    status.set("walk-test: at pen, skipping combat → RETURN");
+                    setState(State.RETURN);
+                    break;
+                }
+                if (!outbound && skipBanking.get())
+                {
+                    log.info("v3: ARRIVED on RETURN — debug skipBanking on, looping back to OUTBOUND");
+                    status.set("walk-test: at bank, skipping banking → OUTBOUND");
+                    setState(State.OUTBOUND);
+                    break;
+                }
                 setState(outbound ? State.AT_PEN : State.BANKING);
                 break;
             case FAILED:

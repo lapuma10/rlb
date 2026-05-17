@@ -228,6 +228,15 @@ public final class RecorderPanel extends PluginPanel
     // V3 — trail-network walker version. Lives next to V2 for direct comparison.
     private final JButton v3StartBtn = new JButton("Start");
     private final JButton v3StopBtn = new JButton("Stop");
+    // ──── V3 debug controls (walk-testing) ────
+    private final javax.swing.JCheckBox v3DebugStopAfterArrivalCb =
+        new javax.swing.JCheckBox("Stop after arrival");
+    private final javax.swing.JCheckBox v3DebugSkipCombatCb =
+        new javax.swing.JCheckBox("Skip combat at pen");
+    private final javax.swing.JCheckBox v3DebugSkipBankingCb =
+        new javax.swing.JCheckBox("Skip banking");
+    private final JButton v3DebugWalkToPenBtn = new JButton("Walk → Pen");
+    private final JButton v3DebugWalkToBankBtn = new JButton("Walk → Bank");
     private final JLabel v3StatusLabel = new JLabel("V3: idle");
     private final JLabel v3KillsLabel = new JLabel("Kills: 0");
     private net.runelite.client.plugins.recorder.scripts.ChickenFarmV3Script chickenFarmV3;
@@ -1567,6 +1576,46 @@ public final class RecorderPanel extends PluginPanel
         v3Box.add(v3Row);
         v3StartBtn.addActionListener(e -> { if (chickenFarmV3 != null) chickenFarmV3.start(); });
         v3StopBtn.addActionListener(e -> { if (chickenFarmV3 != null) chickenFarmV3.stop(); });
+
+        // Debug sub-section — walk-test toggles + force-phase buttons.
+        // Lets you exercise just the OUTBOUND or RETURN walk without
+        // running combat / banking, useful for pinning down navigation
+        // regressions.
+        JPanel debugBox = new JPanel();
+        debugBox.setLayout(new BoxLayout(debugBox, BoxLayout.Y_AXIS));
+        debugBox.setBorder(BorderFactory.createTitledBorder("Debug"));
+        debugBox.setBackground(ColorScheme.DARK_GRAY_COLOR);
+        for (javax.swing.JCheckBox cb : new javax.swing.JCheckBox[]{
+            v3DebugStopAfterArrivalCb, v3DebugSkipCombatCb, v3DebugSkipBankingCb})
+        {
+            cb.setBackground(ColorScheme.DARK_GRAY_COLOR);
+            cb.setForeground(java.awt.Color.LIGHT_GRAY);
+            debugBox.add(cb);
+        }
+        v3DebugStopAfterArrivalCb.addActionListener(e -> {
+            if (chickenFarmV3 != null)
+                chickenFarmV3.setStopAfterArrival(v3DebugStopAfterArrivalCb.isSelected());
+        });
+        v3DebugSkipCombatCb.addActionListener(e -> {
+            if (chickenFarmV3 != null)
+                chickenFarmV3.setSkipCombat(v3DebugSkipCombatCb.isSelected());
+        });
+        v3DebugSkipBankingCb.addActionListener(e -> {
+            if (chickenFarmV3 != null)
+                chickenFarmV3.setSkipBanking(v3DebugSkipBankingCb.isSelected());
+        });
+        JPanel debugBtnRow = new JPanel(new FlowLayout(FlowLayout.LEFT, 4, 4));
+        debugBtnRow.setBackground(ColorScheme.DARK_GRAY_COLOR);
+        debugBtnRow.add(v3DebugWalkToPenBtn);
+        debugBtnRow.add(v3DebugWalkToBankBtn);
+        debugBox.add(debugBtnRow);
+        v3DebugWalkToPenBtn.addActionListener(e -> {
+            if (chickenFarmV3 != null) chickenFarmV3.startForcedOutbound();
+        });
+        v3DebugWalkToBankBtn.addActionListener(e -> {
+            if (chickenFarmV3 != null) chickenFarmV3.startForcedReturn();
+        });
+        v3Box.add(debugBox);
 
         // Training-mode sub-section.
         JPanel trainBox = new JPanel();
