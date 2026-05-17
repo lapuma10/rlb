@@ -125,21 +125,20 @@ public final class CollisionDebugOverlay extends Overlay
                 g.setColor(EDGE_BLOCK);
                 if (poly.npoints >= 4)
                 {
-                    // The engine's canvas tile poly vertices are
-                    // ordered SE, SW, NW, NE for a flat tile (see
-                    // Perspective#getCanvasTilePoly). Map direction →
-                    // edge between adjacent vertices:
-                    //   SE→SW = South edge
-                    //   SW→NW = West edge
-                    //   NW→NE = North edge
-                    //   NE→SE = East edge
+                    // Perspective.getCanvasTilePoly returns vertices in
+                    // world-space order SW → SE → NE → NW
+                    // (Perspective.java:777-791). So:
+                    //   SW→SE = SOUTH edge
+                    //   SE→NE = EAST edge
+                    //   NE→NW = NORTH edge
+                    //   NW→SW = WEST edge
                     int[] x = poly.xpoints;
                     int[] y = poly.ypoints;
                     if ((f & CollisionDataFlag.BLOCK_MOVEMENT_SOUTH) != 0)
                     {
                         g.drawLine(x[0], y[0], x[1], y[1]);
                     }
-                    if ((f & CollisionDataFlag.BLOCK_MOVEMENT_WEST) != 0)
+                    if ((f & CollisionDataFlag.BLOCK_MOVEMENT_EAST) != 0)
                     {
                         g.drawLine(x[1], y[1], x[2], y[2]);
                     }
@@ -147,7 +146,7 @@ public final class CollisionDebugOverlay extends Overlay
                     {
                         g.drawLine(x[2], y[2], x[3], y[3]);
                     }
-                    if ((f & CollisionDataFlag.BLOCK_MOVEMENT_EAST) != 0)
+                    if ((f & CollisionDataFlag.BLOCK_MOVEMENT_WEST) != 0)
                     {
                         g.drawLine(x[3], y[3], x[0], y[0]);
                     }
