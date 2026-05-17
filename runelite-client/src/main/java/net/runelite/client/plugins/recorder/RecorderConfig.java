@@ -290,6 +290,24 @@ public interface RecorderConfig extends Config
 	}
 
 	@ConfigItem(
+		keyName = "objectDebugOverlay",
+		name = "Show object debug overlay",
+		description = "Paint the convex hulls of all interactable game objects "
+			+ "(WallObjects, GameObjects, DecorativeObjects, GroundObjects) "
+			+ "near the player. Each hull is labelled with its first menu "
+			+ "action ('Open', 'Climb-up', etc.) so you can see what a "
+			+ "CLICK_GAME_OBJECT dispatch would actually click. If the bot "
+			+ "claims it clicked a staircase but the hull doesn't visually "
+			+ "cover the model, the projection / impostor lookup is wrong.",
+		section = experimentalSection,
+		position = 1
+	)
+	default boolean objectDebugOverlay()
+	{
+		return false;
+	}
+
+	@ConfigItem(
 		keyName = "collisionDebugOverlay",
 		name = "Show collision debug overlay",
 		description = "Paint per-tile collision flags on the loaded scene. "
