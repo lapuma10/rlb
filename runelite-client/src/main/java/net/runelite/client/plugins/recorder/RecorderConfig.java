@@ -290,6 +290,23 @@ public interface RecorderConfig extends Config
 	}
 
 	@ConfigItem(
+		keyName = "collisionDebugOverlay",
+		name = "Show collision debug overlay",
+		description = "Paint per-tile collision flags on the loaded scene. "
+			+ "Walkable tiles are tinted green; tiles with directional wall "
+			+ "bits get red edges on the blocked sides; tiles with "
+			+ "BLOCK_MOVEMENT_FULL are solid red. Use this to see where V2's "
+			+ "BFS hits dead ends — a missing connection between two green "
+			+ "tiles (red edge with no transport) is a data gap to patch.",
+		section = experimentalSection,
+		position = 1
+	)
+	default boolean collisionDebugOverlay()
+	{
+		return false;
+	}
+
+	@ConfigItem(
 		keyName = "navigatorMode",
 		name = "Navigator mode",
 		description = "How HybridNavigator dispatches requests. V1_ONLY = "
