@@ -117,7 +117,7 @@ public final class WorldSnapshotBuilder
 
         if (client.isClientThread())
         {
-            return captureOnClientThread(client, global, transports, predicates, policy);
+            return captureOnClientThread(client, clientThread, global, transports, predicates, policy);
         }
 
         // Off-client marshall — block until the runnable executes.
@@ -129,7 +129,7 @@ public final class WorldSnapshotBuilder
         {
             try
             {
-                result[0] = captureOnClientThread(client, global, transports, predicates, policy);
+                result[0] = captureOnClientThread(client, clientThread, global, transports, predicates, policy);
             }
             catch (Throwable t)
             {
@@ -162,9 +162,14 @@ public final class WorldSnapshotBuilder
         return result[0];
     }
 
-    /** Capture the snapshot — must be called on the client thread. */
+    /** Capture the snapshot — must be called on the client thread. The
+     *  {@code clientThread} marshaller is forwarded to
+     *  {@link PlayerStateBuilder} so subsequent lazy varbit/varplayer
+     *  reads can re-marshal from worker threads after the snapshot
+     *  leaves the client thread. */
     private static WorldSnapshot captureOnClientThread(
         Client client,
+        @Nullable ClientThread clientThread,
         GlobalCollisionSnapshot global,
         @Nullable Object transports,
         PredicateRegistry predicates,
@@ -216,6 +221,11 @@ public final class WorldSnapshotBuilder
             playerPosition = client.getLocalPlayer().getWorldLocation();
         }
 
+        // Capture the live player capability state on the same client-thread
+        // instant. PlayerStateBuilder asserts client-thread internally; this
+        // is the only caller on the production path.
+        PlayerState player = PlayerStateBuilder.fromClient(client, clientThread);
+
         return new WorldSnapshotImpl(
             view,
             Collections.unmodifiableSet(actorTiles),
@@ -223,7 +233,8 @@ public final class WorldSnapshotBuilder
             transports,
             predicates,
             System.currentTimeMillis(),
-            playerPosition);
+            playerPosition,
+            player);
     }
 
     /** Concrete implementation of {@link WorldSnapshot}. Package-private. */
@@ -236,6 +247,7 @@ public final class WorldSnapshotBuilder
         private final PredicateRegistry predicates;
         private final long capturedAtMs;
         @Nullable private final WorldPoint playerPosition;
+        @Nullable private final PlayerState player;
 
         WorldSnapshotImpl(
             CollisionView view,
@@ -246,7 +258,7 @@ public final class WorldSnapshotBuilder
             long capturedAtMs)
         {
             this(view, actorTiles, objectTiles, transports, predicates,
-                capturedAtMs, /*playerPosition*/ null);
+                capturedAtMs, /*playerPosition*/ null, /*player*/ null);
         }
 
         WorldSnapshotImpl(
@@ -258,6 +270,20 @@ public final class WorldSnapshotBuilder
             long capturedAtMs,
             @Nullable WorldPoint playerPosition)
         {
+            this(view, actorTiles, objectTiles, transports, predicates,
+                capturedAtMs, playerPosition, /*player*/ null);
+        }
+
+        WorldSnapshotImpl(
+            CollisionView view,
+            Set<WorldPoint> actorTiles,
+            Set<WorldPoint> objectTiles,
+            @Nullable Object transports,
+            PredicateRegistry predicates,
+            long capturedAtMs,
+            @Nullable WorldPoint playerPosition,
+            @Nullable PlayerState player)
+        {
             this.view = view;
             this.actorTiles = actorTiles;
             this.objectTiles = objectTiles;
@@ -265,6 +291,7 @@ public final class WorldSnapshotBuilder
             this.predicates = predicates;
             this.capturedAtMs = capturedAtMs;
             this.playerPosition = playerPosition;
+            this.player = player;
         }
 
         @Override
@@ -314,6 +341,13 @@ public final class WorldSnapshotBuilder
         public WorldPoint playerPosition()
         {
             return playerPosition;
+        }
+
+        @Override
+        @Nullable
+        public PlayerState player()
+        {
+            return player;
         }
 
         /** Helper for tests + log: indicate whether the player is on a

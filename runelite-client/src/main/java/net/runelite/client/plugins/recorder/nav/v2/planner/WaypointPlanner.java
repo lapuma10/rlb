@@ -14,6 +14,7 @@ import net.runelite.client.plugins.recorder.nav.v2.collision.PlayerState;
 import net.runelite.client.plugins.recorder.nav.v2.collision.WorldSnapshot;
 import net.runelite.client.plugins.recorder.nav.v2.predicate.NavigationContext;
 import net.runelite.client.plugins.recorder.nav.v2.predicate.PathContext;
+import net.runelite.client.plugins.recorder.nav.v2.predicate.PredicateRegistry;
 import net.runelite.client.plugins.recorder.nav.v2.transport.LinkGraphDijkstra;
 import net.runelite.client.plugins.recorder.nav.v2.transport.PathStep;
 import net.runelite.client.plugins.recorder.nav.v2.transport.ReplanReason;
@@ -106,15 +107,34 @@ public final class WaypointPlanner
 			return V2PathImpl.failed(ReplanReason.REGION_NOT_LOADED);
 		}
 
-		// Build navigation + path context. PlayerState comes via PlayerStateBuilder
-		// at integration; for now we stub when absent.
-		PlayerState player = extractPlayerStateOrNull(snap);
+		// Build navigation + path context. Snapshot owns the live PlayerState
+		// (captured on the client thread at snapshot time); fall back to a
+		// minimal stub when absent so unit-test fixtures using the legacy
+		// fromComponents entry don't NPE.
+		PlayerState player = snap.player();
 		if (player == null)
 		{
 			player = stubPlayerState();
 		}
 		NavigationContext navCtx = new NavigationContextImpl(snap, player, req);
 		PathContext pathCtx = PathContextImpl.planEntry(navCtx, cfg.routeSeed());
+
+		// Adapt the canonical PredicateRegistry into the BFS-local
+		// TilePredicate shape. The registry is empty when no script has
+		// registered conditions and no built-ins are wired — in that case
+		// we still pass the (always-accepting) adapter so callers don't
+		// need to special-case null. Predicate evaluation needs the
+		// canonical PathContext; we forward whatever ctx the kernel hands
+		// us and skip predicate eval if the type doesn't match (defensive).
+		final PredicateRegistry registry = snap.predicates();
+		final TilePredicate bfsPredicate = (registry == null)
+			? null
+			: (tile, ctx) ->
+		{
+			if (registry.size() == 0) return true;
+			if (!(ctx instanceof PathContext pc)) return true;
+			return registry.accepts(tile, pc);
+		};
 
 		Object transportObj = snap.transports();
 		TransportTable table;
@@ -193,7 +213,7 @@ public final class WaypointPlanner
 				// walk-leg accumulator.
 				SkretzoBfsKernel.BfsResult res = SkretzoBfsKernel.plan(
 					bfsView, prevTile, walkTo, cfg,
-					(TilePredicate) null, pathCtx);
+					bfsPredicate, pathCtx);
 				if (res.status() != SkretzoBfsKernel.Status.PATH_FOUND)
 				{
 					ReplanReason reason = (res.status() == SkretzoBfsKernel.Status.BUDGET_EXHAUSTED)
@@ -252,7 +272,7 @@ public final class WaypointPlanner
 		// Step 3: validator over the flat tile sequence.
 		RouteValidator.ValidationResult vr = RouteValidator.validate(
 			flatTileSequence, bfsView,
-			(TilePredicate) null,
+			bfsPredicate,
 			planeJumps, pathCtx);
 		if (!vr.ok())
 		{
@@ -269,15 +289,12 @@ public final class WaypointPlanner
 		return V2PathImpl.of(steps, walkLegFlatTiles, transports);
 	}
 
-	/** Extract a {@link PlayerState} from the snapshot. The snapshot
-	 *  doesn't yet expose a {@code player()} accessor; integration adds
-	 *  one when the navigator builds the snapshot. Until then this
-	 *  returns null and the caller stubs. */
-	private static PlayerState extractPlayerStateOrNull(WorldSnapshot snap)
-	{
-		return null;
-	}
-
+	/** Minimal {@link PlayerState} used only when {@link WorldSnapshot#player()}
+	 *  returns null — i.e. test fixtures using the legacy 6-arg
+	 *  {@code fromComponents} that don't capture a real player. Production
+	 *  snapshots built via {@link
+	 *  net.runelite.client.plugins.recorder.nav.v2.collision.WorldSnapshotBuilder#fromClient}
+	 *  always carry a real {@link PlayerState}. */
 	private static PlayerState stubPlayerState()
 	{
 		return new PlayerState()

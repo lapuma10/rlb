@@ -82,4 +82,24 @@ public interface WorldSnapshot
      *  state captured for one plan call. */
     @javax.annotation.Nullable
     WorldPoint playerPosition();
+
+    /** Player's capability state at snapshot capture: skill levels,
+     *  membership, inventory + equipment references.
+     *
+     *  <p>Consumed by {@code TransportRequirement.satisfiedBy(ctx)} via
+     *  {@link net.runelite.client.plugins.recorder.nav.v2.predicate.NavigationContext#player()}
+     *  — skill-gated transports (agility shortcuts, fairy rings), item-
+     *  gated transports (teleport tablets, dueling rings), and member-
+     *  gated transports all depend on this being a real capture, not a
+     *  stub. Returns {@code null} only for test fixtures that built the
+     *  snapshot via the legacy {@code fromComponents} entry without a
+     *  {@code PlayerState}; the planner falls back to a permissive stub
+     *  in that case. Production snapshots (built via {@code fromClient})
+     *  always carry a real state.
+     *
+     *  <p>Default returns {@code null} so existing test fixtures and
+     *  anonymous-class impls don't need to override; production impls
+     *  override to return the captured state. */
+    @javax.annotation.Nullable
+    default PlayerState player() { return null; }
 }
