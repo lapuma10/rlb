@@ -151,6 +151,11 @@ public final class WaypointPlanner
 
 		// Step 2: walk-leg BFS expansions + transport leg construction.
 		List<List<WalkStep>> walkLegs = new ArrayList<>();
+		/** Per-walk-leg flat BFS tile sequences (full lists before compression).
+		 *  Lane 5's executor consumes these via the shim — single-tile
+		 *  walk legs would break {@code CanvasTilePicker.pickNextInTilesAfter}
+		 *  which needs ≥2 tiles in the list. */
+		List<List<WorldPoint>> walkLegFlatTiles = new ArrayList<>();
 		List<TransportLeg> transports = new ArrayList<>();
 		List<WorldPoint> flatTileSequence = new ArrayList<>();
 		List<PlaneTransition> planeJumps = new ArrayList<>();
@@ -214,6 +219,7 @@ public final class WaypointPlanner
 					walkLegs.isEmpty() ? WaypointType.WALK : WaypointType.WALK,
 					WaypointType.TRANSPORT_APPROACH);
 				walkLegs.add(compressed);
+				walkLegFlatTiles.add(List.copyOf(currentLegTiles));
 				transports.add(leg);
 				// Record plane jump for the validator.
 				if (leg.from().getPlane() != leg.to().getPlane())
@@ -240,6 +246,7 @@ public final class WaypointPlanner
 			List<WalkStep> compressed = PathCompressor.compressLeg(
 				currentLegTiles, WaypointType.WALK, lastType);
 			walkLegs.add(compressed);
+			walkLegFlatTiles.add(List.copyOf(currentLegTiles));
 		}
 
 		// Step 3: validator over the flat tile sequence.
@@ -259,7 +266,7 @@ public final class WaypointPlanner
 		log.info("[nav-v2.planner] plan ok: {} steps ({} walks + {} transports), cost ~{} ticks",
 			steps.size(), walkLegs.stream().mapToInt(List::size).sum(),
 			transports.size(), skel.totalCostTicks());
-		return V2PathImpl.of(steps);
+		return V2PathImpl.of(steps, walkLegFlatTiles, transports);
 	}
 
 	/** Extract a {@link PlayerState} from the snapshot. The snapshot

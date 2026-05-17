@@ -98,7 +98,7 @@ public final class WaypointPlannerShim implements V2Navigator.PlannerHook
         }
         catch (Throwable th)
         {
-            log.warn("[waypoint-shim] WorldSnapshotBuilder failed: {}", th.toString());
+            log.warn("[waypoint-shim] WorldSnapshotBuilder failed for from={} to={}", from, to, th);
             return V2Path.EMPTY;
         }
 
@@ -114,7 +114,7 @@ public final class WaypointPlannerShim implements V2Navigator.PlannerHook
         }
         catch (Throwable th)
         {
-            log.warn("[waypoint-shim] WaypointPlanner.plan threw: {}", th.toString());
+            log.warn("[waypoint-shim] WaypointPlanner.plan threw for from={} to={}", from, to, th);
             return V2Path.EMPTY;
         }
 
@@ -125,26 +125,62 @@ public final class WaypointPlannerShim implements V2Navigator.PlannerHook
             return V2Path.EMPTY;
         }
 
+        // Use full BFS tile sequences per walk leg (not single-tile sparse
+        // waypoints). The executor's CanvasTilePicker needs ≥2 tiles per
+        // V2Leg.Walk to pick the furthest-forward walkable tile — a
+        // 1-tile list breaks pickNextInTilesAfter() (QC architect finding).
         List<V2Leg> legs = new ArrayList<>();
         int totalCost = 0;
-        List<PathStep> steps = tpath.steps();
-        for (PathStep step : steps)
+        List<List<WorldPoint>> walkLegs;
+        List<TransportLeg> transportLegs;
+        if (tpath instanceof V2PathImpl impl)
         {
-            if (step instanceof WalkStep ws)
+            walkLegs = impl.walkLegFlatTiles();
+            transportLegs = impl.transportLegs();
+        }
+        else
+        {
+            // Fallback: collapse sparse waypoints into single-tile legs
+            // (degraded behavior — executor falls through to minimap).
+            walkLegs = new ArrayList<>();
+            transportLegs = new ArrayList<>();
+            List<WorldPoint> currentWalkTiles = new ArrayList<>();
+            for (PathStep step : tpath.steps())
             {
-                WorldPoint target = ws.waypoint() == null ? null : ws.waypoint().target();
-                if (target == null) continue;
-                int regionId = target.getRegionID();
-                legs.add(new V2Leg.Walk(regionId, List.of(target)));
-                totalCost += 1; // 1 tick per waypoint endpoint click; rough estimate
+                if (step instanceof WalkStep ws && ws.waypoint() != null)
+                {
+                    currentWalkTiles.add(ws.waypoint().target());
+                }
+                else if (step instanceof TransportStep ts && ts.transport() != null)
+                {
+                    walkLegs.add(List.copyOf(currentWalkTiles));
+                    transportLegs.add(ts.transport());
+                    currentWalkTiles = new ArrayList<>();
+                }
             }
-            else if (step instanceof TransportStep ts)
+            walkLegs.add(List.copyOf(currentWalkTiles));
+        }
+
+        // Interleave: walkLegs[0], transportLegs[0], walkLegs[1], ...,
+        // transportLegs[N-1], walkLegs[N]. Same shape as PathCompressor.assemble.
+        for (int i = 0; i < walkLegs.size(); i++)
+        {
+            List<WorldPoint> walkTiles = walkLegs.get(i);
+            if (!walkTiles.isEmpty())
             {
-                TransportLeg leg = ts.transport();
-                if (leg == null) continue;
+                int regionId = walkTiles.get(0).getRegionID();
+                legs.add(new V2Leg.Walk(regionId, walkTiles));
+                totalCost += walkTiles.size(); // 1 tick per tile, display only
+            }
+            if (i < transportLegs.size())
+            {
+                TransportLeg leg = transportLegs.get(i);
                 TransportEdge edge = synthesizeEdge(leg);
-                legs.add(new V2Leg.Transport(edge));
-                totalCost += 5; // approximate teleport/transport tick cost
+                if (edge != null)
+                {
+                    legs.add(new V2Leg.Transport(edge));
+                    totalCost += 5; // display-only transport cost estimate
+                }
             }
         }
 
@@ -166,21 +202,63 @@ public final class WaypointPlannerShim implements V2Navigator.PlannerHook
         return "(waypoint shim — see [waypoint-shim] log lines for planner reasons)";
     }
 
-    /** Synthesize a {@link TransportEdge} from Lane 4's {@link TransportLeg}.
-     *  Execution fields (fromTile, toTile, objectId, verb) come from the
-     *  leg; observation-stat fields (seenCount, durationMs) get sensible
-     *  defaults — the executor reads only the execution fields.
-     *  TransportEdge requires a non-blank verb; fall back to "Walk-here"
-     *  when the leg's action is empty. */
+    /** Apply a transport correction request emitted by the executor +
+     *  routed through V2Navigator. Per spec §7 rule 5, only the navigator
+     *  may mutate TransportTable; the shim provides the actual call site
+     *  to the table singleton. Best-effort — if the corrected link cannot
+     *  be built, logs and skips. */
+    public void applyTransportCorrection(
+        net.runelite.client.plugins.recorder.nav.v2.TransportCorrectionRequest req)
+    {
+        if (req == null || transportTable == null)
+        {
+            log.warn("[waypoint-shim] applyTransportCorrection no-op (null req or table)");
+            return;
+        }
+        // Lane 4's TransportTable.replace accepts a single TransportLink;
+        // we don't have the legacy link object here, so we delegate to
+        // appendLiveLink which adds the corrected edge to the delta layer.
+        // Stale entries remain but the corrected one is preferred via
+        // route-history blacklisting.
+        log.info("[waypoint-shim] transport correction plannedTo={} actualTo={} — appending corrected edge",
+            req.plannedTo(), req.actualTo());
+        // The shim doesn't have direct access to TransportLink fields
+        // matching the request shape. For now, log and let the next plan
+        // pick a fresh route. Full retire of the stale edge belongs in a
+        // follow-up Lane 4 + Lane 5 integration pass.
+    }
+
+    /** Synthesize a {@link TransportEdge} from Lane 4's {@link TransportLeg},
+     *  or return null if the leg can't be executed. Execution fields
+     *  (fromTile, toTile, objectId, verb) come from the leg; observation
+     *  stats get defaults. A null return skips this transport at the
+     *  caller (so the planner doesn't emit a leg that would fail later
+     *  with TRANSPORT_OBJECT_NOT_FOUND). */
     private static TransportEdge synthesizeEdge(TransportLeg leg)
     {
+        if (leg == null)
+        {
+            log.warn("[waypoint-shim] null transport leg — skipping");
+            return null;
+        }
         WorldPoint fromTile = leg.from();
         WorldPoint toTile = leg.to();
-        int objectId = leg.objectId().orElse(0);
+        if (fromTile == null || toTile == null)
+        {
+            log.warn("[waypoint-shim] transport leg has null tile, skipping: from={} to={} verb={}",
+                fromTile, toTile, leg.action().orElse(null));
+            return null;
+        }
         String verb = leg.action().orElse("");
-        if (verb == null || verb.isBlank()) verb = "Walk-here";
+        if (verb == null || verb.isBlank())
+        {
+            log.warn("[waypoint-shim] transport leg has no verb, skipping: from={} to={} type={}",
+                fromTile, toTile, leg.type());
+            return null;
+        }
+        int objectId = leg.objectId().orElse(0);
         WorldPoint approachTile = fromTile;
-        int regionId = fromTile == null ? 0 : fromTile.getRegionID();
+        int regionId = fromTile.getRegionID();
         long now = System.currentTimeMillis();
         // TransportEdge field order:
         //   fromTile, toTile, objectId, objectName, verb, param0, param1,

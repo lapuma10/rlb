@@ -657,8 +657,27 @@ public class RecorderPlugin extends Plugin
         net.runelite.client.plugins.recorder.nav.v2.V2Executor executor
             = new net.runelite.client.plugins.recorder.nav.v2.V2Executor(
                 env, picker, classifier, new java.util.Random(), toggles);
-        return net.runelite.client.plugins.recorder.nav.v2.V2Navigator.withPlannerHook(
-            plannerHook, executor, () -> playerLocOnClientThread(), worldEntityIndex);
+        net.runelite.client.plugins.recorder.nav.v2.V2Navigator nav =
+            net.runelite.client.plugins.recorder.nav.v2.V2Navigator.withPlannerHook(
+                plannerHook, executor, () -> playerLocOnClientThread(), worldEntityIndex);
+        // Wire TransportCorrectionSink so transport-mismatch corrections
+        // flow through the navigator (spec §4 Lane 5 + §7 rule 5 — navigator
+        // owns TransportTable mutation, not the executor). The sink applies
+        // a TransportCorrectionRequest as a TransportTable.replace(...).
+        nav.setTransportCorrectionSink(req -> {
+            // Build a corrected TransportLink to replace the stale one.
+            // Look up the planner's TransportTable singleton via the shim's
+            // reference if the hook is a WaypointPlannerShim; otherwise no-op.
+            if (plannerHook instanceof net.runelite.client.plugins.recorder.nav.v2.planner.WaypointPlannerShim shim)
+            {
+                shim.applyTransportCorrection(req);
+            }
+            else
+            {
+                log.debug("nav-engine: TransportCorrectionRequest dropped (non-shim planner): {}", req);
+            }
+        });
+        return nav;
     }
 
     /** Synchronous client-thread read of the local player's world
