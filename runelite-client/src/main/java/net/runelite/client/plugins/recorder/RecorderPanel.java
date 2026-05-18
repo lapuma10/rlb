@@ -40,6 +40,7 @@ import net.runelite.client.plugins.recorder.cook.CookingLocations;
 import net.runelite.client.plugins.recorder.debug.DebugOverlay;
 import net.runelite.client.plugins.recorder.farm.RouteWalker;
 import net.runelite.client.plugins.recorder.mining.MiningLoop;
+import net.runelite.client.plugins.recorder.quest.ErnestQuestScript;
 import net.runelite.client.plugins.recorder.scripts.ChickenFarmV2Script;
 import net.runelite.client.plugins.recorder.scripts.CooksAssistantScript;
 import net.runelite.client.plugins.recorder.scripts.GrandExchangeScript;
@@ -289,11 +290,27 @@ public final class RecorderPanel extends PluginPanel
     private final JButton questStartBtn  = new JButton("Start quest");
     private final JButton questStopBtn   = new JButton("Stop");
     private final JLabel  questStatusLabel = new JLabel("Quest: idle");
+
+    private ErnestQuestScript ernestQuestScript;
+    private TrailRegistry ernestTrailRegistry;
+    private final JButton ernestStartBtn   = new JButton("Start Ernest");
+    private final JButton ernestStopBtn    = new JButton("Stop");
+    private final JLabel  ernestStatusLabel = new JLabel("Ernest: idle");
     // Pie Dish script.
     private net.runelite.client.plugins.recorder.scripts.PieDishScript pieDishScript;
     private final JButton pieDishStartBtn  = new JButton("Start");
     private final JButton pieDishStopBtn   = new JButton("Stop");
     private final JLabel  pieDishStatusLabel = new JLabel("Pie Dish: idle");
+    // Ultra Compost script.
+    private net.runelite.client.plugins.recorder.scripts.UltraCompostScript ultraCompostScript;
+    private final JButton ultraCompostStartBtn  = new JButton("Start");
+    private final JButton ultraCompostStopBtn   = new JButton("Stop");
+    // Default on; read live by UltraCompostScript on each CHECKING_BANK tick.
+    private final javax.swing.JCheckBox ultraCompostBuyBox =
+        new javax.swing.JCheckBox("Buy supplies at GE (phase 2)", true);
+    private final javax.swing.JCheckBox ultraCompostSellBox =
+        new javax.swing.JCheckBox("Sell ultracompost at GE (phase 4)", true);
+    private final JLabel  ultraCompostStatusLabel = new JLabel("Ultra Compost: idle");
     // Pizza script.
     private net.runelite.client.plugins.recorder.scripts.PizzaScript pizzaScript;
     private final JButton pizzaStartBtn  = new JButton("Start");
@@ -338,6 +355,11 @@ public final class RecorderPanel extends PluginPanel
     private final JButton trailShowBtn = new JButton("Show on map");
     private final JTextField trailWalkToField = new JTextField(14);
     private final JButton trailWalkToBtn = new JButton("Walk to…");
+    /** Walks the trail whose name is currently selected in {@link #trailNameCombo}.
+     *  Auto-picks the nearest entry leg via {@code findEntryLeg}, so the player
+     *  can be anywhere on the recorded route — not just at its start. */
+    private final JButton trailWalkSelectedBtn = new JButton("Walk trail");
+    private final JButton trailWalkSelectedStopBtn = new JButton("Stop");
     private final JLabel trailStatusLabel = new JLabel("Trails: idle");
     private volatile Thread trailWalkerThread;
 
@@ -366,9 +388,8 @@ public final class RecorderPanel extends PluginPanel
         tabs.addTab("Record", tabScroll(buildRecordTab()));
         tabs.addTab("Mining", tabScroll(buildMiningTab()));
         tabs.addTab("Cooking", tabScroll(buildCookingTab()));
-        tabs.addTab("Cook's Quest", tabScroll(buildCooksQuestTab()));
-        tabs.addTab("Pie Dish", tabScroll(buildPieDishTab()));
-        tabs.addTab("Pizza", tabScroll(buildPizzaTab()));
+        tabs.addTab("Quests", tabScroll(buildQuestsTab()));
+        tabs.addTab("Moneymakers", tabScroll(buildMoneymakersTab()));
         tabs.addTab("Login",  tabScroll(buildLoginTab()));
         add(tabs, BorderLayout.CENTER);
 
@@ -388,6 +409,8 @@ public final class RecorderPanel extends PluginPanel
         cookStopBtn.addActionListener(e -> onCookStop());
         questStartBtn.addActionListener(e -> onQuestStart());
         questStopBtn.addActionListener(e -> onQuestStop());
+        ernestStartBtn.addActionListener(e -> onErnestStart());
+        ernestStopBtn.addActionListener(e -> onErnestStop());
         markerBtn.addActionListener(e -> onMarker());
         markTileBtn.addActionListener(e -> onMarkTile());
         walkToMarkBtn.addActionListener(e -> onWalkToMark());
@@ -1835,10 +1858,13 @@ public final class RecorderPanel extends PluginPanel
     {
         boolean ready = trailRecorder != null && trailRegistry != null;
         boolean recording = ready && trailRecorder.isRecording();
+        boolean walking = trailWalkerThread != null && trailWalkerThread.isAlive();
         trailRecordBtn.setEnabled(ready && !recording);
         trailStopSaveBtn.setEnabled(ready && recording);
         trailWalkToBtn.setEnabled(ready && !recording);
         trailShowBtn.setEnabled(ready && !recording);
+        trailWalkSelectedBtn.setEnabled(ready && !recording && !walking);
+        trailWalkSelectedStopBtn.setEnabled(walking);
         trailNameCombo.setEnabled(ready && !recording);
         trailStatusLabel.setText("Trails: " + (recording
             ? "recording \"" + trailRecorder.currentName() + "\""
@@ -1873,11 +1899,19 @@ public final class RecorderPanel extends PluginPanel
         row3.add(trailWalkToField);
         row3.add(trailWalkToBtn);
         out.add(row3);
+        // Walk the currently-selected trail (auto-pickup at nearest leg).
+        JPanel row4 = new JPanel(new FlowLayout(FlowLayout.LEFT, 4, 4));
+        row4.setBackground(ColorScheme.DARK_GRAY_COLOR);
+        row4.add(trailWalkSelectedBtn);
+        row4.add(trailWalkSelectedStopBtn);
+        out.add(row4);
         out.add(trailStatusLabel);
         trailRecordBtn.addActionListener(e -> startTrailRecord());
         trailStopSaveBtn.addActionListener(e -> stopTrailAndSave());
         trailShowBtn.addActionListener(e -> showSelectedTrail());
         trailWalkToBtn.addActionListener(e -> walkToTarget());
+        trailWalkSelectedBtn.addActionListener(e -> startWalkSelectedTrail());
+        trailWalkSelectedStopBtn.addActionListener(e -> stopWalkSelectedTrail());
         updateTrailButtons();
         return out;
     }
@@ -2012,13 +2046,101 @@ public final class RecorderPanel extends PluginPanel
                     || s == TrailWalker.Status.ERROR)
                 {
                     final String done = "Trails: " + s;
-                    SwingUtilities.invokeLater(() -> trailStatusLabel.setText(done));
+                    SwingUtilities.invokeLater(() -> {
+                        trailStatusLabel.setText(done);
+                        updateTrailButtons();
+                    });
                     return;
                 }
                 SequenceSleep.sleep(client, 600);
             }
         }
         catch (InterruptedException ie) { Thread.currentThread().interrupt(); }
+        finally
+        {
+            SwingUtilities.invokeLater(this::updateTrailButtons);
+        }
+    }
+
+    /**
+     * Walks the trail whose name is currently in {@link #trailNameCombo}.
+     * Auto-picks the closest leg via {@code TrailPath.findEntryLeg} so the
+     * player can be anywhere along the recorded route — not just at its
+     * start. Spawns a daemon worker so the EDT stays responsive.
+     */
+    private void startWalkSelectedTrail()
+    {
+        if (trailRegistry == null)
+        {
+            trailStatusLabel.setText("Trails: registry not wired");
+            return;
+        }
+        Thread prev = trailWalkerThread;
+        if (prev != null && prev.isAlive())
+        {
+            trailStatusLabel.setText("Trails: walker already running — stop first");
+            return;
+        }
+        String name = currentTrailName();
+        if (name.isEmpty())
+        {
+            trailStatusLabel.setText("Trails: pick a trail name first");
+            return;
+        }
+        trailRegistry.load();   // pick up disk changes since session start
+        var trail = trailRegistry.byName(name);
+        if (trail == null)
+        {
+            trailStatusLabel.setText("Trails: '" + name + "' not in registry");
+            return;
+        }
+        TrailPath path = TrailPath.fromTrail(trail);
+        if (path.isEmpty())
+        {
+            trailStatusLabel.setText("Trails: '" + name + "' resolved to empty path");
+            return;
+        }
+        // Auto-pickup: pick the leg nearest the player so the walker
+        // resumes mid-route instead of routing back to the start.
+        WorldPoint here;
+        try { here = onClientThreadGetWorldPoint(); }
+        catch (Throwable t) { trailStatusLabel.setText("Trails: " + t); return; }
+        if (here == null)
+        {
+            trailStatusLabel.setText("Trails: player not loaded");
+            return;
+        }
+        int entryIdx = path.findEntryLeg(here);
+        if (entryIdx > 0)
+        {
+            path = path.subPath(entryIdx);
+            trailStatusLabel.setText("Trails: '" + name + "' entering at leg " + entryIdx);
+        }
+        else
+        {
+            trailStatusLabel.setText("Trails: '" + name + "' from start");
+        }
+        final TrailPath active = path;
+        Thread t = new Thread(() -> driveTrailWalker(active), "trail-walker-" + name);
+        t.setDaemon(true);
+        trailWalkerThread = t;
+        t.start();
+        updateTrailButtons();
+    }
+
+    private void stopWalkSelectedTrail()
+    {
+        Thread t = trailWalkerThread;
+        if (t != null && t.isAlive())
+        {
+            t.interrupt();
+            trailStatusLabel.setText("Trails: stop requested");
+        }
+        else
+        {
+            trailStatusLabel.setText("Trails: nothing to stop");
+        }
+        updateTrailButtons();
     }
 
     @Nullable
@@ -2229,13 +2351,102 @@ public final class RecorderPanel extends PluginPanel
         p.add(Box.createVerticalStrut(4));
         p.add(buttons);
         p.add(questStatusLabel);
+        // No vertical glue — this is a sub-panel inside the Quests tab now.
+        return p;
+    }
+
+    private JPanel buildQuestsTab()
+    {
+        JPanel p = new JPanel();
+        p.setLayout(new BoxLayout(p, BoxLayout.Y_AXIS));
+        p.add(buildCooksQuestTab());
+        p.add(Box.createVerticalStrut(8));
+        p.add(buildErnestSubPanel());
         p.add(Box.createVerticalGlue());
+        return p;
+    }
+
+    /** GE-based combine-and-flip moneymakers — Pie Dish, Ultra Compost, Pizza.
+     *  Vertically stacks each script's existing sub-panel, same shape as Quests. */
+    private JPanel buildMoneymakersTab()
+    {
+        JPanel p = new JPanel();
+        p.setLayout(new BoxLayout(p, BoxLayout.Y_AXIS));
+        p.add(buildPieDishTab());
+        p.add(Box.createVerticalStrut(8));
+        p.add(buildUltraCompostTab());
+        p.add(Box.createVerticalStrut(8));
+        p.add(buildPizzaTab());
+        p.add(Box.createVerticalGlue());
+        return p;
+    }
+
+    private JPanel buildErnestSubPanel()
+    {
+        JPanel p = new JPanel();
+        p.setLayout(new BoxLayout(p, BoxLayout.Y_AXIS));
+        p.setBorder(BorderFactory.createTitledBorder("Ernest the Chicken"));
+
+        JPanel buttons = new JPanel(new java.awt.GridLayout(1, 2, 4, 0));
+        buttons.add(ernestStartBtn);
+        buttons.add(ernestStopBtn);
+        capHeight(buttons);
+
+        JLabel desc = new JLabel("<html>Pre-conditions: at Draynor bank<br>"
+            + "OR Lumbridge bank P2 (uses recorded trail).<br>"
+            + "All quest items gathered in-quest.</html>");
+        desc.setAlignmentX(Component.LEFT_ALIGNMENT);
+        buttons.setAlignmentX(Component.LEFT_ALIGNMENT);
+        ernestStatusLabel.setAlignmentX(Component.LEFT_ALIGNMENT);
+        capHeight(ernestStatusLabel);
+
+        p.add(desc);
+        p.add(Box.createVerticalStrut(4));
+        p.add(buttons);
+        p.add(ernestStatusLabel);
         return p;
     }
 
     public void setCooksAssistantScript(CooksAssistantScript script)
     {
         this.cooksAssistantScript = script;
+    }
+
+    public void setErnestQuestScript(ErnestQuestScript script, TrailRegistry registry)
+    {
+        this.ernestQuestScript = script;
+        this.ernestTrailRegistry = registry;
+    }
+
+    private void onErnestStart()
+    {
+        if (ernestQuestScript == null || ernestTrailRegistry == null)
+        {
+            ernestStatusLabel.setText("Ernest: unavailable");
+            return;
+        }
+        boolean started = ernestQuestScript.start(ernestTrailRegistry);
+        ernestStatusLabel.setText(started
+            ? "Ernest: starting"
+            : "Ernest: " + ernestQuestScript.status());
+    }
+
+    private void onErnestStop()
+    {
+        if (ernestQuestScript == null) return;
+        ernestQuestScript.stop();
+        ernestStatusLabel.setText("Ernest: stopping");
+    }
+
+    private void refreshErnest()
+    {
+        if (ernestQuestScript == null)
+        {
+            ernestStatusLabel.setText("Ernest: unavailable");
+            return;
+        }
+        ernestStatusLabel.setText((ernestQuestScript.isRunning() ? "running — " : "idle — ")
+            + ernestQuestScript.status());
     }
 
     private void onQuestStart()
@@ -2330,6 +2541,91 @@ public final class RecorderPanel extends PluginPanel
         }
         pieDishStatusLabel.setText(pieDishScript.state()
             + " — " + pieDishScript.status());
+    }
+
+    private JPanel buildUltraCompostTab()
+    {
+        JPanel p = new JPanel();
+        p.setLayout(new BoxLayout(p, BoxLayout.Y_AXIS));
+        p.setBorder(BorderFactory.createTitledBorder("Ultra Compost Maker"));
+
+        JPanel buttons = new JPanel(new java.awt.GridLayout(1, 2, 4, 0));
+        buttons.add(ultraCompostStartBtn);
+        buttons.add(ultraCompostStopBtn);
+        capHeight(buttons);
+
+        JLabel desc = new JLabel("<html>Buys supercompost &amp; volcanic ash at GE,<br>"
+            + "uses ash on supercompost to make ultracompost,<br>"
+            + "then sells. Start near GE (Varrock).</html>");
+
+        desc.setAlignmentX(Component.LEFT_ALIGNMENT);
+        buttons.setAlignmentX(Component.LEFT_ALIGNMENT);
+        ultraCompostBuyBox.setAlignmentX(Component.LEFT_ALIGNMENT);
+        ultraCompostSellBox.setAlignmentX(Component.LEFT_ALIGNMENT);
+        ultraCompostStatusLabel.setAlignmentX(Component.LEFT_ALIGNMENT);
+        capHeight(ultraCompostBuyBox);
+        capHeight(ultraCompostSellBox);
+        capHeight(ultraCompostStatusLabel);
+
+        p.add(desc);
+        p.add(Box.createVerticalStrut(4));
+        p.add(buttons);
+        p.add(Box.createVerticalStrut(4));
+        p.add(ultraCompostBuyBox);
+        p.add(ultraCompostSellBox);
+        p.add(ultraCompostStatusLabel);
+        p.add(Box.createVerticalGlue());
+
+        ultraCompostStartBtn.addActionListener(e -> onUltraCompostStart());
+        ultraCompostStopBtn.addActionListener(e -> onUltraCompostStop());
+        ultraCompostBuyBox.addActionListener(e -> {
+            if (ultraCompostScript != null) ultraCompostScript.setBuyEnabled(ultraCompostBuyBox.isSelected());
+        });
+        ultraCompostSellBox.addActionListener(e -> {
+            if (ultraCompostScript != null) ultraCompostScript.setSellEnabled(ultraCompostSellBox.isSelected());
+        });
+        return p;
+    }
+
+    public void setUltraCompostScript(net.runelite.client.plugins.recorder.scripts.UltraCompostScript script)
+    {
+        this.ultraCompostScript = script;
+        if (script != null)
+        {
+            script.setBuyEnabled(ultraCompostBuyBox.isSelected());
+            script.setSellEnabled(ultraCompostSellBox.isSelected());
+        }
+    }
+
+    private void onUltraCompostStart()
+    {
+        if (ultraCompostScript == null)
+        {
+            ultraCompostStatusLabel.setText("Ultra Compost: unavailable");
+            return;
+        }
+        ultraCompostScript.setBuyEnabled(ultraCompostBuyBox.isSelected());
+        ultraCompostScript.setSellEnabled(ultraCompostSellBox.isSelected());
+        ultraCompostScript.start();
+        ultraCompostStatusLabel.setText("Ultra Compost: starting");
+    }
+
+    private void onUltraCompostStop()
+    {
+        if (ultraCompostScript == null) return;
+        ultraCompostScript.stop();
+        ultraCompostStatusLabel.setText("Ultra Compost: stopping");
+    }
+
+    private void refreshUltraCompost()
+    {
+        if (ultraCompostScript == null)
+        {
+            ultraCompostStatusLabel.setText("Ultra Compost: unavailable");
+            return;
+        }
+        ultraCompostStatusLabel.setText(ultraCompostScript.state()
+            + " — " + ultraCompostScript.status());
     }
 
     private JPanel buildPizzaTab()
@@ -3192,7 +3488,9 @@ public final class RecorderPanel extends PluginPanel
         refreshLumby();
         refreshCooking();
         refreshCooksQuest();
+        refreshErnest();
         refreshPieDish();
+        refreshUltraCompost();
         refreshPizza();
     }
 

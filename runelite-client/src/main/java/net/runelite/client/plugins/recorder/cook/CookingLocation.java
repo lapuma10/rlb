@@ -1,5 +1,6 @@
 package net.runelite.client.plugins.recorder.cook;
 
+import javax.annotation.Nullable;
 import net.runelite.api.coords.WorldArea;
 import net.runelite.client.plugins.recorder.walker.PathSpec;
 
@@ -40,6 +41,15 @@ public final class CookingLocation
      *  Used by the sequence-engine banking steps to find a booth to click
      *  when the NPC scan finds no bankers.  Empty array = NPC-only location. */
     private final int[] bankBoothIds;
+    /** Optional explicit landing zone for the bank → cook walk. When
+     *  set, the script's bank → cook PathSpec walks directly to this
+     *  area instead of picking a 3×3 around the live fire/log tile.
+     *  Keeps the walk-click predictable when the cook spot has a
+     *  narrow walkable strip (e.g. Lumbridge P2 west wall) — the
+     *  player always lands inside the strip, not on a 3×3 that
+     *  spills into a blocked aisle. {@code null} = legacy behaviour
+     *  (target-relative 3×3 window). */
+    @Nullable private final WorldArea cookLandingZone;
 
     private CookingLocation(Builder b)
     {
@@ -52,6 +62,7 @@ public final class CookingLocation
         this.heatSourceName = b.heatSourceName;
         this.groundLogsItemId = b.groundLogsItemId;
         this.bankBoothIds = b.bankBoothIds.clone();
+        this.cookLandingZone = b.cookLandingZone;
     }
 
     public String label() { return label; }
@@ -64,6 +75,7 @@ public final class CookingLocation
     public int groundLogsItemId() { return groundLogsItemId; }
     /** Defensive copy of the bank-booth ObjectID array. */
     public int[] bankBoothIds() { return bankBoothIds.clone(); }
+    @Nullable public WorldArea cookLandingZone() { return cookLandingZone; }
 
     public static Builder builder() { return new Builder(); }
 
@@ -80,6 +92,7 @@ public final class CookingLocation
         private String heatSourceName;
         private int groundLogsItemId;
         private int[] bankBoothIds = new int[0];
+        @Nullable private WorldArea cookLandingZone;
 
         public Builder label(String s) { this.label = s; return this; }
         public Builder kind(SourceKind k) { this.kind = k; return this; }
@@ -90,6 +103,7 @@ public final class CookingLocation
         public Builder heatSourceName(String s) { this.heatSourceName = s; return this; }
         public Builder groundLogsItemId(int id) { this.groundLogsItemId = id; return this; }
         public Builder bankBoothIds(int... ids) { this.bankBoothIds = ids == null ? new int[0] : ids; return this; }
+        public Builder cookLandingZone(WorldArea a) { this.cookLandingZone = a; return this; }
 
         public CookingLocation build()
         {

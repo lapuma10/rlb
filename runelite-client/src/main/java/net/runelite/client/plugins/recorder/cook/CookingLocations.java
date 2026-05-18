@@ -36,6 +36,14 @@ public final class CookingLocations
         .kind(CookingLocation.SourceKind.FIRE_FROM_LOGS)
         .bankArea(new WorldArea(3208, 3218, 3, 3, 2))
         .cookArea(new WorldArea(3205, 3223, 4, 4, 2))
+        // Bank → logs walk lands inside this 3×4 column on the west
+        // side of the room (X∈[3205,3207], Y∈[3224,3227], plane=2). The
+        // log spawns sit along X=3205; the 3-wide window absorbs the
+        // engine's "route to an adjacent walkable tile when the exact
+        // tile is occupied" behaviour without spilling east of the log
+        // line where the player would need a second click to face the
+        // logs again.
+        .cookLandingZone(new WorldArea(3205, 3224, 3, 4, 2))
         .bankToCook(PathSpec.builder("lumby-p2-bank-to-cook")
             .walk("logs-spawn", new WorldArea(3205, 3223, 4, 4, 2))
             .build())

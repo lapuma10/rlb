@@ -696,6 +696,24 @@ public final class CookingScriptV2
     {
         if (tripCookPath != null) return tripCookPath;
         CookingLocation l = location.get();
+
+        // Location-declared landing zone overrides the live fire/log
+        // lookup entirely — the walker targets the fixed area, the
+        // player lands in it, and downstream cookable interaction picks
+        // up the in-range log/fire by world scan. Used by locations
+        // where the cook spot has a narrow walkable strip and the
+        // legacy "3×3 around target" path would spill onto blocked
+        // tiles (Lumbridge Castle P2).
+        WorldArea landing = l.cookLandingZone();
+        if (landing != null)
+        {
+            tripCookPath = PathSpec.builder("v2-cook-zone-" + System.currentTimeMillis())
+                .walk("v2-cook", landing)
+                .build();
+            log.info("cookV2 path: cookLandingZone {} (direct walk, no live target lookup)", landing);
+            return tripCookPath;
+        }
+
         WorldPoint target = pickCookTargetTile(l);
         if (target == null)
         {

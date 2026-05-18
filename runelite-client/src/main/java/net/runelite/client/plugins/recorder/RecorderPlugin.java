@@ -63,6 +63,7 @@ import net.runelite.client.plugins.recorder.scripts.CooksAssistantScript;
 import net.runelite.client.plugins.recorder.scripts.GrandExchangeScript;
 import net.runelite.client.plugins.recorder.scripts.PieDishScript;
 import net.runelite.client.plugins.recorder.scripts.PizzaScript;
+import net.runelite.client.plugins.recorder.scripts.UltraCompostScript;
 import net.runelite.api.coords.WorldArea;
 import net.runelite.client.plugins.recorder.scripts.LumbridgeBankPenScript;
 import net.runelite.client.plugins.recorder.nav.NavigatorFactory;
@@ -158,6 +159,7 @@ public class RecorderPlugin extends Plugin
     private AnnotatorHudOverlay hudOverlay;
     private CooksAssistantScript cooksAssistantScript;
     private PieDishScript pieDishScript;
+    private UltraCompostScript ultraCompostScript;
     private PizzaScript pizzaScript;
     private AreaSelector areaSelector;
     private net.runelite.client.plugins.recorder.inspector.ClickInspector clickInspector;
@@ -386,6 +388,10 @@ public class RecorderPlugin extends Plugin
             client, clientThread, questDispatcher, questResolver, trailRegistry, grandExchangeScript);
         panel.setCooksAssistantScript(cooksAssistantScript);
 
+        // Ernest the Chicken — engine-driven LinearSequence. Construction is
+        // deferred until after V2Navigator is built (see below) because the
+        // cross-scene walks need V2Nav, which doesn't exist yet at this point.
+
         // Pie dish script — buy pie dishes + flour + water, craft pastry dough
         // then pie shells at GE, and sell shells. Uses the same grandExchangeScript
         // for GE buy/sell. Independent dispatcher so it never collides with
@@ -393,6 +399,12 @@ public class RecorderPlugin extends Plugin
         HumanizedInputDispatcher pieDispatcher = new HumanizedInputDispatcher(client, clientThread);
         pieDishScript = new PieDishScript(client, clientThread, pieDispatcher, grandExchangeScript);
         panel.setPieDishScript(pieDishScript);
+
+        // Ultra compost script — buy supercompost + volcanic ash, combine into
+        // ultracompost at GE, sell. Independent dispatcher mirrors pieDishScript.
+        HumanizedInputDispatcher ultraDispatcher = new HumanizedInputDispatcher(client, clientThread);
+        ultraCompostScript = new UltraCompostScript(client, clientThread, ultraDispatcher, grandExchangeScript);
+        panel.setUltraCompostScript(ultraCompostScript);
 
         // Pizza script — three batched bank↔bank loops (combine inputs)
         // plus one bank → kitchen-range round trip to cook the uncooked
@@ -585,12 +597,41 @@ public class RecorderPlugin extends Plugin
             v3V2Nav = buildV2Navigator(v3Dispatcher, sharedV2Planner);
             log.warn("nav-engine: falling back to legacy V2Planner — Skretzo data missing");
         }
-        NavigatorFactory v3NavFactory = new NavigatorFactory(config, v3Walker, trailRegistry, v3V2Nav);
+        net.runelite.client.plugins.recorder.nav.v21.V21Navigator v3V21Nav = buildV21Navigator(v3Dispatcher);
+        NavigatorFactory v3NavFactory = new NavigatorFactory(
+            config, v3Walker, trailRegistry, v3V2Nav, v3V21Nav);
         net.runelite.client.plugins.recorder.scripts.ChickenFarmV3Script chickenFarmV3 =
             new net.runelite.client.plugins.recorder.scripts.ChickenFarmV3Script(
                 client, clientThread, v3Dispatcher, trailRegistry, eventBus,
                 v3NavFactory);
         panel.setChickenFarmV3(chickenFarmV3);
+
+        // Ernest the Chicken — own dispatcher + V2Navigator (independent busy
+        // flag + executor state). NavWalkStep drives this nav for cross-scene
+        // legs (bank→Veronica, manor approach, fountain, etc.); the basement
+        // lever-puzzle keeps the engine's in-scene WalkStep since those are
+        // all within the loaded scene.
+        HumanizedInputDispatcher ernestDispatcher = new HumanizedInputDispatcher(client, clientThread);
+        net.runelite.client.plugins.recorder.nav.v2.V2Navigator ernestV2Nav;
+        if (sharedGlobalSnapshot != null && sharedTransportTable != null)
+        {
+            net.runelite.client.plugins.recorder.nav.v2.planner.WaypointPlannerShim ernestShim
+                = new net.runelite.client.plugins.recorder.nav.v2.planner.WaypointPlannerShim(
+                    client, clientThread, sharedGlobalSnapshot, sharedTransportTable,
+                    sharedPredicates,
+                    () -> this.v2Components);
+            ernestV2Nav = buildV2NavigatorWithHook(ernestDispatcher, ernestShim);
+        }
+        else
+        {
+            ernestV2Nav = buildV2Navigator(ernestDispatcher, sharedV2Planner);
+            log.warn("nav-engine: Ernest falling back to legacy V2Planner — Skretzo data missing");
+        }
+        net.runelite.client.plugins.recorder.quest.ErnestQuestScript ernestQuestScript =
+            new net.runelite.client.plugins.recorder.quest.ErnestQuestScript(
+                client, clientThread, ernestDispatcher, ernestV2Nav);
+        panel.setErnestQuestScript(ernestQuestScript, trailRegistry);
+        eventBus.register(ernestQuestScript);
 
         File inspectDir = new File(RuneLite.RUNELITE_DIR, "recorder/inspect");
         net.runelite.client.plugins.recorder.nav.v2.MultiRegionAStar v2Planner
@@ -648,6 +689,19 @@ public class RecorderPlugin extends Plugin
         keyManager.registerKeyListener(toggleListener);
 
         log.info("Recorder plugin started");
+    }
+
+    /** Build a per-script v2.1 reactive Navigator. Uses the script's own
+     *  dispatcher so its busy flag isn't contended. v2.1 has no shared
+     *  planner — each tick reads the live scene/collision via its own
+     *  env. Cheap to construct; no precomputed graphs. */
+    private net.runelite.client.plugins.recorder.nav.v21.V21Navigator buildV21Navigator(
+        HumanizedInputDispatcher dispatcher)
+    {
+        net.runelite.client.plugins.recorder.nav.v21.V21Env env
+            = new net.runelite.client.plugins.recorder.nav.v21.V21Env(
+                client, clientThread, dispatcher);
+        return new net.runelite.client.plugins.recorder.nav.v21.V21Navigator(env);
     }
 
     /** Build a per-script V2Navigator on top of the shared planner. The
@@ -792,6 +846,7 @@ public class RecorderPlugin extends Plugin
         if (miningLoop != null) miningLoop.stop();
         if (cooksAssistantScript != null) { cooksAssistantScript.stop(); cooksAssistantScript = null; }
         if (pieDishScript != null) { pieDishScript.stop(); pieDishScript = null; }
+        if (ultraCompostScript != null) { ultraCompostScript.stop(); ultraCompostScript = null; }
         if (pizzaScript != null) { pizzaScript.stop(); pizzaScript = null; }
         if (hudOverlay != null) overlayManager.remove(hudOverlay);
         if (areaSelector != null && areaSelector.isActive()) areaSelector.cancel();
