@@ -116,7 +116,11 @@ public final class StaticPlanner
 		{
 			if (expanded++ >= MAX_EXPANSIONS)
 			{
-				return new PlanResult.BudgetExhausted(expanded);
+				WorldPoint best = new WorldPoint(
+					unpackX(bestVisitedKey), unpackY(bestVisitedKey), plane);
+				List<WorldPoint> pathToBest = reconstruct(
+					parent, sx, sy, best.getX(), best.getY(), plane);
+				return new PlanResult.BudgetExhausted(expanded, best, pathToBest);
 			}
 			long[] head = queue.poll();
 			int x = (int) head[0];

@@ -37,9 +37,28 @@ public sealed interface PlanResult
 	 *  Reactive layer scans for "Climb" verbs to bridge. */
 	record PlaneMismatch(int fromPlane, int toPlane) implements PlanResult {}
 
-	/** BFS hit the radius/expansion cap. Soft fail — walk toward the
-	 *  goal centroid, replan from new position next tick. */
-	record BudgetExhausted(int expanded) implements PlanResult {}
+	/** BFS hit the radius/expansion cap. Soft fail — walk along the
+	 *  recorded best-visited frontier path, replan from new position
+	 *  next tick.
+	 *
+	 *  <p>{@code bestVisited} is the BFS tile with the lowest Chebyshev
+	 *  distance to the goal centroid that we managed to reach before
+	 *  the budget ran out. {@code pathToBestVisited} is the reconstructed
+	 *  BFS path from the start tile to it. If no improvement was found
+	 *  (i.e. the start tile is still the best-visited), the path is
+	 *  {@code [start]} and the navigator should treat this as no-progress. */
+	record BudgetExhausted(
+		int expanded,
+		WorldPoint bestVisited,
+		List<WorldPoint> pathToBestVisited
+	) implements PlanResult
+	{
+		public BudgetExhausted
+		{
+			pathToBestVisited = pathToBestVisited == null
+				? List.of() : List.copyOf(pathToBestVisited);
+		}
+	}
 
 	/** Goal has no candidate tiles on the player's plane, or BFS
 	 *  exhausted with no inferrable blocked step. Hard fail. */
