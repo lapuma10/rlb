@@ -1335,10 +1335,10 @@ public class HumanizedInputDispatcher implements InputDispatcher
         }
 
         // Settle ~2 frames so the engine populates the hover menu, then
-        // verify. No right-click fallback — if verb isn't on top after
-        // tracking + correction, the cursor is somehow still off-target
-        // (occluding player, hull popped off-canvas, etc.); abort and
-        // let the script's next tick start fresh.
+        // verify. If the requested verb isn't the left-click default, fall
+        // back to right-click + menu select — Lumbridge plane-1 staircase is
+        // the canonical case: left-click is "Climb" (dialogue), the
+        // "Climb-up" / "Climb-down" options live in the right-click menu.
         SequenceSleep.sleep(client, 60);
         boolean isTop = onClient(() -> isTopMenuVerb(verb));
         if (isTop)
@@ -1349,11 +1349,19 @@ public class HumanizedInputDispatcher implements InputDispatcher
             return true;
         }
         String topLbl = onClient(this::topMenuLabel);
-        lastError.set("tracked: verb '" + verb + "' not at top of menu (top='"
-            + topLbl + "') — aborted, no right-click fallback");
-        log.info("gameObjectClick tracked {} verb='{}' — verb not on top after re-aim "
-                + "(top='{}') — aborting (next tick re-aims fresh)",
+        log.info("gameObjectClick tracked {} verb='{}' not at top (top='{}') — right-click flow",
             tile, verb, topLbl);
+        clickPress(MouseEvent.BUTTON3);
+        SequenceSleep.sleep(client, 120);
+        if (selectMenuVerb(verb)) return true;
+        String menuDump = onClient(this::fullMenuDump);
+        lastError.set("tracked: verb '" + verb + "' not in right-click menu (top='"
+            + topLbl + "', " + menuDump + ")");
+        log.info("gameObjectClick tracked {} verb='{}' — right-click menu missing verb "
+                + "(top='{}', {})",
+            tile, verb, topLbl, menuDump);
+        dismissMenu();
+        SequenceSleep.sleep(client, 120);
         return false;
     }
 
