@@ -2,6 +2,7 @@ package net.runelite.client.plugins.recorder.nav.v21;
 
 import java.util.ArrayDeque;
 import java.util.ArrayList;
+import java.util.Comparator;
 import java.util.Deque;
 import java.util.HashSet;
 import java.util.List;
@@ -273,6 +274,18 @@ public final class BlockerScanner
 	public List<BlockerCandidate> findPerimeterExits(WorldPoint center,
 		WorldPoint goalCentroid, int radius, CollisionView collision)
 	{
+		return findPerimeterExits(center, goalCentroid, radius, collision, null);
+	}
+
+	/** Corridor-aware overload. When {@code corridor} is non-null and
+	 *  two exits' Chebyshev-to-goal differ by ≤1 (a near-tie), the one
+	 *  whose {@code objectTile} is closer (Chebyshev) to the nearest
+	 *  tile in {@code corridor} wins. With {@code corridor == null} (or
+	 *  empty), behavior matches the 4-arg overload verbatim. */
+	public List<BlockerCandidate> findPerimeterExits(WorldPoint center,
+		WorldPoint goalCentroid, int radius, CollisionView collision,
+		@Nullable List<WorldPoint> corridor)
+	{
 		Set<Long> reachable = floodReachable(center, radius, collision);
 		List<ScoredExit> scored = new ArrayList<>();
 		int plane = center.getPlane();
@@ -296,10 +309,48 @@ public final class BlockerScanner
 				Math.abs(y - goalCentroid.getY()));
 			scored.add(new ScoredExit(new BlockerCandidate(wall, matched, at), score));
 		}
-		scored.sort((a, b) -> Integer.compare(a.score, b.score));
+		// Primary key: Chebyshev distance to goal centroid.
+		// Secondary key (only when corridor is non-null/non-empty): when two
+		// candidates' primary keys differ by ≤1, prefer the one whose
+		// objectTile is closer to the corridor. With a null/empty corridor,
+		// the comparator reduces to primary-only, matching the old behavior.
+		final List<WorldPoint> corridorRef = corridor;
+		final boolean useCorridor = corridorRef != null && !corridorRef.isEmpty();
+		Comparator<ScoredExit> cmp = (a, b) ->
+		{
+			int da = a.score;
+			int db = b.score;
+			if (Math.abs(da - db) > 1) return Integer.compare(da, db);
+			if (!useCorridor) return Integer.compare(da, db);
+			int ca = nearestCorridorChebyshev(a.candidate.objectTile(), corridorRef);
+			int cb = nearestCorridorChebyshev(b.candidate.objectTile(), corridorRef);
+			return Integer.compare(ca, cb);
+		};
+		scored.sort(cmp);
 		List<BlockerCandidate> out = new ArrayList<>(scored.size());
 		for (ScoredExit s : scored) out.add(s.candidate);
 		return out;
+	}
+
+	/** Minimum Chebyshev distance from {@code p} to any tile in
+	 *  {@code corridor}. Returns {@link Integer#MAX_VALUE} when the
+	 *  corridor is empty (callers gate empty/null upstream, so this is
+	 *  a defensive guard). */
+	private static int nearestCorridorChebyshev(WorldPoint p, List<WorldPoint> corridor)
+	{
+		int best = Integer.MAX_VALUE;
+		for (WorldPoint c : corridor)
+		{
+			int d = chebyshev(p, c);
+			if (d < best) best = d;
+		}
+		return best;
+	}
+
+	private static int chebyshev(WorldPoint a, WorldPoint b)
+	{
+		return Math.max(Math.abs(a.getX() - b.getX()),
+			Math.abs(a.getY() - b.getY()));
 	}
 
 	/** True iff at least one cardinal neighbor is outside the reachable
