@@ -67,6 +67,20 @@ public final class LiveCollisionView implements CollisionView
 		return new LiveCollisionView(copy, wv.getBaseX(), wv.getBaseY(), plane);
 	}
 
+	/** Capture all four planes' live collision from the current
+	 *  WorldView in one client-thread hop. Returns a 4-element array
+	 *  indexed by plane; planes without flag data yield {@link #EMPTY}
+	 *  rather than throwing. Must be called on the client thread. */
+	public static LiveCollisionView[] captureAllPlanes(WorldView wv)
+	{
+		LiveCollisionView[] out = new LiveCollisionView[4];
+		for (int p = 0; p < 4; p++)
+		{
+			out[p] = capture(wv, p);
+		}
+		return out;
+	}
+
 	@Override
 	public int flagsAt(WorldPoint p)
 	{

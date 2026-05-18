@@ -1,5 +1,6 @@
 package net.runelite.client.plugins.recorder.nav.v21;
 
+import java.util.Objects;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicReference;
@@ -10,6 +11,8 @@ import net.runelite.api.Player;
 import net.runelite.api.WorldView;
 import net.runelite.api.coords.WorldPoint;
 import net.runelite.client.callback.ClientThread;
+import net.runelite.client.plugins.recorder.trail.TrailRegistry;
+import net.runelite.client.plugins.recorder.worldmap.TransportIndex;
 import net.runelite.client.sequence.dispatch.HumanizedInputDispatcher;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -39,23 +42,41 @@ public final class V21Env
 	private final ClientThread clientThread;
 	private final HumanizedInputDispatcher dispatcher;
 	private final BlockerScanner scanner;
+	private final TransportIndex transports;
+	private final TrailRegistry trails;
+	private final GoalDeadEndMemory deadEnds;
+	private final RouteSkeletonStore skeletons;
 
 	public V21Env(Client client, ClientThread clientThread,
-		HumanizedInputDispatcher dispatcher)
+		HumanizedInputDispatcher dispatcher,
+		TransportIndex transports,
+		TrailRegistry trails,
+		GoalDeadEndMemory deadEnds,
+		RouteSkeletonStore skeletons)
 	{
 		this.client = client;
 		this.clientThread = clientThread;
 		this.dispatcher = dispatcher;
 		this.scanner = new BlockerScanner(client);
+		this.transports = Objects.requireNonNull(transports, "transports");
+		this.trails = Objects.requireNonNull(trails, "trails");
+		this.deadEnds = Objects.requireNonNull(deadEnds, "deadEnds");
+		this.skeletons = Objects.requireNonNull(skeletons, "skeletons");
 	}
 
 	public Client client() { return client; }
 	public HumanizedInputDispatcher dispatcher() { return dispatcher; }
 	public BlockerScanner scanner() { return scanner; }
+	public TransportIndex transports() { return transports; }
+	public TrailRegistry trails() { return trails; }
+	public GoalDeadEndMemory deadEnds() { return deadEnds; }
+	public RouteSkeletonStore skeletons() { return skeletons; }
 
 	/** Capture the per-tick snapshot on the client thread. Single hop
 	 *  reads player loc + plane + dispatcher-busy + live collision for
-	 *  the player's plane. */
+	 *  all four planes. The legacy {@link Snapshot#collision()} field
+	 *  is the player-plane shorthand, equal to
+	 *  {@code collisionByPlane[plane]}. */
 	@Nullable
 	public Snapshot snapshot()
 	{
@@ -65,11 +86,12 @@ public final class V21Env
 			WorldPoint here = self == null ? null : self.getWorldLocation();
 			int plane = here == null ? -1 : here.getPlane();
 			WorldView wv = client.getTopLevelWorldView();
-			LiveCollisionView col = (here == null)
+			LiveCollisionView[] byPlane = LiveCollisionView.captureAllPlanes(wv);
+			LiveCollisionView col = (plane < 0 || plane >= byPlane.length)
 				? LiveCollisionView.EMPTY
-				: LiveCollisionView.capture(wv, plane);
+				: byPlane[plane];
 			return new Snapshot(here, plane, dispatcher.isBusy(),
-				System.currentTimeMillis(), col);
+				System.currentTimeMillis(), col, byPlane);
 		});
 	}
 
@@ -105,10 +127,17 @@ public final class V21Env
 
 	/** Immutable per-tick world snapshot. All v2.1 components consume
 	 *  this — no live client reads downstream of {@link V21Env#snapshot()}
-	 *  except the {@link BlockerScanner} hop. */
+	 *  except the {@link BlockerScanner} hop.
+	 *
+	 *  <p>{@link #collision} is the player-plane shorthand for
+	 *  {@code collisionByPlane[plane]}; existing callers that only care
+	 *  about the player's plane keep working. {@link #collisionByPlane}
+	 *  is the new 4-element array indexed by plane (planes without flag
+	 *  data are {@link LiveCollisionView#EMPTY}). */
 	public record Snapshot(@Nullable WorldPoint playerTile,
 		int plane,
 		boolean dispatcherBusy,
 		long nowMs,
-		LiveCollisionView collision) {}
+		LiveCollisionView collision,
+		LiveCollisionView[] collisionByPlane) {}
 }

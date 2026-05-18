@@ -168,6 +168,11 @@ public class RecorderPlugin extends Plugin
     private MapStore worldMapStore;
     private EntityIndex worldEntityIndex;
     private TransportIndex transportIndex;
+    /** v2.1 nav sidecars — populated by Tasks 7/8. Constructed at
+     *  startUp alongside {@link #transportIndex} so V21Env always has
+     *  non-null stores; behavioural use is deferred. */
+    private net.runelite.client.plugins.recorder.nav.v21.GoalDeadEndMemory v21GoalDeadEnds;
+    private net.runelite.client.plugins.recorder.nav.v21.RouteSkeletonStore v21RouteSkeletons;
     private TransportObserver transportObserver;
     private SceneScraper sceneScraper;
     private EntityScraper entityScraper;
@@ -429,6 +434,8 @@ public class RecorderPlugin extends Plugin
         worldMapStore = new MapStore(wmConfig);
         worldEntityIndex = new EntityIndex();
         transportIndex = new TransportIndex();
+        v21GoalDeadEnds = new net.runelite.client.plugins.recorder.nav.v21.GoalDeadEndMemory();
+        v21RouteSkeletons = new net.runelite.client.plugins.recorder.nav.v21.RouteSkeletonStore();
         transportObserver = new TransportObserver(client, transportIndex);
         eventBus.register(transportObserver);
         sceneScraper = new SceneScraper(client, worldMapStore, worldEntityIndex, wmConfig);
@@ -694,13 +701,22 @@ public class RecorderPlugin extends Plugin
     /** Build a per-script v2.1 reactive Navigator. Uses the script's own
      *  dispatcher so its busy flag isn't contended. v2.1 has no shared
      *  planner — each tick reads the live scene/collision via its own
-     *  env. Cheap to construct; no precomputed graphs. */
+     *  env. Cheap to construct; no precomputed graphs.
+     *
+     *  <p>The {@link TransportIndex}, {@link TrailRegistry},
+     *  {@code GoalDeadEndMemory}, and {@code RouteSkeletonStore} are
+     *  shared across all v2.1 navigators — planner reads are read-only
+     *  w.r.t. the index, and dead-end / skeleton sidecars are global
+     *  by design (learning that "this approach to the chicken pen
+     *  failed" should benefit any script that targets the pen). */
     private net.runelite.client.plugins.recorder.nav.v21.V21Navigator buildV21Navigator(
         HumanizedInputDispatcher dispatcher)
     {
         net.runelite.client.plugins.recorder.nav.v21.V21Env env
             = new net.runelite.client.plugins.recorder.nav.v21.V21Env(
-                client, clientThread, dispatcher);
+                client, clientThread, dispatcher,
+                transportIndex, trailRegistry,
+                v21GoalDeadEnds, v21RouteSkeletons);
         return new net.runelite.client.plugins.recorder.nav.v21.V21Navigator(env);
     }
 
@@ -912,6 +928,8 @@ public class RecorderPlugin extends Plugin
         worldMapStore = null;
         worldEntityIndex = null;
         transportIndex = null;
+        v21GoalDeadEnds = null;
+        v21RouteSkeletons = null;
         sceneScraper = null;
         entityScraper = null;
         mapPlanner = null;
