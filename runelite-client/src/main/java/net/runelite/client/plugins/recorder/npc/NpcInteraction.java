@@ -40,7 +40,12 @@ public final class NpcInteraction
         /** Click was issued but no dialogue widget became visible
          *  inside the timeout. The caller's next tick should retry
          *  (re-resolve npcIndex first — the scene may have shifted). */
-        NEVER_OPENED
+        NEVER_OPENED,
+        /** Dialogue widget opened, but the rendered NPC name didn't
+         *  match the expected name (only returned by
+         *  {@link #talkToWithExpectedName}). Options were NOT driven;
+         *  caller's next tick should retry. */
+        WRONG_NPC
     }
 
     private enum State { NONE, NPC_CONTINUES, PLAYER_CONTINUES, OPTION_MENU, LEVELUP }
@@ -281,6 +286,61 @@ public final class NpcInteraction
     }
 
     /**
+     * Same as {@link #talkTo} but verifies the rendered dialog NPC name
+     * matches {@code expectedNpcName} (case-insensitive, trimmed) before
+     * driving options. Guards against the "we clicked Veronica but a
+     * random-event NPC walked up first" race that legacy quest scripts
+     * (Cook's Assistant, ChickenFarm) silently fail on — dialog opens,
+     * we drive Continue prompts blindly, and the player ends up in some
+     * unrelated conversation.
+     *
+     * <p>Returns {@link TalkResult#WRONG_NPC} on name mismatch — options
+     * are NOT driven, the wrong dialog is left for the player / caller
+     * to dismiss. The caller's next retry resolves npcIndex fresh.
+     */
+    public TalkResult talkToWithExpectedName(int npcIndex, String expectedNpcName,
+                                             String verb, long dialogueOpenTimeoutMs,
+                                             String... options)
+        throws InterruptedException
+    {
+        if (client != null && client.isClientThread())
+        {
+            throw new IllegalStateException(
+                "NpcInteraction.talkToWithExpectedName called on the OSRS client thread "
+                    + "— see talkTo for the full reason.");
+        }
+
+        log.info("npc: talkToWithExpectedName idx={} expected='{}' verb='{}' (timeout {}ms, options={})",
+            npcIndex, expectedNpcName, verb, dialogueOpenTimeoutMs, options == null ? 0 : options.length);
+
+        dispatcher.npcClickOnWorker(npcIndex, verb);
+
+        long deadline = System.currentTimeMillis() + dialogueOpenTimeoutMs;
+        while (System.currentTimeMillis() < deadline)
+        {
+            if (inDialogue())
+            {
+                String displayed = onClient(this::readDialogNpcName);
+                if (displayed == null || !displayed.equalsIgnoreCase(expectedNpcName.trim()))
+                {
+                    log.warn("npc: talkToWithExpectedName idx={} expected='{}' but dialog NPC='{}' → WRONG_NPC",
+                        npcIndex, expectedNpcName, displayed);
+                    return TalkResult.WRONG_NPC;
+                }
+                log.info("npc: talkToWithExpectedName idx={} dialog NPC='{}' matches — driving options",
+                    npcIndex, displayed);
+                completeDialogue(options);
+                return TalkResult.OPENED_AND_COMPLETED;
+            }
+            SequenceSleep.sleep(client, DIALOGUE_POLL_INTERVAL_MS);
+        }
+
+        log.warn("npc: talkToWithExpectedName idx={} verb='{}' → NEVER_OPENED (waited {}ms)",
+            npcIndex, verb, dialogueOpenTimeoutMs);
+        return TalkResult.NEVER_OPENED;
+    }
+
+    /**
      * Loops through the active dialogue, clicking Continue and/or picking
      * the first option whose text matches an entry in {@code options}
      * (case-insensitive), until no dialogue is visible.
@@ -353,6 +413,20 @@ public final class NpcInteraction
     {
         Widget w = client.getWidget(widgetId);
         return w != null && !w.isHidden();
+    }
+
+    /**
+     * Client-thread: read the NPC name displayed in the ChatLeft dialog
+     * header. Returns null when the widget is missing or hidden.
+     * Used by {@link #talkToWithExpectedName} to verify the dialog we
+     * woke is with the NPC we clicked, not some random-event walk-up.
+     */
+    private String readDialogNpcName()
+    {
+        Widget w = client.getWidget(InterfaceID.ChatLeft.NAME);
+        if (w == null || w.isHidden()) return null;
+        String text = w.getText();
+        return text == null ? null : text.trim();
     }
 
     /**
