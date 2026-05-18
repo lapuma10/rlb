@@ -3,6 +3,7 @@ package net.runelite.client.plugins.recorder.worldmap;
 import java.io.File;
 import java.util.List;
 import java.util.Set;
+import java.util.concurrent.CopyOnWriteArrayList;
 import javax.annotation.Nullable;
 import lombok.extern.slf4j.Slf4j;
 
@@ -24,6 +25,7 @@ public final class FlushDaemon
     @Nullable private final TransportIndex transports;
     private final File rootDir;
     private final long intervalMs;
+    private final CopyOnWriteArrayList<Runnable> extraCallbacks = new CopyOnWriteArrayList<>();
     private volatile boolean running;
     private Thread t;
 
@@ -55,6 +57,16 @@ public final class FlushDaemon
     {
         running = false;
         if (t != null) t.interrupt();
+    }
+
+    /** Register an extra writer to run on each flush tick (and on the
+     *  shutdown {@link #flushOnce()}). Used by v2.1 sidecars
+     *  (dead-ends, route-skeletons) so they share the same cadence as
+     *  the worldmap/transport stores. Callbacks must be idempotent
+     *  and no-op when their own dirty flag is clear. */
+    public void addFlushCallback(Runnable r)
+    {
+        if (r != null) extraCallbacks.add(r);
     }
 
     private void loop()
@@ -90,6 +102,14 @@ public final class FlushDaemon
         if (transports != null && transports.takeDirty())
         {
             TransportIO.writeAll(rootDir, transports.getAll());
+        }
+        // Extra registered writers (v2.1 dead-end memory, route
+        // skeletons, etc.). Each is responsible for its own dirty
+        // check so a no-op tick is cheap.
+        for (Runnable r : extraCallbacks)
+        {
+            try { r.run(); }
+            catch (Throwable th) { log.warn("worldmap flush callback failed", th); }
         }
     }
 }

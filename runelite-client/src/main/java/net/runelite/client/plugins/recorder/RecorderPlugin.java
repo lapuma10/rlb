@@ -475,6 +475,12 @@ public class RecorderPlugin extends Plugin
 
         flushDaemon = new FlushDaemon(worldMapStore, worldEntityIndex,
             transportIndex, worldmapRoot, wmConfig.flushEverySeconds * 1000L);
+        // v2.1 dead-end sidecar — load on startup, flush on the same
+        // cadence as the worldmap/transport stores via the registered
+        // callback. Path mirrors transports.json's location.
+        java.nio.file.Path v21DeadEndsPath = worldmapRoot.toPath().resolve("v21-deadends.json");
+        v21GoalDeadEnds.loadFrom(v21DeadEndsPath);
+        flushDaemon.addFlushCallback(() -> v21GoalDeadEnds.flushTo(v21DeadEndsPath));
         flushDaemon.start();
 
         // V2 Navigator stack — shared planner + per-script executor.
