@@ -481,6 +481,12 @@ public class RecorderPlugin extends Plugin
         java.nio.file.Path v21DeadEndsPath = worldmapRoot.toPath().resolve("v21-deadends.json");
         v21GoalDeadEnds.loadFrom(v21DeadEndsPath);
         flushDaemon.addFlushCallback(() -> v21GoalDeadEnds.flushTo(v21DeadEndsPath));
+        // v2.1 route-skeleton sidecar — record-only this round, mirrors the
+        // dead-end sidecar's lifecycle (load at startup, flush via daemon
+        // cadence + on shutdown via flushOnce).
+        java.nio.file.Path v21SkeletonsPath = worldmapRoot.toPath().resolve("v21-skeletons.json");
+        v21RouteSkeletons.loadFrom(v21SkeletonsPath);
+        flushDaemon.addFlushCallback(() -> v21RouteSkeletons.flushTo(v21SkeletonsPath));
         flushDaemon.start();
 
         // V2 Navigator stack — shared planner + per-script executor.
