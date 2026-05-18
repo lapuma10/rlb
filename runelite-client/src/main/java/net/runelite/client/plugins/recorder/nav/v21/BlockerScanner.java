@@ -442,6 +442,41 @@ public final class BlockerScanner
 		}
 	}
 
+	/** Scan the loaded scene for any {@link TileObject} (game object, wall
+	 *  object, decorative object, ground object) within {@code radius} tiles
+	 *  (Chebyshev) of {@code near} whose {@code getId() == objectId}.
+	 *
+	 *  <p>Used by the v21 anchor selector + transport router to confirm
+	 *  that a recorded transport's object is currently visible before
+	 *  attempting to dispatch a click. Returns the first match found, or
+	 *  null when nothing matches.
+	 *
+	 *  <p>Threading: reads {@code Scene}, must be called on the client
+	 *  thread (the navigator marshals via {@link V21Env#onClient}).
+	 *
+	 *  @param objectId  the {@link TileObject#getId()} to match
+	 *  @param near      centre of the scan; plane defines which plane to scan
+	 *  @param radius    Chebyshev radius (tiles) around {@code near} */
+	@Nullable
+	public TileObject findObjectInScene(int objectId, WorldPoint near, int radius)
+	{
+		if (near == null) return null;
+		List<TileObject> bucket = new ArrayList<>();
+		int plane = near.getPlane();
+		for (int dx = -radius; dx <= radius; dx++)
+		{
+			for (int dy = -radius; dy <= radius; dy++)
+			{
+				collectObjects(new WorldPoint(near.getX() + dx, near.getY() + dy, plane), bucket);
+			}
+		}
+		for (TileObject obj : bucket)
+		{
+			if (obj != null && obj.getId() == objectId) return obj;
+		}
+		return null;
+	}
+
 	@Nullable
 	private BlockerCandidate pickFirstUnblocking(List<TileObject> candidates, WorldPoint approachFrom)
 	{

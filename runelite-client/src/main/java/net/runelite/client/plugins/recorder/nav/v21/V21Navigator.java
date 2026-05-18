@@ -1,41 +1,57 @@
 package net.runelite.client.plugins.recorder.nav.v21;
 
+import java.util.ArrayList;
 import java.util.List;
 import java.util.Objects;
+import java.util.Optional;
 import java.util.Random;
+import java.util.function.Predicate;
 import javax.annotation.Nullable;
+import net.runelite.api.TileObject;
 import net.runelite.api.coords.WorldPoint;
 import net.runelite.client.plugins.recorder.nav.NavRequest;
 import net.runelite.client.plugins.recorder.nav.NavStatus;
 import net.runelite.client.plugins.recorder.nav.Navigator;
+import net.runelite.client.plugins.recorder.nav.v2.bfs.CollisionView;
+import net.runelite.client.plugins.recorder.trail.Trail;
+import net.runelite.client.plugins.recorder.worldmap.TransportEdge;
+import net.runelite.client.plugins.recorder.worldmap.TransportIndex;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 /** Reactive walker. Plans → acts → replans, every tick. No full-route
  *  validation, no Dijkstra skeleton, no precomputed transport graph.
  *
- *  <p><b>Tick loop:</b>
+ *  <p><b>Tick priorities (post-Task-10):</b>
  *  <ol>
- *    <li>Snapshot world (player tile, plane, dispatcher-busy, live
- *        collision for player's plane).</li>
- *    <li>If goal already satisfied → ARRIVED.</li>
- *    <li>If a reactive interaction is in flight, evaluate whether it
- *        produced progress. PROGRESSED ⇒ clear pending, fall through
- *        to replan. FAILED ⇒ blacklist, fall through. STILL_WAITING
- *        ⇒ yield RUNNING.</li>
- *    <li>Plan with {@link StaticPlanner} from current tile to goal.
- *        Success → walk along the path. BlockedEdge → walk to source
- *        side, then scan for unblocking object on the edge and click.
- *        PlaneMismatch → scan around player for a Climb verb and
- *        click. BudgetExhausted → walk toward centroid, replan next
- *        tick. NoCandidate / HARD_STALL → FAILED.</li>
+ *    <li>Snapshot world (multi-plane collision).</li>
+ *    <li>Goal satisfied → ARRIVED (writes RouteSkeleton on success).</li>
+ *    <li>Dispatcher busy → RUNNING.</li>
+ *    <li>{@link ReactiveSolver#evaluatePending} → progressed/failed
+ *        transitions, dead-end signal when applicable.</li>
+ *    <li>HARD_STALL check.</li>
+ *    <li>{@code pendingExit} (sticky perimeter exit) early-return.</li>
+ *    <li>{@code pendingTransport} (sticky transport / anchor) early-return.</li>
+ *    <li>Trail anchor rung — next reachable anchor adopted as
+ *        pendingExit or pendingTransport.</li>
+ *    <li>{@link StaticPlanner#plan}:
+ *      <ul>
+ *        <li>Success → walker.walkAlong path.</li>
+ *        <li>BlockedEdge → {@link #handleBlockedEdge}.</li>
+ *        <li>PlaneMismatch → {@link #handlePlaneMismatch}:
+ *          router → next-anchor-on-current-plane → trail-corridor →
+ *          planar projection → typed FAILED.</li>
+ *        <li>BudgetExhausted → walker.walkAlong(pathToBestVisited).</li>
+ *        <li>NoCandidate → FAILED.</li>
+ *      </ul>
+ *    </li>
  *  </ol>
  *
- *  <p><b>Why this is different from v2:</b> v2 proves a full route
- *  before any click. If a door is missing from the static transport
- *  table, the route is unreachable. v2.1 reads the door from the live
- *  scene at the moment BFS reports a blocked edge — no static data
- *  needed. Doors are runtime problems first, data second. */
+ *  <p>Sticky subtasks own their tick slot: while a pending subtask is
+ *  active, the planner is not consulted. Pre-dispatch state is captured
+ *  at the moment of dispatch (inside {@link #attemptStickyClick}) and
+ *  preserved until the next solver outcome resolves — never overwritten
+ *  per tick. */
 public final class V21Navigator implements Navigator
 {
 	private static final Logger log = LoggerFactory.getLogger(V21Navigator.class);
@@ -44,6 +60,12 @@ public final class V21Navigator implements Navigator
 	 *  enough for slow stair animations + cs2 dialogs, short enough
 	 *  the bot doesn't spin forever. */
 	private static final int HARD_STALL_TICKS = 15;
+	/** Window for the inverse-transport heuristic: a transport that
+	 *  fires within this many ms of its inverse (same object id, swapped
+	 *  fromTile/toTile) marks the FIRST transport as dead-end for the
+	 *  goal. 6 ticks × 600 ms = 3.6 s — long enough for an animation
+	 *  to complete on the destination plane and us to click "back". */
+	private static final long INVERSE_WINDOW_MS = 6L * 600L;
 
 	private final V21Env env;
 	private final WalkExecutor walker;
@@ -60,6 +82,39 @@ public final class V21Navigator implements Navigator
 	 *  interaction. Cleared on interaction dispatch, blacklist hit, or
 	 *  new navigation request. */
 	@Nullable private BlockerCandidate pendingExit;
+	/** Sticky transport / plane-changing anchor click. The
+	 *  {@link BlockerCandidate} is what gets dispatched — anchors and
+	 *  router picks both reduce to {@code BlockerCandidate} for execution.
+	 *  No synthetic {@link TransportEdge} ever lives here. */
+	@Nullable private BlockerCandidate pendingTransport;
+	@Nullable private TrailGuide trailGuide;
+	private int nextAnchorIndex = 0;
+	/** The anchor whose click is sticky right now. Null when
+	 *  {@link #pendingTransport} or {@link #pendingExit} came from the
+	 *  router or perimeter-exit ranker rather than the trail. */
+	@Nullable private InteractionAnchor activeAnchor;
+	/** The edge key of a router-picked pending transport. Null for
+	 *  anchor-driven dispatches (TransportObserver may write the
+	 *  matching edge after the click). Used by the PROGRESSED handler
+	 *  to look up the fired edge. */
+	@Nullable private String pendingEdgeKey;
+	/** Last fired transport, retained across the PROGRESSED handler for
+	 *  inverse-transport detection (forced reverse within {@code
+	 *  INVERSE_WINDOW_MS} marks the first edge as dead-end). */
+	@Nullable private TransportEdge lastFiredEdge;
+	private long lastFiredAtMs;
+	/** Pre-dispatch state captured atomically with the click in
+	 *  {@link #attemptStickyClick}. Preserved across ticks until the
+	 *  solver outcome resolves; then cleared. Reading these in the
+	 *  PROGRESSED branch tells us what the world looked like BEFORE we
+	 *  clicked, so we can detect plane changes correctly. */
+	private int pendingStartPlane = -1;
+	@Nullable private WorldPoint pendingStartTile;
+	private long pendingStartedAtMs;
+	/** Ordered edge keys of transports successfully fired during the
+	 *  current navigation request. Written to a {@link RouteSkeleton}
+	 *  on ARRIVED. Cleared on new request. */
+	private final List<String> skeletonInProgress = new ArrayList<>();
 
 	public V21Navigator(V21Env env)
 	{
@@ -90,6 +145,25 @@ public final class V21Navigator implements Navigator
 			stallTicks = 0;
 			pendingExit = null;
 			solver.reset();
+
+			String trailName = (request != null) ? request.trailName() : null;
+			Trail trail = (trailName != null) ? env.trails().byName(trailName) : null;
+			trailGuide = (trail != null) ? TrailGuide.fromTrail(trail) : null;
+			nextAnchorIndex = 0;
+			activeAnchor = null;
+			pendingTransport = null;
+			pendingEdgeKey = null;
+			lastFiredEdge = null;
+			lastFiredAtMs = 0L;
+			pendingStartPlane = -1;
+			pendingStartTile = null;
+			pendingStartedAtMs = 0L;
+			skeletonInProgress.clear();
+			if (trailGuide != null)
+			{
+				log.info("v21.guide: trail={} anchors={} corridor={}",
+					trailName, trailGuide.anchors().size(), trailGuide.corridor().size());
+			}
 		}
 		Goal goal = activeGoal;
 		if (goal == null)
@@ -101,6 +175,18 @@ public final class V21Navigator implements Navigator
 		{
 			diag.arrived(goal, snap.playerTile());
 			stallTicks = 0;
+			if (!skeletonInProgress.isEmpty())
+			{
+				env.skeletons().recordSuccess(new RouteSkeleton(
+					routeKey(),
+					goal.centroid(),
+					goal.centroid().getPlane(),
+					List.copyOf(skeletonInProgress),
+					snap.nowMs()));
+				log.info("v21.skeleton: recorded {} edges for route={} goal={}",
+					skeletonInProgress.size(), routeKey(), goal.centroid());
+			}
+			skeletonInProgress.clear();
 			return NavStatus.ARRIVED;
 		}
 
@@ -108,15 +194,116 @@ public final class V21Navigator implements Navigator
 		// dispatch both feed the same HumanizedInputDispatcher.
 		if (snap.dispatcherBusy()) return NavStatus.RUNNING;
 
-		// Evaluate any pending reactive interaction first.
+		// Evaluate any pending reactive interaction first. The PROGRESSED
+		// / FAILED branches read pendingStart{Plane,Tile,Ms} captured at
+		// the dispatch tick by attemptStickyClick.
 		ReactiveSolver.Outcome out = solver.evaluatePending(
 			snap.playerTile(), snap.plane(), snap.nowMs());
 		if (out == ReactiveSolver.Outcome.STILL_WAITING) return NavStatus.RUNNING;
-		if (out == ReactiveSolver.Outcome.PROGRESSED || out == ReactiveSolver.Outcome.FAILED)
+		if (out == ReactiveSolver.Outcome.PROGRESSED)
 		{
-			// Interaction resolved — gate was opened (or blacklisted). Clear
-			// the sticky exit so the fresh replan runs from new position.
+			boolean planeChanged = (pendingStartPlane != -1
+				&& pendingStartPlane != snap.plane());
+			if (planeChanged && isAnchorOrEdgePending())
+			{
+				// Resolve the actual fired edge so we can record it in
+				// the skeleton + detect inverse-transport.
+				String firedKey = (pendingEdgeKey != null) ? pendingEdgeKey
+					: (activeAnchor != null
+						? findEdgeKeyByObjectAndApproach(env.transports(),
+							activeAnchor.objectId(),
+							activeAnchor.approachTile(),
+							activeAnchor.verb())
+						: null);
+				if (firedKey != null) skeletonInProgress.add(firedKey);
+
+				// Re-check forward reachability: can ANY next step
+				// (anchor or known transport) bring us closer to the
+				// goal? If not, the transport we just fired was a
+				// dead-end for this goal. Player landing on the goal
+				// plane after the transport is a strong "yes, this
+				// helped" — skip the dead-end mark in that case.
+				boolean canContinue = (snap.plane() == goal.centroid().getPlane());
+				if (!canContinue && trailGuide != null)
+				{
+					Optional<AnchorSelector.Active> nextActive =
+						AnchorSelector.selectActive(
+							trailGuide, nextAnchorIndex,
+							snap.playerTile(),
+							(start, g) -> new StaticPlanner(snap.collision()).plan(start, g),
+							a -> env.deadEnds().isDeadEnd(
+								GoalDeadEndKey.fromAnchor(routeKey(), a, goal.centroid()),
+								snap.nowMs()),
+							this::findInSceneOnClient);
+					if (nextActive.isPresent()) canContinue = true;
+				}
+				if (!canContinue)
+				{
+					Predicate<TransportEdge> isEdgeBad =
+						buildEdgeBlacklistPredicate(snap, goal, routeKey());
+					Optional<TransportCandidate> tc = TransportRouter.findNext(
+						snap.playerTile(), goal.centroid(),
+						env.transports(), snap.collisionByPlane(),
+						this::findInSceneOnClient, isEdgeBad);
+					if (tc.isPresent()) canContinue = true;
+				}
+				if (!canContinue)
+				{
+					markDeadEndForFiredTransport(snap.nowMs(),
+						"DESTINATION_NO_KNOWN_PROGRESS");
+				}
+
+				// Inverse-transport detection: forced reverse within
+				// INVERSE_WINDOW_MS marks the FIRST transport as bad.
+				TransportEdge fired = (firedKey != null)
+					? env.transports().byKey(firedKey) : null;
+				if (fired != null && lastFiredEdge != null
+					&& snap.nowMs() - lastFiredAtMs < INVERSE_WINDOW_MS
+					&& fired.fromTile().equals(lastFiredEdge.toTile())
+					&& fired.toTile().equals(lastFiredEdge.fromTile())
+					&& fired.objectId() == lastFiredEdge.objectId())
+				{
+					env.deadEnds().markDeadEnd(
+						GoalDeadEndKey.fromEdge(routeKey(), lastFiredEdge, goal.centroid()),
+						"FORCED_INVERSE_WITHIN_6_TICKS",
+						snap.nowMs());
+					log.info("v21.deadend: FORCED_INVERSE on {} (just fired inverse {})",
+						lastFiredEdge.key(), fired.key());
+				}
+
+				// Advance anchor pointer if an anchor was active.
+				if (activeAnchor != null) nextAnchorIndex++;
+				activeAnchor = null;
+				pendingTransport = null;
+				pendingEdgeKey = null;
+				lastFiredEdge = fired;
+				lastFiredAtMs = snap.nowMs();
+				pendingStartPlane = -1;
+				pendingStartTile = null;
+			}
+			else
+			{
+				// PROGRESSED on a same-plane interaction (door / gate /
+				// route walk) — clear sticky and replan.
+				pendingTransport = null;
+				pendingExit = null;
+				activeAnchor = null;
+				pendingEdgeKey = null;
+				pendingStartPlane = -1;
+				pendingStartTile = null;
+			}
+		}
+		else if (out == ReactiveSolver.Outcome.FAILED)
+		{
+			// Solver already short-blacklisted. Clear sticky state; do
+			// NOT mark dead-end here — that's the long-term layer and
+			// shouldn't fire on every solver miss.
+			pendingTransport = null;
 			pendingExit = null;
+			activeAnchor = null;
+			pendingEdgeKey = null;
+			pendingStartPlane = -1;
+			pendingStartTile = null;
 		}
 
 		// Progress accounting.
@@ -150,6 +337,56 @@ public final class V21Navigator implements Navigator
 			// through to full replan.
 		}
 
+		// Sticky transport / anchor click.
+		if (pendingTransport != null)
+		{
+			NavStatus s = handlePendingTransport(pendingTransport, snap);
+			if (s != null) return s;
+			// null → pending was cleared (blacklisted / dead-end / can't
+			// plan); fall through.
+		}
+
+		// Trail anchor rung. In-order, reachability-checked. Sits AFTER
+		// both pending early-returns and BEFORE the planner call.
+		if (trailGuide != null && pendingTransport == null && pendingExit == null)
+		{
+			final V21Env.Snapshot snapRef = snap;
+			final Goal goalRef = goal;
+			Optional<AnchorSelector.Active> picked = AnchorSelector.selectActive(
+				trailGuide, nextAnchorIndex, snap.playerTile(),
+				(start, g) -> new StaticPlanner(snapRef.collision()).plan(start, g),
+				a -> env.deadEnds().isDeadEnd(
+					GoalDeadEndKey.fromAnchor(routeKey(), a, goalRef.centroid()),
+					snapRef.nowMs()),
+				this::findInSceneOnClient);
+			if (picked.isPresent())
+			{
+				InteractionAnchor a = picked.get().anchor();
+				TileObject obj = picked.get().sceneObject();
+				BlockerCandidate bc = new BlockerCandidate(obj, a.verb(), snap.playerTile());
+				activeAnchor = a;
+				if (!a.isTransportAnchor())
+				{
+					pendingExit = bc;
+					log.info("v21.anchor: adopt local-anchor idx={} objectId={} verb={} at={}",
+						picked.get().indexInGuide(), a.objectId(), a.verb(), a.objectTile());
+					NavStatus s = handlePendingExit(pendingExit, snap);
+					return (s != null) ? s : NavStatus.RUNNING;
+				}
+				else
+				{
+					pendingTransport = bc;
+					// pendingEdgeKey stays null — anchor may or may not
+					// correspond to an index edge. The PROGRESSED handler
+					// resolves the actual fired edge via TransportObserver/index.
+					log.info("v21.anchor: adopt transport-anchor idx={} objectId={} verb={} at={}",
+						picked.get().indexInGuide(), a.objectId(), a.verb(), a.objectTile());
+					NavStatus s = handlePendingTransport(pendingTransport, snap);
+					return (s != null) ? s : NavStatus.RUNNING;
+				}
+			}
+		}
+
 		// Re-plan from current position.
 		PlanResult plan = new StaticPlanner(snap.collision()).plan(snap.playerTile(), goal);
 		diag.plan(snap.playerTile(), goal, plan);
@@ -177,11 +414,17 @@ public final class V21Navigator implements Navigator
 		{
 			return handlePlaneMismatch(snap);
 		}
-		if (plan instanceof PlanResult.BudgetExhausted)
+		if (plan instanceof PlanResult.BudgetExhausted bx)
 		{
-			// Walk toward centroid. The next tick's BFS, starting from
-			// the new position, may find a candidate within budget.
-			walker.walkTo(goal.centroid(), snap.playerTile());
+			List<WorldPoint> path = bx.pathToBestVisited();
+			if (path == null || path.size() <= 1
+				|| path.get(path.size() - 1).equals(snap.playerTile()))
+			{
+				log.warn("v21: BUDGET_EXHAUSTED_NO_PROGRESS expanded={} player={} goal={}",
+					bx.expanded(), snap.playerTile(), goal.centroid());
+				return NavStatus.FAILED;
+			}
+			walker.walkAlong(path, snap.playerTile());
 			return NavStatus.RUNNING;
 		}
 		// PlanResult.NoCandidate or unknown — fail fast.
@@ -245,9 +488,10 @@ public final class V21Navigator implements Navigator
 			Goal currentGoal = activeGoal;
 			WorldPoint goalCentroid = currentGoal != null
 				? currentGoal.centroid() : be.from();
+			List<WorldPoint> corridor = (trailGuide != null) ? trailGuide.corridor() : null;
 			List<BlockerCandidate> exits = env.onClient(() ->
 				env.scanner().findPerimeterExits(snap.playerTile(), goalCentroid,
-					BlockerScanner.SCENE_SCAN_RADIUS, snap.collision()));
+					BlockerScanner.SCENE_SCAN_RADIUS, snap.collision(), corridor));
 			BlockerCandidate exit = null;
 			for (BlockerCandidate cand : exits)
 			{
@@ -277,7 +521,7 @@ public final class V21Navigator implements Navigator
 			return NavStatus.RUNNING;
 		}
 		diag.blockerFound(be.from(), be.to(), b);
-		solver.attempt(b, snap.playerTile(), snap.nowMs());
+		attemptStickyClick(b, snap);
 		return NavStatus.RUNNING;
 	}
 
@@ -324,113 +568,207 @@ public final class V21Navigator implements Navigator
 		// Within interaction range — click.
 		log.info("v21: pendingExit dist={} — clicking verb={} at {}",
 			dist, exit.verb(), exit.objectTile());
-		solver.attempt(atHere, snap.playerTile(), snap.nowMs());
+		attemptStickyClick(atHere, snap);
 		pendingExit = null;
 		return NavStatus.RUNNING;
 	}
 
+	/** Walk toward or click the sticky transport / plane-changing anchor.
+	 *  Returns RUNNING when a walk or click was dispatched. Returns null
+	 *  when the pending is no longer actionable — caller falls through. */
+	@Nullable
+	private NavStatus handlePendingTransport(BlockerCandidate t, V21Env.Snapshot snap)
+		throws InterruptedException
+	{
+		Goal goal = activeGoal;
+		if (goal == null)
+		{
+			pendingTransport = null;
+			pendingEdgeKey = null;
+			activeAnchor = null;
+			return null;
+		}
+		// Re-build with current player tile for blacklist key accuracy.
+		BlockerCandidate atHere = new BlockerCandidate(
+			t.object(), t.verb(), snap.playerTile());
+		if (solver.isBlacklisted(atHere, snap.nowMs()))
+		{
+			log.info("v21: pendingTransport {} blacklisted — clearing", t.objectTile());
+			pendingTransport = null;
+			pendingEdgeKey = null;
+			return null;
+		}
+		// Anchor-dead-end check.
+		if (activeAnchor != null
+			&& env.deadEnds().isDeadEnd(
+				GoalDeadEndKey.fromAnchor(routeKey(), activeAnchor, goal.centroid()),
+				snap.nowMs()))
+		{
+			log.info("v21: pendingTransport anchor objectId={} dead-end — clearing",
+				activeAnchor.objectId());
+			pendingTransport = null;
+			activeAnchor = null;
+			return null;
+		}
+		// Edge-dead-end check (router-driven pending).
+		if (pendingEdgeKey != null)
+		{
+			TransportEdge e = env.transports().byKey(pendingEdgeKey);
+			if (e != null && env.deadEnds().isDeadEnd(
+					GoalDeadEndKey.fromEdge(routeKey(), e, goal.centroid()),
+					snap.nowMs()))
+			{
+				log.info("v21: pendingTransport edge {} dead-end — clearing", pendingEdgeKey);
+				pendingTransport = null;
+				pendingEdgeKey = null;
+				return null;
+			}
+		}
+
+		int dist = Math.max(
+			Math.abs(snap.playerTile().getX() - t.objectTile().getX()),
+			Math.abs(snap.playerTile().getY() - t.objectTile().getY()));
+
+		if (dist > 2)
+		{
+			Goal subGoal = new Goal.Area(t.objectTile(), 1);
+			PlanResult sub = new StaticPlanner(snap.collision())
+				.plan(snap.playerTile(), subGoal);
+			if (sub instanceof PlanResult.Success s)
+			{
+				log.debug("v21: pendingTransport walk → {} (dist={}, strict)",
+					t.objectTile(), dist);
+				walker.walkAlongStrict(s.tiles(), snap.playerTile());
+				return NavStatus.RUNNING;
+			}
+			if (sub instanceof PlanResult.BlockedEdge be)
+			{
+				return handleBlockedEdge(be, snap);
+			}
+			// NoCandidate / PlaneMismatch / BudgetExhausted at this scale
+			// — give up the pending, let the main tick replan.
+			log.warn("v21: cannot plan to pendingTransport {} (sub={}) — clearing",
+				t.objectTile(), sub.getClass().getSimpleName());
+			pendingTransport = null;
+			pendingEdgeKey = null;
+			return null;
+		}
+
+		// Within interaction range — click.
+		log.info("v21: pendingTransport dist={} — clicking verb={} at {}",
+			dist, t.verb(), t.objectTile());
+		attemptStickyClick(atHere, snap);
+		return NavStatus.RUNNING;
+	}
+
+	/** Five-rung plane-mismatch handler:
+	 *  <ol>
+	 *    <li>TransportRouter on known-edge graph.</li>
+	 *    <li>Next trail anchor on player's plane (in trail order).</li>
+	 *    <li>Trail-corridor tile on player's plane closest to next anchor /
+	 *        trail terminus.</li>
+	 *    <li>Planar projection of goal centroid on player plane.</li>
+	 *    <li>Typed FAILED — {@code NO_KNOWN_TRANSPORT_ROUTE_TO_GOAL}.</li>
+	 *  </ol> */
 	private NavStatus handlePlaneMismatch(V21Env.Snapshot snap) throws InterruptedException
 	{
 		diag.planeMismatchScanning(snap.playerTile());
 		Goal goal = activeGoal;
 		if (goal == null) return NavStatus.FAILED;
-		int planeDir = Integer.signum(goal.centroid().getPlane() - snap.plane());
+		String rk = routeKey();
 
-		// Scene-wide scan (32-tile radius) for the nearest staircase /
-		// trapdoor matching the direction of plane change. The previous
-		// 3×3-around-player scan only worked when the bot already stood
-		// on the staircase — useless from the bank floor.
-		BlockerCandidate climb = env.onClient(() ->
-			env.scanner().findClimbInScene(snap.playerTile(),
-				BlockerScanner.SCENE_SCAN_RADIUS, planeDir, snap.collision()));
-		// The reachability filter floods walkable tiles via canMove, but
-		// the staircase OBJECT'S tile is itself collision-blocked (a stair
-		// occupies its tile and you stand adjacent to interact). So even
-		// when the player can clearly walk up to the staircase, the
-		// staircase's own tile is never in the flood-fill set and the
-		// filtered scan misses it. Fall back to an unfiltered scan in
-		// both directions. The walk toward the found tile then hits a
-		// BlockedEdge → handleBlockedEdge opens any intervening door.
-		// Strict CLIMB_UP/DOWN_VERBS make this safe even for descending —
-		// trapdoors use "Open" / "Enter" which aren't in those sets.
-		if (climb == null && planeDir != 0)
+		// 1. TransportRouter on the known graph.
+		Predicate<TransportEdge> isEdgeBad = buildEdgeBlacklistPredicate(snap, goal, rk);
+		Optional<TransportCandidate> next = TransportRouter.findNext(
+			snap.playerTile(), goal.centroid(),
+			env.transports(), snap.collisionByPlane(),
+			this::findInSceneOnClient, isEdgeBad);
+		if (next.isPresent())
 		{
-			climb = env.onClient(() ->
-				env.scanner().findClimbInScene(snap.playerTile(),
-					BlockerScanner.SCENE_SCAN_RADIUS, planeDir, null));
-			if (climb != null)
+			TransportCandidate tc = next.get();
+			pendingTransport = tc.executable();
+			pendingEdgeKey = tc.edge().key();
+			log.info("v21.transport: chosen edge {} chain={} cost={}",
+				pendingEdgeKey, tc.chainLength(), tc.estimatedTotalCost());
+			NavStatus s = handlePendingTransport(pendingTransport, snap);
+			return (s != null) ? s : NavStatus.RUNNING;
+		}
+
+		// 2. Trail-guided same-plane progression toward the next anchor
+		//    in trail order whose approachTile is on the current plane.
+		if (trailGuide != null)
+		{
+			InteractionAnchor sameplane = nextAnchorOnCurrentPlane(
+				trailGuide, nextAnchorIndex, snap.plane());
+			if (sameplane != null)
 			{
-				log.info("v21: PLANE_MISMATCH unfiltered fallback — climb objectId={} verb={} at={}",
-					climb.objectId(), climb.verb(), climb.objectTile());
+				log.info("v21.fallback: walking toward next-anchor-on-plane idx-from={} "
+						+ "objectId={} approach={}",
+					nextAnchorIndex, sameplane.objectId(), sameplane.approachTile());
+				NavStatus s = walkTowardSubGoal(snap, sameplane.approachTile());
+				if (s != null) return s;
 			}
 		}
-		if (climb == null)
+
+		// 3. Trail-corridor fallback on player's plane.
+		if (trailGuide != null)
 		{
-			// No staircase / trapdoor in the current scene. Walk toward
-			// the goal's xy on the player's plane — the loaded scene
-			// only covers ~104 tiles, so we have to physically approach
-			// the building that contains the stairs (the bank's
-			// ground-floor entrance, in the pen→bank case). Next tick
-			// the new scene window will have the bank's stairs in
-			// range and Pass 1 will pick them.
-			WorldPoint planarTarget = new WorldPoint(
-				goal.centroid().getX(), goal.centroid().getY(), snap.plane());
-			log.info("v21: PLANE_MISMATCH no climb in scene (planeDir={}) — "
-				+ "walking toward planar target {}", planeDir, planarTarget);
-			Goal planarGoal = new Goal.Area(planarTarget, 1);
-			PlanResult planar = new StaticPlanner(snap.collision())
-				.plan(snap.playerTile(), planarGoal);
-			if (planar instanceof PlanResult.Success s)
+			WorldPoint corridorTarget = trailCorridorTargetOnCurrentPlane(
+				trailGuide, nextAnchorIndex, snap.playerTile(),
+				goal.centroid(), snap.collision());
+			if (corridorTarget != null)
 			{
-				walker.walkAlong(s.tiles(), snap.playerTile());
-				return NavStatus.RUNNING;
+				log.info("v21.fallback: walking toward corridor tile {}", corridorTarget);
+				NavStatus s = walkTowardSubGoal(snap, corridorTarget);
+				if (s != null) return s;
 			}
-			if (planar instanceof PlanResult.BlockedEdge be)
-			{
-				return handleBlockedEdge(be, snap);
-			}
-			log.warn("v21: cannot plan toward planar target {} from {} — yielding",
-				planarTarget, snap.playerTile());
-			return NavStatus.RUNNING;
 		}
 
-		int dist = Math.max(
-			Math.abs(snap.playerTile().getX() - climb.objectTile().getX()),
-			Math.abs(snap.playerTile().getY() - climb.objectTile().getY()));
+		// 4. Planar projection of goal centroid (last resort before
+		//    failure). Project the goal's xy onto the current plane.
+		WorldPoint planarTarget = new WorldPoint(
+			goal.centroid().getX(), goal.centroid().getY(), snap.plane());
+		log.info("v21.fallback: planar projection toward {}", planarTarget);
+		NavStatus s = walkTowardSubGoal(snap, planarTarget);
+		if (s != null) return s;
 
-		// Close enough to interact — click. Re-build the candidate with
-		// the current player tile so the blacklist key reflects where
-		// we actually attempted from.
-		if (dist <= 2)
+		// 5. Typed FAILED.
+		log.warn("v21: NO_KNOWN_TRANSPORT_ROUTE_TO_GOAL player={} goal={} routeKey={}",
+			snap.playerTile(), goal.centroid(), rk);
+		return NavStatus.FAILED;
+	}
+
+	/** Plan and walk one step toward an intermediate sub-goal. Returns
+	 *  RUNNING on a successful dispatch, null if the planner had no
+	 *  workable answer (caller falls through to the next rung). */
+	@Nullable
+	private NavStatus walkTowardSubGoal(V21Env.Snapshot snap, WorldPoint sub)
+		throws InterruptedException
+	{
+		PlanResult pr = new StaticPlanner(snap.collision())
+			.plan(snap.playerTile(), new Goal.Area(sub, 1));
+		if (pr instanceof PlanResult.Success ps)
 		{
-			BlockerCandidate atHere = new BlockerCandidate(
-				climb.object(), climb.verb(), snap.playerTile());
-			if (solver.isBlacklisted(atHere, snap.nowMs())) return NavStatus.RUNNING;
-			diag.blockerFound(snap.playerTile(), climb.objectTile(), atHere);
-			solver.attempt(atHere, snap.playerTile(), snap.nowMs());
+			walker.walkAlong(ps.tiles(), snap.playerTile());
 			return NavStatus.RUNNING;
 		}
-
-		// Walk toward the staircase — synthesize a sub-goal at its tile
-		// and run the planner. If the route to the staircase is itself
-		// blocked (e.g. closed bank door), recurse the BlockedEdge
-		// handler so the door gets opened on the way.
-		log.info("v21: PLANE_MISMATCH — walking toward climb objectId={} verb={} at={} (dist={})",
-			climb.objectId(), climb.verb(), climb.objectTile(), dist);
-		Goal subGoal = new Goal.Area(climb.objectTile(), 1);
-		PlanResult sub = new StaticPlanner(snap.collision()).plan(snap.playerTile(), subGoal);
-		if (sub instanceof PlanResult.Success s)
-		{
-			walker.walkAlong(s.tiles(), snap.playerTile());
-			return NavStatus.RUNNING;
-		}
-		if (sub instanceof PlanResult.BlockedEdge be)
+		if (pr instanceof PlanResult.BlockedEdge be)
 		{
 			return handleBlockedEdge(be, snap);
 		}
-		log.warn("v21: cannot plan to staircase {} from {} — yielding",
-			climb.objectTile(), snap.playerTile());
-		return NavStatus.RUNNING;
+		if (pr instanceof PlanResult.BudgetExhausted bx)
+		{
+			List<WorldPoint> path = bx.pathToBestVisited();
+			if (path != null && path.size() > 1
+				&& !path.get(path.size() - 1).equals(snap.playerTile()))
+			{
+				walker.walkAlong(path, snap.playerTile());
+				return NavStatus.RUNNING;
+			}
+		}
+		// PlanResult.NoCandidate, PlaneMismatch, or BudgetExhausted with
+		// no improvement — let the caller try the next fallback rung.
+		return null;
 	}
 
 	/** Adapt {@link NavRequest} into a {@link Goal}. Round-1 supports
@@ -449,6 +787,199 @@ public final class V21Navigator implements Navigator
 		return null;  // entity-only or trail-only — defer to round 2
 	}
 
+	// ─── helpers ────────────────────────────────────────────────────
+
+	/** The active request's trail name, or null when no trail is bound
+	 *  to this navigation. Used as the {@code routeKey} for goal-aware
+	 *  dead-end + skeleton entries. */
+	@Nullable
+	private String routeKey()
+	{
+		return (activeRequest != null) ? activeRequest.trailName() : null;
+	}
+
+	/** Marshal a scene lookup onto the client thread. The router /
+	 *  selector run on the worker thread; scanning the scene reads
+	 *  {@code Scene} which is client-thread only. */
+	@Nullable
+	private TileObject findInSceneOnClient(int objectId, WorldPoint near, int radius)
+	{
+		return env.onClient(() -> env.scanner().findObjectInScene(objectId, near, radius));
+	}
+
+	/** Capture pre-dispatch state and dispatch the click. Single capture
+	 *  site so the {@code pendingStart*} fields are guaranteed atomic
+	 *  with the dispatch — never overwritten on subsequent ticks until
+	 *  the solver outcome resolves. */
+	private void attemptStickyClick(BlockerCandidate b, V21Env.Snapshot snap)
+	{
+		pendingStartPlane = snap.plane();
+		pendingStartTile = snap.playerTile();
+		pendingStartedAtMs = snap.nowMs();
+		solver.attempt(b, snap.playerTile(), snap.nowMs());
+	}
+
+	/** True iff a sticky anchor click or a router-picked edge click is
+	 *  currently pending — used to gate the PROGRESSED handler's
+	 *  dead-end / skeleton signal so plain perimeter-exit progress
+	 *  doesn't write to the transport-only lanes. */
+	private boolean isAnchorOrEdgePending()
+	{
+		return activeAnchor != null || pendingEdgeKey != null;
+	}
+
+	/** Predicate the router and selectors use to skip edges. Short-term
+	 *  blacklisted edges (the solver's 20s TTL) and long-term goal-aware
+	 *  dead-end edges both return true. */
+	private Predicate<TransportEdge> buildEdgeBlacklistPredicate(
+		V21Env.Snapshot snap, Goal goal, @Nullable String rk)
+	{
+		final long nowMs = snap.nowMs();
+		final WorldPoint goalCentroid = goal.centroid();
+		return e ->
+		{
+			BlockerCandidate atHere = blockerForEdge(e, snap.playerTile());
+			if (atHere != null && solver.isBlacklisted(atHere, nowMs)) return true;
+			return env.deadEnds().isDeadEnd(
+				GoalDeadEndKey.fromEdge(rk, e, goalCentroid), nowMs);
+		};
+	}
+
+	/** Build a {@link BlockerCandidate} for the given edge by finding
+	 *  its in-scene object. Returns null when the object is not visible
+	 *  right now (legitimate when the scene doesn't cover the edge's
+	 *  fromTile). Caller treats null as "skip this edge for now." */
+	@Nullable
+	private BlockerCandidate blockerForEdge(TransportEdge e, WorldPoint playerTile)
+	{
+		TileObject obj = findInSceneOnClient(e.objectId(), e.fromTile(),
+			TransportRouter.SCENE_PROBE_RADIUS);
+		if (obj == null) return null;
+		return new BlockerCandidate(obj, e.verb(), playerTile);
+	}
+
+	/** Look up an edge matching {@code (approach tile, verb, objectId)}
+	 *  in the index. Returns the matched edge's {@link
+	 *  TransportEdge#key()} or null when none exists. Used by the
+	 *  PROGRESSED handler to identify which real edge an anchor click
+	 *  just exercised. */
+	@Nullable
+	private String findEdgeKeyByObjectAndApproach(TransportIndex idx,
+		int objectId, WorldPoint approach, String verb)
+	{
+		if (idx == null || approach == null || verb == null) return null;
+		for (TransportEdge e : idx.getOutgoing(approach))
+		{
+			if (e.objectId() == objectId && verb.equalsIgnoreCase(e.verb()))
+			{
+				return e.key();
+			}
+		}
+		return null;
+	}
+
+	/** Mark the just-fired transport as goal-aware dead-end. Builds the
+	 *  key from {@link #activeAnchor} when present (anchor-driven
+	 *  dispatch), otherwise from the edge identified by
+	 *  {@link #pendingEdgeKey} (router-driven). No-op when neither is
+	 *  available (shouldn't happen — caller gates on
+	 *  {@link #isAnchorOrEdgePending}). */
+	private void markDeadEndForFiredTransport(long nowMs, String reason)
+	{
+		WorldPoint goalCentroid = (activeGoal != null) ? activeGoal.centroid() : null;
+		if (goalCentroid == null) return;
+		String rk = routeKey();
+		if (activeAnchor != null)
+		{
+			env.deadEnds().markDeadEnd(
+				GoalDeadEndKey.fromAnchor(rk, activeAnchor, goalCentroid),
+				reason, nowMs);
+			log.info("v21.deadend: anchor objectId={} verb={} reason={}",
+				activeAnchor.objectId(), activeAnchor.verb(), reason);
+			return;
+		}
+		if (pendingEdgeKey != null)
+		{
+			TransportEdge e = env.transports().byKey(pendingEdgeKey);
+			if (e != null)
+			{
+				env.deadEnds().markDeadEnd(
+					GoalDeadEndKey.fromEdge(rk, e, goalCentroid),
+					reason, nowMs);
+				log.info("v21.deadend: edge {} reason={}", pendingEdgeKey, reason);
+			}
+		}
+	}
+
+	/** Iterate {@code anchors.subList(fromIndex, size)} and return the
+	 *  first anchor whose {@code approachTile.plane == plane}, or null
+	 *  if none. Used by the plane-mismatch fallback to walk toward the
+	 *  next reachable anchor on the current plane in trail order. */
+	@Nullable
+	private static InteractionAnchor nextAnchorOnCurrentPlane(TrailGuide g,
+		int fromIdx, int plane)
+	{
+		if (g == null) return null;
+		List<InteractionAnchor> all = g.anchors();
+		for (int i = fromIdx; i < all.size(); i++)
+		{
+			InteractionAnchor a = all.get(i);
+			if (a.approachTile().getPlane() == plane) return a;
+		}
+		return null;
+	}
+
+	/** Choose a corridor tile on the player's plane to walk toward when
+	 *  no anchor remains on this plane. Picks the tile closest to the
+	 *  next anchor's approachTile (or to the goal centroid if past the
+	 *  last anchor), subject to a {@code chebyshev(player, t) ≤ 32}
+	 *  practical-walk-range cap. Returns null if nothing reachable.
+	 *
+	 *  <p>Cost: O(N) corridor scan + a single BFS for the chosen tile. */
+	@Nullable
+	private static WorldPoint trailCorridorTargetOnCurrentPlane(TrailGuide g,
+		int fromIdx, WorldPoint player, WorldPoint goalCentroid, CollisionView col)
+	{
+		if (g == null || player == null) return null;
+		List<InteractionAnchor> anchors = g.anchors();
+		WorldPoint referenceTile;
+		if (fromIdx < anchors.size())
+		{
+			referenceTile = anchors.get(fromIdx).approachTile();
+		}
+		else
+		{
+			referenceTile = goalCentroid;
+		}
+		if (referenceTile == null) return null;
+
+		WorldPoint best = null;
+		int bestDistToRef = Integer.MAX_VALUE;
+		for (WorldPoint t : g.corridor())
+		{
+			if (t == null) continue;
+			if (t.getPlane() != player.getPlane()) continue;
+			if (t.equals(player)) continue;
+			int dPlayer = chebyshev(player, t);
+			if (dPlayer > 32) continue;
+			int dRef = chebyshev(t, referenceTile);
+			if (dRef < bestDistToRef)
+			{
+				bestDistToRef = dRef;
+				best = t;
+			}
+		}
+		if (best == null) return null;
+		PlanResult p = new StaticPlanner(col).plan(player, new Goal.Area(best, 1));
+		return (p instanceof PlanResult.Success) ? best : null;
+	}
+
+	private static int chebyshev(WorldPoint a, WorldPoint b)
+	{
+		return Math.max(Math.abs(a.getX() - b.getX()),
+			Math.abs(a.getY() - b.getY()));
+	}
+
 	@Override
 	public void cancel()
 	{
@@ -458,6 +989,17 @@ public final class V21Navigator implements Navigator
 		lastPlayerTile = null;
 		stallTicks = 0;
 		pendingExit = null;
+		pendingTransport = null;
+		pendingEdgeKey = null;
+		activeAnchor = null;
+		lastFiredEdge = null;
+		lastFiredAtMs = 0L;
+		pendingStartPlane = -1;
+		pendingStartTile = null;
+		pendingStartedAtMs = 0L;
+		trailGuide = null;
+		nextAnchorIndex = 0;
+		skeletonInProgress.clear();
 		solver.reset();
 	}
 

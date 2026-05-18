@@ -84,6 +84,16 @@ public final class TransportIndex
         return out;
     }
 
+    /** Look up an edge by its {@link TransportEdge#key()}. Returns null
+     *  when no edge is stored under that key — used by v21's PROGRESSED
+     *  handler to resolve a router-picked edge after the dispatch
+     *  succeeds. */
+    public TransportEdge byKey(String key)
+    {
+        if (key == null) return null;
+        return byKey.get(key);
+    }
+
     /** Replace all in-memory contents with the given edges — used by
      *  TransportIO when loading the persisted snapshot at plugin
      *  startup. Atomic: clears then bulk-inserts under the underlying
