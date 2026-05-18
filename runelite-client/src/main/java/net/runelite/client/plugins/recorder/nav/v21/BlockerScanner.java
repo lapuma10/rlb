@@ -142,7 +142,12 @@ public final class BlockerScanner
 	 *  <p>The {@link BlockerCandidate#interactionTile} is the object's
 	 *  own world tile — callers replace this with the player's current
 	 *  position before dispatching, so the blacklist key reflects the
-	 *  actual approach. */
+	 *  actual approach.
+	 *
+	 *  @deprecated v21 plane-mismatch no longer scans for nearby Climb verbs — see
+	 *              TrailGuide anchors + TransportRouter for destination-aware selection.
+	 */
+	@Deprecated
 	@Nullable
 	public BlockerCandidate findClimbInScene(WorldPoint center, int radius, int planeDir)
 	{
@@ -154,7 +159,12 @@ public final class BlockerScanner
 	 *  by {@code radius}) and rejects any candidate whose own tile is
 	 *  outside that flood. This is the fix for "scanner sees the
 	 *  trapdoor inside the hen-house" — the trapdoor is geometrically in
-	 *  range but separated from the bot by walls. */
+	 *  range but separated from the bot by walls.
+	 *
+	 *  @deprecated v21 plane-mismatch no longer scans for nearby Climb verbs — see
+	 *              TrailGuide anchors + TransportRouter for destination-aware selection.
+	 */
+	@Deprecated
 	@Nullable
 	public BlockerCandidate findClimbInScene(WorldPoint center, int radius, int planeDir,
 		@Nullable CollisionView collision)
