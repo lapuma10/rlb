@@ -27,9 +27,11 @@ import net.runelite.client.plugins.recorder.worldmap.TransportIndex;
  *  goal (same plane, BFS) or another edge's approach tile (chained
  *  multi-hop, depth-bounded). Same-plane segments use BFS when the
  *  relevant plane's collision view is loaded; if it isn't, the router
- *  falls back to Chebyshev. The first call that goes off-collision uses
- *  Chebyshev only as a last-resort estimator — provably-blocked tiles
- *  on a loaded plane return {@code +Infinity} and rule the edge out.
+ *  falls back to Chebyshev. Provably-blocked tiles on a loaded plane
+ *  return {@code +Infinity} and rule the edge out; a BFS that runs out
+ *  of expansion budget without proving either way falls back to
+ *  Chebyshev so the candidate isn't a false-negative skip — see
+ *  {@link #bfsOrChebyshev}.
  *
  *  <p>Pure compute. The scene lookup is injected as
  *  {@link SceneFinder} (same pattern as {@link AnchorSelector}); the
@@ -63,10 +65,26 @@ public final class TransportRouter
 	public static final int MAX_INTER_TRANSPORT_WALK = 64;
 
 	/** BFS expansion budget for the approach-reachability check and for
-	 *  same-plane segment-cost estimation. 1024 is enough for any
-	 *  scene-local reachability check; longer paths get rejected as
-	 *  "not router's job". */
-	public static final int BFS_BUDGET = 1024;
+	 *  same-plane segment-cost estimation. 8192 matches
+	 *  {@code StaticPlanner.MAX_EXPANSIONS} and covers Chebyshev distance
+	 *  up to ~45 in open 8-direction BFS ((2·45+1)² = 8281), comfortably
+	 *  handling the {@link #MAX_INTER_TRANSPORT_WALK} = 64 gate for
+	 *  realistic transport pairs. Walks beyond budget fall back to
+	 *  Chebyshev rather than being silently ruled out — see
+	 *  {@link #bfsOrChebyshev}. */
+	public static final int BFS_BUDGET = 8192;
+
+	/** Sentinel returned by {@link #bfsDistance} when the BFS queue
+	 *  empties without reaching the goal — the goal is provably
+	 *  unreachable on the given collision view. */
+	static final int BFS_UNREACHABLE = -1;
+
+	/** Sentinel returned by {@link #bfsDistance} when the BFS expansion
+	 *  budget is hit before the queue empties — reachability is unknown
+	 *  (the search may simply not have explored far enough). Callers
+	 *  should fall back to a less-informed estimate rather than ruling
+	 *  the goal out. */
+	static final int BFS_BUDGET_EXHAUSTED = -2;
 
 	/** Three-argument scene finder (same shape as
 	 *  {@link AnchorSelector.SceneFinder}). Returns null when the
@@ -117,7 +135,12 @@ public final class TransportRouter
 			// player-side tile by construction; sanity check anyway).
 			if (e.approachTile().getPlane() != playerTile.getPlane()) continue;
 			int walkCost = bfsDistance(playerTile, e.approachTile(), playerPlaneView, BFS_BUDGET);
-			if (walkCost == Integer.MAX_VALUE) continue;
+			// Skip on both provably-blocked AND budget-exhausted — the
+			// router won't click an approach it can't reason about. If
+			// the budget is being hit on a real approach, raise it; the
+			// fallback to Chebyshev only applies between transports, not
+			// to the player's own first hop.
+			if (walkCost < 0) continue;
 
 			// Forward cost: estimate the cost from the edge's destination
 			// to the goal, possibly through more transports.
@@ -191,14 +214,24 @@ public final class TransportRouter
 		return byPlane[plane];
 	}
 
-	/** Returns BFS distance in tiles, or {@code Integer.MAX_VALUE} if
-	 *  unreachable within {@code budget} expansions. Uses
-	 *  {@link SkretzoBfsKernel#canMove} so the router and the runtime
-	 *  walker apply the same step rule. */
+	/** Returns BFS distance in tiles, or one of the sentinels:
+	 *  <ul>
+	 *    <li>{@link #BFS_UNREACHABLE} — the BFS queue emptied without
+	 *        finding the goal; the goal is provably unreachable from
+	 *        {@code from} on this collision view.</li>
+	 *    <li>{@link #BFS_BUDGET_EXHAUSTED} — the expansion budget was
+	 *        hit before the queue emptied; reachability is unknown.</li>
+	 *  </ul>
+	 *  Uses {@link SkretzoBfsKernel#canMove} so the router and the runtime
+	 *  walker apply the same step rule. The {@code view == null} and
+	 *  cross-plane cases are caller-side bugs (the caller should check
+	 *  the view and plane first), so they collapse to
+	 *  {@link #BFS_UNREACHABLE} here; in practice {@link #bfsOrChebyshev}
+	 *  already guards both. */
 	static int bfsDistance(WorldPoint from, WorldPoint to, CollisionView view, int budget)
 	{
-		if (view == null) return Integer.MAX_VALUE;
-		if (from.getPlane() != to.getPlane()) return Integer.MAX_VALUE;
+		if (view == null) return BFS_UNREACHABLE;
+		if (from.getPlane() != to.getPlane()) return BFS_UNREACHABLE;
 		int sx = from.getX(), sy = from.getY();
 		int gx = to.getX(),  gy = to.getY();
 		int plane = from.getPlane();
@@ -216,7 +249,7 @@ public final class TransportRouter
 		};
 		while (!queue.isEmpty())
 		{
-			if (expanded++ >= budget) return Integer.MAX_VALUE;
+			if (expanded++ >= budget) return BFS_BUDGET_EXHAUSTED;
 			long[] head = queue.poll();
 			int x = (int) head[0], y = (int) head[1];
 			int d = dist.get(pack(x, y));
@@ -235,27 +268,41 @@ public final class TransportRouter
 				queue.add(new long[]{nx, ny});
 			}
 		}
-		return Integer.MAX_VALUE;
+		return BFS_UNREACHABLE;
 	}
 
-	/** Reachability-aware distance. When the view is loaded (non-null
-	 *  and not {@link LiveCollisionView#EMPTY}), runs BFS and returns
-	 *  {@code +Infinity} when the BFS proves unreachable (or exceeds
-	 *  budget — both equally mean "router can't reason past this"). When
-	 *  the view is unavailable, falls back to Chebyshev — the
-	 *  least-information estimate. */
-	private static double bfsOrChebyshev(WorldPoint a, WorldPoint b, CollisionView view)
+	/** Reachability-aware distance. Three branches:
+	 *  <ul>
+	 *    <li>View is null or {@link LiveCollisionView#EMPTY} → Chebyshev
+	 *        (we have no collision data, return the least-informed
+	 *        estimate).</li>
+	 *    <li>BFS returns a real distance (≥ 0) → return it directly.</li>
+	 *    <li>BFS returns {@link #BFS_UNREACHABLE} → return {@code
+	 *        +Infinity} so the router prunes the candidate.</li>
+	 *    <li>BFS returns {@link #BFS_BUDGET_EXHAUSTED} → fall back to
+	 *        Chebyshev. We cannot prove reachability either way, and
+	 *        silently ruling out the transport would be a false-negative.
+	 *        The Chebyshev estimate keeps the candidate in the running;
+	 *        the runtime walker (or the next router call after the view
+	 *        loads further) will discover the truth.</li>
+	 *  </ul> */
+	static double bfsOrChebyshev(WorldPoint a, WorldPoint b, CollisionView view)
 	{
 		if (view == null || view == LiveCollisionView.EMPTY)
 		{
 			return chebyshev(a, b);
 		}
 		int d = bfsDistance(a, b, view, BFS_BUDGET);
-		if (d == Integer.MAX_VALUE)
+		if (d >= 0)
 		{
-			return Double.POSITIVE_INFINITY;
+			return d;
 		}
-		return d;
+		if (d == BFS_BUDGET_EXHAUSTED)
+		{
+			return chebyshev(a, b);
+		}
+		// d == BFS_UNREACHABLE
+		return Double.POSITIVE_INFINITY;
 	}
 
 	static int chebyshev(WorldPoint a, WorldPoint b)

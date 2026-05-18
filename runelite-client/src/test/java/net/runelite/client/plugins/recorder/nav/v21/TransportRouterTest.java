@@ -232,10 +232,19 @@ public class TransportRouterTest
 	@Test
 	public void chainBlockedOnIntermediatePlaneIsRejected()
 	{
-		// Same shape as the prior test, but P1 has a wall around edgeB's
-		// approach so the forward-estimate's BFS from edgeA.toTile to
-		// edgeB.approachTile returns +Infinity. With no other route to
-		// the goal plane, the router returns empty.
+		// Same shape as the prior test, but P1 is fully blocked so the
+		// forward-estimate's BFS from edgeA.toTile to edgeB.approachTile
+		// has no walkable tile at all — the BFS queue empties immediately
+		// (no neighbor passes canMove from the start tile) and returns
+		// BFS_UNREACHABLE → +Infinity. With no other route to the goal
+		// plane, the router returns empty.
+		//
+		// (A localized wall around b1 in an otherwise-passable plane
+		// would NOT prove unreachable within budget — BFS would keep
+		// exploring the open space and hit the expansion cap, which the
+		// new sentinel logic correctly treats as "unknown" → Chebyshev
+		// fallback, NOT +Infinity. To exercise the provably-blocked
+		// branch we need a view where BFS provably empties its queue.)
 		WorldPoint player = new WorldPoint(3200, 3200, 0);
 		WorldPoint goal = new WorldPoint(3230, 3230, 2);
 		WorldPoint a0 = new WorldPoint(3205, 3205, 0);
@@ -244,11 +253,10 @@ public class TransportRouterTest
 		WorldPoint b2 = new WorldPoint(3215, 3210, 2);
 		TransportEdge edgeA = edge(STAIR_A, a0, a1);
 		TransportEdge edgeB = edge(STAIR_B, b1, b2);
-		// P1 blocked around edgeB's approach so chain can't bridge.
-		CollisionView p1Wall = wallAround(b1);
+		// P1 fully blocked → BFS proves unreachable (queue empties).
 		Optional<TransportCandidate> result = TransportRouter.findNext(
 			player, goal, indexOf(edgeA, edgeB),
-			planes(null, p1Wall, null, null),
+			planes(null, blocked(), null, null),
 			sceneWith(STAIR_A, STAIR_B),
 			noBlacklist());
 		assertFalse("chain whose P1 segment is BFS-blocked must be rejected",
@@ -317,5 +325,120 @@ public class TransportRouterTest
 			sceneWith(),
 			noBlacklist());
 		assertFalse(result.isPresent());
+	}
+
+	// --- bfsDistance / bfsOrChebyshev sentinel behaviour ---------------
+	//
+	// These exercise the underlying primitives directly (both are
+	// package-private). The sentinels distinguish "provably unreachable"
+	// (queue emptied) from "budget exhausted" (cap hit before queue
+	// empties); bfsOrChebyshev maps the former to +Infinity (prune) and
+	// the latter to Chebyshev (don't false-negative skip the candidate).
+
+	@Test
+	public void bfsDistanceReachableReturnsDistance()
+	{
+		WorldPoint from = new WorldPoint(3200, 3200, 0);
+		WorldPoint to = new WorldPoint(3205, 3205, 0);  // Chebyshev 5
+		int d = TransportRouter.bfsDistance(from, to, passable(), TransportRouter.BFS_BUDGET);
+		assertEquals("BFS in passable view returns true distance", 5, d);
+	}
+
+	@Test
+	public void bfsDistanceFullyBlockedReturnsUnreachableSentinel()
+	{
+		// Whole plane is blocked → BFS from start has no valid neighbour;
+		// queue empties on the first poll → BFS_UNREACHABLE.
+		WorldPoint from = new WorldPoint(3200, 3200, 0);
+		WorldPoint to = new WorldPoint(3205, 3205, 0);
+		int d = TransportRouter.bfsDistance(from, to, blocked(), TransportRouter.BFS_BUDGET);
+		assertEquals("queue empties without reach → BFS_UNREACHABLE (-1)",
+			TransportRouter.BFS_UNREACHABLE, d);
+	}
+
+	@Test
+	public void bfsDistanceBudgetExhaustedReturnsExhaustedSentinel()
+	{
+		// Passable view, but goal far beyond budget. With a tiny budget
+		// of 4, BFS pops <= 4 cells from the queue and bails before
+		// reaching anything > a couple tiles away.
+		WorldPoint from = new WorldPoint(3200, 3200, 0);
+		WorldPoint to = new WorldPoint(3300, 3300, 0);  // Chebyshev 100
+		int d = TransportRouter.bfsDistance(from, to, passable(), 4);
+		assertEquals("budget hit before queue empties → BFS_BUDGET_EXHAUSTED (-2)",
+			TransportRouter.BFS_BUDGET_EXHAUSTED, d);
+	}
+
+	@Test
+	public void bfsOrChebyshevPassableViewReturnsBfsDistance()
+	{
+		WorldPoint a = new WorldPoint(3200, 3200, 0);
+		WorldPoint b = new WorldPoint(3205, 3205, 0);
+		double v = TransportRouter.bfsOrChebyshev(a, b, passable());
+		assertEquals("passable BFS reach → returns the BFS distance",
+			5.0, v, 0.0);
+	}
+
+	@Test
+	public void bfsOrChebyshevBlockedReturnsInfinity()
+	{
+		WorldPoint a = new WorldPoint(3200, 3200, 0);
+		WorldPoint b = new WorldPoint(3205, 3205, 0);
+		double v = TransportRouter.bfsOrChebyshev(a, b, blocked());
+		assertTrue("fully-blocked view → +Infinity (prune the edge)",
+			Double.isInfinite(v) && v > 0);
+	}
+
+	@Test
+	public void bfsOrChebyshevBudgetExhaustedFallsBackToChebyshev()
+	{
+		// Goal at Chebyshev 100 on a passable plane is well beyond
+		// BFS_BUDGET=8192 (which covers ~Chebyshev 45). Confirm
+		// bfsOrChebyshev returns the Chebyshev estimate, NOT +Infinity.
+		// This is the policy change: a BFS that runs out of expansion
+		// budget must not false-negative skip the transport.
+		WorldPoint a = new WorldPoint(3200, 3200, 0);
+		WorldPoint b = new WorldPoint(3300, 3300, 0);  // Chebyshev 100
+		double v = TransportRouter.bfsOrChebyshev(a, b, passable());
+		assertFalse("budget exhausted must NOT collapse to +Infinity",
+			Double.isInfinite(v));
+		assertEquals("budget exhausted → Chebyshev fallback (100)",
+			100.0, v, 0.0);
+	}
+
+	@Test
+	public void budgetExhaustedFallsBackToChebyshev()
+	{
+		// End-to-end sanity check through findNext: place the second
+		// hop's approach at a Chebyshev distance that exceeds BFS_BUDGET
+		// reach (~45) but stays within MAX_INTER_TRANSPORT_WALK (=64).
+		// On the previous code path (no sentinel distinction) BFS would
+		// return Integer.MAX_VALUE → +Infinity, the chain would be
+		// pruned, and the router would return empty. With the new policy
+		// budget-exhausted falls back to Chebyshev, the chain stays
+		// alive, and the router returns the immediate hop.
+		//
+		// Player P0, goal P2. edgeA P0→P1, edgeB P1→P2. On P1, a1 is
+		// ~60 tiles from b1 — Chebyshev = 60 (< MAX_INTER_TRANSPORT_WALK
+		// = 64) but BFS in an open plane can't enumerate that far within
+		// BFS_BUDGET = 8192 (would need ~(2*60+1)^2 = 14641 expansions).
+		WorldPoint player = new WorldPoint(3200, 3200, 0);
+		WorldPoint goal = new WorldPoint(3270, 3270, 2);
+		WorldPoint a0 = new WorldPoint(3205, 3205, 0);   // edgeA from
+		WorldPoint a1 = new WorldPoint(3206, 3205, 1);   // edgeA to
+		WorldPoint b1 = new WorldPoint(3266, 3265, 1);   // edgeB from (~60 from a1)
+		WorldPoint b2 = new WorldPoint(3266, 3265, 2);   // edgeB to
+		TransportEdge edgeA = edge(STAIR_A, a0, a1);
+		TransportEdge edgeB = edge(STAIR_B, b1, b2);
+		Optional<TransportCandidate> result = TransportRouter.findNext(
+			player, goal, indexOf(edgeA, edgeB),
+			planes(null, null, null, null),
+			sceneWith(STAIR_A, STAIR_B),
+			noBlacklist());
+		assertTrue("budget-exhausted inter-transport walk must NOT silently"
+				+ " prune the chain — Chebyshev fallback keeps it alive",
+			result.isPresent());
+		assertEquals("router picks the immediate hop edgeA",
+			edgeA.key(), result.get().edge().key());
 	}
 }
