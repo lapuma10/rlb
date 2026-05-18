@@ -13,36 +13,38 @@ import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertNotEquals;
 import static org.junit.Assert.assertTrue;
 
-/** Pen-route regression — pins the topological-honesty behaviour of
- *  the collision-aware Dijkstra against REAL bundled Skretzo data.
+/** Pen-route regression — pins the bank→pen route works end-to-end
+ *  via collision-aware Dijkstra + cow-pen gate transport override.
  *
- *  <p>The route bank→pen on plane 0 (stair-bottom (3205, 3228) →
- *  chicken pen (3235, 3295)) genuinely has NO bridging transport in
- *  Skretzo's bundled data: the cow-pen / chicken-pen fence at y≈3263
- *  partitions the Lumbridge town component from the pen-area
- *  component, and the existing transports.tsv has no gate entries
- *  there. Adding the missing gate transports is a follow-up task
- *  (the data fix), separate from the Dijkstra-logic fix tested here.
+ *  <p>The route bank→pen crosses TWO collision-bound boundaries in
+ *  static Skretzo data:
+ *  <ol>
+ *    <li>The Lumbridge town ↔ farm-area fence at y≈3263 — bridged by
+ *        the cow-pen south gate (object 1559) at
+ *        (3251, 3263)↔(3251, 3264). The gate is normally already open
+ *        in-game; the override entry exists so the planner knows
+ *        the opening is passable.</li>
+ *    <li>The chicken pen south fence at y≈3295 — bridged by the
+ *        chicken pen south gate (object 1560) at
+ *        (3236, 3295)↔(3236, 3296).</li>
+ *  </ol>
  *
- *  <p>What this regression pins:
+ *  <p>This test pins:
  *  <ul>
- *    <li><b>Without components</b>: Dijkstra optimistically returns OK
- *        with a direct walk — the pre-2026-05-17 lie that BFS later
- *        had to invalidate. Status was wrong; the route was bogus.</li>
- *    <li><b>With components</b>: Dijkstra correctly returns UNREACHABLE
- *        immediately. No bogus skeleton handed downstream, no BFS
- *        round-trip on a path that can't exist. Honest topology.</li>
- *  </ul>
- *
- *  <p>Once the missing cow-pen gate transports are added to
- *  transports-overrides.tsv, this test will start failing on the
- *  "with components" branch (because the route will succeed). At that
- *  point: update the test to assert OK + the gate transport in the
- *  skeleton. */
+ *    <li><b>With components</b>: Dijkstra returns OK and the skeleton
+ *        uses the cow-pen gate transport to cross the fence.</li>
+ *    <li><b>Without components</b>: Dijkstra picks the abstract-cheaper
+ *        direct walk (zero transports) — captured as a regression
+ *        guard against silently reverting to pre-fix behaviour.</li>
+ *  </ul> */
 public class LinkGraphDijkstraPenRouteRegressionTest
 {
     private static final WorldPoint STAIR_BOTTOM = new WorldPoint(3205, 3228, 0);
     private static final WorldPoint PEN_TARGET = new WorldPoint(3235, 3295, 0);
+
+    /** Cow-pen south gate (object 1559) — bridges town ↔ farm-area
+     *  components per transports-overrides.tsv. */
+    private static final int COW_PEN_GATE_OBJECT_ID = 1559;
 
     private static NavigationContext anyCtx()
     {
@@ -58,33 +60,39 @@ public class LinkGraphDijkstraPenRouteRegressionTest
     }
 
     @Test
-    public void penRoute_withComponents_returnsUnreachable_honestly()
+    public void penRoute_withComponents_routesViaCowPenGate()
     {
         GlobalCollisionSnapshot snap = GlobalCollisionSnapshot.fromBundledResource();
         ConnectivityComponents components = ConnectivityComponents.fromSnapshot(snap);
         TransportTable table = TransportTable.loadDefaults();
 
         // Precondition: stair-bottom and pen-target are in different
-        // components. If this ever changes (e.g. data update), the
-        // test premise is gone and someone should re-examine.
+        // components. The cow-pen gate transport in the override TSV
+        // bridges them.
         int outsideId = components.componentOf(STAIR_BOTTOM);
         int insideId  = components.componentOf(PEN_TARGET);
         assertTrue("stair-bottom walkable", outsideId >= 0);
         assertTrue("pen target walkable", insideId >= 0);
         assertNotEquals(
-            "premise: stair-bottom and pen target are in different components",
+            "premise: stair-bottom (town) and pen target (farm area) are in different components",
             outsideId, insideId);
 
         LinkGraphDijkstra.SkeletonResult r = LinkGraphDijkstra.findRouteSkeleton(
             anyCtx(), table, STAIR_BOTTOM, PEN_TARGET, components);
 
-        // The honest answer: there is no walkable + transport route.
-        // The override pen-gate (1560) has BOTH endpoints inside the
-        // pen-area component, so it doesn't bridge. No other transport
-        // crosses the cow-pen fence in current Skretzo data.
         assertEquals(
-            "with components, Dijkstra is honest — UNREACHABLE when no bridging transport exists",
-            LinkGraphDijkstra.Status.UNREACHABLE, r.status());
+            "with components AND the cow-pen gate override, Dijkstra finds a valid route",
+            LinkGraphDijkstra.Status.OK, r.status());
+
+        boolean usesCowPenGate = r.nodes().stream()
+            .filter(n -> n.kind() == LinkGraphDijkstra.NodeKind.TRANSPORT)
+            .anyMatch(n -> n.transport() != null
+                && n.transport().objectId().isPresent()
+                && n.transport().objectId().get() == COW_PEN_GATE_OBJECT_ID);
+        assertTrue(
+            "skeleton must include the cow-pen south gate (object 1559) — it's the only "
+                + "bridge across the town↔farm-area component boundary",
+            usesCowPenGate);
     }
 
     @Test
