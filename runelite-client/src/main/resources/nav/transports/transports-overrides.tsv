@@ -24,3 +24,25 @@
 # gate above).
 3251 3263 0	3251 3264 0	Open Gate 1559						1
 3251 3264 0	3251 3263 0	Open Gate 1559						1
+
+# Draynor Manor — p=2 door (object 11470) between the SW spiral-staircase
+# landing room and the larger upstairs area where Professor Oddenstein
+# paces. Without this entry, V2's BFS partitions the SW room from the
+# rest of p=2, so the planner refuses any p=1 → p=2 climb whose final
+# leg ends at Oddenstein (TARGET_UNREACHABLE at the post-climb BFS).
+# Anchor tile (3108, 3364, p=2) from the click inspector; west-edge
+# orientation (passage between x=3107 and x=3108) confirmed by N-edge
+# attempt failing with same BFS leg unreachable.
+3107 3364 2	3108 3364 2	Open Door 11470						1
+3108 3364 2	3107 3364 2	Open Door 11470						1
+
+# Draynor Manor — p=1 doors along the path from the south-staircase
+# landing to the fish-food room (3109, 3357, p=1). Three door instances
+# read from the click inspector during the manor walkthrough; same
+# north-edge orientation assumption as the p=2 entry above.
+3116 3361 1	3116 3362 1	Open Door 11470						1
+3116 3362 1	3116 3361 1	Open Door 11470						1
+3113 3367 1	3113 3368 1	Open Door 11471						1
+3113 3368 1	3113 3367 1	Open Door 11471						1
+3110 3358 1	3110 3359 1	Open Door 11471						1
+3110 3359 1	3110 3358 1	Open Door 11471						1

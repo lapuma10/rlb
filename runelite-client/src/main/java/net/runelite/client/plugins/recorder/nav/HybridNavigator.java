@@ -39,6 +39,11 @@ public final class HybridNavigator implements Navigator
 
     private final Navigator v1;
     @Nullable private final Navigator v2;
+    /** v2.1 reactive walker (own implementation; not a v2 variant).
+     *  Null when the plugin hasn't wired it (test fixtures, older
+     *  scripts) — selecting V2_1_REACTIVE with v21 == null falls back
+     *  to V1, mirroring how v2 == null degrades V2 modes. */
+    @Nullable private final Navigator v21;
     private final Supplier<NavigatorMode> modeSupplier;
 
     @Nullable private NavRequest activeRequest;
@@ -52,10 +57,17 @@ public final class HybridNavigator implements Navigator
 
     public HybridNavigator(Navigator v1, @Nullable Navigator v2, Supplier<NavigatorMode> modeSupplier)
     {
+        this(v1, v2, null, modeSupplier);
+    }
+
+    public HybridNavigator(Navigator v1, @Nullable Navigator v2, @Nullable Navigator v21,
+                           Supplier<NavigatorMode> modeSupplier)
+    {
         if (v1 == null) throw new IllegalArgumentException("V1 navigator is required");
         if (modeSupplier == null) throw new IllegalArgumentException("modeSupplier is required");
         this.v1 = v1;
         this.v2 = v2;
+        this.v21 = v21;
         this.modeSupplier = modeSupplier;
     }
 
@@ -84,10 +96,38 @@ public final class HybridNavigator implements Navigator
                 return runV1(request);
             case V2_STRICT:
                 return runV2Strict(request);
+            case V2_1_REACTIVE:
+                return runV21(request);
             case V2_WITH_V1_FALLBACK:
             default:
                 return runV2WithFallback(request);
         }
+    }
+
+    private NavStatus runV21(NavRequest request) throws InterruptedException
+    {
+        if (v21 == null)
+        {
+            log.warn("hybrid: V2_1_REACTIVE selected but v21 unavailable — falling back to V1");
+            activeHandler = v1;
+            return v1.tick(request);
+        }
+        if (activeHandler == null)
+        {
+            log.info("hybrid: V2_1_REACTIVE → handler=reactive-v21 request={}", request);
+        }
+        activeHandler = v21;
+        NavStatus s = v21.tick(request);
+        if (s == NavStatus.FAILED)
+        {
+            log.warn("hybrid: V2_1_REACTIVE FAILED for {} — see nav-v21 logs for the typed reason",
+                request);
+        }
+        else
+        {
+            logTerminal("V2_1_REACTIVE", "reactive-v21", s);
+        }
+        return s;
     }
 
     private NavStatus runV1(NavRequest request) throws InterruptedException
@@ -217,6 +257,10 @@ public final class HybridNavigator implements Navigator
         if (v2 != null)
         {
             try { v2.cancel(); } catch (Throwable th) { log.debug("v2 cancel threw", th); }
+        }
+        if (v21 != null)
+        {
+            try { v21.cancel(); } catch (Throwable th) { log.debug("v21 cancel threw", th); }
         }
     }
 

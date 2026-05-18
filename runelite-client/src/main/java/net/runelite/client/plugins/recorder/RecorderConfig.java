@@ -286,7 +286,12 @@ public interface RecorderConfig extends Config
 	{
 		V1_ONLY,
 		V2_WITH_V1_FALLBACK,
-		V2_STRICT
+		V2_STRICT,
+		/** v2.1 reactive walker. Plans → acts → replans every tick;
+		 *  doors/gates/stairs are runtime problems found via live scene
+		 *  scan, not pre-validated data. The explicit replacement for
+		 *  v2's plan-then-prove failure mode. */
+		V2_1_REACTIVE
 	}
 
 	@ConfigItem(
@@ -330,7 +335,9 @@ public interface RecorderConfig extends Config
 		description = "How HybridNavigator dispatches requests. V1_ONLY = "
 			+ "TrailWalker only (default, safe). V2_WITH_V1_FALLBACK = try "
 			+ "V2 first, fall back to V1 if V2 fails for any reason. "
-			+ "V2_STRICT = V2 only, fail clearly if V2 can't satisfy.",
+			+ "V2_STRICT = V2 only, fail clearly if V2 can't satisfy. "
+			+ "V2_1_REACTIVE = experimental reactive walker (plan → act → "
+			+ "replan each tick, scans live scene for doors/stairs).",
 		section = experimentalSection,
 		position = 2
 	)

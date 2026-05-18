@@ -27,23 +27,43 @@ public final class NavigatorFactory
 
     /** Production constructor — builds {@link TrailNavigator} from the
      *  walker + registry; binds the externally-built {@code v2} as the
-     *  V2 instance. */
+     *  V2 instance. v2.1 defaults to null (older call sites). */
     public NavigatorFactory(RecorderConfig config,
                             TrailWalker walker,
                             TrailRegistry registry,
                             @Nullable V2Navigator v2)
     {
-        this(config, new TrailNavigator(walker, registry), v2);
+        this(config, walker, registry, v2, null);
+    }
+
+    /** Production ctor including v2.1. Pass the reactive Navigator
+     *  instance built by {@code RecorderPlugin.buildV21Navigator}; null
+     *  means "v2.1 mode falls back to V1". */
+    public NavigatorFactory(RecorderConfig config,
+                            TrailWalker walker,
+                            TrailRegistry registry,
+                            @Nullable V2Navigator v2,
+                            @Nullable Navigator v21)
+    {
+        this(config, new TrailNavigator(walker, registry), v2, v21);
     }
 
     /** Test-friendly ctor — bind both Navigators directly. */
     public NavigatorFactory(RecorderConfig config, Navigator trailV1, @Nullable Navigator worldmapV2)
     {
-        this.hybrid = new HybridNavigator(trailV1, worldmapV2, config::navigatorMode);
+        this(config, trailV1, worldmapV2, null);
+    }
+
+    /** Test-friendly ctor — bind all three Navigators directly. */
+    public NavigatorFactory(RecorderConfig config, Navigator trailV1,
+                            @Nullable Navigator worldmapV2,
+                            @Nullable Navigator reactiveV21)
+    {
+        this.hybrid = new HybridNavigator(trailV1, worldmapV2, reactiveV21, config::navigatorMode);
     }
 
     /** Legacy 2-arg test ctor for sites that haven't built V2 yet.
-     *  V2 selection there falls back to V1. */
+     *  V2 / V2.1 selection there falls back to V1. */
     public NavigatorFactory(RecorderConfig config, Navigator trailV1)
     {
         this(config, trailV1, (Navigator) null);

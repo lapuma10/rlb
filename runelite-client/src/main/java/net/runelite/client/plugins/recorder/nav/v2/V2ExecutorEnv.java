@@ -286,6 +286,24 @@ public final class V2ExecutorEnv implements V2Executor.Env
     }
 
     @Override
+    public void rotateCameraToward(WorldPoint target, boolean force)
+    {
+        if (target == null) return;
+        try
+        {
+            dispatcher.rotateCameraToward(target, force);
+        }
+        catch (InterruptedException ie)
+        {
+            Thread.currentThread().interrupt();
+        }
+        catch (Throwable th)
+        {
+            log.debug("v2-executor-env: rotateCameraToward threw", th);
+        }
+    }
+
+    @Override
     public boolean dynamicEntityOnTile(WorldPoint tile)
     {
         if (tile == null) return false;
