@@ -448,8 +448,9 @@ public final class BlockerScanner
 	 *
 	 *  <p>Used by the v21 anchor selector + transport router to confirm
 	 *  that a recorded transport's object is currently visible before
-	 *  attempting to dispatch a click. Returns the first match found, or
-	 *  null when nothing matches.
+	 *  attempting to dispatch a click. Returns the first match in
+	 *  row-major (S→N, then W→E) scan order — NOT necessarily the
+	 *  closest to {@code near}. Returns null when nothing matches.
 	 *
 	 *  <p>Threading: reads {@code Scene}, must be called on the client
 	 *  thread (the navigator marshals via {@link V21Env#onClient}).

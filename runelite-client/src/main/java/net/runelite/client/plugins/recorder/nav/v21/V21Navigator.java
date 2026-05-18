@@ -109,7 +109,10 @@ public final class V21Navigator implements Navigator
 	 *  PROGRESSED branch tells us what the world looked like BEFORE we
 	 *  clicked, so we can detect plane changes correctly. */
 	private int pendingStartPlane = -1;
+	/** Captured at dispatch alongside pendingStartPlane. Currently unread —
+	 *  reserved for future dead-end attribution / timing diagnostics. */
 	@Nullable private WorldPoint pendingStartTile;
+	/** See {@link #pendingStartTile}. */
 	private long pendingStartedAtMs;
 	/** Ordered edge keys of transports successfully fired during the
 	 *  current navigation request. Written to a {@link RouteSkeleton}
@@ -275,11 +278,13 @@ public final class V21Navigator implements Navigator
 				if (activeAnchor != null) nextAnchorIndex++;
 				activeAnchor = null;
 				pendingTransport = null;
+				pendingExit = null;
 				pendingEdgeKey = null;
 				lastFiredEdge = fired;
 				lastFiredAtMs = snap.nowMs();
 				pendingStartPlane = -1;
 				pendingStartTile = null;
+				pendingStartedAtMs = 0L;
 			}
 			else
 			{
@@ -291,6 +296,7 @@ public final class V21Navigator implements Navigator
 				pendingEdgeKey = null;
 				pendingStartPlane = -1;
 				pendingStartTile = null;
+				pendingStartedAtMs = 0L;
 			}
 		}
 		else if (out == ReactiveSolver.Outcome.FAILED)
@@ -304,6 +310,7 @@ public final class V21Navigator implements Navigator
 			pendingEdgeKey = null;
 			pendingStartPlane = -1;
 			pendingStartTile = null;
+			pendingStartedAtMs = 0L;
 		}
 
 		// Progress accounting.
