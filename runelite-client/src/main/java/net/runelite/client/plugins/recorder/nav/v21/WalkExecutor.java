@@ -23,13 +23,17 @@ import org.slf4j.LoggerFactory;
  *  always-calling it is cheap on short walks and load-bearing on
  *  long ones.
  *
- *  <p>Uses {@code strictWalk = true} so the dispatcher rejects the
- *  click when canvas hover resolves to a non-Walk target (NPC, game
- *  object, Cancel). Without this, the minimap fallback fires
- *  unconditionally, producing "Attack Chicken" → minimap clicks that
- *  walk the bot in the wrong direction. Camera rotation before
- *  dispatch already brings far targets on-screen; skipping a tick
- *  when resolution still fails is safe — the navigator replans. */
+ *  <p>Two strict-mode variants exist. {@link #walkAlong} dispatches a
+ *  non-strict walk: every tile in {@code path} is BFS-validated, so if
+ *  the hover happens to resolve to "Attack Chicken" on top of the
+ *  target tile, the dispatcher's minimap fallback is an acceptable
+ *  rescue — we still end up walking the BFS-correct route.
+ *  {@link #walkAlongStrict} dispatches a strict walk: when the hover
+ *  isn't WALK, the dispatcher refuses to fall back to the minimap.
+ *  This is required for transport-approach final walks where the
+ *  caller needs to stand on a specific source tile to interact with
+ *  the transport — a minimap fallback could route us to an adjacent
+ *  walkable tile instead and the verb click then fails. */
 public final class WalkExecutor
 {
 	private static final Logger log = LoggerFactory.getLogger(WalkExecutor.class);
@@ -55,34 +59,68 @@ public final class WalkExecutor
 		this.rng = rng;
 	}
 
-	/** Walk one step along {@code path} starting from {@code from}. Picks
-	 *  a tile {@code MIN_LOOKAHEAD..MAX_LOOKAHEAD} ahead of {@code from}
-	 *  in the path, capped at the last tile. Returns true if a click
-	 *  was dispatched. */
-	public boolean walkAlong(List<WorldPoint> path, WorldPoint from) throws InterruptedException
+	/** Walk one step along {@code path} starting from {@code playerNow}.
+	 *  Picks a tile {@code MIN_LOOKAHEAD..MAX_LOOKAHEAD} ahead of
+	 *  {@code playerNow} in the path, capped at the last tile. Returns
+	 *  true if a click was dispatched.
+	 *
+	 *  <p>Non-strict — the dispatcher may fall back to the minimap when
+	 *  the canvas hover isn't WALK. Safe because every tile in
+	 *  {@code path} is BFS-validated, so a minimap rescue still routes
+	 *  the player along a correct corridor. */
+	public boolean walkAlong(List<WorldPoint> path, WorldPoint playerNow) throws InterruptedException
 	{
-		if (path == null || path.isEmpty()) return false;
-		if (dispatcher.isBusy()) return false;
-		int startIdx = 0;
-		for (int i = 0; i < path.size(); i++)
+		if (path == null || path.isEmpty() || !path.get(0).equals(playerNow))
 		{
-			if (path.get(i).equals(from)) { startIdx = i; break; }
+			log.warn("v21.walk: stale path — first tile {} != playerNow {}",
+				path == null || path.isEmpty() ? null : path.get(0), playerNow);
+			return false;
 		}
-		int lookahead = MIN_LOOKAHEAD + rng.nextInt(MAX_LOOKAHEAD - MIN_LOOKAHEAD + 1);
-		int targetIdx = Math.min(startIdx + lookahead, path.size() - 1);
-		return dispatchWalk(path.get(targetIdx), from);
+		if (dispatcher.isBusy()) return false;
+		WorldPoint target = pickLookahead(path);
+		return dispatchWalk(target, playerNow, false);
+	}
+
+	/** Strict variant of {@link #walkAlong}. The dispatched walk refuses
+	 *  to fall back to the minimap when the canvas hover isn't WALK —
+	 *  used for transport-approach final walks where we must end up on
+	 *  a specific source tile to interact with the transport object. */
+	public boolean walkAlongStrict(List<WorldPoint> path, WorldPoint playerNow) throws InterruptedException
+	{
+		if (path == null || path.isEmpty() || !path.get(0).equals(playerNow))
+		{
+			log.warn("v21.walk: stale path — first tile {} != playerNow {}",
+				path == null || path.isEmpty() ? null : path.get(0), playerNow);
+			return false;
+		}
+		if (dispatcher.isBusy()) return false;
+		WorldPoint target = pickLookahead(path);
+		return dispatchWalk(target, playerNow, true);
 	}
 
 	/** Walk directly to a specific tile. Used when we need to get to a
-	 *  blocker's source side before interacting. */
+	 *  blocker's source side before interacting.
+	 *
+	 *  @deprecated v21 dispatches walks only through walkAlong /
+	 *  walkAlongStrict with a BFS-validated path. Any new call site
+	 *  must opt into bypassing path validation — prefer constructing a
+	 *  path with StaticPlanner first. */
+	@Deprecated
 	public boolean walkTo(WorldPoint tile, WorldPoint from) throws InterruptedException
 	{
 		if (tile == null) return false;
 		if (dispatcher.isBusy()) return false;
-		return dispatchWalk(tile, from);
+		return dispatchWalk(tile, from, true);
 	}
 
-	private boolean dispatchWalk(WorldPoint tile, WorldPoint from) throws InterruptedException
+	private WorldPoint pickLookahead(List<WorldPoint> path)
+	{
+		int lookahead = MIN_LOOKAHEAD + rng.nextInt(MAX_LOOKAHEAD - MIN_LOOKAHEAD + 1);
+		int targetIdx = Math.min(lookahead, path.size() - 1);
+		return path.get(targetIdx);
+	}
+
+	private boolean dispatchWalk(WorldPoint tile, WorldPoint from, boolean strict) throws InterruptedException
 	{
 		int dist = Math.max(Math.abs(tile.getX() - from.getX()),
 			Math.abs(tile.getY() - from.getY()));
@@ -98,12 +136,12 @@ public final class WalkExecutor
 			log.debug("v21.walk: rotate camera toward {} (dist={})", tile, dist);
 			dispatcher.rotateCameraToward(tile);
 		}
-		log.debug("v21.walk: dispatch {} (dist={})", tile, dist);
+		log.debug("v21.walk: dispatch {} (dist={}, strict={})", tile, dist, strict);
 		ActionRequest req = ActionRequest.builder()
 			.kind(ActionRequest.Kind.WALK)
 			.channel(ActionRequest.Channel.MOUSE)
 			.tile(tile)
-			.strictWalk(true)
+			.strictWalk(strict)
 			.build();
 		dispatcher.dispatch(req);
 		return true;
