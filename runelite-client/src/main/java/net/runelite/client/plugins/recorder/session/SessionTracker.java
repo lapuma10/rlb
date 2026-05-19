@@ -15,6 +15,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Timer;
 import java.util.TimerTask;
+import java.util.concurrent.CopyOnWriteArrayList;
 
 @Slf4j
 public class SessionTracker implements ScriptLifecycleListener {
@@ -22,10 +23,12 @@ public class SessionTracker implements ScriptLifecycleListener {
     private final ClientThread clientThread;
     private final SessionStore sessionStore;
 
+    private final Object lock = new Object();
     @Nullable private LoginSession currentLoginSession;
+    @Nullable private String currentAccountName;
     private final Map<String, ScriptRun> activeRuns = new HashMap<>();
     @Nullable private Timer periodicSaveTimer;
-    private final List<Runnable> sessionStateCallbacks = new ArrayList<>();
+    private final CopyOnWriteArrayList<Runnable> sessionStateCallbacks = new CopyOnWriteArrayList<>();
 
     public SessionTracker(Client client, ClientThread clientThread, SessionStore sessionStore) {
         this.client = client;
@@ -49,7 +52,16 @@ public class SessionTracker implements ScriptLifecycleListener {
 
     @Nullable
     public LoginSession getCurrentSession() {
-        return currentLoginSession;
+        synchronized (lock) {
+            return currentLoginSession;
+        }
+    }
+
+    @Nullable
+    public String getCurrentAccountName() {
+        synchronized (lock) {
+            return currentAccountName;
+        }
     }
 
     private String accountNameOrDefault() {
@@ -70,45 +82,66 @@ public class SessionTracker implements ScriptLifecycleListener {
     }
 
     private void onLogin() {
-        if (currentLoginSession != null) {
-            // Already tracking; LOGGED_IN can fire repeatedly during a session (region transitions etc.)
-            return;
+        boolean isNew;
+        String resolvedName;
+        synchronized (lock) {
+            if (currentLoginSession != null) {
+                // Already tracking; LOGGED_IN can fire repeatedly during a session (region transitions etc.)
+                return;
+            }
+            resolvedName = accountNameOrDefault();
+            currentAccountName = resolvedName;
+            long loginTime = System.currentTimeMillis();
+            String sessionId = String.valueOf(loginTime);
+            currentLoginSession = new LoginSession(sessionId, loginTime, null, loginTime, new ArrayList<>());
+            isNew = true;
         }
-        long loginTime = System.currentTimeMillis();
-        String sessionId = String.valueOf(loginTime);
-        currentLoginSession = new LoginSession(sessionId, loginTime, null, loginTime, new ArrayList<>());
-        log.debug("Session started: {} at {}", accountNameOrDefault(), loginTime);
-        startPeriodicSaves();
-        notifyStateChanged();
+        // startPeriodicSaves and notifyStateChanged must run outside the lock
+        if (isNew) {
+            log.debug("Session started: {} at {}", resolvedName, System.currentTimeMillis());
+            startPeriodicSaves();
+            notifyStateChanged();
+        }
     }
 
     private void onLogout() {
-        if (currentLoginSession == null) {
-            return;
+        String accountName;
+        LoginSession sessionToSave;
+        synchronized (lock) {
+            if (currentLoginSession == null) {
+                return;
+            }
+            // Use the name captured at login; client.getUsername() returns "" at this point.
+            accountName = currentAccountName != null ? currentAccountName : "default";
+            long logoutTime = System.currentTimeMillis();
+
+            // finalizeAllActiveRuns mutates currentLoginSession and clears activeRuns; caller holds lock.
+            finalizeAllActiveRuns(logoutTime);
+
+            sessionToSave = new LoginSession(
+                currentLoginSession.sessionId(),
+                currentLoginSession.loginTime(),
+                logoutTime,
+                logoutTime,
+                currentLoginSession.runs()
+            );
         }
-        long logoutTime = System.currentTimeMillis();
-        String accountName = accountNameOrDefault();
 
-        finalizeAllActiveRuns(logoutTime);
-
-        currentLoginSession = new LoginSession(
-            currentLoginSession.sessionId(),
-            currentLoginSession.loginTime(),
-            logoutTime,
-            logoutTime,
-            currentLoginSession.runs()
-        );
-
+        // I/O outside the lock
         LocalDate sessionDate = LocalDate.now(ZoneId.systemDefault());
-        sessionStore.upsertSession(accountName, sessionDate, currentLoginSession);
-        log.debug("Session ended: {} at {}", accountName, logoutTime);
+        sessionStore.upsertSession(accountName, sessionDate, sessionToSave);
+        log.debug("Session ended: {} at {}", accountName, sessionToSave.logoutTime());
 
-        currentLoginSession = null;
-        activeRuns.clear();
+        synchronized (lock) {
+            currentLoginSession = null;
+            activeRuns.clear();
+            currentAccountName = null;
+        }
         stopPeriodicSaves();
         notifyStateChanged();
     }
 
+    /** Must be called with {@code lock} already held. Mutates {@code currentLoginSession} and clears {@code activeRuns}. */
     private void finalizeAllActiveRuns(long endTime) {
         if (currentLoginSession == null) return;
         List<ScriptRun> finalizedRuns = new ArrayList<>(currentLoginSession.runs());
@@ -136,56 +169,64 @@ public class SessionTracker implements ScriptLifecycleListener {
 
     @Override
     public void onScriptStarted(String scriptId, String displayName) {
-        if (currentLoginSession == null) {
-            log.warn("Script started but no login session active: {}", scriptId);
-            return;
+        synchronized (lock) {
+            if (currentLoginSession == null) {
+                log.warn("Script started but no login session active: {}", scriptId);
+                return;
+            }
+            if (activeRuns.containsKey(scriptId)) {
+                log.warn("Script {} already active; ignoring duplicate start", scriptId);
+                return;
+            }
+            long startMs = System.currentTimeMillis();
+            ScriptRun activeRun = new ScriptRun(scriptId, displayName, startMs, null, null, null);
+            activeRuns.put(scriptId, activeRun);
+            log.debug("Script started: {} ({})", displayName, scriptId);
         }
-        if (activeRuns.containsKey(scriptId)) {
-            log.warn("Script {} already active; ignoring duplicate start", scriptId);
-            return;
-        }
-        long startMs = System.currentTimeMillis();
-        ScriptRun activeRun = new ScriptRun(scriptId, displayName, startMs, null, null, null);
-        activeRuns.put(scriptId, activeRun);
-        log.debug("Script started: {} ({})", displayName, scriptId);
         notifyStateChanged();
     }
 
     @Override
     public void onScriptStopped(String scriptId, @Nullable Integer count, @Nullable String countLabel) {
-        if (currentLoginSession == null) {
-            log.warn("Script stopped but no login session active: {}", scriptId);
-            return;
+        String accountName;
+        LoginSession updatedSession;
+        ScriptRun activeRun;
+        synchronized (lock) {
+            if (currentLoginSession == null) {
+                log.warn("Script stopped but no login session active: {}", scriptId);
+                return;
+            }
+            activeRun = activeRuns.remove(scriptId);
+            if (activeRun == null) {
+                log.warn("Script {} stopped but was not active", scriptId);
+                return;
+            }
+            long endMs = System.currentTimeMillis();
+            ScriptRun finalizedRun = new ScriptRun(
+                activeRun.scriptId(),
+                activeRun.displayName(),
+                activeRun.startMs(),
+                endMs,
+                count,
+                countLabel
+            );
+            List<ScriptRun> runs = new ArrayList<>(currentLoginSession.runs());
+            runs.add(finalizedRun);
+            updatedSession = new LoginSession(
+                currentLoginSession.sessionId(),
+                currentLoginSession.loginTime(),
+                currentLoginSession.logoutTime(),
+                endMs,
+                runs
+            );
+            currentLoginSession = updatedSession;
+            accountName = currentAccountName != null ? currentAccountName : "default";
+            log.debug("Script stopped: {} ({}), duration: {}ms, count: {}",
+                activeRun.displayName(), scriptId, endMs - activeRun.startMs(), count);
         }
-        ScriptRun activeRun = activeRuns.remove(scriptId);
-        if (activeRun == null) {
-            log.warn("Script {} stopped but was not active", scriptId);
-            return;
-        }
-        long endMs = System.currentTimeMillis();
-        ScriptRun finalizedRun = new ScriptRun(
-            activeRun.scriptId(),
-            activeRun.displayName(),
-            activeRun.startMs(),
-            endMs,
-            count,
-            countLabel
-        );
-        List<ScriptRun> runs = new ArrayList<>(currentLoginSession.runs());
-        runs.add(finalizedRun);
-        currentLoginSession = new LoginSession(
-            currentLoginSession.sessionId(),
-            currentLoginSession.loginTime(),
-            currentLoginSession.logoutTime(),
-            endMs,
-            runs
-        );
-        log.debug("Script stopped: {} ({}), duration: {}ms, count: {}",
-            activeRun.displayName(), scriptId, endMs - activeRun.startMs(), count);
-
-        String accountName = accountNameOrDefault();
+        // I/O outside the lock
         LocalDate sessionDate = LocalDate.now(ZoneId.systemDefault());
-        sessionStore.upsertSession(accountName, sessionDate, currentLoginSession);
+        sessionStore.upsertSession(accountName, sessionDate, updatedSession);
         notifyStateChanged();
     }
 
@@ -215,46 +256,63 @@ public class SessionTracker implements ScriptLifecycleListener {
     }
 
     private void periodicSave() {
-        if (currentLoginSession == null) return;
-
-        long now = System.currentTimeMillis();
-        List<ScriptRun> runs = new ArrayList<>(currentLoginSession.runs());
-        for (ScriptRun activeRun : activeRuns.values()) {
-            runs.add(activeRun);
+        LoginSession snapshot;
+        String accountName;
+        String sessionId;
+        synchronized (lock) {
+            if (currentLoginSession == null) return;
+            long now = System.currentTimeMillis();
+            List<ScriptRun> runs = new ArrayList<>(currentLoginSession.runs());
+            for (ScriptRun activeRun : activeRuns.values()) {
+                runs.add(activeRun);
+            }
+            snapshot = new LoginSession(
+                currentLoginSession.sessionId(),
+                currentLoginSession.loginTime(),
+                currentLoginSession.logoutTime(),
+                now,
+                runs
+            );
+            accountName = currentAccountName != null ? currentAccountName : "default";
+            sessionId = currentLoginSession.sessionId();
         }
-        LoginSession snapshot = new LoginSession(
-            currentLoginSession.sessionId(),
-            currentLoginSession.loginTime(),
-            currentLoginSession.logoutTime(),
-            now,
-            runs
-        );
+        // I/O outside the lock
         LocalDate sessionDate = LocalDate.now(ZoneId.systemDefault());
-        sessionStore.upsertSession(accountNameOrDefault(), sessionDate, snapshot);
-        log.debug("Periodic save: session {}", currentLoginSession.sessionId());
+        sessionStore.upsertSession(accountName, sessionDate, snapshot);
+        log.debug("Periodic save: session {}", sessionId);
     }
 
     // ---- Shutdown (plugin stop) ----
 
     public void onShutdown() {
         stopPeriodicSaves();
-        if (currentLoginSession == null) return;
+        String accountName;
+        LoginSession finalSession;
+        synchronized (lock) {
+            if (currentLoginSession == null) return;
+            accountName = currentAccountName != null ? currentAccountName : "default";
+            long shutdownTime = System.currentTimeMillis();
 
-        long shutdownTime = System.currentTimeMillis();
-        finalizeAllActiveRuns(shutdownTime);
+            // finalizeAllActiveRuns mutates currentLoginSession; caller holds lock.
+            finalizeAllActiveRuns(shutdownTime);
 
-        LoginSession finalSession = new LoginSession(
-            currentLoginSession.sessionId(),
-            currentLoginSession.loginTime(),
-            shutdownTime,
-            shutdownTime,
-            currentLoginSession.runs()
-        );
+            finalSession = new LoginSession(
+                currentLoginSession.sessionId(),
+                currentLoginSession.loginTime(),
+                shutdownTime,
+                shutdownTime,
+                currentLoginSession.runs()
+            );
+        }
+        // I/O outside the lock
         LocalDate sessionDate = LocalDate.now(ZoneId.systemDefault());
-        sessionStore.upsertSession(accountNameOrDefault(), sessionDate, finalSession);
+        sessionStore.upsertSession(accountName, sessionDate, finalSession);
 
-        currentLoginSession = null;
-        activeRuns.clear();
+        synchronized (lock) {
+            currentLoginSession = null;
+            activeRuns.clear();
+            currentAccountName = null;
+        }
         log.debug("Session finalized on plugin shutdown");
     }
 }
