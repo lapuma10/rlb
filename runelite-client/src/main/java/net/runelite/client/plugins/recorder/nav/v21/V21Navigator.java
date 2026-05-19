@@ -525,6 +525,14 @@ public final class V21Navigator implements Navigator
 			// Store as sticky subtask so subsequent ticks continue toward
 			// this exit instead of restarting the full planner pipeline.
 			pendingExit = exit;
+			// If this blocker corresponds to the next unfinished trail anchor,
+			// tag it so the PROGRESSED handler advances nextAnchorIndex when
+			// the click fires. Without this, a gate that's the recorded next
+			// anchor opens, the player passes through, but the anchor cursor
+			// never moves — and the plane-mismatch fallback's
+			// nextAnchorOnCurrentPlane (plane-only filter) re-targets the
+			// same gate indefinitely.
+			tagActiveAnchorIfMatchesNext(exit);
 			NavStatus exitStatus = handlePendingExit(exit, snap);
 			return exitStatus != null ? exitStatus : NavStatus.RUNNING;
 		}
@@ -535,8 +543,34 @@ public final class V21Navigator implements Navigator
 			return NavStatus.RUNNING;
 		}
 		diag.blockerFound(be.from(), be.to(), b);
+		// Mirror of the perimeter-exit branch above: tag activeAnchor when the
+		// on-edge blocker is the next trail anchor. Same rationale.
+		tagActiveAnchorIfMatchesNext(b);
 		attemptStickyClick(b, snap);
 		return NavStatus.RUNNING;
+	}
+
+	/** If the given blocker matches the next unfinished trail anchor by
+	 *  {@code objectId} and {@code objectTile} proximity (Chebyshev ≤ 2),
+	 *  set {@link #activeAnchor} so the PROGRESSED handler advances
+	 *  {@link #nextAnchorIndex} naturally on the next solver outcome.
+	 *
+	 *  <p>Tolerance: anchors record a specific objectTile from the recorder;
+	 *  perimeter exits return the actual scene-object tile. They should
+	 *  coincide, but a tile or two of jitter is possible from recording vs
+	 *  live placement. ≤ 2 is a safe tolerance. */
+	private void tagActiveAnchorIfMatchesNext(BlockerCandidate b)
+	{
+		if (trailGuide == null) return;
+		if (nextAnchorIndex >= trailGuide.anchors().size()) return;
+		InteractionAnchor candidate = trailGuide.anchors().get(nextAnchorIndex);
+		if (candidate.objectId() == b.objectId()
+			&& chebyshev(b.objectTile(), candidate.objectTile()) <= 2)
+		{
+			activeAnchor = candidate;
+			log.info("v21.anchor: tagging activeAnchor from blocker — idx={} objectId={} at={}",
+				nextAnchorIndex, candidate.objectId(), candidate.objectTile());
+		}
 	}
 
 	/** Walk toward or click the sticky perimeter exit.

@@ -48,7 +48,10 @@ public class TrailGuideTest
 	@Test
 	public void samePlaneTransportClassifiedAsLocalDoor()
 	{
-		// Open Gate at (3211, 3242, p=0), next tile event still p=0.
+		// Open Gate at (3211, 3242, p=0), all subsequent tiles still p=0.
+		// Lookahead never finds a plane-differing Tile → observedDestPlane
+		// stays null and the verb fallback ("Open" ∈ LOCAL_VERBS) classifies
+		// the anchor as a local door.
 		Trail trail = new Trail("gate", 0L, List.of(
 			tile(0,    3210, 3242, 0),
 			openGate(600, 3211, 3242, 0),
@@ -56,9 +59,34 @@ public class TrailGuideTest
 		TrailGuide guide = TrailGuide.fromTrail(trail);
 		assertEquals(1, guide.anchors().size());
 		InteractionAnchor a = guide.anchors().get(0);
-		assertNotNull(a.observedDestPlane());
-		assertEquals(Integer.valueOf(0), a.observedDestPlane());
+		assertNull("same-plane transport: no plane-differing Tile to observe",
+			a.observedDestPlane());
 		assertFalse("same-plane transport must classify as local door (not transport)",
+			a.isTransportAnchor());
+	}
+
+	@Test
+	public void midWalkSamePlaneTileIsSkippedToFindRealPlaneChange()
+	{
+		// Regression: the pen→castle staircase records a mid-walk Tile event
+		// BEFORE the plane change propagates:
+		//   TRANSPORT (3204, 3229, p=0) Climb-up
+		//   TILE      (3205, 3228, p=0)   ← mid-walk, still source plane
+		//   TILE      (3206, 3229, p=1)   ← real plane-change tile
+		// The OLD "first Tile after Transport wins" logic picked p=0 and
+		// mis-classified the staircase as a local door. The fixed lookahead
+		// scans forward for the first Tile whose plane DIFFERS from source.
+		Trail trail = new Trail("stair-with-midwalk", 0L, List.of(
+			tile(0,    3204, 3229, 0),
+			climbUp(600, 3204, 3229, 0),    // Transport, source plane = 0
+			tile(1200, 3205, 3228, 0),      // mid-walk, still p=0
+			tile(1800, 3206, 3229, 1)));    // real plane-change tile
+		TrailGuide guide = TrailGuide.fromTrail(trail);
+		assertEquals(1, guide.anchors().size());
+		InteractionAnchor a = guide.anchors().get(0);
+		assertEquals("must skip the mid-walk same-plane Tile and observe p=1",
+			Integer.valueOf(1), a.observedDestPlane());
+		assertTrue("staircase must classify as transport anchor",
 			a.isTransportAnchor());
 	}
 

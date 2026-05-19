@@ -48,15 +48,28 @@ public record TrailGuide(
 			}
 			else if (e instanceof TrailEvent.Transport tr)
 			{
+				// Scan forward for the FIRST Tile event whose plane DIFFERS
+				// from the transport's source plane. The recorder occasionally
+				// captures a mid-walk Tile event BEFORE the plane change
+				// propagates (e.g. pen→castle stair: Climb-up at (3204,3229,p=0)
+				// → Tile (3205,3228,p=0) [mid-walk] → Tile (3206,3229,p=1)).
+				// If we picked the FIRST Tile we'd mis-classify the stair as a
+				// local door (observedDestPlane == source plane). Stops at the
+				// next Transport event (no plane change observed before the
+				// next click means same-plane all the way for this anchor) —
+				// observedDestPlane stays null and isTransportAnchor() falls
+				// back to the verb heuristic.
+				int sourcePlane = tr.tile() != null ? tr.tile().getPlane() : 0;
 				Integer observedDestPlane = null;
 				for (int j = i + 1; j < events.size(); j++)
 				{
-					if (events.get(j) instanceof TrailEvent.Tile next)
+					TrailEvent peek = events.get(j);
+					if (peek instanceof TrailEvent.Transport) break;
+					if (peek instanceof TrailEvent.Tile next
+						&& next.tile() != null
+						&& next.tile().getPlane() != sourcePlane)
 					{
-						if (next.tile() != null)
-						{
-							observedDestPlane = next.tile().getPlane();
-						}
+						observedDestPlane = next.tile().getPlane();
 						break;
 					}
 				}
