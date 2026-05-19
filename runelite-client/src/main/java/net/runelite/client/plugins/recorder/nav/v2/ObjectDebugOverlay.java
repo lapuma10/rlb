@@ -9,6 +9,7 @@ import java.awt.Rectangle;
 import java.awt.Shape;
 import java.awt.Stroke;
 import javax.annotation.Nullable;
+import net.runelite.api.Actor;
 import net.runelite.api.Client;
 import net.runelite.api.DecorativeObject;
 import net.runelite.api.GameObject;
@@ -146,6 +147,11 @@ public final class ObjectDebugOverlay extends Overlay
                     for (GameObject go : gobs)
                     {
                         if (go == null) continue;
+                        // Tile.getGameObjects() also contains wrappers around
+                        // Actors (Players, NPCs). Their getId() resolves to
+                        // an unrelated ObjectComposition and their hull paints
+                        // over the actor model — skip them.
+                        if (go.getRenderable() instanceof Actor) continue;
                         // Multi-tile objects appear on every covered tile —
                         // only render once at the canonical (sceneMin) tile
                         // to avoid hull stacking + label duplication.
