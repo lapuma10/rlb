@@ -1,7 +1,7 @@
 package net.runelite.client.plugins.recorder.session;
 
-import com.fasterxml.jackson.databind.ObjectMapper;
-import com.fasterxml.jackson.databind.SerializationFeature;
+import com.google.gson.Gson;
+import com.google.gson.GsonBuilder;
 import lombok.extern.slf4j.Slf4j;
 import java.io.IOException;
 import java.nio.file.Files;
@@ -20,7 +20,7 @@ import java.util.Map;
 public class SessionStore {
     private static final String SESSION_DIR = ".runelite/recorder/sessions";
     private static final DateTimeFormatter DATE_FORMAT = DateTimeFormatter.ISO_LOCAL_DATE;
-    private final ObjectMapper mapper;
+    private final Gson gson;
     private final Path baseDir;
 
     public SessionStore() {
@@ -29,8 +29,7 @@ public class SessionStore {
 
     public SessionStore(Path baseDir) {
         this.baseDir = baseDir;
-        this.mapper = new ObjectMapper();
-        mapper.enable(SerializationFeature.INDENT_OUTPUT);
+        this.gson = new GsonBuilder().setPrettyPrinting().create();
     }
 
     private Path getSessionDirectory(String accountName) {
@@ -50,8 +49,8 @@ public class SessionStore {
         }
         try {
             String content = Files.readString(dayFile);
-            DaySessionFile dayData = mapper.readValue(content, DaySessionFile.class);
-            return dayData.sessions != null ? dayData.sessions : new ArrayList<>();
+            DaySessionFile dayData = gson.fromJson(content, DaySessionFile.class);
+            return dayData != null && dayData.sessions != null ? dayData.sessions : new ArrayList<>();
         } catch (IOException e) {
             log.warn("Failed to load session file {}: {}", dayFile, e.getMessage());
             return new ArrayList<>();
@@ -80,7 +79,7 @@ public class SessionStore {
             Path tmpFile = dayFile.resolveSibling(dayFile.getFileName() + ".tmp");
 
             DaySessionFile dayData = new DaySessionFile(date.format(DATE_FORMAT), sessions);
-            String json = mapper.writeValueAsString(dayData);
+            String json = gson.toJson(dayData);
             Files.writeString(tmpFile, json);
             Files.move(tmpFile, dayFile, StandardCopyOption.ATOMIC_MOVE, StandardCopyOption.REPLACE_EXISTING);
 
