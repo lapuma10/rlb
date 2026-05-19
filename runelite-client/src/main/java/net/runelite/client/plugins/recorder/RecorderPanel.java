@@ -443,6 +443,7 @@ public final class RecorderPanel extends PluginPanel
     public void dispose()
     {
         if (refreshTimer != null) { refreshTimer.stop(); refreshTimer = null; }
+        if (statsPanel != null) { statsPanel.dispose(); }
     }
 
     private JComponent buildStatusHeader()
