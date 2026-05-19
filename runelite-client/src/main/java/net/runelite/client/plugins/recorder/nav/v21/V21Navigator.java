@@ -290,6 +290,13 @@ public final class V21Navigator implements Navigator
 			{
 				// PROGRESSED on a same-plane interaction (door / gate /
 				// route walk) — clear sticky and replan.
+				// When activeAnchor != null, a local-door anchor (Open /
+				// Pass / etc.) just fired. Advance nextAnchorIndex so the
+				// next tick's anchor rung doesn't re-pick the same anchor:
+				// the door's object id often stays stable after toggling,
+				// and AnchorSelector doesn't re-verify verb availability.
+				// Mirrors the plane-changed branch above.
+				if (activeAnchor != null) nextAnchorIndex++;
 				pendingTransport = null;
 				pendingExit = null;
 				activeAnchor = null;
@@ -650,6 +657,16 @@ public final class V21Navigator implements Navigator
 			}
 			if (sub instanceof PlanResult.BlockedEdge be)
 			{
+				// Clear pending-transport state BEFORE delegating: the
+				// blocker may take multiple ticks to resolve, during which
+				// the active anchor / router pick is stale. handleBlockedEdge
+				// may set pendingExit, and pendingExit + pendingTransport
+				// must not coexist (mutex invariant). The next-tick anchor
+				// rung / handlePlaneMismatch will freshly re-pick the
+				// transport (likely the same one) after the blocker clears.
+				pendingTransport = null;
+				pendingEdgeKey = null;
+				activeAnchor = null;
 				return handleBlockedEdge(be, snap);
 			}
 			// NoCandidate / PlaneMismatch / BudgetExhausted at this scale
