@@ -2776,6 +2776,23 @@ public final class RecorderPanel extends PluginPanel
         pizzaScript.setCookPizza(pizzaCookBox.isSelected());
         pizzaScript.setAddAnchovies(pizzaAnchoviesBox.isSelected());
         pizzaScript.setAfkBreaksEnabled(pizzaBreaksBox.isSelected());
+        // Wire auto-login so the script recovers from an OSRS auto-kick
+        // mid-session. Capture selectedUsername + world here so the
+        // worker doesn't read mutable EDT state mid-flight.
+        if (loginAssistantV2 != null && selectedUsername != null && credentialStore != null)
+        {
+            final String pizzaUser = selectedUsername;
+            String worldText = worldField == null || worldField.getText() == null
+                ? "" : worldField.getText().trim();
+            Integer pizzaWorld;
+            if (worldText.isEmpty()) pizzaWorld = null;
+            else try { pizzaWorld = Integer.parseInt(worldText); }
+                 catch (NumberFormatException nfe) { pizzaWorld = null; }
+            boolean pizzaJagex = accountPrefs != null && accountPrefs.isJagex(pizzaUser);
+            pizzaScript.setAutoLogin(loginAssistantV2,
+                () -> new LoginCredentials(pizzaUser, credentialStore),
+                pizzaWorld, pizzaJagex);
+        }
         pizzaScript.start();
         StringBuilder flags = new StringBuilder();
         if (pizzaTomatoBox.isSelected())    flags.append("T");
@@ -3839,9 +3856,15 @@ public final class RecorderPanel extends PluginPanel
             }
 
             // 2) Slow path: disk I/O aggregation on a background thread → publish to EDT.
+            // Pass the in-memory snapshot of the current session as an override so the live
+            // "Script active" / breakdown updates within ~1s instead of waiting 60s for the next
+            // periodic flush. The override is keyed by sessionId — it replaces the disk version
+            // of THIS session (or is appended if no disk version yet).
             final String accountName = cachedAccount;
             final TimePeriod period = currentPeriod;
             final LocalDate today = LocalDate.now();
+            final LoginSession liveSnapshot = sessionTracker.getCurrentSnapshot();
+            final LocalDate liveDate = sessionTracker.getCurrentSessionDate();
             new SwingWorker<SessionStats, Void>()
             {
                 @Override
@@ -3849,11 +3872,11 @@ public final class RecorderPanel extends PluginPanel
                 {
                     switch (period)
                     {
-                        case DAILY:    return sessionStore.aggregateDaily(accountName, today);
-                        case WEEKLY:   return sessionStore.aggregateWeekly(accountName, today);
-                        case MONTHLY:  return sessionStore.aggregateMonthly(accountName, YearMonth.now());
-                        case ALL_TIME: return sessionStore.aggregateAllTime(accountName);
-                        default:       return sessionStore.aggregateDaily(accountName, today);
+                        case DAILY:    return sessionStore.aggregateDaily(accountName, today, liveSnapshot, liveDate);
+                        case WEEKLY:   return sessionStore.aggregateWeekly(accountName, today, liveSnapshot, liveDate);
+                        case MONTHLY:  return sessionStore.aggregateMonthly(accountName, YearMonth.now(), liveSnapshot, liveDate);
+                        case ALL_TIME: return sessionStore.aggregateAllTime(accountName, liveSnapshot, liveDate);
+                        default:       return sessionStore.aggregateDaily(accountName, today, liveSnapshot, liveDate);
                     }
                 }
 

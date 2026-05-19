@@ -119,6 +119,35 @@ public class SessionTracker implements ScriptLifecycleListener {
         }
     }
 
+    @Nullable
+    public LocalDate getCurrentSessionDate() {
+        synchronized (lock) {
+            return currentSessionDate;
+        }
+    }
+
+    /** Live snapshot of the current session including any active runs (open, endMs=null, lastSavedMs=now).
+     *  Used by the UI to show live "Script active" time without waiting for the 60s periodic flush.
+     *  Returns null when no session is active. */
+    @Nullable
+    public LoginSession getCurrentSnapshot() {
+        synchronized (lock) {
+            if (currentLoginSession == null) return null;
+            long now = System.currentTimeMillis();
+            List<ScriptRun> runs = new ArrayList<>(currentLoginSession.runs());
+            for (ScriptRun activeRun : activeRuns.values()) {
+                runs.add(activeRun);
+            }
+            return new LoginSession(
+                currentLoginSession.sessionId(),
+                currentLoginSession.loginTime(),
+                currentLoginSession.logoutTime(),
+                now,
+                runs
+            );
+        }
+    }
+
     private String accountNameOrDefault() {
         String name = client.getUsername();
         return (name == null || name.isEmpty()) ? DEFAULT_ACCOUNT : name;

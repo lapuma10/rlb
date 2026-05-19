@@ -174,6 +174,134 @@ public class SessionStoreTest {
     }
 
     @Test
+    public void sameScriptTwiceInSession_doesNotDoubleCount() {
+        // Regression: a session with two runs of the SAME scriptId used to be counted
+        // twice in per-script totals because the old loop called accumulate once per run
+        // and each call scanned all runs in the session. Should be ONE entry of 30 min.
+        LocalDate date = LocalDate.of(2026, 5, 19);
+        String account = "testaccount";
+
+        LoginSession session = new LoginSession("1000", 0, 1_800_000L, 1_800_000, List.of(
+            new ScriptRun("mining", "Mining", 0, 600_000L, 10, "ores"),
+            new ScriptRun("mining", "Mining", 600_000, 1_800_000L, 20, "ores")
+        ));
+        store.upsertSession(account, date, session);
+
+        SessionStats stats = store.aggregateDaily(account, date);
+        assertEquals(1, stats.scripts().size());
+        ScriptStats mining = stats.scripts().get("mining");
+        // 10 min + 20 min = 30 min, NOT 60 min.
+        assertEquals(1_800_000L, mining.totalMs());
+        assertEquals(30, (int) mining.totalCount());
+    }
+
+    @Test
+    public void openRunContributesToPerScriptTotalMs() {
+        // Regression: open runs (endMs=null) were skipped by per-script accumulation,
+        // showing 0m in the breakdown even though global active time was correct.
+        LocalDate date = LocalDate.of(2026, 5, 19);
+        String account = "testaccount";
+
+        LoginSession session = new LoginSession("1000", 1000, null, 2500, List.of(
+            new ScriptRun("mining", "Mining", 1000, null, null, null)
+        ));
+        store.upsertSession(account, date, session);
+
+        SessionStats stats = store.aggregateDaily(account, date);
+        ScriptStats mining = stats.scripts().get("mining");
+        // Open run treated as [1000, lastSavedMs=2500] = 1500ms per script.
+        assertEquals(1500, mining.totalMs());
+    }
+
+    @Test
+    public void periodicOpenRunThenFinalClosed_noDuplicate() {
+        // Real lifecycle: tracker writes open run via periodic save, then later upserts
+        // the same session with the run closed. upsert-by-sessionId must replace, not append.
+        LocalDate date = LocalDate.of(2026, 5, 19);
+        String account = "testaccount";
+
+        LoginSession openSnapshot = new LoginSession("s1", 1000, null, 2000, List.of(
+            new ScriptRun("mining", "Mining", 1000, null, null, null)
+        ));
+        store.upsertSession(account, date, openSnapshot);
+
+        LoginSession closed = new LoginSession("s1", 1000, 3000L, 3000, List.of(
+            new ScriptRun("mining", "Mining", 1000, 3000L, 42, "ores")
+        ));
+        store.upsertSession(account, date, closed);
+
+        List<LoginSession> loaded = store.loadDay(account, date);
+        assertEquals(1, loaded.size());
+        assertEquals(1, loaded.get(0).runs().size());
+        assertEquals(42, (int) loaded.get(0).runs().get(0).count());
+
+        SessionStats stats = store.aggregateDaily(account, date);
+        assertEquals(2000, stats.totalScriptActiveMs());
+        assertEquals(1, stats.scripts().size());
+    }
+
+    @Test
+    public void countAggregation_mixedNullAndNonNull() {
+        // If any run for a scriptId lacks a count, the merged count is null
+        // (we can't claim a total when partial data is missing).
+        LocalDate date = LocalDate.of(2026, 5, 19);
+        String account = "testaccount";
+
+        // Session A: counted (10).
+        store.upsertSession(account, date, new LoginSession("a", 0, 1000L, 1000, List.of(
+            new ScriptRun("mining", "Mining", 0, 1000L, 10, "ores")
+        )));
+        // Session B: uncounted (null count).
+        store.upsertSession(account, date, new LoginSession("b", 2000, 3000L, 3000, List.of(
+            new ScriptRun("mining", "Mining", 2000, 3000L, null, null)
+        )));
+
+        SessionStats stats = store.aggregateDaily(account, date);
+        ScriptStats mining = stats.scripts().get("mining");
+        // Time still sums (1000 + 1000 = 2000), but count is null because partial.
+        assertEquals(2000, mining.totalMs());
+        org.junit.Assert.assertNull(mining.totalCount());
+    }
+
+    @Test
+    public void aggregateDailyWithLiveOverride_appendsAndReplaces() {
+        // When the panel passes a live in-memory snapshot, aggregateDaily must replace
+        // (by sessionId) the stale disk version — not double-count it.
+        LocalDate date = LocalDate.of(2026, 5, 19);
+        String account = "testaccount";
+
+        // Disk: an old periodic snapshot of session s1 with lastSavedMs=2000.
+        store.upsertSession(account, date, new LoginSession("s1", 1000, null, 2000, List.of(
+            new ScriptRun("mining", "Mining", 1000, null, null, null)
+        )));
+
+        // Live snapshot of the SAME session, now at lastSavedMs=5000 (3s later).
+        LoginSession live = new LoginSession("s1", 1000, null, 5000, List.of(
+            new ScriptRun("mining", "Mining", 1000, null, null, null)
+        ));
+
+        SessionStats stats = store.aggregateDaily(account, date, live, date);
+        // Active = [1000, 5000] = 4000, NOT 4000+1000=5000 (which would happen if duplicated).
+        assertEquals(4000, stats.totalScriptActiveMs());
+        assertEquals(4000, stats.totalLoginMs());
+    }
+
+    @Test
+    public void aggregateAllTimeWithLiveOverride_brandNewSessionAppended() {
+        // Brand-new session with no disk file yet still appears in all-time via the live override.
+        LocalDate date = LocalDate.of(2026, 5, 19);
+        String account = "testaccount";
+
+        LoginSession live = new LoginSession("brand_new", 1000, null, 4000, List.of(
+            new ScriptRun("mining", "Mining", 1000, null, null, null)
+        ));
+
+        SessionStats stats = store.aggregateAllTime(account, live, date);
+        assertEquals(3000, stats.totalScriptActiveMs());
+        assertEquals(1, stats.scripts().size());
+    }
+
+    @Test
     public void concurrentUpsert_doesNotLoseWrites() throws Exception {
         LocalDate date = LocalDate.of(2026, 5, 19);
         String account = "testaccount";

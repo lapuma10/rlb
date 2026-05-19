@@ -196,48 +196,102 @@ public class SessionStore {
         return new SessionStats(totalLoginMs, totalScriptActiveMs, idleMs, scriptStatsMap);
     }
 
+    /** Load the day file, then if {@code liveOverride} matches this date by sessionId,
+     *  swap it in (or append if new). Lets the UI show live data for the current session
+     *  without waiting for the 60s periodic flush to land on disk. */
+    private List<LoginSession> loadDayWithOverride(String accountName, LocalDate date,
+                                                    @javax.annotation.Nullable LoginSession liveOverride,
+                                                    @javax.annotation.Nullable LocalDate liveDate) {
+        List<LoginSession> sessions = loadDay(accountName, date);
+        if (liveOverride == null || liveDate == null || !liveDate.equals(date)) {
+            return sessions;
+        }
+        for (int i = 0; i < sessions.size(); i++) {
+            if (sessions.get(i).sessionId().equals(liveOverride.sessionId())) {
+                sessions.set(i, liveOverride);
+                return sessions;
+            }
+        }
+        sessions.add(liveOverride);
+        return sessions;
+    }
+
     public SessionStats aggregateDaily(String accountName, LocalDate date) {
-        return aggregateFromSessions(loadDay(accountName, date));
+        return aggregateDaily(accountName, date, null, null);
+    }
+
+    public SessionStats aggregateDaily(String accountName, LocalDate date,
+                                       @javax.annotation.Nullable LoginSession liveOverride,
+                                       @javax.annotation.Nullable LocalDate liveDate) {
+        return aggregateFromSessions(loadDayWithOverride(accountName, date, liveOverride, liveDate));
     }
 
     public SessionStats aggregateWeekly(String accountName, LocalDate midweekDate) {
+        return aggregateWeekly(accountName, midweekDate, null, null);
+    }
+
+    public SessionStats aggregateWeekly(String accountName, LocalDate midweekDate,
+                                        @javax.annotation.Nullable LoginSession liveOverride,
+                                        @javax.annotation.Nullable LocalDate liveDate) {
         LocalDate monday = midweekDate.minusDays(midweekDate.getDayOfWeek().getValue() - 1);
         List<LoginSession> allSessions = new ArrayList<>();
         for (int i = 0; i < 7; i++) {
-            allSessions.addAll(loadDay(accountName, monday.plusDays(i)));
+            allSessions.addAll(loadDayWithOverride(accountName, monday.plusDays(i), liveOverride, liveDate));
         }
         return aggregateFromSessions(allSessions);
     }
 
     public SessionStats aggregateMonthly(String accountName, YearMonth month) {
+        return aggregateMonthly(accountName, month, null, null);
+    }
+
+    public SessionStats aggregateMonthly(String accountName, YearMonth month,
+                                         @javax.annotation.Nullable LoginSession liveOverride,
+                                         @javax.annotation.Nullable LocalDate liveDate) {
         LocalDate startDate = month.atDay(1);
         LocalDate endDate = month.atEndOfMonth();
         List<LoginSession> allSessions = new ArrayList<>();
         for (LocalDate date = startDate; !date.isAfter(endDate); date = date.plusDays(1)) {
-            allSessions.addAll(loadDay(accountName, date));
+            allSessions.addAll(loadDayWithOverride(accountName, date, liveOverride, liveDate));
         }
         return aggregateFromSessions(allSessions);
     }
 
     public SessionStats aggregateAllTime(String accountName) {
+        return aggregateAllTime(accountName, null, null);
+    }
+
+    public SessionStats aggregateAllTime(String accountName,
+                                         @javax.annotation.Nullable LoginSession liveOverride,
+                                         @javax.annotation.Nullable LocalDate liveDate) {
         Path sessionDir = getSessionDirectory(accountName);
-        if (!Files.exists(sessionDir)) {
-            return new SessionStats(0, 0, 0, Map.of());
-        }
         List<LoginSession> allSessions = new ArrayList<>();
-        try (var stream = Files.list(sessionDir)) {
-            stream.filter(p -> p.getFileName().toString().endsWith(".json"))
-                .forEach(p -> {
-                    try {
-                        String dateStr = p.getFileName().toString().replace(".json", "");
-                        LocalDate date = LocalDate.parse(dateStr, DATE_FORMAT);
-                        allSessions.addAll(loadDay(accountName, date));
-                    } catch (Exception e) {
-                        log.warn("Failed to load session file {}", p, e);
-                    }
-                });
-        } catch (IOException e) {
-            log.error("Failed to list session directory: {}", e.getMessage());
+        boolean liveAccountedFor = false;
+
+        if (Files.exists(sessionDir)) {
+            try (var stream = Files.list(sessionDir)) {
+                List<LocalDate> dates = new ArrayList<>();
+                stream.filter(p -> p.getFileName().toString().endsWith(".json"))
+                    .forEach(p -> {
+                        try {
+                            String dateStr = p.getFileName().toString().replace(".json", "");
+                            dates.add(LocalDate.parse(dateStr, DATE_FORMAT));
+                        } catch (Exception e) {
+                            log.warn("Failed to parse session filename {}", p, e);
+                        }
+                    });
+                for (LocalDate d : dates) {
+                    allSessions.addAll(loadDayWithOverride(accountName, d, liveOverride, liveDate));
+                    if (liveDate != null && liveDate.equals(d)) liveAccountedFor = true;
+                }
+            } catch (IOException e) {
+                log.error("Failed to list session directory: {}", e.getMessage());
+            }
+        }
+
+        // Brand new session: no file on disk for its date yet, but it's live in memory.
+        if (!liveAccountedFor && liveOverride != null && liveDate != null) {
+            allSessions.add(liveOverride);
         }
         return aggregateFromSessions(allSessions);
     }
