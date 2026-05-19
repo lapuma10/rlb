@@ -87,6 +87,8 @@ import net.runelite.client.plugins.recorder.debug.TileMarker;
 import net.runelite.client.plugins.recorder.hotkey.HotkeyHandler;
 import net.runelite.client.plugins.recorder.mining.MiningLoop;
 import net.runelite.client.plugins.recorder.session.SessionDirectory;
+import net.runelite.client.plugins.recorder.session.SessionStore;
+import net.runelite.client.plugins.recorder.session.SessionTracker;
 import net.runelite.client.plugins.recorder.nav.v2.CollisionDebugOverlay;
 import net.runelite.client.plugins.recorder.nav.v2.ObjectDebugOverlay;
 import net.runelite.client.plugins.recorder.nav.v2.V2PathOverlay;
@@ -183,6 +185,9 @@ public class RecorderPlugin extends Plugin
     /** Root for persisted region/entity/transport JSON. Set in startUp;
      *  read by both the FlushDaemon and the bootstrap path. */
     private File worldmapRoot;
+
+    private SessionStore sessionStore;
+    private SessionTracker sessionTracker;
 
     /** Precomputed connectivity components for static collision. Built
      *  on a background daemon thread during startUp; null until that
@@ -676,6 +681,11 @@ public class RecorderPlugin extends Plugin
             .build();
         clientToolbar.addNavigation(navButton);
 
+        sessionStore = new SessionStore();
+        sessionTracker = new SessionTracker(client, clientThread, sessionStore);
+        eventBus.register(sessionTracker);
+        panel.setSessionTracker(sessionTracker, sessionStore);
+
         eventBus.register(eventCapture);
         mouseManager.registerMouseListener(mouseCapture);
         mouseManager.registerMouseListener(tileMarker);
@@ -863,6 +873,10 @@ public class RecorderPlugin extends Plugin
     @Override
     protected void shutDown()
     {
+        if (sessionTracker != null) {
+            eventBus.unregister(sessionTracker);
+            sessionTracker.onShutdown();
+        }
         // Stop in-flight recording first so producers don't enqueue while we
         // tear listeners down. abort() drains and closes the writer without
         // running analysis or popping a file browser.
