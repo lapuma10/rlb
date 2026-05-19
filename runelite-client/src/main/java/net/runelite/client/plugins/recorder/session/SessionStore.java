@@ -51,8 +51,8 @@ public class SessionStore {
             String content = Files.readString(dayFile);
             DaySessionFile dayData = gson.fromJson(content, DaySessionFile.class);
             return dayData != null && dayData.sessions != null ? dayData.sessions : new ArrayList<>();
-        } catch (IOException e) {
-            log.warn("Failed to load session file {}: {}", dayFile, e.getMessage());
+        } catch (Exception e) {
+            log.warn("Failed to read session file {} ({}): {}", dayFile, e.getClass().getSimpleName(), e.getMessage());
             return new ArrayList<>();
         }
     }
