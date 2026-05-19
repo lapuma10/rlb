@@ -157,6 +157,8 @@ public final class LumbridgeBankPenScript
     private final AtomicBoolean running = new AtomicBoolean(false);
     private final AtomicReference<Thread> worker = new AtomicReference<>();
 
+    public boolean isRunning() { return running.get(); }
+
     // Walk-pacing state. The outer tick loop re-clicks every ~500ms, but
     // the engine takes ~600ms per tile + only paths up to 25 tiles per
     // click. Re-clicking on every tick spams the engine with redundant

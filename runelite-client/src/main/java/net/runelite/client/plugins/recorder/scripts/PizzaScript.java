@@ -217,6 +217,8 @@ public final class PizzaScript
     private final AtomicReference<String>  status  = new AtomicReference<>("idle");
     private final AtomicBoolean            running = new AtomicBoolean(false);
     private final AtomicReference<Thread>  worker  = new AtomicReference<>();
+
+    public boolean isRunning() { return running.get(); }
     // ─── Per-loop enable flags (panel-driven) ───────────────────────────
     // Read live in tickDecide so toggling a checkbox during a run takes
     // effect at the NEXT bank trip, not mid-batch.  Default = all true:

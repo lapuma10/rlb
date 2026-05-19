@@ -157,6 +157,8 @@ public final class ChickenFarmV2Script
     private final AtomicReference<Thread> worker = new AtomicReference<>();
     private long lastBankActionAtMs;
 
+    public boolean isRunning() { return running.get(); }
+
     public ChickenFarmV2Script(Client client, ClientThread clientThread,
                                HumanizedInputDispatcher dispatcher,
                                TransportResolver resolver)

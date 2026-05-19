@@ -150,6 +150,8 @@ public final class CookingScriptV3
     private final AtomicBoolean running = new AtomicBoolean(false);
     private final AtomicReference<Thread> worker = new AtomicReference<>();
 
+    public boolean isRunning() { return running.get(); }
+
     private final AtomicInteger cookedCount = new AtomicInteger(0);
     private final AtomicInteger burntCount  = new AtomicInteger(0);
 

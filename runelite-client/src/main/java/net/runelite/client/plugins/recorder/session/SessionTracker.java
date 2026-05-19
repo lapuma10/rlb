@@ -15,7 +15,9 @@ import java.util.List;
 import java.util.Map;
 import java.util.Timer;
 import java.util.TimerTask;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CopyOnWriteArrayList;
+import java.util.function.BooleanSupplier;
 
 @Slf4j
 public class SessionTracker implements ScriptLifecycleListener {
@@ -31,7 +33,15 @@ public class SessionTracker implements ScriptLifecycleListener {
     @Nullable private LocalDate currentSessionDate;
     private final Map<String, ScriptRun> activeRuns = new HashMap<>();
     @Nullable private Timer periodicSaveTimer;
+    @Nullable private Timer scriptPollTimer;
     private final CopyOnWriteArrayList<Runnable> sessionStateCallbacks = new CopyOnWriteArrayList<>();
+
+    /** Auto-detected scripts: poll each supplier every second and translate false→true / true→false
+     *  into onScriptStarted / onScriptStopped. Lets callers register a script once instead of
+     *  threading callbacks through every Start/Stop button. */
+    private record RegisteredScript(String scriptId, String displayName, BooleanSupplier isRunning) {}
+    private final CopyOnWriteArrayList<RegisteredScript> scriptRegistry = new CopyOnWriteArrayList<>();
+    private final ConcurrentHashMap<String, Boolean> lastScriptState = new ConcurrentHashMap<>();
 
     public SessionTracker(Client client, ClientThread clientThread, SessionStore sessionStore) {
         this.client = client;
@@ -41,6 +51,48 @@ public class SessionTracker implements ScriptLifecycleListener {
 
     public void registerSessionStateCallback(Runnable callback) {
         sessionStateCallbacks.add(callback);
+    }
+
+    /** Register a bot script for auto-tracking. The tracker polls {@code isRunning} every second;
+     *  a false→true transition fires {@link #onScriptStarted}, true→false fires {@link #onScriptStopped}.
+     *  Safe to call before login — pre-session transitions are silently ignored. */
+    public void registerScript(String scriptId, String displayName, BooleanSupplier isRunning) {
+        scriptRegistry.add(new RegisteredScript(scriptId, displayName, isRunning));
+        lastScriptState.put(scriptId, safeIsRunning(isRunning));
+        startScriptPollTimerIfNeeded();
+    }
+
+    private static boolean safeIsRunning(BooleanSupplier s) {
+        try { return s.getAsBoolean(); } catch (Exception e) { return false; }
+    }
+
+    private synchronized void startScriptPollTimerIfNeeded() {
+        if (scriptPollTimer != null) return;
+        scriptPollTimer = new Timer("SessionTracker-ScriptPoll", true);
+        scriptPollTimer.scheduleAtFixedRate(new TimerTask() {
+            @Override public void run() {
+                try { pollScripts(); } catch (Exception e) { log.warn("Script poll failed", e); }
+            }
+        }, 1000L, 1000L);
+    }
+
+    private void pollScripts() {
+        // Only fire transitions while logged in — otherwise the tracker silently swallows them
+        // (and would clutter the log with "no session active" warnings).
+        if (getCurrentSession() == null) {
+            // Still refresh baseline so a script started pre-login but stopped post-login doesn't fire a spurious stop.
+            for (RegisteredScript rs : scriptRegistry) {
+                lastScriptState.put(rs.scriptId, safeIsRunning(rs.isRunning));
+            }
+            return;
+        }
+        for (RegisteredScript rs : scriptRegistry) {
+            boolean now = safeIsRunning(rs.isRunning);
+            Boolean prev = lastScriptState.put(rs.scriptId, now);
+            if (prev == null || prev == now) continue;
+            if (now) onScriptStarted(rs.scriptId, rs.displayName);
+            else onScriptStopped(rs.scriptId, null, null);
+        }
     }
 
     private void notifyStateChanged() {
@@ -104,6 +156,13 @@ public class SessionTracker implements ScriptLifecycleListener {
         if (isNew) {
             log.debug("Session started: {} at {}", resolvedName, System.currentTimeMillis());
             startPeriodicSaves();
+            // Catch scripts that were running BEFORE login — open a run for each so this
+            // session's tracking starts now (we don't know when they actually started).
+            for (RegisteredScript rs : scriptRegistry) {
+                boolean now = safeIsRunning(rs.isRunning);
+                lastScriptState.put(rs.scriptId, now);
+                if (now) onScriptStarted(rs.scriptId, rs.displayName);
+            }
             notifyStateChanged();
         }
     }
@@ -295,6 +354,10 @@ public class SessionTracker implements ScriptLifecycleListener {
 
     public void onShutdown() {
         stopPeriodicSaves();
+        if (scriptPollTimer != null) {
+            scriptPollTimer.cancel();
+            scriptPollTimer = null;
+        }
         String accountName;
         LocalDate sessionDate;
         LoginSession finalSession;

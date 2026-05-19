@@ -83,6 +83,8 @@ public final class ChickenFarmV3Script
     private final AtomicReference<Thread> worker = new AtomicReference<>();
     private long lastBankActionAtMs;
 
+    public boolean isRunning() { return running.get(); }
+
     // ──── Debug toggles ────
     // Read by the corresponding tick* methods to short-circuit phases
     // for walk-testing without running a full bot cycle. The panel's

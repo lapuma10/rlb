@@ -3622,6 +3622,36 @@ public final class RecorderPanel extends PluginPanel
         // Non-Swing assignments first — visible immediately to any caller.
         this.sessionTracker = sessionTracker;
         this.sessionStore = sessionStore;
+
+        // Auto-track every known script via isRunning() polling. One registration line per script;
+        // the tracker polls each supplier every second and fires onScriptStarted / onScriptStopped
+        // on false→true / true→false transitions. Suppliers are null-safe — the field may be null
+        // at registration time but populated by the time the poll fires.
+        sessionTracker.registerScript("chicken_combat", "Chicken Combat",
+            () -> chickenLoop != null && chickenLoop.isRunning());
+        sessionTracker.registerScript("chicken_farm_v3", "Chicken Farm V3",
+            () -> chickenFarmV3 != null && chickenFarmV3.isRunning());
+        sessionTracker.registerScript("chicken_farm_v2", "Chicken Farm V2",
+            () -> chickenFarmV2 != null && chickenFarmV2.isRunning());
+        sessionTracker.registerScript("lumby_bank_pen", "Lumbridge Bank Pen",
+            () -> lumbyScript != null && lumbyScript.isRunning());
+        sessionTracker.registerScript("cooking_v2", "Cooking V2",
+            () -> cookingScriptV2 != null && cookingScriptV2.isRunning());
+        sessionTracker.registerScript("cooking_v3", "Cooking V3",
+            () -> cookingScriptV3 != null && cookingScriptV3.isRunning());
+        sessionTracker.registerScript("cooks_assistant", "Cook's Assistant",
+            () -> cooksAssistantScript != null && cooksAssistantScript.isRunning());
+        sessionTracker.registerScript("ernest_quest", "Ernest Quest",
+            () -> ernestQuestScript != null && ernestQuestScript.isRunning());
+        sessionTracker.registerScript("pie_dish", "Pie Dish",
+            () -> pieDishScript != null && pieDishScript.isRunning());
+        sessionTracker.registerScript("ultra_compost", "Ultra Compost",
+            () -> ultraCompostScript != null && ultraCompostScript.isRunning());
+        sessionTracker.registerScript("pizza", "Pizza",
+            () -> pizzaScript != null && pizzaScript.isRunning());
+        sessionTracker.registerScript("mining", "Mining",
+            () -> miningLoop != null && miningLoop.isRunning());
+
         // All Swing mutations (tab swap + callback registration) on the EDT.
         SwingUtilities.invokeLater(() -> {
             int statsTabIndex = tabs.indexOfTab("Stats");

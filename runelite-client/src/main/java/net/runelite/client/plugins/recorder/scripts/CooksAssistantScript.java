@@ -227,6 +227,8 @@ public final class CooksAssistantScript
     private final AtomicBoolean           running = new AtomicBoolean(false);
     private final AtomicReference<Thread> worker  = new AtomicReference<>();
 
+    public boolean isRunning() { return running.get(); }
+
     /** Epoch-ms of the last dispatcher call — throttles re-dispatches. */
     private long lastDispatchMs;
     /** True once the RUN_TASK that runs {@link NpcInteraction#talkTo}

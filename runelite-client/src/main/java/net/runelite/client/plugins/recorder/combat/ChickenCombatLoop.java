@@ -298,6 +298,11 @@ public final class ChickenCombatLoop
         stopAfterKill.set(true);
     }
 
+    public boolean isRunning() {
+        Thread t = worker;
+        return t != null && t.isAlive();
+    }
+
     public State state() { return state.get(); }
     public String latestStatus() { return latestStatus.get(); }
     public int killCount() { return killCount.get(); }

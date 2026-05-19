@@ -130,6 +130,8 @@ public final class PieDishScript
     private final AtomicBoolean           running = new AtomicBoolean(false);
     private final AtomicReference<Thread> worker  = new AtomicReference<>();
 
+    public boolean isRunning() { return running.get(); }
+
     // Supply amounts updated from bank during CHECKING_BANK.
     private int flourAmt, waterAmt, dishAmt, pastryAmt, shellAmt;
 

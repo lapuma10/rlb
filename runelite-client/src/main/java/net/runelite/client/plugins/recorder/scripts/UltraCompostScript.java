@@ -116,6 +116,8 @@ public final class UltraCompostScript
     private final AtomicBoolean           running = new AtomicBoolean(false);
     private final AtomicReference<Thread> worker  = new AtomicReference<>();
 
+    public boolean isRunning() { return running.get(); }
+
     // Phase toggles — read live in CHECKING_BANK. When the cycle would
     // transition to a disabled phase, the script DONEs cleanly so the user
     // can run a make-only loop (e.g. supplies bought manually) or a sell-
