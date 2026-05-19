@@ -22,6 +22,7 @@ public class SessionStore {
     private static final DateTimeFormatter DATE_FORMAT = DateTimeFormatter.ISO_LOCAL_DATE;
     private final Gson gson;
     private final Path baseDir;
+    private final Object writeLock = new Object();
 
     public SessionStore() {
         this(Paths.get(System.getProperty("user.home")).resolve(SESSION_DIR));
@@ -58,44 +59,48 @@ public class SessionStore {
     }
 
     public void upsertSession(String accountName, LocalDate date, LoginSession session) {
-        try {
-            Path sessionDir = getSessionDirectory(accountName);
-            Files.createDirectories(sessionDir);
+        synchronized (writeLock) {
+            try {
+                Path sessionDir = getSessionDirectory(accountName);
+                Files.createDirectories(sessionDir);
 
-            List<LoginSession> sessions = loadDay(accountName, date);
-            boolean found = false;
-            for (int i = 0; i < sessions.size(); i++) {
-                if (sessions.get(i).sessionId().equals(session.sessionId())) {
-                    sessions.set(i, session);
-                    found = true;
-                    break;
+                List<LoginSession> sessions = loadDay(accountName, date);
+                boolean found = false;
+                for (int i = 0; i < sessions.size(); i++) {
+                    if (sessions.get(i).sessionId().equals(session.sessionId())) {
+                        sessions.set(i, session);
+                        found = true;
+                        break;
+                    }
                 }
+                if (!found) {
+                    sessions.add(session);
+                }
+
+                Path dayFile = getDayFile(accountName, date);
+                Path tmpFile = dayFile.resolveSibling(dayFile.getFileName() + ".tmp");
+
+                DaySessionFile dayData = new DaySessionFile(date.format(DATE_FORMAT), sessions);
+                String json = gson.toJson(dayData);
+                Files.writeString(tmpFile, json);
+                Files.move(tmpFile, dayFile, StandardCopyOption.ATOMIC_MOVE, StandardCopyOption.REPLACE_EXISTING);
+
+                log.debug("Upserted session {} for {}", session.sessionId(), date);
+            } catch (IOException e) {
+                log.error("Failed to upsert session for {}: {}", date, e.getMessage(), e);
             }
-            if (!found) {
-                sessions.add(session);
-            }
-
-            Path dayFile = getDayFile(accountName, date);
-            Path tmpFile = dayFile.resolveSibling(dayFile.getFileName() + ".tmp");
-
-            DaySessionFile dayData = new DaySessionFile(date.format(DATE_FORMAT), sessions);
-            String json = gson.toJson(dayData);
-            Files.writeString(tmpFile, json);
-            Files.move(tmpFile, dayFile, StandardCopyOption.ATOMIC_MOVE, StandardCopyOption.REPLACE_EXISTING);
-
-            log.debug("Upserted session {} for {}", session.sessionId(), date);
-        } catch (IOException e) {
-            log.error("Failed to upsert session for {}: {}", date, e.getMessage(), e);
         }
     }
 
     public void deleteDay(String accountName, LocalDate date) {
-        try {
-            Path dayFile = getDayFile(accountName, date);
-            Files.deleteIfExists(dayFile);
-            log.debug("Deleted session file for {}", date);
-        } catch (IOException e) {
-            log.error("Failed to delete session file for {}: {}", date, e.getMessage());
+        synchronized (writeLock) {
+            try {
+                Path dayFile = getDayFile(accountName, date);
+                Files.deleteIfExists(dayFile);
+                log.debug("Deleted session file for {}", date);
+            } catch (IOException e) {
+                log.error("Failed to delete session file for {}: {}", date, e.getMessage());
+            }
         }
     }
 
