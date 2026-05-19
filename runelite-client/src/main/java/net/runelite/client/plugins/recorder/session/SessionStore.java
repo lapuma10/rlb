@@ -131,7 +131,7 @@ public class SessionStore {
         return totalMs;
     }
 
-    private ScriptStats accumulateScriptStats(String scriptId, List<ScriptRun> runs, long sessionLastSavedMs) {
+    private ScriptStats computeScriptStats(String scriptId, List<ScriptRun> runs, long sessionLastSavedMs) {
         String displayName = "";
         long totalMs = 0;
         int totalCount = 0;
@@ -139,7 +139,6 @@ public class SessionStore {
         boolean hasCount = false;
 
         for (ScriptRun run : runs) {
-            if (!run.scriptId().equals(scriptId)) continue;
             displayName = run.displayName();
             long endMs = run.endMs() != null ? run.endMs() : sessionLastSavedMs;
             totalMs += endMs - run.startMs();
@@ -163,28 +162,27 @@ public class SessionStore {
 
         for (LoginSession session : sessions) {
             totalLoginMs += session.loginDurationMs();
+
+            // Group runs by scriptId in a single O(N) pass; also collect all intervals for the global union.
+            Map<String, List<ScriptRun>> runsById = new HashMap<>();
             for (ScriptRun run : session.runs()) {
                 long endMs = run.endMs() != null ? run.endMs() : session.lastSavedMs();
                 allRunIntervals.add(new Interval(run.startMs(), endMs));
+                runsById.computeIfAbsent(run.scriptId(), k -> new ArrayList<>()).add(run);
             }
-        }
 
-        // Rebuild scriptStatsMap to ensure per-session contribution counted exactly once per scriptId.
-        for (LoginSession session : sessions) {
-            java.util.Set<String> seen = new java.util.HashSet<>();
-            for (ScriptRun run : session.runs()) {
-                if (!seen.add(run.scriptId())) continue;
-                ScriptStats sessionScriptStats = accumulateScriptStats(run.scriptId(), session.runs(), session.lastSavedMs());
-                ScriptStats existing = scriptStatsMap.get(run.scriptId());
+            for (Map.Entry<String, List<ScriptRun>> entry : runsById.entrySet()) {
+                ScriptStats perSession = computeScriptStats(entry.getKey(), entry.getValue(), session.lastSavedMs());
+                ScriptStats existing = scriptStatsMap.get(entry.getKey());
                 if (existing == null) {
-                    scriptStatsMap.put(run.scriptId(), sessionScriptStats);
+                    scriptStatsMap.put(entry.getKey(), perSession);
                 } else {
-                    Integer mergedCount = (existing.totalCount() != null && sessionScriptStats.totalCount() != null)
-                        ? existing.totalCount() + sessionScriptStats.totalCount() : null;
-                    scriptStatsMap.put(run.scriptId(), new ScriptStats(
+                    Integer mergedCount = (existing.totalCount() != null && perSession.totalCount() != null)
+                        ? existing.totalCount() + perSession.totalCount() : null;
+                    scriptStatsMap.put(entry.getKey(), new ScriptStats(
                         existing.scriptId(),
                         existing.displayName(),
-                        existing.totalMs() + sessionScriptStats.totalMs(),
+                        existing.totalMs() + perSession.totalMs(),
                         mergedCount,
                         existing.countLabel()
                     ));

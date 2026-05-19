@@ -3778,14 +3778,14 @@ public final class RecorderPanel extends PluginPanel
         void refreshStats()
         {
             if (sessionTracker == null || sessionStore == null) return;
+            // Skip work when the Stats tab isn't on screen — saves ~1 disk-scan/sec when user is elsewhere.
+            if (!isShowing()) return;
 
             // 1) Fast path: in-memory live counters — synchronous, EDT-safe.
             LoginSession currentSession = sessionTracker.getCurrentSession();
             String cachedAccount = sessionTracker.getCurrentAccountName();
-            final String accountName = (cachedAccount != null && !cachedAccount.isEmpty())
-                ? cachedAccount : "default";
 
-            resetBtn.setEnabled(currentSession == null);
+            resetBtn.setEnabled(currentSession == null && cachedAccount != null);
 
             if (currentSession != null)
             {
@@ -3799,7 +3799,17 @@ public final class RecorderPanel extends PluginPanel
                 loginStatusLabel.setText("Not logged in");
             }
 
+            // No account known yet (never logged in this client run) → don't aggregate; "default" would mix unrelated saves.
+            if (cachedAccount == null || cachedAccount.isEmpty())
+            {
+                scriptActiveLabel.setText("Script active: —");
+                idleLabel.setText("Idle: —");
+                statsTextArea.setText("Log in once to see stats.\n");
+                return;
+            }
+
             // 2) Slow path: disk I/O aggregation on a background thread → publish to EDT.
+            final String accountName = cachedAccount;
             final TimePeriod period = currentPeriod;
             final LocalDate today = LocalDate.now();
             new SwingWorker<SessionStats, Void>()

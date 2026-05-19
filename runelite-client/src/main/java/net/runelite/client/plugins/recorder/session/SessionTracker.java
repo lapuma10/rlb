@@ -23,9 +23,12 @@ public class SessionTracker implements ScriptLifecycleListener {
     private final ClientThread clientThread;
     private final SessionStore sessionStore;
 
+    private static final String DEFAULT_ACCOUNT = "default";
+
     private final Object lock = new Object();
     @Nullable private LoginSession currentLoginSession;
     @Nullable private String currentAccountName;
+    @Nullable private LocalDate currentSessionDate;
     private final Map<String, ScriptRun> activeRuns = new HashMap<>();
     @Nullable private Timer periodicSaveTimer;
     private final CopyOnWriteArrayList<Runnable> sessionStateCallbacks = new CopyOnWriteArrayList<>();
@@ -66,7 +69,7 @@ public class SessionTracker implements ScriptLifecycleListener {
 
     private String accountNameOrDefault() {
         String name = client.getUsername();
-        return (name == null || name.isEmpty()) ? "default" : name;
+        return (name == null || name.isEmpty()) ? DEFAULT_ACCOUNT : name;
     }
 
     // ---- Login / logout detection ----
@@ -94,6 +97,7 @@ public class SessionTracker implements ScriptLifecycleListener {
             long loginTime = System.currentTimeMillis();
             String sessionId = String.valueOf(loginTime);
             currentLoginSession = new LoginSession(sessionId, loginTime, null, loginTime, new ArrayList<>());
+            currentSessionDate = LocalDate.now(ZoneId.systemDefault());
             isNew = true;
         }
         // startPeriodicSaves and notifyStateChanged must run outside the lock
@@ -106,13 +110,16 @@ public class SessionTracker implements ScriptLifecycleListener {
 
     private void onLogout() {
         String accountName;
+        LocalDate sessionDate;
         LoginSession sessionToSave;
         synchronized (lock) {
             if (currentLoginSession == null) {
                 return;
             }
-            // Use the name captured at login; client.getUsername() returns "" at this point.
-            accountName = currentAccountName != null ? currentAccountName : "default";
+            // Use the name + date captured at login; client.getUsername() returns "" at this point,
+            // and using "now" as the date would split sessions crossing midnight across two files.
+            accountName = currentAccountName != null ? currentAccountName : DEFAULT_ACCOUNT;
+            sessionDate = currentSessionDate != null ? currentSessionDate : LocalDate.now(ZoneId.systemDefault());
             long logoutTime = System.currentTimeMillis();
 
             // finalizeAllActiveRuns mutates currentLoginSession and clears activeRuns; caller holds lock.
@@ -128,7 +135,6 @@ public class SessionTracker implements ScriptLifecycleListener {
         }
 
         // I/O outside the lock
-        LocalDate sessionDate = LocalDate.now(ZoneId.systemDefault());
         sessionStore.upsertSession(accountName, sessionDate, sessionToSave);
         log.debug("Session ended: {} at {}", accountName, sessionToSave.logoutTime());
 
@@ -136,6 +142,7 @@ public class SessionTracker implements ScriptLifecycleListener {
             currentLoginSession = null;
             activeRuns.clear();
             currentAccountName = null;
+            currentSessionDate = null;
         }
         stopPeriodicSaves();
         notifyStateChanged();
@@ -189,6 +196,7 @@ public class SessionTracker implements ScriptLifecycleListener {
     @Override
     public void onScriptStopped(String scriptId, @Nullable Integer count, @Nullable String countLabel) {
         String accountName;
+        LocalDate sessionDate;
         LoginSession updatedSession;
         ScriptRun activeRun;
         synchronized (lock) {
@@ -220,12 +228,12 @@ public class SessionTracker implements ScriptLifecycleListener {
                 runs
             );
             currentLoginSession = updatedSession;
-            accountName = currentAccountName != null ? currentAccountName : "default";
+            accountName = currentAccountName != null ? currentAccountName : DEFAULT_ACCOUNT;
+            sessionDate = currentSessionDate != null ? currentSessionDate : LocalDate.now(ZoneId.systemDefault());
             log.debug("Script stopped: {} ({}), duration: {}ms, count: {}",
                 activeRun.displayName(), scriptId, endMs - activeRun.startMs(), count);
         }
         // I/O outside the lock
-        LocalDate sessionDate = LocalDate.now(ZoneId.systemDefault());
         sessionStore.upsertSession(accountName, sessionDate, updatedSession);
         notifyStateChanged();
     }
@@ -258,6 +266,7 @@ public class SessionTracker implements ScriptLifecycleListener {
     private void periodicSave() {
         LoginSession snapshot;
         String accountName;
+        LocalDate sessionDate;
         String sessionId;
         synchronized (lock) {
             if (currentLoginSession == null) return;
@@ -273,11 +282,11 @@ public class SessionTracker implements ScriptLifecycleListener {
                 now,
                 runs
             );
-            accountName = currentAccountName != null ? currentAccountName : "default";
+            accountName = currentAccountName != null ? currentAccountName : DEFAULT_ACCOUNT;
+            sessionDate = currentSessionDate != null ? currentSessionDate : LocalDate.now(ZoneId.systemDefault());
             sessionId = currentLoginSession.sessionId();
         }
         // I/O outside the lock
-        LocalDate sessionDate = LocalDate.now(ZoneId.systemDefault());
         sessionStore.upsertSession(accountName, sessionDate, snapshot);
         log.debug("Periodic save: session {}", sessionId);
     }
@@ -287,10 +296,12 @@ public class SessionTracker implements ScriptLifecycleListener {
     public void onShutdown() {
         stopPeriodicSaves();
         String accountName;
+        LocalDate sessionDate;
         LoginSession finalSession;
         synchronized (lock) {
             if (currentLoginSession == null) return;
-            accountName = currentAccountName != null ? currentAccountName : "default";
+            accountName = currentAccountName != null ? currentAccountName : DEFAULT_ACCOUNT;
+            sessionDate = currentSessionDate != null ? currentSessionDate : LocalDate.now(ZoneId.systemDefault());
             long shutdownTime = System.currentTimeMillis();
 
             // finalizeAllActiveRuns mutates currentLoginSession; caller holds lock.
@@ -305,13 +316,13 @@ public class SessionTracker implements ScriptLifecycleListener {
             );
         }
         // I/O outside the lock
-        LocalDate sessionDate = LocalDate.now(ZoneId.systemDefault());
         sessionStore.upsertSession(accountName, sessionDate, finalSession);
 
         synchronized (lock) {
             currentLoginSession = null;
             activeRuns.clear();
             currentAccountName = null;
+            currentSessionDate = null;
         }
         log.debug("Session finalized on plugin shutdown");
     }

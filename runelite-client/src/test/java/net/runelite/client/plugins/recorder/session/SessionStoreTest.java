@@ -5,10 +5,16 @@ import org.junit.Rule;
 import org.junit.Test;
 import org.junit.rules.TemporaryFolder;
 
+import java.nio.file.Files;
+import java.nio.file.Path;
 import java.time.LocalDate;
+import java.util.ArrayList;
 import java.util.List;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.TimeUnit;
 
 import static org.junit.Assert.assertEquals;
+import static org.junit.Assert.assertTrue;
 
 public class SessionStoreTest {
     @Rule
@@ -143,5 +149,67 @@ public class SessionStoreTest {
 
         store.deleteDay(account, date);
         assertEquals(0, store.loadDay(account, date).size());
+    }
+
+    @Test
+    public void loadDay_corruptJson_returnsEmpty() throws Exception {
+        LocalDate date = LocalDate.of(2026, 5, 19);
+        String account = "testaccount";
+
+        // First write a valid file so the account dir exists.
+        LoginSession s = new LoginSession("1000", 1000, 2000L, 2000, List.of());
+        store.upsertSession(account, date, s);
+
+        // Now corrupt the file. loadDay must NOT throw; aggregateAllTime depends on this.
+        Path dayFile = tempDir.getRoot().toPath()
+            .resolve(account).resolve(date.toString() + ".json");
+        Files.writeString(dayFile, "{not valid json at all");
+
+        List<LoginSession> loaded = store.loadDay(account, date);
+        assertEquals(0, loaded.size());
+
+        // aggregateAllTime should also survive a corrupt file in the directory.
+        SessionStats stats = store.aggregateAllTime(account);
+        assertEquals(0, stats.totalLoginMs());
+    }
+
+    @Test
+    public void concurrentUpsert_doesNotLoseWrites() throws Exception {
+        LocalDate date = LocalDate.of(2026, 5, 19);
+        String account = "testaccount";
+
+        int threads = 8;
+        int writesPerThread = 25;
+        CountDownLatch start = new CountDownLatch(1);
+        CountDownLatch done = new CountDownLatch(threads);
+        List<Thread> workers = new ArrayList<>();
+        for (int t = 0; t < threads; t++) {
+            final int threadId = t;
+            Thread w = new Thread(() -> {
+                try {
+                    start.await();
+                    for (int i = 0; i < writesPerThread; i++) {
+                        String sid = "t" + threadId + "_" + i;
+                        long start_ = i * 1000L;
+                        long end_ = start_ + 500;
+                        LoginSession ls = new LoginSession(sid, start_, end_, end_, List.of(
+                            new ScriptRun("mining", "Mining", start_, end_, 1, "ores")
+                        ));
+                        store.upsertSession(account, date, ls);
+                    }
+                } catch (InterruptedException ignored) {
+                } finally {
+                    done.countDown();
+                }
+            });
+            workers.add(w);
+            w.start();
+        }
+        start.countDown();
+        assertTrue("threads did not finish in time", done.await(30, TimeUnit.SECONDS));
+
+        List<LoginSession> loaded = store.loadDay(account, date);
+        // Every distinct sessionId written by every thread must be present (no read-modify-write loss).
+        assertEquals(threads * writesPerThread, loaded.size());
     }
 }

@@ -12,9 +12,7 @@ public record LoginSession(
 )
 {
     public long loginDurationMs() {
-        if (logoutTime != null) {
-            return logoutTime - loginTime;
-        }
-        return lastSavedMs - loginTime;
+        long end = logoutTime != null ? logoutTime : lastSavedMs;
+        return Math.max(0, end - loginTime);
     }
 }
