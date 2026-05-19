@@ -115,7 +115,20 @@ import java.util.function.Consumer;
 import java.util.function.Supplier;
 import javax.annotation.Nullable;
 import javax.swing.AbstractAction;
+import javax.swing.ButtonGroup;
+import javax.swing.JRadioButton;
+import javax.swing.JTextArea;
 import javax.swing.KeyStroke;
+import java.awt.Font;
+import java.time.LocalDate;
+import java.time.YearMonth;
+import java.util.Map;
+import net.runelite.client.plugins.recorder.session.LoginSession;
+import net.runelite.client.plugins.recorder.session.ScriptStats;
+import net.runelite.client.plugins.recorder.session.SessionStats;
+import net.runelite.client.plugins.recorder.session.SessionStore;
+import net.runelite.client.plugins.recorder.session.SessionTracker;
+import net.runelite.client.plugins.recorder.session.TimePeriod;
 
 @Slf4j
 public final class RecorderPanel extends PluginPanel
@@ -362,6 +375,10 @@ public final class RecorderPanel extends PluginPanel
     private final JButton trailWalkSelectedStopBtn = new JButton("Stop");
     private final JLabel trailStatusLabel = new JLabel("Trails: idle");
     private volatile Thread trailWalkerThread;
+    // Session stats — wired by RecorderPlugin via setSessionTracker().
+    private SessionTracker sessionTracker;
+    private SessionStore sessionStore;
+    private StatsPanel statsPanel;
 
     public RecorderPanel(RecorderManager manager, Client client)
     {
@@ -391,6 +408,8 @@ public final class RecorderPanel extends PluginPanel
         tabs.addTab("Quests", tabScroll(buildQuestsTab()));
         tabs.addTab("Moneymakers", tabScroll(buildMoneymakersTab()));
         tabs.addTab("Login",  tabScroll(buildLoginTab()));
+        statsPanel = new StatsPanel(null, null, client);
+        tabs.addTab("Stats", statsPanel);
         add(tabs, BorderLayout.CENTER);
 
         recordBtn.addActionListener(this::onRecordToggle);
@@ -3593,6 +3612,21 @@ public final class RecorderPanel extends PluginPanel
     // Mining section
     // ----------------------------------------------------------------------
 
+    /** Wire the session tracker + store. Called by RecorderPlugin at startUp.
+     *  Replaces the placeholder StatsPanel (constructed with nulls) with a
+     *  fully-wired instance and registers for state-change notifications. */
+    public void setSessionTracker(SessionTracker sessionTracker, SessionStore sessionStore)
+    {
+        this.sessionTracker = sessionTracker;
+        this.sessionStore = sessionStore;
+        int statsTabIndex = tabs.indexOfTab("Stats");
+        statsPanel = new StatsPanel(sessionTracker, sessionStore, client);
+        tabs.setComponentAt(statsTabIndex, statsPanel);
+        sessionTracker.registerSessionStateCallback(() -> {
+            if (statsPanel != null) statsPanel.refreshStats();
+        });
+    }
+
     /** Wire the mining loop. Called by the plugin during startUp once the
      *  dispatcher is constructed. The loop's status callback updates
      *  {@link #miningStatusLabel} via the EDT (see {@link #onMiningStatus}). */
@@ -3651,5 +3685,169 @@ public final class RecorderPanel extends PluginPanel
             && st != MiningLoop.State.ABORTED);
         miningOreCountLabel.setText("Ores: " + miningLoop.oresMined());
         miningRockCountLabel.setText("Rocks: " + miningLoop.candidatesSnapshot().size());
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // Stats tab — session / script runtime display
+    // ─────────────────────────────────────────────────────────────────────────
+
+    private static class StatsPanel extends JPanel
+    {
+        private final @Nullable SessionTracker sessionTracker;
+        private final @Nullable SessionStore sessionStore;
+        private final Client client;
+        private TimePeriod currentPeriod = TimePeriod.DAILY;
+        private final JLabel loginStatusLabel = new JLabel("Not logged in");
+        private final JLabel scriptActiveLabel = new JLabel("Script active: —");
+        private final JLabel idleLabel = new JLabel("Idle: —");
+        private final JTextArea statsTextArea = new JTextArea(15, 40);
+        private final JButton resetBtn = new JButton("Reset Today");
+        private Timer refreshTimer;
+
+        StatsPanel(@Nullable SessionTracker sessionTracker,
+                   @Nullable SessionStore sessionStore,
+                   Client client)
+        {
+            this.sessionTracker = sessionTracker;
+            this.sessionStore = sessionStore;
+            this.client = client;
+            initUI();
+            startRefreshTimer();
+        }
+
+        private void initUI()
+        {
+            setLayout(new BorderLayout(4, 4));
+            setBorder(BorderFactory.createEmptyBorder(4, 4, 4, 4));
+
+            JPanel topPanel = new JPanel(new FlowLayout(FlowLayout.LEADING, 4, 0));
+            ButtonGroup periodGroup = new ButtonGroup();
+            for (TimePeriod period : TimePeriod.values())
+            {
+                JRadioButton rb = new JRadioButton(period.getLabel());
+                rb.addActionListener(e -> { currentPeriod = period; refreshStats(); });
+                periodGroup.add(rb);
+                topPanel.add(rb);
+                if (period == TimePeriod.DAILY) rb.setSelected(true);
+            }
+            topPanel.add(Box.createHorizontalStrut(20));
+            resetBtn.addActionListener(e -> resetToday());
+            topPanel.add(resetBtn);
+
+            add(topPanel, BorderLayout.NORTH);
+
+            JPanel sessionPanel = new JPanel();
+            sessionPanel.setLayout(new BoxLayout(sessionPanel, BoxLayout.Y_AXIS));
+            sessionPanel.setBorder(BorderFactory.createTitledBorder("Current Session"));
+            sessionPanel.add(loginStatusLabel);
+            sessionPanel.add(scriptActiveLabel);
+            sessionPanel.add(idleLabel);
+
+            statsTextArea.setEditable(false);
+            statsTextArea.setFont(new Font(Font.MONOSPACED, Font.PLAIN, 12));
+            JScrollPane statsScroll = new JScrollPane(statsTextArea);
+
+            JPanel centerPanel = new JPanel(new BorderLayout(0, 4));
+            centerPanel.add(sessionPanel, BorderLayout.NORTH);
+            centerPanel.add(statsScroll, BorderLayout.CENTER);
+
+            add(centerPanel, BorderLayout.CENTER);
+        }
+
+        private void startRefreshTimer()
+        {
+            refreshTimer = new Timer(1000, e -> refreshStats());
+            refreshTimer.start();
+        }
+
+        void refreshStats()
+        {
+            if (sessionTracker == null || sessionStore == null) return;
+
+            LoginSession currentSession = sessionTracker.getCurrentSession();
+            String accountName = client.getUsername();
+            if (accountName == null || accountName.isEmpty()) accountName = "default";
+
+            resetBtn.setEnabled(currentSession == null);
+
+            if (currentSession != null)
+            {
+                long loginDurationMs = System.currentTimeMillis() - currentSession.loginTime();
+                long h = loginDurationMs / 3_600_000L;
+                long m = (loginDurationMs % 3_600_000L) / 60_000L;
+                loginStatusLabel.setText(String.format("Logged in: %dh %dm", h, m));
+            }
+            else
+            {
+                loginStatusLabel.setText("Not logged in");
+            }
+
+            SessionStats stats;
+            LocalDate today = LocalDate.now();
+            switch (currentPeriod)
+            {
+                case DAILY:    stats = sessionStore.aggregateDaily(accountName, today); break;
+                case WEEKLY:   stats = sessionStore.aggregateWeekly(accountName, today); break;
+                case MONTHLY:  stats = sessionStore.aggregateMonthly(accountName, YearMonth.now()); break;
+                case ALL_TIME: stats = sessionStore.aggregateAllTime(accountName); break;
+                default:       stats = sessionStore.aggregateDaily(accountName, today);
+            }
+            updateStatsDisplay(stats);
+        }
+
+        private void updateStatsDisplay(SessionStats stats)
+        {
+            long h  = stats.totalLoginMs()        / 3_600_000L;
+            long m  = (stats.totalLoginMs()        % 3_600_000L) / 60_000L;
+            long ah = stats.totalScriptActiveMs()  / 3_600_000L;
+            long am = (stats.totalScriptActiveMs() % 3_600_000L) / 60_000L;
+            long ih = stats.idleMs()               / 3_600_000L;
+            long im = (stats.idleMs()              % 3_600_000L) / 60_000L;
+
+            scriptActiveLabel.setText(String.format("Script active: %dh %dm", ah, am));
+            idleLabel.setText(String.format("Idle: %dh %dm", ih, im));
+
+            StringBuilder sb = new StringBuilder();
+            sb.append("SCRIPT BREAKDOWN\n");
+            sb.append("-------------------------------------\n");
+            for (Map.Entry<String, ScriptStats> entry : stats.scripts().entrySet())
+            {
+                ScriptStats s = entry.getValue();
+                long sh = s.totalMs() / 3_600_000L;
+                long sm = (s.totalMs() % 3_600_000L) / 60_000L;
+                sb.append(String.format("%-25s %3dh %2dm", s.displayName(), sh, sm));
+                if (s.totalCount() != null)
+                {
+                    sb.append(String.format("  %d %s", s.totalCount(),
+                        s.countLabel() == null ? "" : s.countLabel()));
+                }
+                sb.append("\n");
+            }
+            sb.append("-------------------------------------\n");
+            sb.append(String.format("TOTAL              %3dh %2dm\n", h, m));
+            statsTextArea.setText(sb.toString());
+        }
+
+        private void resetToday()
+        {
+            if (sessionStore == null) return;
+            LoginSession current = sessionTracker != null ? sessionTracker.getCurrentSession() : null;
+            if (current != null)
+            {
+                JOptionPane.showMessageDialog(this, "Cannot reset while logged in.",
+                    "Reset Disabled", JOptionPane.INFORMATION_MESSAGE);
+                return;
+            }
+            String accountName = client.getUsername();
+            if (accountName == null || accountName.isEmpty()) accountName = "default";
+
+            int confirm = JOptionPane.showConfirmDialog(this,
+                "Delete today's session data?", "Confirm Reset", JOptionPane.YES_NO_OPTION);
+            if (confirm == JOptionPane.YES_OPTION)
+            {
+                sessionStore.deleteDay(accountName, LocalDate.now());
+                refreshStats();
+            }
+        }
     }
 }
