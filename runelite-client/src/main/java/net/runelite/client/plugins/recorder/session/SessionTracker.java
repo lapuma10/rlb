@@ -3,7 +3,9 @@ package net.runelite.client.plugins.recorder.session;
 import lombok.extern.slf4j.Slf4j;
 import net.runelite.api.Client;
 import net.runelite.api.GameState;
+import net.runelite.api.Player;
 import net.runelite.api.events.GameStateChanged;
+import net.runelite.api.events.GameTick;
 import net.runelite.client.callback.ClientThread;
 import net.runelite.client.eventbus.Subscribe;
 import javax.annotation.Nullable;
@@ -149,8 +151,21 @@ public class SessionTracker implements ScriptLifecycleListener {
     }
 
     private String accountNameOrDefault() {
-        String name = client.getUsername();
-        return (name == null || name.isEmpty()) ? DEFAULT_ACCOUNT : name;
+        // Prefer the in-game character display name (set after the game world finishes loading,
+        // a couple of ticks past LOGGED_IN). Fall back to the login credential, then default.
+        // Reading client.getLocalPlayer() requires the client thread — callers are either
+        // an @Subscribe handler (on the eventbus → client thread) or the periodic Timer
+        // (off-thread, where this returns the cached login name or default).
+        try {
+            Player local = client.getLocalPlayer();
+            if (local != null && local.getName() != null && !local.getName().isEmpty()) {
+                return local.getName();
+            }
+        } catch (Exception ignored) {
+            // off-thread read can throw; fall through to the safer accessor below
+        }
+        String login = client.getUsername();
+        return (login == null || login.isEmpty()) ? DEFAULT_ACCOUNT : login;
     }
 
     // ---- Login / logout detection ----
@@ -162,6 +177,25 @@ public class SessionTracker implements ScriptLifecycleListener {
             onLogin();
         } else if (state == GameState.LOGIN_SCREEN) {
             onLogout();
+        }
+    }
+
+    /** Late-resolve the account name. {@code client.getUsername()} is empty when LOGGED_IN
+     *  first fires, so {@link #onLogin} initially caches "default". GameTick runs on the client
+     *  thread after the game world loads, by which time {@code getLocalPlayer().getName()} is
+     *  populated. Once we've nailed it down, this is a no-op. */
+    @Subscribe
+    public void onGameTick(GameTick event) {
+        synchronized (lock) {
+            if (currentLoginSession == null) return;
+            if (currentAccountName != null && !DEFAULT_ACCOUNT.equals(currentAccountName)) return;
+            String resolved = accountNameOrDefault();
+            if (resolved != null && !DEFAULT_ACCOUNT.equals(resolved)
+                && !resolved.equals(currentAccountName))
+            {
+                log.info("Session account name late-resolved: {} → {}", currentAccountName, resolved);
+                currentAccountName = resolved;
+            }
         }
     }
 
@@ -229,8 +263,9 @@ public class SessionTracker implements ScriptLifecycleListener {
         synchronized (lock) {
             currentLoginSession = null;
             activeRuns.clear();
-            currentAccountName = null;
-            currentSessionDate = null;
+            // Intentionally keep currentAccountName + currentSessionDate cached so the panel
+            // can still display the just-logged-out account's stats. Next login overwrites
+            // them (or leaves them if the same account logs back in).
         }
         stopPeriodicSaves();
         notifyStateChanged();

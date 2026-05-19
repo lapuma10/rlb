@@ -3908,15 +3908,18 @@ public final class RecorderPanel extends PluginPanel
             scriptActiveLabel.setText(String.format("Script active: %dh %dm", ah, am));
             idleLabel.setText(String.format("Idle: %dh %dm", ih, im));
 
+            // Narrow panel — keep the format compact so the right-hand minutes/counts
+            // don't get cut off. Column 14 hits the hours, leaves room for "Xh XXm  9999 ores"
+            // in ~28 chars (matches the panel width users actually have).
             StringBuilder sb = new StringBuilder();
             sb.append("SCRIPT BREAKDOWN\n");
-            sb.append("-------------------------------------\n");
+            sb.append("------------------------------\n");
             for (Map.Entry<String, ScriptStats> entry : stats.scripts().entrySet())
             {
                 ScriptStats s = entry.getValue();
                 long sh = s.totalMs() / 3_600_000L;
                 long sm = (s.totalMs() % 3_600_000L) / 60_000L;
-                sb.append(String.format("%-25s %3dh %2dm", s.displayName(), sh, sm));
+                sb.append(String.format("%-13s %2dh %2dm", s.displayName(), sh, sm));
                 if (s.totalCount() != null)
                 {
                     sb.append(String.format("  %d %s", s.totalCount(),
@@ -3924,8 +3927,13 @@ public final class RecorderPanel extends PluginPanel
                 }
                 sb.append("\n");
             }
-            sb.append("-------------------------------------\n");
-            sb.append(String.format("TOTAL              %3dh %2dm\n", h, m));
+            // Idle row — shown right below the scripts so scripts + idle = TOTAL is verifiable
+            // by eye. Same column layout so it lines up with the per-script and TOTAL rows.
+            long iah = stats.idleMs() / 3_600_000L;
+            long iam = (stats.idleMs() % 3_600_000L) / 60_000L;
+            sb.append(String.format("%-13s %2dh %2dm\n", "Idle", iah, iam));
+            sb.append("------------------------------\n");
+            sb.append(String.format("%-13s %2dh %2dm\n", "TOTAL", h, m));
             statsTextArea.setText(sb.toString());
         }
 
