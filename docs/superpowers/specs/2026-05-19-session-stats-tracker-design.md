@@ -20,81 +20,102 @@ Add a "Stats" tab to RecorderPanel that displays:
 
 ### Session File Format
 
-Each login session is stored as a JSON file: `~/.runelite/recorder/sessions/<accountname>/<YYYY-MM-DD>.json`
+Each day is stored as a JSON file: `~/.runelite/recorder/sessions/<accountname>/<YYYY-MM-DD>.json`
+
+Multiple login sessions can occur in a single day. Raw data is stored as events (script runs), not pre-aggregated. Aggregation happens at read time.
 
 ```json
 {
   "date": "2026-05-19",
-  "loginTime": 1716144123000,
-  "logoutTime": 1716161234000,
-  "scripts": {
-    "ChickenFarmV3": {
-      "name": "Chicken Farm V3",
-      "totalMs": 3300000,
+  "sessions": [
+    {
+      "sessionId": "1716144123000",
+      "loginTime": 1716144123000,
+      "logoutTime": 1716161234000,
       "runs": [
         {
+          "scriptId": "chicken_farm_v3",
+          "displayName": "Chicken Farm V3",
           "startMs": 1716144123000,
           "endMs": 1716147423000,
-          "count": 42
-        }
-      ]
-    },
-    "CookingV3": {
-      "name": "Cooking V3",
-      "totalMs": 1920000,
-      "runs": [
+          "count": 42,
+          "countLabel": "kills"
+        },
         {
+          "scriptId": "cooking_v3",
+          "displayName": "Cooking V3",
           "startMs": 1716147500000,
           "endMs": 1716149420000,
-          "count": 180
-        }
-      ]
-    },
-    "MiningLoop": {
-      "name": "Mining",
-      "totalMs": 1020000,
-      "runs": [
+          "count": 180,
+          "countLabel": "cooked"
+        },
         {
+          "scriptId": "mining",
+          "displayName": "Mining",
           "startMs": 1716149500000,
           "endMs": 1716150520000,
-          "count": 84
+          "count": 84,
+          "countLabel": "ores"
         }
       ]
     }
-  }
+  ]
 }
 ```
 
 **Fields:**
-- `date`: ISO date string (YYYY-MM-DD) — used for file organization and daily boundary detection
+- `date`: ISO date string (YYYY-MM-DD) — file organization and boundary detection
+- `sessions`: array of login sessions for this day (supports multiple logins per day)
+- `sessionId`: unique ID for this session (use `loginTimeMs` as the session ID)
 - `loginTime`, `logoutTime`: milliseconds since epoch
-- `scripts.<name>.totalMs`: cumulative milliseconds across all runs of this script today
-- `scripts.<name>.runs`: array of individual run segments (start, end, optional count like kills/ores/items cooked)
-- `count`: script-specific metric (kills for combat, ores for mining, items cooked for cooking, etc.) — populated when the script stops/reports completion
+- `runs`: flat array of all script run segments in this session
+  - `scriptId`: stable identifier (e.g., `chicken_farm_v3`) — does not change if display name changes
+  - `displayName`: human-readable label for UI
+  - `startMs`, `endMs`: milliseconds since epoch (always in same session, no midnight crossing)
+  - `count`: script-specific metric (kills, ores, items cooked, etc.) — null if not reported
+  - `countLabel`: name of the metric (`"kills"`, `"ores"`, `"cooked"`, etc.) — helps UI label the number
 
 ### In-Memory Session State
 
 While logged in, `SessionTracker` maintains:
 ```java
-class SessionState {
-  long loginTimeMs;
-  long currentSessionStartMs;
-  Map<String, ScriptRuntime> scripts = new HashMap<>();  // script name → current run state
-}
+record LoginSession(
+  String sessionId,
+  long loginTimeMs,
+  List<ScriptRun> runs
+) {}
 
-class ScriptRuntime {
-  String name;
-  long totalMs;
-  List<RunSegment> runs;  // all runs in this session
-  long currentRunStartMs;  // null if not running
-  int currentCount;  // accumulating count (kills, ores, etc.)
-}
+record ScriptRun(
+  String scriptId,
+  String displayName,
+  long startMs,
+  Long endMs,           // null while running
+  Integer count,        // null until script stops
+  String countLabel
+) {}
 
-class RunSegment {
-  long startMs, endMs;
-  int count;
+// Per-script current state (not persisted; used to track active runs)
+class ActiveScriptState {
+  String scriptId;
+  String displayName;
+  long startMs;
+  int currentCount;     // accumulating while script is running
+  String countLabel;    // e.g., "kills", "ores"
 }
 ```
+
+Tracker maintains:
+- `currentLoginSession: LoginSession` (null if logged out)
+- `activeScripts: Map<String, ActiveScriptState>` (script ID → current state)
+
+When a script stops, the tracker:
+1. Finalizes the run: `ScriptRun(scriptId, displayName, startMs, endMs=now, count, countLabel)`
+2. Adds to `currentLoginSession.runs`
+3. Removes from `activeScripts`
+
+On logout:
+1. Writes `currentLoginSession` to disk
+2. Clears `currentLoginSession` and `activeScripts`
 
 ---
 
@@ -134,16 +155,28 @@ Responsibility: read/write session files; aggregate across multiple days.
 **Return type:** `SessionStats` (immutable record)
 ```java
 record SessionStats(
-  long totalLoginMs,
+  long totalLoginMs,           // sum of all (logoutTime - loginTime) in the period
+  long totalScriptActiveMs,    // union of all script run intervals (no double-counting overlaps)
+  long idleMs,                 // totalLoginMs - totalScriptActiveMs
   Map<String, ScriptStats> scripts
 ) {}
 
 record ScriptStats(
-  String name,
-  long totalMs,
-  int totalCount  // aggregate across all runs in the period
+  String scriptId,
+  String displayName,
+  long totalMs,                // sum of individual run durations
+  Integer totalCount,          // sum of counts across all runs (null if script never reported counts)
+  String countLabel            // e.g., "kills", "ores" (from last run of this script)
 ) {}
 ```
+
+**Note on overlapping scripts:** If two scripts run simultaneously (e.g., Combat + Banking), `totalScriptActiveMs` counts the union of their intervals, not the sum. This prevents double-counting idle time.
+
+**Algorithm:**
+1. Collect all script run intervals: `[(s1.start, s1.end), (s2.start, s2.end), ...]`
+2. Merge overlapping intervals
+3. Sum the merged intervals to get `totalScriptActiveMs`
+4. `idleMs = totalLoginMs - totalScriptActiveMs`
 
 #### 3. StatsPanel (new JPanel)
 
@@ -153,21 +186,28 @@ Responsibility: display current session + aggregated stats; handle radio-button 
 
 **UI structure:**
 ```
-┌─────────────────────────────────────────────────┐
-│  [Daily] [Weekly] [Monthly] [All-Time]  [Reset] │
-├─────────────────────────────────────────────────┤
-│ CURRENT SESSION (only when logged in)           │
-│ Logged in: 2h 34m (started 2:15 PM)            │
-├─────────────────────────────────────────────────┤
-│ Chicken Farm V3    1h 45m    42 kills           │
-│ Cooking V3         32m       180 cooked         │
-│ Mining             17m       84 ores            │
-│ ─────────────────────────────────────────────── │
-│ Total              2h 34m                       │
-├─────────────────────────────────────────────────┤
-│ [scroll area for many scripts]                  │
-└─────────────────────────────────────────────────┘
+┌──────────────────────────────────────────────────────┐
+│  [Daily] [Weekly] [Monthly] [All-Time]      [Reset]  │
+├──────────────────────────────────────────────────────┤
+│ CURRENT SESSION (only when logged in)                │
+│ Logged in: 2h 34m (started 2:15 PM)                 │
+│ Script active: 1h 45m    Idle: 49m                  │
+├──────────────────────────────────────────────────────┤
+│ Script Breakdown:                                    │
+│ ─────────────────────────────────────────────────── │
+│ Chicken Farm V3    1h 12m    42 kills               │
+│ Cooking V3         33m       180 cooked              │
+│ Mining             —          —                      │
+│ ─────────────────────────────────────────────────── │
+│ [scroll area for many scripts]                       │
+└──────────────────────────────────────────────────────┘
 ```
+
+**On logout,** display updates to show the finalized session (login time, script active, idle, script breakdown).
+
+**Per-period display** (Daily/Weekly/Monthly/All-Time):
+- Shows totals for the selected period (sum of all login sessions, all script runs, etc.)
+- If multiple login sessions in the period, shows aggregated time across all of them
 
 **Key methods:**
 - `setPeriod(TimePeriod)` — switch between Daily/Weekly/Monthly/AllTime; re-render stats
@@ -186,43 +226,54 @@ Responsibility: display current session + aggregated stats; handle radio-button 
 2. RecorderPlugin forwards to SessionTracker
 3. SessionTracker:
    - Records `loginTime = System.currentTimeMillis()`
-   - Creates new `SessionState`
+   - Creates new `LoginSession` with `sessionId = loginTime`
+   - Initializes empty `runs` list
    - Notifies StatsPanel via callback
-4. StatsPanel displays "Logged in: 0h 0m (started HH:MM AM/PM)"
-5. 1-second refresh timer starts
+4. StatsPanel displays "Logged in: 0h 0m (started HH:MM AM/PM)" and "Script active: 0m"
+5. 1-second refresh timer starts (updates login/idle times)
 
 ### Script Activation
 
-1. Script starts (e.g., ChickenFarmV3 begins)
-2. Script event fires (via RecorderManager or script state transition)
-3. SessionTracker records:
-   - `sessionState.scripts.get("ChickenFarmV3").currentRunStartMs = now`
-4. StatsPanel shows "Chicken Farm V3: 0m" (0 duration so far)
+1. Script starts (e.g., ChickenFarmV3 begins) and calls:
+   ```java
+   sessionTracker.onScriptStarted("chicken_farm_v3", "Chicken Farm V3");
+   ```
+2. SessionTracker:
+   - Creates `ActiveScriptState` for this script
+   - Records `startMs = now`
+   - Adds to `activeScripts` map
+3. StatsPanel updates to show "Chicken Farm V3: 0m" (0 duration so far)
 
 ### Script Deactivation
 
-1. Script stops (e.g., ChickenFarmV3 ends or is manually stopped)
-2. Script event fires with completion count (e.g., 42 kills)
-3. SessionTracker:
-   - Records `endMs` for the current run
-   - Adds RunSegment to the `runs` list
-   - Updates `totalMs`
-   - Clears `currentRunStartMs` (script not running)
-   - Stores the count (42 kills)
-4. StatsPanel updates label: "Chicken Farm V3: 45m 42 kills"
+1. Script stops (e.g., ChickenFarmV3 ends or is manually stopped) and calls:
+   ```java
+   sessionTracker.onScriptStopped("chicken_farm_v3", 42, "kills");
+   ```
+2. SessionTracker:
+   - Finalizes the run: `ScriptRun(scriptId, displayName, startMs, endMs=now, count, countLabel)`
+   - Appends to `currentLoginSession.runs`
+   - Removes from `activeScripts`
+   - **Saves session to disk** (atomic write to `<date>.json.tmp`, then move to `<date>.json`)
+3. StatsPanel updates label: "Chicken Farm V3: 45m 42 kills"
 
 ### Logout → Session End
 
 1. Player logs out → `GameStateChanged(LOGGED_OUT)` fires
 2. SessionTracker:
    - Records `logoutTime = System.currentTimeMillis()`
-   - Calls `SessionStore.saveSession(accountName, sessionState)` on a background worker
-   - Clears in-memory session
+   - Finalizes any still-running scripts (treat as stopped with null count)
+   - Writes `currentLoginSession` to disk (atomic write)
+   - Clears `currentLoginSession` and `activeScripts`
    - Notifies StatsPanel via callback
 3. StatsPanel:
    - Clears "Logged in: ..." display
    - Calls `SessionStore.aggregateDaily(accountName, today)` to refresh stats
    - Displays cumulative totals for the day
+
+### Periodic Saving
+
+In addition to on-logout, SessionTracker saves every 60 seconds while logged in. This ensures data survives client crashes.
 
 ### UI Period Switching
 
@@ -268,11 +319,21 @@ tabs.addTab("Stats", statsPanel);
 
 ### Script Event Detection
 
-Existing scripts already emit state changes (e.g., ChickenFarmV3 transitions IDLE → RUNNING → IDLE). SessionTracker listens by:
-- Observing script status labels (e.g., chickenStatusLabel, miningStatusLabel)
-- Or scripts emit events directly via a callback interface
+Existing scripts already manage their own state transitions (e.g., ChickenFarmV3 → IDLE → RUNNING → IDLE). SessionTracker subscribes to script lifecycle events via a callback interface.
 
-**Approach:** Wrap script status updates so SessionTracker can observe them. Add a `ScriptLifecycleListener` interface that scripts call on start/stop.
+**Add to SessionTracker:**
+```java
+interface ScriptLifecycleListener {
+  void onScriptStarted(String scriptId, String displayName);
+  void onScriptStopped(String scriptId, Integer count, String countLabel);
+}
+```
+
+**Each script calls:**
+- `sessionTracker.onScriptStarted("chicken_farm_v3", "Chicken Farm V3")` on start
+- `sessionTracker.onScriptStopped("chicken_farm_v3", 42, "kills")` on stop/death (count can be null)
+
+Scripts are responsible for calling these methods at the right times. Do NOT observe UI labels; labels are presentation only.
 
 ---
 
@@ -281,18 +342,56 @@ Existing scripts already emit state changes (e.g., ChickenFarmV3 transitions IDL
 ```
 runelite-client/src/main/java/net/runelite/client/plugins/recorder/
   session/
-    SessionTracker.java       (login/logout detection, event forwarding)
-    SessionStore.java         (JSON persistence, aggregation queries)
-    SessionState.java         (in-memory session record)
-    SessionStats.java         (aggregated result record)
-    TimePeriod.java           (enum: DAILY, WEEKLY, MONTHLY, ALL_TIME)
+    SessionTracker.java           (GameStateChanged listener, script lifecycle callbacks)
+    SessionStore.java             (JSON read/write, aggregation queries)
+    SessionStats.java             (aggregated result record)
+    LoginSession.java             (in-memory session + runs)
+    ScriptRun.java                (single script run record)
+    ScriptStats.java              (aggregated per-script stats)
+    TimePeriod.java               (enum: DAILY, WEEKLY, MONTHLY, ALL_TIME)
+    ScriptLifecycleListener.java  (interface for script callbacks)
 
 runelite-client/src/test/java/net/runelite/client/plugins/recorder/
   session/
-    SessionStoreTest.java     (JSON read/write, aggregation logic)
+    SessionStoreTest.java         (JSON round-trip, aggregation, midnight crossing)
 ```
 
-StatsPanel lives in RecorderPanel.java (new inner class or method).
+**StatsPanel:** Add to `RecorderPanel.java` (new inner class or separate file in the same directory).
+
+---
+
+## Disk I/O & Durability
+
+### Atomic Writes
+
+All writes to session JSON files use atomic writes to prevent corruption if the client exits mid-write:
+
+```java
+Path tmpPath = dateFile.resolveSibling(dateFile.getFileName() + ".tmp");
+Files.write(tmpPath, json);
+Files.move(tmpPath, dateFile, ATOMIC_MOVE, REPLACE_EXISTING);
+```
+
+This ensures the file is either the old version or the new version, never a partial JSON.
+
+### Write Occasions
+
+SessionTracker writes to disk on:
+1. **Script stop** — record the completed run
+2. **Periodic tick** — every 60 seconds while logged in (survives crashes)
+3. **Logout** — finalize the session
+4. **Plugin shutdown** — finalize current session if still open
+
+### Midnight Crossing
+
+If a player logs in at 23:30:00 and is still online at 00:30:00 (next day):
+
+- A single `LoginSession` spans both dates (23:30:00 – 00:30:00)
+- On save, the session is written to the **day it started** (2026-05-19.json in this example)
+- Script runs that cross midnight are NOT split; they live in the file of the day the session started
+- Aggregation (weekly, monthly, all-time) includes runs even if they cross midnight
+
+**Rationale:** Sessions are atomic units. A player who logs in once and plays for 2 hours across midnight should not have their run split into two files. Midnight boundaries are only used for file organization, not for splitting runs.
 
 ---
 
