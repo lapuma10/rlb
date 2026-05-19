@@ -119,6 +119,7 @@ import javax.swing.ButtonGroup;
 import javax.swing.JRadioButton;
 import javax.swing.JTextArea;
 import javax.swing.KeyStroke;
+import javax.swing.SwingWorker;
 import java.awt.Font;
 import java.time.LocalDate;
 import java.time.YearMonth;
@@ -3617,13 +3618,20 @@ public final class RecorderPanel extends PluginPanel
      *  fully-wired instance and registers for state-change notifications. */
     public void setSessionTracker(SessionTracker sessionTracker, SessionStore sessionStore)
     {
+        // Non-Swing assignments first — visible immediately to any caller.
         this.sessionTracker = sessionTracker;
         this.sessionStore = sessionStore;
-        int statsTabIndex = tabs.indexOfTab("Stats");
-        statsPanel = new StatsPanel(sessionTracker, sessionStore, client);
-        tabs.setComponentAt(statsTabIndex, statsPanel);
-        sessionTracker.registerSessionStateCallback(() -> {
-            if (statsPanel != null) statsPanel.refreshStats();
+        // All Swing mutations (tab swap + callback registration) on the EDT.
+        SwingUtilities.invokeLater(() -> {
+            int statsTabIndex = tabs.indexOfTab("Stats");
+            StatsPanel old = statsPanel;
+            statsPanel = new StatsPanel(sessionTracker, sessionStore, client);
+            tabs.setComponentAt(statsTabIndex, statsPanel);
+            if (old != null) old.dispose();
+            sessionTracker.registerSessionStateCallback(() ->
+                SwingUtilities.invokeLater(() -> {
+                    if (statsPanel != null) statsPanel.refreshStats();
+                }));
         });
     }
 
@@ -3760,13 +3768,21 @@ public final class RecorderPanel extends PluginPanel
             refreshTimer.start();
         }
 
+        /** Stop the refresh timer. Must be called before discarding this panel. */
+        void dispose()
+        {
+            if (refreshTimer != null) refreshTimer.stop();
+        }
+
         void refreshStats()
         {
             if (sessionTracker == null || sessionStore == null) return;
 
+            // 1) Fast path: in-memory live counters — synchronous, EDT-safe.
             LoginSession currentSession = sessionTracker.getCurrentSession();
-            String accountName = client.getUsername();
-            if (accountName == null || accountName.isEmpty()) accountName = "default";
+            String cachedAccount = sessionTracker.getCurrentAccountName();
+            final String accountName = (cachedAccount != null && !cachedAccount.isEmpty())
+                ? cachedAccount : "default";
 
             resetBtn.setEnabled(currentSession == null);
 
@@ -3782,17 +3798,38 @@ public final class RecorderPanel extends PluginPanel
                 loginStatusLabel.setText("Not logged in");
             }
 
-            SessionStats stats;
-            LocalDate today = LocalDate.now();
-            switch (currentPeriod)
+            // 2) Slow path: disk I/O aggregation on a background thread → publish to EDT.
+            final TimePeriod period = currentPeriod;
+            final LocalDate today = LocalDate.now();
+            new SwingWorker<SessionStats, Void>()
             {
-                case DAILY:    stats = sessionStore.aggregateDaily(accountName, today); break;
-                case WEEKLY:   stats = sessionStore.aggregateWeekly(accountName, today); break;
-                case MONTHLY:  stats = sessionStore.aggregateMonthly(accountName, YearMonth.now()); break;
-                case ALL_TIME: stats = sessionStore.aggregateAllTime(accountName); break;
-                default:       stats = sessionStore.aggregateDaily(accountName, today);
-            }
-            updateStatsDisplay(stats);
+                @Override
+                protected SessionStats doInBackground()
+                {
+                    switch (period)
+                    {
+                        case DAILY:    return sessionStore.aggregateDaily(accountName, today);
+                        case WEEKLY:   return sessionStore.aggregateWeekly(accountName, today);
+                        case MONTHLY:  return sessionStore.aggregateMonthly(accountName, YearMonth.now());
+                        case ALL_TIME: return sessionStore.aggregateAllTime(accountName);
+                        default:       return sessionStore.aggregateDaily(accountName, today);
+                    }
+                }
+
+                @Override
+                protected void done()
+                {
+                    try
+                    {
+                        updateStatsDisplay(get());
+                    }
+                    catch (Exception e)
+                    {
+                        // Worker threw — keep last shown stats; log lightly.
+                        log.warn("StatsPanel aggregation failed", e);
+                    }
+                }
+            }.execute();
         }
 
         private void updateStatsDisplay(SessionStats stats)
@@ -3830,19 +3867,25 @@ public final class RecorderPanel extends PluginPanel
 
         private void resetToday()
         {
-            if (sessionStore == null) return;
-            LoginSession current = sessionTracker != null ? sessionTracker.getCurrentSession() : null;
+            if (sessionStore == null || sessionTracker == null) return;
+            LoginSession current = sessionTracker.getCurrentSession();
             if (current != null)
             {
                 JOptionPane.showMessageDialog(this, "Cannot reset while logged in.",
                     "Reset Disabled", JOptionPane.INFORMATION_MESSAGE);
                 return;
             }
-            String accountName = client.getUsername();
-            if (accountName == null || accountName.isEmpty()) accountName = "default";
-
+            String accountName = sessionTracker.getCurrentAccountName();
+            if (accountName == null)
+            {
+                JOptionPane.showMessageDialog(this,
+                    "No account known yet — log in once first.",
+                    "Reset Unavailable", JOptionPane.INFORMATION_MESSAGE);
+                return;
+            }
             int confirm = JOptionPane.showConfirmDialog(this,
-                "Delete today's session data?", "Confirm Reset", JOptionPane.YES_NO_OPTION);
+                "Delete today's session data for " + accountName + "?",
+                "Confirm Reset", JOptionPane.YES_NO_OPTION);
             if (confirm == JOptionPane.YES_OPTION)
             {
                 sessionStore.deleteDay(accountName, LocalDate.now());
