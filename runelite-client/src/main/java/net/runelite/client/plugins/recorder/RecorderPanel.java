@@ -3865,19 +3865,26 @@ public final class RecorderPanel extends PluginPanel
             final LocalDate today = LocalDate.now();
             final LoginSession liveSnapshot = sessionTracker.getCurrentSnapshot();
             final LocalDate liveDate = sessionTracker.getCurrentSessionDate();
-            new SwingWorker<SessionStats, Void>()
+            new SwingWorker<StatsBundle, Void>()
             {
                 @Override
-                protected SessionStats doInBackground()
+                protected StatsBundle doInBackground()
                 {
+                    SessionStats periodStats;
                     switch (period)
                     {
-                        case DAILY:    return sessionStore.aggregateDaily(accountName, today, liveSnapshot, liveDate);
-                        case WEEKLY:   return sessionStore.aggregateWeekly(accountName, today, liveSnapshot, liveDate);
-                        case MONTHLY:  return sessionStore.aggregateMonthly(accountName, YearMonth.now(), liveSnapshot, liveDate);
-                        case ALL_TIME: return sessionStore.aggregateAllTime(accountName, liveSnapshot, liveDate);
-                        default:       return sessionStore.aggregateDaily(accountName, today, liveSnapshot, liveDate);
+                        case DAILY:    periodStats = sessionStore.aggregateDaily(accountName, today, liveSnapshot, liveDate); break;
+                        case WEEKLY:   periodStats = sessionStore.aggregateWeekly(accountName, today, liveSnapshot, liveDate); break;
+                        case MONTHLY:  periodStats = sessionStore.aggregateMonthly(accountName, YearMonth.now(), liveSnapshot, liveDate); break;
+                        case ALL_TIME: periodStats = sessionStore.aggregateAllTime(accountName, liveSnapshot, liveDate); break;
+                        default:       periodStats = sessionStore.aggregateDaily(accountName, today, liveSnapshot, liveDate);
                     }
+                    // Skip the all-time pass when the user is already viewing all-time —
+                    // would just duplicate the section.
+                    SessionStats allTimeStats = (period == TimePeriod.ALL_TIME)
+                        ? null
+                        : sessionStore.aggregateAllTime(accountName, liveSnapshot, liveDate);
+                    return new StatsBundle(periodStats, allTimeStats);
                 }
 
                 @Override
@@ -3885,7 +3892,8 @@ public final class RecorderPanel extends PluginPanel
                 {
                     try
                     {
-                        updateStatsDisplay(get());
+                        StatsBundle b = get();
+                        updateStatsDisplay(b.period, b.allTime);
                     }
                     catch (Exception e)
                     {
@@ -3896,7 +3904,9 @@ public final class RecorderPanel extends PluginPanel
             }.execute();
         }
 
-        private void updateStatsDisplay(SessionStats stats)
+        private record StatsBundle(SessionStats period, @javax.annotation.Nullable SessionStats allTime) {}
+
+        private void updateStatsDisplay(SessionStats stats, @javax.annotation.Nullable SessionStats allTime)
         {
             long h  = stats.totalLoginMs()        / 3_600_000L;
             long m  = (stats.totalLoginMs()        % 3_600_000L) / 60_000L;
@@ -3912,7 +3922,20 @@ public final class RecorderPanel extends PluginPanel
             // don't get cut off. Column 14 hits the hours, leaves room for "Xh XXm  9999 ores"
             // in ~28 chars (matches the panel width users actually have).
             StringBuilder sb = new StringBuilder();
-            sb.append("SCRIPT BREAKDOWN\n");
+            appendBreakdown(sb, currentPeriod.getLabel().toUpperCase() + " BREAKDOWN", stats);
+            if (allTime != null)
+            {
+                sb.append("\n");
+                appendBreakdown(sb, "ALL-TIME BREAKDOWN", allTime);
+            }
+            statsTextArea.setText(sb.toString());
+        }
+
+        private static void appendBreakdown(StringBuilder sb, String heading, SessionStats stats)
+        {
+            long h  = stats.totalLoginMs() / 3_600_000L;
+            long m  = (stats.totalLoginMs() % 3_600_000L) / 60_000L;
+            sb.append(heading).append("\n");
             sb.append("------------------------------\n");
             for (Map.Entry<String, ScriptStats> entry : stats.scripts().entrySet())
             {
@@ -3929,12 +3952,11 @@ public final class RecorderPanel extends PluginPanel
             }
             // Idle row — shown right below the scripts so scripts + idle = TOTAL is verifiable
             // by eye. Same column layout so it lines up with the per-script and TOTAL rows.
-            long iah = stats.idleMs() / 3_600_000L;
-            long iam = (stats.idleMs() % 3_600_000L) / 60_000L;
-            sb.append(String.format("%-13s %2dh %2dm\n", "Idle", iah, iam));
+            long ih = stats.idleMs() / 3_600_000L;
+            long im = (stats.idleMs() % 3_600_000L) / 60_000L;
+            sb.append(String.format("%-13s %2dh %2dm\n", "Idle", ih, im));
             sb.append("------------------------------\n");
             sb.append(String.format("%-13s %2dh %2dm\n", "TOTAL", h, m));
-            statsTextArea.setText(sb.toString());
         }
 
         private void resetToday()
