@@ -32,6 +32,7 @@ Multiple login sessions can occur in a single day. Raw data is stored as events 
       "sessionId": "1716144123000",
       "loginTime": 1716144123000,
       "logoutTime": 1716161234000,
+      "lastSavedMs": 1716161200000,
       "runs": [
         {
           "scriptId": "chicken_farm_v3",
@@ -64,16 +65,18 @@ Multiple login sessions can occur in a single day. Raw data is stored as events 
 ```
 
 **Fields:**
-- `date`: ISO date string (YYYY-MM-DD) — file organization and boundary detection
+- `date`: ISO date string (YYYY-MM-DD) — file organization (session belongs to the date it started)
 - `sessions`: array of login sessions for this day (supports multiple logins per day)
 - `sessionId`: unique ID for this session (use `loginTimeMs` as the session ID)
-- `loginTime`, `logoutTime`: milliseconds since epoch
-- `runs`: flat array of all script run segments in this session
+- `loginTime`: milliseconds since epoch (session start)
+- `logoutTime`: milliseconds since epoch (session end) — null if session is still open (client crashed or still online)
+- `lastSavedMs`: milliseconds since epoch — timestamp of when this session was last persisted
+- `runs`: flat array of all script run segments
   - `scriptId`: stable identifier (e.g., `chicken_farm_v3`) — does not change if display name changes
   - `displayName`: human-readable label for UI
-  - `startMs`, `endMs`: milliseconds since epoch (always in same session, no midnight crossing)
+  - `startMs`, `endMs`: milliseconds since epoch. Runs are not split by date boundaries; a run may cross midnight. Aggregation decides whether to count it fully or partially based on period
   - `count`: script-specific metric (kills, ores, items cooked, etc.) — null if not reported
-  - `countLabel`: name of the metric (`"kills"`, `"ores"`, `"cooked"`, etc.) — helps UI label the number
+  - `countLabel`: name of the metric (`"kills"`, `"ores"`, `"cooked"`, etc.) — null if count is null
 
 ### In-Memory Session State
 
@@ -82,40 +85,33 @@ While logged in, `SessionTracker` maintains:
 record LoginSession(
   String sessionId,
   long loginTimeMs,
-  List<ScriptRun> runs
+  Long logoutTimeMs,         // null if session is still open
+  List<ScriptRun> runs,      // finalized runs
+  Map<String, ScriptRun> activeRuns  // open runs (activeRuns only in memory, persisted to disk)
 ) {}
 
 record ScriptRun(
   String scriptId,
   String displayName,
   long startMs,
-  Long endMs,           // null while running
-  Integer count,        // null until script stops
-  String countLabel
+  Long endMs,                // null while running
+  Integer count,             // null if not yet reported
+  String countLabel          // null if count is null
 ) {}
-
-// Per-script current state (not persisted; used to track active runs)
-class ActiveScriptState {
-  String scriptId;
-  String displayName;
-  long startMs;
-  int currentCount;     // accumulating while script is running
-  String countLabel;    // e.g., "kills", "ores"
-}
 ```
 
 Tracker maintains:
 - `currentLoginSession: LoginSession` (null if logged out)
-- `activeScripts: Map<String, ActiveScriptState>` (script ID → current state)
+  - `runs`: completed script runs (have `endMs` and optionally `count`)
+  - `activeRuns`: open script runs (may have null `endMs` and `count`); synchronized with disk on periodic saves
 
-When a script stops, the tracker:
-1. Finalizes the run: `ScriptRun(scriptId, displayName, startMs, endMs=now, count, countLabel)`
-2. Adds to `currentLoginSession.runs`
-3. Removes from `activeScripts`
+**Important:** Both `runs` and `activeRuns` are persisted. On load, merge them back into a single list for aggregation purposes.
 
-On logout:
-1. Writes `currentLoginSession` to disk
-2. Clears `currentLoginSession` and `activeScripts`
+### Script Lifecycle Invariants
+
+- Only one run per `scriptId` can be active at a time
+- If `onScriptStarted(scriptId)` is called while `scriptId` is already active, **log a warning and ignore the duplicate**
+- If `onScriptStopped(scriptId)` is called with no active run, **log a warning and ignore**
 
 ---
 
@@ -145,17 +141,18 @@ Responsibility: read/write session files; aggregate across multiple days.
 **Location:** `runelite-client/src/main/java/net/runelite/client/plugins/recorder/session/SessionStore.java`
 
 **Key methods:**
-- `saveSession(String accountName, SessionState)` → writes `<accountName>/<YYYY-MM-DD>.json`
-- `loadSession(String accountName, LocalDate)` → reads and parses `<accountName>/<YYYY-MM-DD>.json`
-- `aggregateDaily(String accountName, LocalDate)` → total duration + per-script breakdown for one day
-- `aggregateWeekly(String accountName, LocalDate)` → sum across Mon–Sun (or chosen week)
-- `aggregateMonthly(String accountName, YearMonth)` → sum across all days in the month
-- `aggregateAllTime(String accountName)` → sum all files in the account's session directory
+- `upsertSession(String accountName, LocalDate date, LoginSession session)` → upsert by `sessionId` (load day file, find session, replace, write atomically)
+- `loadDay(String accountName, LocalDate)` → reads `<accountName>/<YYYY-MM-DD>.json`, returns all sessions for that day
+- `deleteDay(String accountName, LocalDate)` → deletes the session file (for Reset button)
+- `aggregateDaily(String accountName, LocalDate)` → sum all sessions **started** on this date; total login/active time + per-script breakdown
+- `aggregateWeekly(String accountName, LocalDate)` → sum all sessions started Mon–Sun
+- `aggregateMonthly(String accountName, YearMonth)` → sum all sessions started in this month
+- `aggregateAllTime(String accountName)` → sum all sessions in account's session directory
 
 **Return type:** `SessionStats` (immutable record)
 ```java
 record SessionStats(
-  long totalLoginMs,           // sum of all (logoutTime - loginTime) in the period
+  long totalLoginMs,           // sum of all (logoutTime - loginTime); open sessions use lastSavedMs instead
   long totalScriptActiveMs,    // union of all script run intervals (no double-counting overlaps)
   long idleMs,                 // totalLoginMs - totalScriptActiveMs
   Map<String, ScriptStats> scripts
@@ -164,16 +161,18 @@ record SessionStats(
 record ScriptStats(
   String scriptId,
   String displayName,
-  long totalMs,                // sum of individual run durations
+  long totalMs,                // sum of individual run durations (including open runs: endMs or lastSavedMs)
   Integer totalCount,          // sum of counts across all runs (null if script never reported counts)
   String countLabel            // e.g., "kills", "ores" (from last run of this script)
 ) {}
 ```
 
+**Open run handling:** When calculating duration of an open run (null `endMs`), use `lastSavedMs` as the end time. This ensures crashed sessions are still counted up to the last successful save.
+
 **Note on overlapping scripts:** If two scripts run simultaneously (e.g., Combat + Banking), `totalScriptActiveMs` counts the union of their intervals, not the sum. This prevents double-counting idle time.
 
 **Algorithm:**
-1. Collect all script run intervals: `[(s1.start, s1.end), (s2.start, s2.end), ...]`
+1. Collect all script run intervals: `[(s1.start, s1.end||lastSavedMs), (s2.start, s2.end||lastSavedMs), ...]`
 2. Merge overlapping intervals
 3. Sum the merged intervals to get `totalScriptActiveMs`
 4. `idleMs = totalLoginMs - totalScriptActiveMs`
@@ -252,9 +251,9 @@ Responsibility: display current session + aggregated stats; handle radio-button 
    ```
 2. SessionTracker:
    - Finalizes the run: `ScriptRun(scriptId, displayName, startMs, endMs=now, count, countLabel)`
-   - Appends to `currentLoginSession.runs`
-   - Removes from `activeScripts`
-   - **Saves session to disk** (atomic write to `<date>.json.tmp`, then move to `<date>.json`)
+   - Moves from `activeRuns` to `runs`
+   - Updates `lastSavedMs = now`
+   - **Upserts session to disk** (load day file, find session by `sessionId`, replace, write atomically)
 3. StatsPanel updates label: "Chicken Farm V3: 45m 42 kills"
 
 ### Logout → Session End
@@ -262,8 +261,9 @@ Responsibility: display current session + aggregated stats; handle radio-button 
 1. Player logs out → `GameStateChanged(LOGGED_OUT)` fires
 2. SessionTracker:
    - Records `logoutTime = System.currentTimeMillis()`
-   - Finalizes any still-running scripts (treat as stopped with null count)
-   - Writes `currentLoginSession` to disk (atomic write)
+   - Finalizes any still-running scripts in `activeRuns` (treat as stopped with null count, endMs = now)
+   - Updates `lastSavedMs = now`
+   - Upserts `currentLoginSession` to disk
    - Clears `currentLoginSession` and `activeScripts`
    - Notifies StatsPanel via callback
 3. StatsPanel:
@@ -271,9 +271,41 @@ Responsibility: display current session + aggregated stats; handle radio-button 
    - Calls `SessionStore.aggregateDaily(accountName, today)` to refresh stats
    - Displays cumulative totals for the day
 
-### Periodic Saving
+### Plugin Shutdown
 
-In addition to on-logout, SessionTracker saves every 60 seconds while logged in. This ensures data survives client crashes.
+1. Plugin is shutting down:
+2. SessionTracker:
+   - If currently logged in:
+     - Records `logoutTime = System.currentTimeMillis()`
+     - Finalizes any open script runs (move from `activeRuns` to `runs`)
+     - Upserts `currentLoginSession` to disk
+   - Stops periodic save scheduler
+   - Clears in-memory state
+
+### Periodic Saving (Crash Recovery)
+
+Every 60 seconds while logged in:
+1. SessionTracker takes current `activeRuns` and writes them to the session file with `endMs = null`
+2. Updates `lastSavedMs = now`
+3. Upserts the session to disk (replaces existing session with same `sessionId`)
+
+If the client crashes, the next time the session file is loaded:
+- Open runs (null `endMs`) are treated as ending at `lastSavedMs`
+- Duration and metrics are calculated up to the crash point
+
+### UI Period Label Clarity
+
+The Daily view displays "**Sessions started on this date**". If a session spans midnight (23:30 → 00:30), it is counted fully under the day it started, not split. This matches the file organization and keeps sessions atomic.
+
+### Reset Button Behavior
+
+The Reset button is **only enabled in Daily view** and only works on **completed sessions**:
+
+- If player is currently logged in: Reset is **disabled** (shows gray button with tooltip "Cannot reset active session")
+- If player is logged out: Reset deletes completed sessions from today, clearing the display
+- If there are only active/open sessions from today: Reset is **disabled**
+
+This prevents data loss from accidental resets during active play.
 
 ### UI Period Switching
 
