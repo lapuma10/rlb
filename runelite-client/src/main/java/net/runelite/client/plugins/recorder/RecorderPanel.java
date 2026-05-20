@@ -84,6 +84,8 @@ import javax.swing.JScrollPane;
 import javax.swing.JTabbedPane;
 import javax.swing.JTextField;
 import javax.swing.JViewport;
+import javax.swing.JSpinner;
+import javax.swing.SpinnerNumberModel;
 import javax.swing.SwingUtilities;
 import javax.swing.Timer;
 import java.awt.BasicStroke;
@@ -359,6 +361,19 @@ public final class RecorderPanel extends PluginPanel
     private final JButton   fletchStopBtn     = new JButton("Stop");
     private final JLabel    fletchStatusLabel = new JLabel("idle");
     private final JLabel    fletchBreakLabel  = new JLabel("breaks: idle");
+    // Rooftop Agility script.
+    private net.runelite.client.plugins.recorder.scripts.RooftopAgilityScript rooftopAgilityScript;
+    private final JComboBox<net.runelite.client.plugins.recorder.scripts.RooftopAgilityScript.RooftopCourseId>
+        rooftopCourseCombo = new JComboBox<>(
+            net.runelite.client.plugins.recorder.scripts.RooftopAgilityScript.RooftopCourseId.values());
+    private final JSpinner  rooftopTargetSpinner =
+        new JSpinner(new SpinnerNumberModel(20, 1, 99, 1));
+    private final JSpinner  rooftopEatAtHpSpinner =
+        new JSpinner(new SpinnerNumberModel(8, 1, 99, 1));
+    private final JCheckBox rooftopMarksCheck  = new JCheckBox("Pick up marks of grace", true);
+    private final JButton   rooftopStartBtn    = new JButton("Start");
+    private final JButton   rooftopStopBtn     = new JButton("Stop");
+    private final JLabel    rooftopStatusLabel = new JLabel("idle");
     // GE Core (Phase A): wired by RecorderPlugin via setGrandExchangeScript.
     private GrandExchangeTab grandExchangeTab;
     private final JTabbedPane tabs = new JTabbedPane();
@@ -421,6 +436,7 @@ public final class RecorderPanel extends PluginPanel
         tabs.addTab("Mining", tabScroll(buildMiningTab()));
         tabs.addTab("Cooking", tabScroll(buildCookingTab()));
         tabs.addTab("Fletching", tabScroll(buildFletchingTab()));
+        tabs.addTab("Agility", tabScroll(buildAgilityTab()));
         tabs.addTab("Quests", tabScroll(buildQuestsTab()));
         tabs.addTab("Moneymakers", tabScroll(buildMoneymakersTab()));
         tabs.addTab("Login",  tabScroll(buildLoginTab()));
@@ -2977,6 +2993,115 @@ public final class RecorderPanel extends PluginPanel
         fletchBreakLabel.setText(fletchingScript.breakStatus());
     }
 
+    // ----------------------------------------------------------------------
+    // Rooftop Agility tab
+    // ----------------------------------------------------------------------
+
+    private JPanel buildAgilityTab()
+    {
+        JPanel p = new JPanel();
+        p.setLayout(new BoxLayout(p, BoxLayout.Y_AXIS));
+        p.setBorder(BorderFactory.createTitledBorder("Rooftop Agility"));
+
+        JLabel courseLabel = new JLabel("Course:");
+        JLabel targetLabel = new JLabel("Target level:");
+        JLabel eatLabel    = new JLabel("Eat below HP:");
+        courseLabel.setAlignmentX(Component.LEFT_ALIGNMENT);
+        targetLabel.setAlignmentX(Component.LEFT_ALIGNMENT);
+        eatLabel.setAlignmentX(Component.LEFT_ALIGNMENT);
+        rooftopCourseCombo.setAlignmentX(Component.LEFT_ALIGNMENT);
+        rooftopTargetSpinner.setAlignmentX(Component.LEFT_ALIGNMENT);
+        rooftopEatAtHpSpinner.setAlignmentX(Component.LEFT_ALIGNMENT);
+        rooftopMarksCheck.setAlignmentX(Component.LEFT_ALIGNMENT);
+        rooftopStatusLabel.setAlignmentX(Component.LEFT_ALIGNMENT);
+        capHeight(rooftopCourseCombo);
+        capHeight(rooftopTargetSpinner);
+        capHeight(rooftopEatAtHpSpinner);
+        capHeight(rooftopMarksCheck);
+        capHeight(rooftopStatusLabel);
+
+        JPanel buttons = new JPanel(new java.awt.GridLayout(1, 2, 4, 0));
+        buttons.add(rooftopStartBtn);
+        buttons.add(rooftopStopBtn);
+        buttons.setAlignmentX(Component.LEFT_ALIGNMENT);
+        capHeight(buttons);
+
+        rooftopStartBtn.addActionListener(e -> onRooftopStart());
+        rooftopStopBtn.addActionListener(e -> onRooftopStop());
+
+        p.add(courseLabel);
+        p.add(rooftopCourseCombo);
+        p.add(Box.createVerticalStrut(4));
+        p.add(targetLabel);
+        p.add(rooftopTargetSpinner);
+        p.add(Box.createVerticalStrut(4));
+        p.add(rooftopMarksCheck);
+        p.add(Box.createVerticalStrut(4));
+        p.add(eatLabel);
+        p.add(rooftopEatAtHpSpinner);
+        p.add(Box.createVerticalStrut(4));
+        p.add(buttons);
+        p.add(Box.createVerticalStrut(4));
+        p.add(rooftopStatusLabel);
+        p.add(Box.createVerticalGlue());
+        return p;
+    }
+
+    /** Wire the Rooftop Agility script. Called by RecorderPlugin at startUp. */
+    public void setRooftopAgilityScript(
+        net.runelite.client.plugins.recorder.scripts.RooftopAgilityScript script)
+    {
+        this.rooftopAgilityScript = script;
+    }
+
+    private void onRooftopStart()
+    {
+        if (rooftopAgilityScript == null)
+        {
+            rooftopStatusLabel.setText("unavailable");
+            return;
+        }
+        var course = (net.runelite.client.plugins.recorder.scripts.RooftopAgilityScript.RooftopCourseId)
+            rooftopCourseCombo.getSelectedItem();
+        if (course == null)
+        {
+            rooftopStatusLabel.setText("select a course");
+            return;
+        }
+        rooftopAgilityScript.setSelectedCourse(course);
+        rooftopAgilityScript.setTargetLevel((Integer) rooftopTargetSpinner.getValue());
+        rooftopAgilityScript.setPickupMarks(rooftopMarksCheck.isSelected());
+        rooftopAgilityScript.setEatAtHp((Integer) rooftopEatAtHpSpinner.getValue());
+        rooftopAgilityScript.start();
+        rooftopStatusLabel.setText("starting…");
+    }
+
+    private void onRooftopStop()
+    {
+        if (rooftopAgilityScript != null) rooftopAgilityScript.stop();
+    }
+
+    private void refreshRooftop()
+    {
+        if (rooftopAgilityScript == null)
+        {
+            rooftopStatusLabel.setText("unavailable");
+            return;
+        }
+        String runtime = "—";
+        if (rooftopAgilityScript.isRunning())
+        {
+            long ms  = System.currentTimeMillis() - rooftopAgilityScript.startedAt();
+            long sec = ms / 1000L;
+            runtime = String.format("%d:%02d:%02d", sec / 3600, (sec / 60) % 60, sec % 60);
+        }
+        rooftopStatusLabel.setText(String.format("%s — %d laps — %d marks — %s",
+            rooftopAgilityScript.status(),
+            rooftopAgilityScript.lapsCompleted(),
+            rooftopAgilityScript.marksPicked(),
+            runtime));
+    }
+
     /** Wire the V2 cooking script. The plugin constructs the script in
      *  startUp and hands it here; the panel only owns the UI surface.
      *  Two start buttons (V2 + V3) share a Stop button. */
@@ -3677,6 +3802,7 @@ public final class RecorderPanel extends PluginPanel
         refreshUltraCompost();
         refreshPizza();
         refreshFletching();
+        refreshRooftop();
     }
 
     /** Mirror the bare chicken combat loop's state into the panel labels.
@@ -3815,6 +3941,8 @@ public final class RecorderPanel extends PluginPanel
             () -> pizzaScript != null && pizzaScript.isRunning());
         sessionTracker.registerScript("fletching", "Fletching",
             () -> fletchingScript != null && fletchingScript.isRunning());
+        sessionTracker.registerScript("rooftop_agility", "Rooftop Agility",
+            () -> rooftopAgilityScript != null && rooftopAgilityScript.isRunning());
         sessionTracker.registerScript("mining", "Mining",
             () -> miningLoop != null && miningLoop.isRunning());
 

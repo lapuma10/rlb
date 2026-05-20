@@ -166,6 +166,7 @@ public class RecorderPlugin extends Plugin
     private UltraCompostScript ultraCompostScript;
     private PizzaScript pizzaScript;
     private net.runelite.client.plugins.recorder.scripts.FletchingScript fletchingScript;
+    private net.runelite.client.plugins.recorder.scripts.RooftopAgilityScript rooftopAgilityScript;
     private AreaSelector areaSelector;
     private net.runelite.client.plugins.recorder.inspector.ClickInspector clickInspector;
 
@@ -437,6 +438,16 @@ public class RecorderPlugin extends Plugin
         fletchingScript = new net.runelite.client.plugins.recorder.scripts.FletchingScript(
             client, clientThread, fletchDispatcher);
         panel.setFletchingScript(fletchingScript);
+
+        // Rooftop Agility — Draynor v1. @Subscribe onGameTick driver (no
+        // worker thread; the loop only reads + decides + enqueues one
+        // ActionRequest per tick, so client-thread execution is safe).
+        // Own dispatcher to avoid busy-flag collisions with other scripts.
+        HumanizedInputDispatcher rooftopDispatcher = new HumanizedInputDispatcher(client, clientThread);
+        rooftopAgilityScript = new net.runelite.client.plugins.recorder.scripts.RooftopAgilityScript(
+            client, clientThread, rooftopDispatcher);
+        eventBus.register(rooftopAgilityScript);
+        panel.setRooftopAgilityScript(rooftopAgilityScript);
 
         // Click inspector — toggleable diagnostic. Subscribes itself to the
         // EventBus only when enabled; safe to leave off by default.
@@ -905,6 +916,11 @@ public class RecorderPlugin extends Plugin
         if (ultraCompostScript != null) { ultraCompostScript.stop(); ultraCompostScript = null; }
         if (pizzaScript != null) { pizzaScript.stop(); pizzaScript = null; }
         if (fletchingScript != null) { fletchingScript.stop(); fletchingScript = null; }
+        if (rooftopAgilityScript != null) {
+            rooftopAgilityScript.stop();
+            eventBus.unregister(rooftopAgilityScript);
+            rooftopAgilityScript = null;
+        }
         if (hudOverlay != null) overlayManager.remove(hudOverlay);
         if (areaSelector != null && areaSelector.isActive()) areaSelector.cancel();
         if (debugOverlay != null) overlayManager.remove(debugOverlay);
