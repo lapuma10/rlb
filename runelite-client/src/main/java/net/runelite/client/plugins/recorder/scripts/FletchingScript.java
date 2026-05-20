@@ -183,6 +183,15 @@ public final class FletchingScript
     private final AtomicBoolean           running = new AtomicBoolean(false);
     private final AtomicReference<Thread> worker  = new AtomicReference<>();
 
+    /** AFK-break humanizer; live-toggled from the panel.  When false,
+     *  the {@link #breaks} scheduler is disabled and never fires. */
+    private final AtomicBoolean afkBreaksEnabled = new AtomicBoolean(true);
+
+    /** AFK break scheduler.  Constructed in {@link #start()} so a
+     *  Stop+Start rolls a fresh activity window.  Null while the
+     *  worker isn't running. */
+    private net.runelite.client.plugins.recorder.afk.BreakScheduler breaks;
+
     private Action nextAction = Action.CUT;
 
     // Per-state flags — reset in setState()
@@ -214,6 +223,23 @@ public final class FletchingScript
 
     public void setItem(FletchItem item) { selectedItem.set(item); }
     public void setMode(Mode m)          { mode.set(m); }
+    public boolean afkBreaksEnabled() { return afkBreaksEnabled.get(); }
+    public void setAfkBreaksEnabled(boolean v)
+    {
+        afkBreaksEnabled.set(v);
+        if (breaks != null)
+        {
+            if (v) breaks.enable(System.currentTimeMillis());
+            else   breaks.disable();
+        }
+    }
+    /** Panel accessor for the break-status countdown line. */
+    public String breakStatus()
+    {
+        return breaks == null
+            ? "breaks: idle (script not running)"
+            : breaks.statusLine(System.currentTimeMillis());
+    }
 
     public void start()
     {
@@ -244,6 +270,14 @@ public final class FletchingScript
         nextAction = (m == Mode.STRING) ? Action.STRING : Action.CUT;
         setState(State.BANKING);
 
+        // Fresh scheduler each Start — clean activity window.  start()
+        // is guarded by running.compareAndSet so the construct/set isn't
+        // racy with the worker thread, which spawns AFTER this line.
+        breaks = new net.runelite.client.plugins.recorder.afk.BreakScheduler(
+            System::currentTimeMillis,
+            ThreadLocalRandom.current(),
+            afkBreaksEnabled.get());
+
         Thread t = new Thread(this::tickLoop, "fletching-script");
         t.setDaemon(true);
         worker.set(t);
@@ -255,6 +289,10 @@ public final class FletchingScript
         running.set(false);
         Thread t = worker.getAndSet(null);
         if (t != null) { t.interrupt(); try { t.join(2_000); } catch (InterruptedException ie) { Thread.currentThread().interrupt(); } }
+        // Halt the scheduler explicitly — otherwise the panel's refresh
+        // timer keeps polling breaks.statusLine() and the countdown
+        // visually ticks forward even though the worker has exited.
+        if (breaks != null) breaks.disable();
         setState(State.IDLE);
         status.set("stopped");
     }
@@ -285,6 +323,24 @@ public final class FletchingScript
 
     private void tickBanking() throws InterruptedException
     {
+        // AFK-break gate.  Banking entry is the safe boundary (between
+        // batches, never mid-process).  endBreakIfDue runs first so the
+        // wake-up tick proceeds to normal work immediately rather than
+        // wasting a tick.
+        long breakNow = System.currentTimeMillis();
+        if (breaks != null) breaks.endBreakIfDue(breakNow);
+        if (breaks != null && breaks.isInBreak(breakNow))
+        {
+            status.set(breaks.statusLine(breakNow));
+            return;
+        }
+        if (breaks != null && breaks.isBreakDue(breakNow, state.get() == State.BANKING))
+        {
+            breaks.startBreak(breakNow);
+            status.set(breaks.statusLine(breakNow));
+            return;
+        }
+
         if (Boolean.TRUE.equals(onClient(bank::isBankPinUp)))
         { abortWith("bank PIN required"); return; }
 
