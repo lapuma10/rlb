@@ -141,16 +141,21 @@ public final class ErnestTheChicken {
             // Resume the same trail to the stairs base inside the manor.
             .then(new ReplayTrailStep(client, trailWalker, draynorBankToManor,
                 "Veronica→StairsBase", playerAtStairsBase, abortRequested))
-            // Draynor Manor: south staircase on p=0 only goes to p=1. The
-            // p=1→p=2 staircase is in a different room. Climb the first
-            // flight, then let V2Nav route us to Oddenstein (PROFESSOR_TILE
-            // on p=2) via the second staircase transport — the planner has
-            // 2342 plane-changing transports loaded, the manor stairs
-            // should be in there.
+            // Draynor Manor has two staircase flights: p=0→p=1 (south stairs),
+            // then p=1→p=2 (id=11511, ~4 tiles NW on p=1). The professor's exact
+            // tile is blocked in the static collision map (NPC occupancy), so nav
+            // can't BFS to it. We climb both flights explicitly, then use a wide
+            // arrival radius — the player lands ~4 tiles from the professor after
+            // the second climb, which passes withinArrival immediately.
             .then(new InteractWithObjectStep(scanner, clientThread, "Staircase", 5, "Climb-up", playerOnPlane(1)))
-            .then(new NavWalkStep(nav, PROFESSOR_TILE, 2))
+            .then(new InteractWithObjectStep(scanner, clientThread, 11511, 6, "Climb-up", playerOnPlane(2)))
+            .then(new InteractWithObjectStep(scanner, clientThread, 11470, 4, "Open", doorNotPresent(scanner, 11470, 5)))
+            .then(new NavWalkStep(nav, PROFESSOR_TILE, 5))
+            // skipWhen = already has any quest item (mid-quest resume); doneWhen = snap->true
+            // so the step always advances once the dialogue completes on a fresh run.
             .then(new TalkToNpcStep(npc, clientThread, "Professor Oddenstein", null, DIALOG_OPTIONS,
-                hasAny(fishFood, poison, oilCan, key, pressureGauge, rubberTube)))
+                hasAny(fishFood, poison, oilCan, key, pressureGauge, rubberTube),
+                snap -> true))
 
             // Fish food — middle floor. Plane change from p2 → p1 handled by nav transports.
             .then(new NavWalkStep(nav, FISH_FOOD_ROOM, 2))
@@ -195,7 +200,13 @@ public final class ErnestTheChicken {
             .then(new TakeGroundItemStep(scanner, clientThread, rubberTube, 6, "Rubber tube"))
 
             // Final hand-in — Professor Oddenstein assembles the machine.
-            .then(new NavWalkStep(nav, PROFESSOR_TILE, 2))
+            // Nav cannot BFS to the professor's exact tile (NPC-blocked); climb
+            // both staircase flights explicitly, same as the initial visit.
+            .then(new NavWalkStep(nav, STAIRS_BASE, 3))
+            .then(new InteractWithObjectStep(scanner, clientThread, "Staircase", 5, "Climb-up", playerOnPlane(1)))
+            .then(new InteractWithObjectStep(scanner, clientThread, 11511, 6, "Climb-up", playerOnPlane(2)))
+            .then(new InteractWithObjectStep(scanner, clientThread, 11470, 4, "Open", doorNotPresent(scanner, 11470, 5)))
+            .then(new NavWalkStep(nav, PROFESSOR_TILE, 5))
             .then(new TalkToNpcStep(npc, clientThread, "Professor Oddenstein", null, DIALOG_OPTIONS, questFinished));
     }
 
@@ -358,7 +369,7 @@ public final class ErnestTheChicken {
             WorldPoint here = snap.player().worldLocation();
             if (here == null) return false;
             return here.getX() >= 3070 && here.getX() <= 3130
-                && here.getY() >= 3220 && here.getY() <= 3380;
+                && here.getY() >= DRAYNOR_BANK_ARRIVED.getY() && here.getY() <= 3380;
         };
     }
 
@@ -387,6 +398,20 @@ public final class ErnestTheChicken {
         return snap -> snap.player() != null
             && snap.player().worldLocation() != null
             && snap.player().worldLocation().getY() < y;
+    }
+
+    /** True when the closed-state door object {@code id} is absent from the
+     *  scene within {@code radius} tiles — i.e., the door is already open
+     *  (OSRS replaces the closed-door object id with a different open-door id
+     *  when interacted with). Using this as {@code doneWhen} in
+     *  {@link InteractWithObjectStep} means the step is ALREADY_SATISFIED if
+     *  the door is open, and waits for the swap otherwise. Must be called on
+     *  the client thread (safe inside engine tick / onStart / check). */
+    private static Predicate<WorldSnapshot> doorNotPresent(SceneScanner scanner, int id, int radius) {
+        return snap -> {
+            SceneScanner.Match m = scanner.findGameObjectById(id, radius);
+            return m == null || m.gameObject == null;
+        };
     }
 
     /** Stateful predicate: returns false on first call (records baseline

@@ -34,6 +34,13 @@ public final class TalkToNpcStep implements Step {
     private final String npcName;
     private final int[] preferredIds;
     private final String[] dialogOptions;
+    /** Checked at {@link #onStart}: if true, marks ALREADY_SATISFIED and skips
+     *  dispatch (resume-safe skip). Defaults to {@code doneWhen} when the
+     *  single-predicate constructor is used. */
+    private final Predicate<WorldSnapshot> skipWhen;
+    /** Checked in {@link #check}: gates the RUNNING → Succeeded transition
+     *  once the dialogue task has exited. Use {@code snap -> true} to succeed
+     *  as soon as the dialogue completes regardless of external state. */
     private final Predicate<WorldSnapshot> doneWhen;
 
     /** Tracks whether the dialogue RUN_TASK is still in flight on the
@@ -46,17 +53,35 @@ public final class TalkToNpcStep implements Step {
      *  shape as the ReplayTrailStep taskExited fix. */
     private final AtomicBoolean taskExited = new AtomicBoolean(true);
 
+    /** Single-predicate constructor — {@code skipWhen} and {@code doneWhen}
+     *  both use the same predicate (existing behavior). */
     public TalkToNpcStep(NpcInteraction npc,
                          ClientThread clientThread,
                          String npcName,
                          int[] preferredIds,
                          String[] dialogOptions,
                          Predicate<WorldSnapshot> doneWhen) {
+        this(npc, clientThread, npcName, preferredIds, dialogOptions, doneWhen, doneWhen);
+    }
+
+    /** Two-predicate constructor — {@code skipWhen} governs the ALREADY_SATISFIED
+     *  skip at onStart; {@code doneWhen} governs the success gate in check().
+     *  Use when the skip condition differs from the success condition, e.g. a
+     *  "has any quest item" skip paired with a {@code snap -> true} done (so the
+     *  step always advances once the fresh dialogue completes). */
+    public TalkToNpcStep(NpcInteraction npc,
+                         ClientThread clientThread,
+                         String npcName,
+                         int[] preferredIds,
+                         String[] dialogOptions,
+                         Predicate<WorldSnapshot> skipWhen,
+                         Predicate<WorldSnapshot> doneWhen) {
         this.npc = npc;
         this.clientThread = clientThread;
         this.npcName = npcName;
         this.preferredIds = preferredIds == null ? new int[0] : preferredIds;
         this.dialogOptions = dialogOptions == null ? new String[0] : dialogOptions;
+        this.skipWhen = skipWhen != null ? skipWhen : doneWhen;
         this.doneWhen = doneWhen;
     }
 
@@ -71,7 +96,7 @@ public final class TalkToNpcStep implements Step {
     public void onStart(StepContext ctx) {
         Blackboard step = ctx.bb().scope(BlackboardScope.STEP);
 
-        if (doneWhen.test(ctx.snapshot())) {
+        if (skipWhen.test(ctx.snapshot())) {
             step.put(K_OUTCOME, Outcome.ALREADY_SATISFIED);
             log.info("quest-talk: {} already satisfied — skipping dispatch", npcName);
             return;
