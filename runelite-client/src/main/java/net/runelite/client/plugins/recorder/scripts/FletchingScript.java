@@ -56,7 +56,7 @@ public final class FletchingScript
             1, KeyEvent.VK_1, 1, 15, 5.0, false, true, "Arrow shafts"),
         SHORTBOW_U(
             ItemID.LOGS, ItemID.UNSTRUNG_SHORTBOW, ItemID.SHORTBOW,
-            5, KeyEvent.VK_SPACE, 1, 1, 5.0, true, true, "Shortbow (u)"),
+            5, KeyEvent.VK_3, 1, 1, 5.0, true, true, "Shortbow (u)"),
         LONGBOW_U(
             ItemID.LOGS, ItemID.UNSTRUNG_LONGBOW, ItemID.LONGBOW,
             10, KeyEvent.VK_4, 1, 1, 10.0, true, true, "Longbow (u)"),
@@ -70,7 +70,7 @@ public final class FletchingScript
             20, KeyEvent.VK_2, 1, 1, 16.5, true, true, "Oak shortbow (u)"),
         OAK_LONGBOW_U(
             ItemID.OAK_LOGS, ItemID.UNSTRUNG_OAK_LONGBOW, ItemID.OAK_LONGBOW,
-            25, KeyEvent.VK_SPACE, 1, 1, 25.0, true, true, "Oak longbow (u)"),
+            25, KeyEvent.VK_3, 1, 1, 25.0, true, true, "Oak longbow (u)"),
 
         // Willow logs
         WILLOW_ARROW_SHAFTS(
@@ -81,7 +81,7 @@ public final class FletchingScript
             35, KeyEvent.VK_2, 1, 1, 33.3, true, true, "Willow shortbow (u)"),
         WILLOW_LONGBOW_U(
             ItemID.WILLOW_LOGS, ItemID.UNSTRUNG_WILLOW_LONGBOW, ItemID.WILLOW_LONGBOW,
-            40, KeyEvent.VK_SPACE, 1, 1, 41.5, true, true, "Willow longbow (u)"),
+            40, KeyEvent.VK_3, 1, 1, 41.5, true, true, "Willow longbow (u)"),
 
         // Maple logs
         MAPLE_ARROW_SHAFTS(
@@ -92,7 +92,7 @@ public final class FletchingScript
             50, KeyEvent.VK_2, 1, 1, 50.0, true, true, "Maple shortbow (u)"),
         MAPLE_LONGBOW_U(
             ItemID.MAPLE_LOGS, ItemID.UNSTRUNG_MAPLE_LONGBOW, ItemID.MAPLE_LONGBOW,
-            55, KeyEvent.VK_SPACE, 1, 1, 58.3, true, true, "Maple longbow (u)"),
+            55, KeyEvent.VK_3, 1, 1, 58.3, true, true, "Maple longbow (u)"),
 
         // Yew logs
         YEW_ARROW_SHAFTS(
@@ -103,7 +103,7 @@ public final class FletchingScript
             65, KeyEvent.VK_2, 1, 1, 67.5, true, true, "Yew shortbow (u)"),
         YEW_LONGBOW_U(
             ItemID.YEW_LOGS, ItemID.UNSTRUNG_YEW_LONGBOW, ItemID.YEW_LONGBOW,
-            70, KeyEvent.VK_SPACE, 1, 1, 75.0, true, true, "Yew longbow (u)"),
+            70, KeyEvent.VK_3, 1, 1, 75.0, true, true, "Yew longbow (u)"),
 
         // Magic logs
         MAGIC_ARROW_SHAFTS(
@@ -114,7 +114,7 @@ public final class FletchingScript
             80, KeyEvent.VK_2, 1, 1, 83.3, true, true, "Magic shortbow (u)"),
         MAGIC_LONGBOW_U(
             ItemID.MAGIC_LOGS, ItemID.UNSTRUNG_MAGIC_LONGBOW, ItemID.MAGIC_LONGBOW,
-            85, KeyEvent.VK_SPACE, 1, 1, 91.5, true, true, "Magic longbow (u)");
+            85, KeyEvent.VK_3, 1, 1, 91.5, true, true, "Magic longbow (u)");
 
         final int     logId;
         final int     unstrungId;
@@ -386,14 +386,16 @@ public final class FletchingScript
                 bankFailures = 0; lastBankActionMs = System.currentTimeMillis();
                 return;
             }
-            // 2. Logs
+            // 2. Logs — Withdraw-All. Inventory cap is 27 with the knife already in,
+            // so "All" naturally tops out at 27 logs and we avoid the Withdraw-X chatbox
+            // round-trip. (Shield recipes that consume 2 logs/action are deferred to v2;
+            // they'd need Withdraw-26 instead, but no v1 item uses logsPerAction > 1.)
             if (inventoryCount(item.logId) == 0)
             {
                 long logAmt = bank.bankItemAmount(item.logId);
                 if (logAmt <= 0) { abortWith("no logs in bank"); return; }
-                int qty = item.logWithdrawCount();
-                status.set("bank: withdrawing " + qty + " logs");
-                if (!bank.tryWithdrawX(item.logId, qty))
+                status.set("bank: withdrawing logs (all)");
+                if (!bank.tryWithdrawAll(item.logId))
                 {
                     if (++bankFailures >= MAX_BANK_FAILURES) { abortWith("withdraw logs failed"); return; }
                     return;
@@ -476,7 +478,15 @@ public final class FletchingScript
     private void tickCut() throws InterruptedException
     {
         FletchItem item = selectedItem.get();
-        safeDismissLevelUp();
+        // Level-up popup terminates the in-flight Skillmulti cs2, so on dismiss we MUST
+        // reset the click chain — same pattern as UltraCompostScript.tickCrafting.
+        if (safeDismissLevelUp())
+        {
+            status.set("cut: dismissed level-up — resetting click chain");
+            clicksDone = false; confirmed = false;
+            skillmultiWaitMs = 0L; craftWaitMs = 0L;
+            return;
+        }
 
         if (!clicksDone)
         {
@@ -571,7 +581,13 @@ public final class FletchingScript
     private void tickString() throws InterruptedException
     {
         FletchItem item = selectedItem.get();
-        safeDismissLevelUp();
+        if (safeDismissLevelUp())
+        {
+            status.set("string: dismissed level-up — resetting click chain");
+            clicksDone = false; confirmed = false;
+            skillmultiWaitMs = 0L; craftWaitMs = 0L;
+            return;
+        }
 
         if (!clicksDone)
         {
@@ -635,7 +651,10 @@ public final class FletchingScript
                 else status.set("string: waiting for skillmulti (" + elapsed + "ms)");
                 return;
             }
-            dispatcher.tapKey(KeyEvent.VK_SPACE);
+            // Stringing dialog is single-option (just the matching strung bow). Press the
+            // numeric position-1 key explicitly rather than VK_SPACE — Space is dynamically
+            // rebound to "last used", so it's not safe to assume on a fresh batch.
+            dispatcher.tapKey(KeyEvent.VK_1);
             confirmed = true;
             craftWaitMs = System.currentTimeMillis();
             return;
@@ -648,7 +667,7 @@ public final class FletchingScript
             Widget w = client.getWidget(InterfaceID.Skillmulti.UNIVERSE);
             return w != null && !w.isHidden();
         }));
-        if (dialogOpen) dispatcher.tapKey(KeyEvent.VK_SPACE);
+        if (dialogOpen) dispatcher.tapKey(KeyEvent.VK_1);
 
         long elapsed = System.currentTimeMillis() - craftWaitMs;
         if (elapsed > CRAFT_TIMEOUT_MS) { abortWith("string timeout — " + unstrungLeft + " unstrung left"); return; }
@@ -673,10 +692,18 @@ public final class FletchingScript
         setState(State.BANKING);
     }
 
-    private void safeDismissLevelUp()
+    /** Detects + dismisses the level-up popup with a humanized 3–34s delay.
+     *
+     *  <p>Returns {@code true} ONCE per popup, on the tick we press Space —
+     *  caller must reset the click chain ({@code clicksDone}, {@code confirmed},
+     *  {@code skillmultiWaitMs}, {@code craftWaitMs}) and {@code return} so the
+     *  next tick re-engages Use → click → Skillmulti. Same shape as
+     *  {@code UltraCompostScript.dismissLevelUpIfVisible}: the popup terminates
+     *  the in-flight Skillmulti cs2, so without the reset the FSM sits at
+     *  "confirmed, waiting for inventory to drain" forever and only escapes via
+     *  the 90s CRAFT_TIMEOUT_MS abort. */
+    private boolean safeDismissLevelUp()
     {
-        // Inlined from CookingScriptV3.safeDismissLevelUp (same logic; cook.isLevelUpVisible()
-        // and cook.dismissLevelUp() are trivially inlined since we own the dispatcher here).
         try
         {
             boolean visible = Boolean.TRUE.equals(onClient(() -> {
@@ -686,7 +713,7 @@ public final class FletchingScript
             if (!visible)
             {
                 levelUpFirstSeenAtMs = 0L;
-                return;
+                return false;
             }
             long now = System.currentTimeMillis();
             if (levelUpFirstSeenAtMs == 0L)
@@ -697,7 +724,7 @@ public final class FletchingScript
                 levelUpFirstSeenAtMs  = now;
                 levelUpDismissAfterMs = now + delay;
                 log.info("fletching: level-up — will dismiss in {}ms", delay);
-                return;
+                return false;
             }
             if (now >= levelUpDismissAfterMs)
             {
@@ -705,10 +732,12 @@ public final class FletchingScript
                     now - levelUpFirstSeenAtMs);
                 dispatcher.tapKey(KeyEvent.VK_SPACE);
                 levelUpFirstSeenAtMs = 0L;
+                return true;
             }
         }
         catch (InterruptedException ie) { Thread.currentThread().interrupt(); }
         catch (Throwable th) { log.warn("fletching: dismissLevelUp threw", th); }
+        return false;
     }
 
     // ─── Helpers ─────────────────────────────────────────────────────────────────
