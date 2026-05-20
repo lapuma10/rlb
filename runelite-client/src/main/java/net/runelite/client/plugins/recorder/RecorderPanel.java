@@ -352,8 +352,9 @@ public final class RecorderPanel extends PluginPanel
             net.runelite.client.plugins.recorder.scripts.FletchingScript.Mode.values());
     private final JComboBox<net.runelite.client.plugins.recorder.scripts.FletchingScript.FletchItem>
         fletchItemCombo = new JComboBox<>();
-    private final JCheckBox fletchBreaksCheck = new JCheckBox("Enable breaks", true);
-    private final JCheckBox fletchDevCheck    = new JCheckBox("Dev mode (show unverified)", false);
+    private final JCheckBox fletchBreaksCheck    = new JCheckBox("Enable breaks", true);
+    private final JCheckBox fletchAutoLevelCheck = new JCheckBox("Auto-level (advance bow tier on level-up)", false);
+    private final JCheckBox fletchDevCheck       = new JCheckBox("Dev mode (show unverified)", false);
     private final JButton   fletchStartBtn    = new JButton("Start");
     private final JButton   fletchStopBtn     = new JButton("Stop");
     private final JLabel    fletchStatusLabel = new JLabel("idle");
@@ -2862,12 +2863,14 @@ public final class RecorderPanel extends PluginPanel
         fletchModeCombo.setAlignmentX(Component.LEFT_ALIGNMENT);
         fletchItemCombo.setAlignmentX(Component.LEFT_ALIGNMENT);
         fletchBreaksCheck.setAlignmentX(Component.LEFT_ALIGNMENT);
+        fletchAutoLevelCheck.setAlignmentX(Component.LEFT_ALIGNMENT);
         fletchDevCheck.setAlignmentX(Component.LEFT_ALIGNMENT);
         fletchStatusLabel.setAlignmentX(Component.LEFT_ALIGNMENT);
         fletchBreakLabel.setAlignmentX(Component.LEFT_ALIGNMENT);
         capHeight(fletchModeCombo);
         capHeight(fletchItemCombo);
         capHeight(fletchBreaksCheck);
+        capHeight(fletchAutoLevelCheck);
         capHeight(fletchDevCheck);
         capHeight(fletchStatusLabel);
         capHeight(fletchBreakLabel);
@@ -2900,6 +2903,10 @@ public final class RecorderPanel extends PluginPanel
             if (fletchingScript != null)
                 fletchingScript.setAfkBreaksEnabled(fletchBreaksCheck.isSelected());
         });
+        fletchAutoLevelCheck.addActionListener(e -> {
+            if (fletchingScript != null)
+                fletchingScript.setAutoLevelEnabled(fletchAutoLevelCheck.isSelected());
+        });
 
         fletchStartBtn.addActionListener(e -> onFletchStart());
         fletchStopBtn.addActionListener(e -> onFletchStop());
@@ -2911,6 +2918,7 @@ public final class RecorderPanel extends PluginPanel
         p.add(fletchItemCombo);
         p.add(Box.createVerticalStrut(4));
         p.add(fletchBreaksCheck);
+        p.add(fletchAutoLevelCheck);
         p.add(fletchDevCheck);
         p.add(Box.createVerticalStrut(4));
         p.add(buttons);
@@ -2947,6 +2955,7 @@ public final class RecorderPanel extends PluginPanel
         fletchingScript.setItem(item);
         fletchingScript.setMode(m);
         fletchingScript.setAfkBreaksEnabled(fletchBreaksCheck.isSelected());
+        fletchingScript.setAutoLevelEnabled(fletchAutoLevelCheck.isSelected());
         fletchingScript.start();
         fletchStatusLabel.setText("starting…");
     }

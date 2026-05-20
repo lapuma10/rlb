@@ -191,7 +191,12 @@ public final class FletchingScript
 
     /** AFK-break humanizer; live-toggled from the panel.  When false,
      *  the {@link #breaks} scheduler is disabled and never fires. */
-    private final AtomicBoolean afkBreaksEnabled = new AtomicBoolean(true);
+     private final AtomicBoolean afkBreaksEnabled = new AtomicBoolean(true);
+
+    /** When true, dismissing a level-up popup also bumps {@link #selectedItem}
+     *  to the highest-tier bow we can now make on the same log type (see
+     *  {@link #maybeAdvanceItem()}). Arrow shafts stay on shafts. */
+    private final AtomicBoolean autoLevelEnabled = new AtomicBoolean(false);
 
     /** AFK break scheduler.  Constructed in {@link #start()} so a
      *  Stop+Start rolls a fresh activity window.  Null while the
@@ -234,12 +239,16 @@ public final class FletchingScript
     public void setAfkBreaksEnabled(boolean v)
     {
         afkBreaksEnabled.set(v);
+        log.info("fletching: setAfkBreaksEnabled({}) — scheduler {}", v,
+            breaks == null ? "not yet constructed" : (v ? "re-enabled" : "disabled"));
         if (breaks != null)
         {
             if (v) breaks.enable(System.currentTimeMillis());
             else   breaks.disable();
         }
     }
+    public boolean autoLevelEnabled() { return autoLevelEnabled.get(); }
+    public void setAutoLevelEnabled(boolean v) { autoLevelEnabled.set(v); }
     /** Panel accessor for the break-status countdown line. */
     public String breakStatus()
     {
@@ -362,19 +371,40 @@ public final class FletchingScript
         }
         if (!bank.bankReady()) { status.set("bank: waiting for contents"); return; }
 
+        FletchItem item = selectedItem.get();
+
         if (!depositDone)
         {
-            status.set("bank: depositing");
-            if (!bank.depositAllInventory())
+            // Subsequent-batch optimization: on the CUT path, if we already have a knife
+            // AND the inventory holds the just-made bows, deposit just the bows so the knife
+            // stays — avoids the next-cycle "withdraw knife" trip. Falls back to deposit-all
+            // for: the first bank visit (no knife yet), arrow shafts (no unstrung id), and
+            // anything in the STRING / CUT_AND_STRING-string-phase path.
+            boolean keepKnife = nextAction == Action.CUT
+                && item.unstrungId > 0
+                && inventoryCount(KNIFE) > 0
+                && inventoryCount(item.unstrungId) > 0;
+            if (keepKnife)
             {
-                if (++bankFailures >= MAX_BANK_FAILURES) { abortWith("depositAllInventory failed " + bankFailures + "×"); return; }
-                return;
+                status.set("bank: depositing " + item.label() + " (keep knife)");
+                if (!bank.tryDepositAll(item.unstrungId))
+                {
+                    if (++bankFailures >= MAX_BANK_FAILURES) { abortWith("tryDepositAll bows failed " + bankFailures + "×"); return; }
+                    return;
+                }
+            }
+            else
+            {
+                status.set("bank: depositing");
+                if (!bank.depositAllInventory())
+                {
+                    if (++bankFailures >= MAX_BANK_FAILURES) { abortWith("depositAllInventory failed " + bankFailures + "×"); return; }
+                    return;
+                }
             }
             depositDone = true; bankFailures = 0; lastBankActionMs = System.currentTimeMillis();
             return;
         }
-
-        FletchItem item = selectedItem.get();
 
         if (nextAction == Action.CUT)
         {
@@ -779,12 +809,46 @@ public final class FletchingScript
                     now - levelUpFirstSeenAtMs);
                 dispatcher.tapKey(KeyEvent.VK_SPACE);
                 levelUpFirstSeenAtMs = 0L;
+                if (autoLevelEnabled.get()) maybeAdvanceItem();
                 return true;
             }
         }
         catch (InterruptedException ie) { Thread.currentThread().interrupt(); }
         catch (Throwable th) { log.warn("fletching: dismissLevelUp threw", th); }
         return false;
+    }
+
+    /** Auto-advance: when level-up dismisses, switch {@link #selectedItem} to
+     *  the highest-level verified bow we can now make on the SAME log type.
+     *  Stays within one log tier (no cross-tier jump — that would require a
+     *  bank scan for the new logs). Skips arrow shafts: if the user picked
+     *  shafts they probably want shafts XP, not bow XP.
+     *  <p>Called only when {@link #autoLevelEnabled} is true. */
+    private void maybeAdvanceItem()
+    {
+        FletchItem current = selectedItem.get();
+        if (!current.canString) return;  // on arrow shafts — leave alone
+        Integer level = onClient(() -> client.getRealSkillLevel(net.runelite.api.Skill.FLETCHING));
+        if (level == null) return;
+        FletchItem best = current;
+        for (FletchItem candidate : FletchItem.values())
+        {
+            if (!candidate.verified) continue;
+            if (candidate.logId != current.logId) continue;
+            if (!candidate.canString) continue;
+            if (candidate.levelReq > level) continue;
+            if (mode.get() != Mode.FLETCH && !candidate.canString) continue;
+            if (candidate.levelReq > best.levelReq) best = candidate;
+        }
+        if (best != current)
+        {
+            log.info("fletching: autolevel — advancing {} → {} (level {})",
+                current.label(), best.label(), level);
+            selectedItem.set(best);
+            // Click chain is reset by the caller (tickCut/tickString) after
+            // dismissLevelUp returns true, so the next tick re-engages with
+            // the new item's skillmultiWidget.
+        }
     }
 
     // ─── Helpers ─────────────────────────────────────────────────────────────────
