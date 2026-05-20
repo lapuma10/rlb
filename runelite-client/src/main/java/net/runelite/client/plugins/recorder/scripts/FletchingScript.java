@@ -195,9 +195,10 @@ public final class FletchingScript
     private Action nextAction = Action.CUT;
 
     // Per-state flags — reset in setState()
-    private boolean bankDone, depositDone, clicksDone, confirmed;
+    private boolean depositDone, clicksDone, confirmed;
     private long    skillmultiWaitMs, craftWaitMs, lastBankActionMs;
     private int     bankFailures;
+    private int     useClickFailures;
     private long    levelUpFirstSeenAtMs;
     private long    levelUpDismissAfterMs;
 
@@ -462,7 +463,6 @@ public final class FletchingScript
         SequenceSleep.sleep(client, 400);
         if (!Boolean.TRUE.equals(onClient(bank::isBankOpen)))
         {
-            bankDone = true;
             setState(State.PROCESSING);
         }
     }
@@ -499,8 +499,14 @@ public final class FletchingScript
             if (err != null)
             {
                 log.warn("fletching cut: Use click error: {}", err);
+                if (++useClickFailures >= MAX_BANK_FAILURES)
+                {
+                    abortWith("use-click on knife failed " + useClickFailures + "×");
+                    return;
+                }
                 return;
             }
+            useClickFailures = 0;
 
             SequenceSleep.sleep(client, INTER_CLICK_SETTLE_MS);
 
@@ -588,8 +594,14 @@ public final class FletchingScript
             if (err != null)
             {
                 log.warn("fletching string: Use click error: {}", err);
+                if (++useClickFailures >= MAX_BANK_FAILURES)
+                {
+                    abortWith("use-click on bowstring failed " + useClickFailures + "×");
+                    return;
+                }
                 return;
             }
+            useClickFailures = 0;
 
             SequenceSleep.sleep(client, INTER_CLICK_SETTLE_MS);
 
@@ -705,8 +717,8 @@ public final class FletchingScript
     {
         log.info("fletching: {} → {}", state.get(), s);
         state.set(s);
-        bankDone = false; depositDone = false; clicksDone = false; confirmed = false;
-        skillmultiWaitMs = 0; craftWaitMs = 0; lastBankActionMs = 0; bankFailures = 0;
+        depositDone = false; clicksDone = false; confirmed = false;
+        skillmultiWaitMs = 0; craftWaitMs = 0; lastBankActionMs = 0; bankFailures = 0; useClickFailures = 0;
     }
 
     private void abortWith(String reason)
