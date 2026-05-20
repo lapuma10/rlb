@@ -30,6 +30,7 @@ import net.runelite.api.gameval.VarbitID;
 import net.runelite.api.widgets.Widget;
 import net.runelite.client.callback.ClientThread;
 import net.runelite.client.sequence.activities.banking.BankActions;
+import net.runelite.client.plugins.recorder.transport.VerbMatcher;
 import net.runelite.client.sequence.dispatch.HumanizedInputDispatcher;
 import net.runelite.client.sequence.dispatch.SequenceSleep;
 import net.runelite.client.sequence.internal.ActionRequest;
@@ -1098,31 +1099,27 @@ public final class BankInteraction implements BankActions
      *  {@code bankAmt <= need ? tryWithdrawAll : tryWithdrawX}). */
     private boolean withdrawXClickChain(int itemId, int qty) throws InterruptedException
     {
-        // Phase 1: verb-scan.  Single candidate matches both the cached
-        // last-Y and the fixed Withdraw-1/5/10 forms.  Verb format
-        // confirmed against the live menu: OSRS renders the cached-Y
-        // entry as "Withdraw-51000" (full digits, no K abbreviation).
-        if (withdrawWithFirstMatching(itemId,
-                java.util.List.of("Withdraw-" + qty)))
+        // ONE right-click: try the cached Withdraw-N first (skips chatbox
+        // round-trip), Withdraw-X as guaranteed fallback. Previously we did
+        // three separate right-clicks (verb-scan + retry-after-settle +
+        // Withdraw-X) — both retries fire `dismissMenu` between them, so a
+        // qty without a cached Y entry cost ~3s of cursor-thrashing per item.
+        // rightClickAndPickFirstMatching iterates candidates in priority
+        // order on the SAME open menu, so this collapses to a single right-
+        // click that picks whichever verb is actually present.
+        String exactVerb = "Withdraw-" + qty;
+        String matched = rightClickPickWithdrawVerb(itemId,
+            java.util.List.of(exactVerb, "Withdraw-X"));
+        if (matched == null) return false;
+        if (VerbMatcher.matches(exactVerb, matched))
         {
+            // Cached Withdraw-Y hit (or fixed Withdraw-1/5/10) — no chatbox.
             return true;
         }
-        // Cache-miss: caller's qty doesn't match the slot's cached Y or
-        // any fixed verb. Logged so production-log audits can measure
-        // Phase 1 hit-rate over time. The chatbox path below sets the
-        // cached Y to qty, so the next call with the same qty WILL hit.
-        log.info("bank: verb-scan miss for itemId={} qty={} — falling back to chatbox",
-            itemId, qty);
-
-        // Fallback: chatbox path.  formatChatboxQty collapses clean
-        // multiples to "Nk"/"Nm" so 51000 types as 3 chars instead of
-        // 5; non-clean qtys pass through unchanged.
-        boolean picked = withdrawWithVerb(itemId, "Withdraw-X");
-        if (!picked) return false;
-        // Withdraw-X opens a chatbox numeric prompt. Use the dispatcher's
-        // shared helper that gates on VarClientID.MESLAYERMODE — widget
-        // visibility on Chatbox.MES_LAYER lies for these prompts (the
-        // hidden chain reports false even when the dialog is on screen).
+        // Withdraw-X picked — type the qty. formatChatboxQty collapses clean
+        // multiples to "Nk"/"Nm" so 51000 types as 3 chars instead of 5;
+        // non-clean qtys pass through unchanged. Uses MESLAYERMODE gating
+        // (widget visibility lies for these CS2 numeric prompts).
         String typed = formatChatboxQty(qty);
         if (!dispatcher.typeChatboxAndEnter(typed, 3500L))
         {
@@ -1132,18 +1129,15 @@ public final class BankInteraction implements BankActions
         return true;
     }
 
-    /** Sibling of {@link #withdrawWithVerb} that picks the first menu
-     *  entry whose verb matches ANY candidate (priority order). Same
-     *  scroll-and-find loop, dispatches
-     *  {@link HumanizedInputDispatcher#rightClickAndPickFirstMatching}
-     *  instead of {@code rightClickAndPickMenu}. Returns true iff a
-     *  candidate was found and clicked.
-     *
-     *  <p>Used by {@link #withdrawXClickChain} for the verb-scan
-     *  fast path (cached {@code Withdraw-Y} / fixed {@code Withdraw-1/5/10}
-     *  hit). Returns false on no-match (caller falls back to the
-     *  chatbox flow) or on item-not-in-bank / scroll-find timeout. */
-    private boolean withdrawWithFirstMatching(int itemId, java.util.List<String> verbs)
+    /** Right-click the bank slot for {@code itemId} once and pick the first
+     *  menu entry whose verb matches any of {@code verbs}, iterated in
+     *  priority order. Scrolls the bank container into the slot first if
+     *  it's not currently visible. Returns the matched verb on hit, or
+     *  null on miss / scroll-timeout / item-not-in-bank. Replaces the
+     *  retry-after-settle dance in the legacy {@code withdrawWithFirstMatching}
+     *  — including "Withdraw-X" in the candidate list makes the retry
+     *  redundant because Withdraw-X is always present in the bank-slot menu. */
+    private String rightClickPickWithdrawVerb(int itemId, java.util.List<String> verbs)
         throws InterruptedException
     {
         long deadline = System.currentTimeMillis() + 10_000L;
@@ -1151,7 +1145,7 @@ public final class BankInteraction implements BankActions
         while (safety-- > 0 && System.currentTimeMillis() < deadline)
         {
             ScrollOrBounds sb = onClient(() -> resolveBankSlotInfo(itemId));
-            if (sb == null) return false;
+            if (sb == null) return null;
             if (sb.bounds != null)
             {
                 int cx = sb.bounds.x + sb.bounds.width / 2;
@@ -1159,31 +1153,13 @@ public final class BankInteraction implements BankActions
                 String matched = dispatcher.rightClickAndPickFirstMatching(cx, cy, verbs);
                 if (matched != null)
                 {
-                    log.info("bank: verb-scan hit '{}' itemId={} at bounds={}",
+                    log.info("bank: verb pick '{}' itemId={} at bounds={}",
                         matched, itemId, sb.bounds);
-                    return true;
+                    return matched;
                 }
-                // First-attempt miss can be a transient menu-population
-                // race (rRight after a fresh bank reopen the cached
-                // Withdraw-Y row sometimes hasn't rendered yet by the
-                // time rightClickAndPickFirstMatching reads the menu).
-                // Dismiss the open menu, sleep one full game tick, and
-                // try once more before falling back to the chatbox path
-                // — saves ~5s of Withdraw-X chatbox typing on the
-                // ~10% of withdraws that hit this race.
-                log.info("bank: verb-scan first attempt missed itemId={} — retrying after settle",
-                    itemId);
-                dispatcher.dismissMenu();
-                SequenceSleep.sleep(client, 250L);
-                String retry = dispatcher.rightClickAndPickFirstMatching(cx, cy, verbs);
-                if (retry != null)
-                {
-                    log.info("bank: verb-scan hit '{}' on retry itemId={} at bounds={}",
-                        retry, itemId, sb.bounds);
-                    return true;
-                }
-                // Still no candidate after retry — caller falls back.
-                return false;
+                log.warn("bank: verb pick MISS — none of {} present for itemId={} at bounds={}",
+                    verbs, itemId, sb.bounds);
+                return null;
             }
             int notches = Math.max(1, Math.min(3, sb.scrollNotches));
             log.info("bank: verb-scan scroll burst toward itemId={} (dir={}, notches={})",
@@ -1193,7 +1169,7 @@ public final class BankInteraction implements BankActions
             SequenceSleep.sleep(client, 150L + (long) (Math.random() * 250L));
         }
         log.warn("bank: verb-scan scroll-to-find timed out for itemId={}", itemId);
-        return false;
+        return null;
     }
 
     /** Format {@code qty} for the bank/GE chatbox numeric prompt.
