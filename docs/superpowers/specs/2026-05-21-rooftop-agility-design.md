@@ -1,6 +1,6 @@
 # Rooftop Agility Script — v1 Design
 
-**Status:** design ready 2026-05-21. Pending Draynor tile/object capture before implementation.
+**Status:** LOCKED 2026-05-21. Implementation-ready after Draynor tile/object capture.
 **Scope:** Draynor Rooftop only. Single-course operation. Manual user-driven
 course selection. Stop at configurable target level. Pick up marks of grace
 on the current rooftop only. Eat food if HP drops, else stop.
@@ -150,7 +150,10 @@ construction (in the static initializer) and throws
   must land us where the script will click the first obstacle. (We don't
   introduce a separate `recoveryTiles` field; we enforce the simpler
   invariant.)
-- Any `reachableMarkTiles` entry that is not in `validTiles`.
+- Any tile in `stageTiles`, `successTiles`, `lapEndTiles`, or
+  `reachableMarkTiles` (across all nodes / the course) that is not in
+  `validTiles`. Catches the most common paste mistake — forgetting to
+  add a tile to the `validTiles` superset.
 - Any tile that appears in **two different** node `stageTiles` (built via
   `stageByTile.put(t, i) != null` returning a different stage). Duplicate
   stage tiles silently break stage detection — fail loud at startup.
@@ -194,14 +197,14 @@ if (dispatcher.isBusy())               return   # gate ALL dispatch-enqueueing b
 if (handleBlockingDialog())            return   # Escape stuck menus; only if dispatcher free
 if (handleLowHp())                     return   # eat or stop; respects throttle internally
 
+if (state == PICKING_MARK):                     # finish the mini-state before anything else dispatches
+    handlePickingMark()
+    return
+
 if (maybeEnableRun())                  return   # at most ONE ActionRequest per tick; returns true if it enqueued
 if (now < nextActionAt)                return   # throttle gate; everything below dispatches
 
 if (isPlayerBusy())                    return   # pose != idle, moving, animating
-
-if (state == PICKING_MARK):
-    handlePickingMark()
-    return
 
 if (handleObstacleTimeout())           return   # may walk to recovery; sets nextActionAt
 if (handleFallOrInvalidPosition())     return   # may walk to recovery; sets nextActionAt
@@ -446,9 +449,11 @@ request is ignored.
 long nextRunToggleAt;          // earliest time we may attempt another run-toggle
 
 private boolean maybeEnableRun() {
-    if (isRunEnabled())                            return false;
-    if (now < nextRunToggleAt)                     return false;
-    if (client.getEnergy() / 100 < runOnAtLeast)   return false;
+    if (isRunEnabled())             return false;
+    if (now < nextRunToggleAt)      return false;
+
+    int energyPercent = client.getEnergy() / 100;   // client.getEnergy() returns 0..10000
+    if (energyPercent < runOnAtLeast) return false;
 
     dispatcher.enqueueRunToggle();
     nextRunToggleAt = now + 2_000;
@@ -463,6 +468,8 @@ script observes run off (i.e. it's re-rolled on the falling edge of
 ## 14. Target level stop
 
 ```java
+static final int DEFAULT_TARGET_LEVEL = 20;   // Draynor exit level; panel pre-populates this
+
 private boolean handleTargetLevel() {
     if (client.getRealSkillLevel(Skill.AGILITY) < targetLevel) return false;
     stop("Target level reached");
@@ -471,14 +478,19 @@ private boolean handleTargetLevel() {
 ```
 
 Real level only (`getRealSkillLevel`), not boosted level. Boosts are out of
-scope for v1.
+scope for v1. The panel field defaults to `DEFAULT_TARGET_LEVEL`; the user
+can override before pressing Start.
 
 ## 15. Lap tracking
 
 ```java
 int  lapsCompleted;
 long lastLapCompletedAt;
+long startedAt;                // set when Start is pressed; cleared on Stop
 ```
+
+`startedAt` lets the panel render runtime as `(now - startedAt)` formatted
+`HH:MM:SS` for diagnostics during the acceptance runs.
 
 Incremented when:
 
@@ -505,7 +517,7 @@ Pick up marks:    [✓]
 Eat below HP:     [ 8  ]              // eats first inventory item with an "Eat" action
 [ Start ] [ Stop ]
 
-Status: Running — stage 3/7 (Tightrope) — 12 laps — 4 marks
+Status: Running — stage 3/7 (Tightrope) — 12 laps — 4 marks — 18m
 ```
 
 Pre-flight validation in `Start`:
