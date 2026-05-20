@@ -82,6 +82,7 @@ import net.runelite.client.plugins.recorder.capture.NearbyResolver;
 import net.runelite.client.plugins.recorder.combat.ChickenCombatLoop;
 import net.runelite.client.plugins.recorder.combat.ChickenOverlay;
 import net.runelite.client.plugins.recorder.debug.DebugOverlay;
+import net.runelite.client.plugins.recorder.debug.GeDebugOverlay;
 import net.runelite.client.plugins.recorder.debug.LoginDebugOverlay;
 import net.runelite.client.plugins.recorder.debug.TileMarker;
 import net.runelite.client.plugins.recorder.hotkey.HotkeyHandler;
@@ -151,6 +152,7 @@ public class RecorderPlugin extends Plugin
     private V2PathOverlay v2PathOverlay;
     private CollisionDebugOverlay collisionDebugOverlay;
     private ObjectDebugOverlay objectDebugOverlay;
+    private GeDebugOverlay geDebugOverlay;
     private net.runelite.client.plugins.recorder.worldmap.WorldMapMinimapOverlay worldMapMinimapOverlay;
     private TileMarker tileMarker;
     private ChickenCombatLoop chickenLoop;
@@ -163,6 +165,7 @@ public class RecorderPlugin extends Plugin
     private PieDishScript pieDishScript;
     private UltraCompostScript ultraCompostScript;
     private PizzaScript pizzaScript;
+    private net.runelite.client.plugins.recorder.scripts.FletchingScript fletchingScript;
     private AreaSelector areaSelector;
     private net.runelite.client.plugins.recorder.inspector.ClickInspector clickInspector;
 
@@ -244,6 +247,7 @@ public class RecorderPlugin extends Plugin
         v2PathOverlay = new V2PathOverlay(client, config);
         collisionDebugOverlay = new CollisionDebugOverlay(client, config);
         objectDebugOverlay = new ObjectDebugOverlay(client, config);
+        geDebugOverlay = new GeDebugOverlay(client, config);
         panel.setTransportResolver(new TransportResolver(client));
         tileMarker = new TileMarker(client);
         panel.setDebugOverlay(debugOverlay);
@@ -260,6 +264,7 @@ public class RecorderPlugin extends Plugin
         overlayManager.add(v2PathOverlay);
         overlayManager.add(collisionDebugOverlay);
         overlayManager.add(objectDebugOverlay);
+        overlayManager.add(geDebugOverlay);
         overlayManager.add(hudOverlay);
 
         // Wire login assistant. We construct a fresh dispatcher here for
@@ -424,6 +429,14 @@ public class RecorderPlugin extends Plugin
         HumanizedInputDispatcher pizzaDispatcher = new HumanizedInputDispatcher(client, clientThread);
         pizzaScript = new PizzaScript(client, clientThread, pizzaDispatcher, trailRegistry);
         panel.setPizzaScript(pizzaScript);
+
+        // Fletching script — buy bow strings + logs, fletch unstrung bows, string
+        // them, sell. Independent dispatcher so it never collides with Pizza/Cooking
+        // on the dispatcher busy flag.
+        HumanizedInputDispatcher fletchDispatcher = new HumanizedInputDispatcher(client, clientThread);
+        fletchingScript = new net.runelite.client.plugins.recorder.scripts.FletchingScript(
+            client, clientThread, fletchDispatcher);
+        panel.setFletchingScript(fletchingScript);
 
         // Click inspector — toggleable diagnostic. Subscribes itself to the
         // EventBus only when enabled; safe to leave off by default.
@@ -891,6 +904,7 @@ public class RecorderPlugin extends Plugin
         if (pieDishScript != null) { pieDishScript.stop(); pieDishScript = null; }
         if (ultraCompostScript != null) { ultraCompostScript.stop(); ultraCompostScript = null; }
         if (pizzaScript != null) { pizzaScript.stop(); pizzaScript = null; }
+        if (fletchingScript != null) { fletchingScript.stop(); fletchingScript = null; }
         if (hudOverlay != null) overlayManager.remove(hudOverlay);
         if (areaSelector != null && areaSelector.isActive()) areaSelector.cancel();
         if (debugOverlay != null) overlayManager.remove(debugOverlay);
@@ -901,6 +915,7 @@ public class RecorderPlugin extends Plugin
         if (v2PathOverlay != null) { overlayManager.remove(v2PathOverlay); v2PathOverlay.detach(); }
         if (collisionDebugOverlay != null) overlayManager.remove(collisionDebugOverlay);
         if (objectDebugOverlay != null) overlayManager.remove(objectDebugOverlay);
+        if (geDebugOverlay != null) overlayManager.remove(geDebugOverlay);
         if (worldMapMinimapOverlay != null)
         {
             overlayManager.remove(worldMapMinimapOverlay);
