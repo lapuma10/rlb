@@ -55,54 +55,107 @@ Each entry stores:
 | 4 | Longbow (u) | 10 | `VK_4` | no | yes |
 | 5 | Crossbow stock | 9 | `VK_5` | no | no |
 
-### Other log types — PLACEHOLDER
+### Oak logs (5 options)
 
-Exact dialog option order and key positions must be confirmed in-game or from OSRS wiki before
-implementation. Rows marked **[VERIFY]** are estimates based on wiki level data; key mappings
-are unknown until the dialog is seen in-game.
+| Slot | Key | Item | Level | XP | Stackable | Item ID | Can string |
+|---|---|---|---|---|---|---|---|
+| 1 | `VK_1` | Arrow shafts | 15 | 10 | yes (30/log) | 52 | no |
+| 2 | `VK_2` | Oak shortbow (u) | 20 | 16.5 | no | 54 | yes |
+| 3 | `VK_SPACE` | Oak longbow (u) | 25 | 25 | no | 56 | yes |
+| 4 | `VK_4` | Oak shield | 27 | 50 | no | 22251 | no — needs **2 logs** |
+| 5 | `VK_5` | Oak stock | 24 | 16 | no | 9442 | no |
 
-A background research task was dispatched at spec-write time to fill in this table from the
-OSRS wiki. Update this section before implementation.
+### Willow logs (5 options)
 
-| Log | Item | Level | Key | Notes |
-|---|---|---|---|---|
-| Oak | Oak shortbow (u) | 20 | [VERIFY] | |
-| Oak | Oak longbow (u) | 25 | [VERIFY] | |
-| Oak | Oak stock | 27 | [VERIFY] | |
-| Oak | Oak shield | 32 | [VERIFY] | user confirmed shields exist |
-| Willow | Willow shortbow (u) | 35 | [VERIFY] | |
-| Willow | Willow longbow (u) | 40 | [VERIFY] | |
-| Willow | Willow stock | 42 | [VERIFY] | |
-| Teak | Teak stock | 46 | [VERIFY] | crossbow stock only? |
-| Maple | Maple shortbow (u) | 50 | [VERIFY] | |
-| Maple | Maple longbow (u) | 55 | [VERIFY] | |
-| Maple | Maple stock | 54 | [VERIFY] | |
-| Mahogany | Mahogany stock | 61 | [VERIFY] | |
-| Yew | Yew shortbow (u) | 65 | [VERIFY] | |
-| Yew | Yew longbow (u) | 70 | [VERIFY] | |
-| Magic | Magic shortbow (u) | 80 | [VERIFY] | |
-| Magic | Magic longbow (u) | 85 | [VERIFY] | |
-| Redwood | Redwood shield | 92 | [VERIFY] | TBD |
+| Slot | Key | Item | Level | XP | Stackable | Item ID | Can string |
+|---|---|---|---|---|---|---|---|
+| 1 | `VK_1` | Arrow shafts | 30 | 15 | yes (45/log) | 52 | no |
+| 2 | `VK_2` | Willow shortbow (u) | 35 | 33.3 | no | 60 | yes |
+| 3 | `VK_SPACE` | Willow longbow (u) | 40 | 41.5 | no | 58 | yes |
+| 4 | `VK_4` | Willow stock | 39 | 22 | no | 9444 | no |
+| 5 | `VK_5` | Willow shield | 42 | 83 | no | 22254 | no — needs **2 logs** |
+
+### Teak logs (1 option — single-item dialog)
+
+| Slot | Key | Item | Level | XP | Stackable | Item ID | Can string |
+|---|---|---|---|---|---|---|---|
+| 1 | `VK_SPACE` | Teak stock | 46 | 27 | no | 9446 | no |
+
+### Maple logs (5 options)
+
+| Slot | Key | Item | Level | XP | Stackable | Item ID | Can string |
+|---|---|---|---|---|---|---|---|
+| 1 | `VK_1` | Arrow shafts | 45 | 20 | yes (60/log) | 52 | no |
+| 2 | `VK_2` | Maple shortbow (u) | 50 | 50 | no | 64 | yes |
+| 3 | `VK_SPACE` | Maple longbow (u) | 55 | 58.3 | no | 62 | yes |
+| 4 | `VK_4` | Maple stock | 54 | 32 | no | 9448 | no |
+| 5 | `VK_5` | Maple shield | 57 | 116.5 | no | 22257 | no — needs **2 logs** |
+
+### Mahogany logs (1 option — single-item dialog)
+
+| Slot | Key | Item | Level | XP | Stackable | Item ID | Can string |
+|---|---|---|---|---|---|---|---|
+| 1 | `VK_SPACE` | Mahogany stock | 61 | 41 | no | 9450 | no |
+
+### Yew logs (5 options)
+
+| Slot | Key | Item | Level | XP | Stackable | Item ID | Can string |
+|---|---|---|---|---|---|---|---|
+| 1 | `VK_1` | Arrow shafts | 60 | 25 | yes (75/log) | 52 | no |
+| 2 | `VK_2` | Yew shortbow (u) | 65 | 67.5 | no | 68 | yes |
+| 3 | `VK_SPACE` | Yew longbow (u) | 70 | 75 | no | 66 | yes |
+| 4 | `VK_4` | Yew stock | 69 | 50 | no | 9452 | no |
+| 5 | `VK_5` | Yew shield | 72 | 150 | no | 22260 | no — needs **2 logs** |
+
+### Magic logs (5 options)
+
+| Slot | Key | Item | Level | XP | Stackable | Item ID | Can string |
+|---|---|---|---|---|---|---|---|
+| 1 | `VK_1` | Arrow shafts | 75 | 30 | yes (90/log) | 52 | no |
+| 2 | `VK_2` | Magic shortbow (u) | 80 | 83.3 | no | 72 | yes |
+| 3 | `VK_SPACE` | Magic longbow (u) | 85 | 91.5 | no | 70 | yes |
+| 4 | `VK_4` | Magic stock | 85 | 70 | no | 21952 | no |
+| 5 | `VK_5` | Magic shield | 87 | 183 | no | 22263 | no — needs **2 logs** |
+
+### Redwood logs (3 options)
+
+| Slot | Key | Item | Level | XP | Stackable | Item ID | Can string |
+|---|---|---|---|---|---|---|---|
+| 1 | `VK_1` | Arrow shafts | 90 | 35 | yes (105/log) | 52 | no |
+| 2 | `VK_2` | Redwood hiking staff | 90 | 10.5 | no | 31049 | no |
+| 3 | `VK_SPACE` | Redwood shield | 92 | 216 | no | 22266 | no — needs **2 logs** |
+
+### Shield implementation note
+
+Shields consume **2 logs per shield**, so a 27-log inventory yields 13 shields with 1 log left over.
+Banking: withdraw **26 logs** (not 27) when the selected item is a shield. The leftover from
+odd-lot situations (bank has an odd number) gets deposited on the next trip as waste.
+
+### Normal logs correction
+
+The wiki confirms wooden stock (level 9) appears as slot 5 even though shortbow (level 5) and
+longbow (level 10) bracket it — the game groups bows first, then stocks. Item IDs confirmed:
+wooden stock = 9440, shortbow (u) = 50, longbow (u) = 48.
 
 ### Stringing bows
 
-All stringing uses bowstring on unstrung bow → single-option skillmulti → `VK_SPACE`.
+All stringing uses bowstring (item ID 1777) on unstrung bow → single-option skillmulti → `VK_SPACE`.
 Batch size: 14 bowstrings + 14 unstrung bows = 28 slots.
 
-| Unstrung | Strung | Level |
-|---|---|---|
-| Shortbow (u) | Shortbow | 5 |
-| Longbow (u) | Longbow | 10 |
-| Oak shortbow (u) | Oak shortbow | 20 |
-| Oak longbow (u) | Oak longbow | 25 |
-| Willow shortbow (u) | Willow shortbow | 35 |
-| Willow longbow (u) | Willow longbow | 40 |
-| Maple shortbow (u) | Maple shortbow | 50 |
-| Maple longbow (u) | Maple longbow | 55 |
-| Yew shortbow (u) | Yew shortbow | 65 |
-| Yew longbow (u) | Yew longbow | 70 |
-| Magic shortbow (u) | Magic shortbow | 80 |
-| Magic longbow (u) | Magic longbow | 85 |
+| Level | Unstrung | Unstrung ID | Strung | Strung ID | XP |
+|---|---|---|---|---|---|
+| 5 | Shortbow (u) | 50 | Shortbow | 841 | 5 |
+| 10 | Longbow (u) | 48 | Longbow | 839 | 10 |
+| 20 | Oak shortbow (u) | 54 | Oak shortbow | 843 | 16.5 |
+| 25 | Oak longbow (u) | 56 | Oak longbow | 845 | 25 |
+| 35 | Willow shortbow (u) | 60 | Willow shortbow | 849 | 33.3 |
+| 40 | Willow longbow (u) | 58 | Willow longbow | 847 | 41.5 |
+| 50 | Maple shortbow (u) | 64 | Maple shortbow | 853 | 50 |
+| 55 | Maple longbow (u) | 62 | Maple longbow | 851 | 58.3 |
+| 65 | Yew shortbow (u) | 68 | Yew shortbow | 857 | 67.5 |
+| 70 | Yew longbow (u) | 66 | Yew longbow | 855 | 75 |
+| 80 | Magic shortbow (u) | 72 | Magic shortbow | 861 | 83.3 |
+| 85 | Magic longbow (u) | 70 | Magic longbow | 859 | 91.5 |
 
 ---
 
@@ -268,10 +321,15 @@ The `RecorderPlugin` instantiates `FletchingScript` the same way it instantiates
 
 ## What Needs In-Game Verification Before Implementation
 
-1. **Skillmulti key positions for all non-normal log types** — which key maps to which item per dialog. See the [VERIFY] rows in the item catalog. The wiki research subagent dispatched during spec write should fill most of these in; confirm in-game for any remaining gaps.
-2. **Oak shield and Redwood shield** item IDs — confirm `ItemID.*` names via click-inspector.
-3. **Teak and Mahogany** dialog layouts — these may only produce crossbow stocks; confirm.
-4. **Stringing skillmulti** — confirm it is always a single option (Space) for all bow types.
+1. **Skillmulti key positions** — the wiki does not publish dialog slot order directly. The tables
+   above follow ascending-level ordering which matches wiki data, but **verify in-game** for any
+   log type where you intend to use a non-Space key before trusting a wrong key would silently
+   fletch the wrong item. Normal logs are confirmed from screenshot; others need checking.
+2. **Shield item IDs** — wiki-sourced IDs (22251, 22254, 22257, 22260, 22263, 22266) should be
+   cross-checked via click-inspector on the actual items.
+3. **Stringing skillmulti** — confirm it is always a single option (Space) for all bow types in-game.
+4. **Teak/Mahogany single-option dialog** — confirm whether a single-item dialog auto-confirms
+   on open or still requires a keypress / click.
 
 ---
 
