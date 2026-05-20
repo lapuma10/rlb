@@ -280,7 +280,130 @@ public final class FletchingScript
 
     private void tickBanking() throws InterruptedException
     {
-        status.set("banking not implemented yet");
+        if (Boolean.TRUE.equals(onClient(bank::isBankPinUp)))
+        { abortWith("bank PIN required"); return; }
+
+        if (!Boolean.TRUE.equals(onClient(bank::isBankOpen)))
+        {
+            long now = System.currentTimeMillis();
+            if (now - lastBankActionMs < BANK_PACE_MS) { status.set("bank: pacing"); return; }
+            status.set("bank: opening");
+            bank.tryClickBankBoothRandom();
+            lastBankActionMs = now;
+            return;
+        }
+        if (!bank.bankReady()) { status.set("bank: waiting for contents"); return; }
+
+        if (!depositDone)
+        {
+            status.set("bank: depositing");
+            if (!bank.depositAllInventory())
+            {
+                if (++bankFailures >= MAX_BANK_FAILURES) { abortWith("depositAllInventory failed " + bankFailures + "×"); return; }
+                return;
+            }
+            depositDone = true; bankFailures = 0; lastBankActionMs = System.currentTimeMillis();
+            return;
+        }
+
+        FletchItem item = selectedItem.get();
+
+        if (nextAction == Action.CUT)
+        {
+            // 1. Knife
+            if (inventoryCount(KNIFE) == 0)
+            {
+                long knifeAmt = bank.bankItemAmount(KNIFE);
+                if (knifeAmt <= 0) { abortWith("no knife in bank"); return; }
+                status.set("bank: withdrawing knife");
+                if (!bank.tryWithdrawX(KNIFE, 1))
+                {
+                    if (++bankFailures >= MAX_BANK_FAILURES) { abortWith("withdraw knife failed"); return; }
+                    return;
+                }
+                bankFailures = 0; lastBankActionMs = System.currentTimeMillis();
+                return;
+            }
+            // 2. Logs
+            if (inventoryCount(item.logId) == 0)
+            {
+                long logAmt = bank.bankItemAmount(item.logId);
+                if (logAmt <= 0) { abortWith("no logs in bank"); return; }
+                int qty = item.logWithdrawCount();
+                status.set("bank: withdrawing " + qty + " logs");
+                if (!bank.tryWithdrawX(item.logId, qty))
+                {
+                    if (++bankFailures >= MAX_BANK_FAILURES) { abortWith("withdraw logs failed"); return; }
+                    return;
+                }
+                bankFailures = 0; lastBankActionMs = System.currentTimeMillis();
+                return;
+            }
+        }
+        else // STRING
+        {
+            // 1. Unstrung bows
+            if (inventoryCount(item.unstrungId) == 0)
+            {
+                long unstrungAmt = bank.bankItemAmount(item.unstrungId);
+                if (unstrungAmt <= 0)
+                {
+                    if (mode.get() == Mode.CUT_AND_STRING) { nextAction = Action.CUT; depositDone = false; return; }
+                    abortWith("no unstrung " + item.label() + " in bank"); return;
+                }
+                status.set("bank: withdrawing unstrung bows");
+                if (!bank.tryWithdrawX(item.unstrungId, 14))
+                {
+                    if (++bankFailures >= MAX_BANK_FAILURES) { abortWith("withdraw unstrung failed"); return; }
+                    return;
+                }
+                bankFailures = 0; lastBankActionMs = System.currentTimeMillis();
+                return;
+            }
+            // 2. Bowstrings
+            if (inventoryCount(BOWSTRING) == 0)
+            {
+                long bsAmt = bank.bankItemAmount(BOWSTRING);
+                if (bsAmt <= 0)
+                {
+                    if (mode.get() == Mode.CUT_AND_STRING) { nextAction = Action.CUT; depositDone = false; return; }
+                    abortWith("no bowstrings in bank"); return;
+                }
+                status.set("bank: withdrawing bowstrings");
+                if (!bank.tryWithdrawX(BOWSTRING, 14))
+                {
+                    if (++bankFailures >= MAX_BANK_FAILURES) { abortWith("withdraw bowstrings failed"); return; }
+                    return;
+                }
+                bankFailures = 0; lastBankActionMs = System.currentTimeMillis();
+                return;
+            }
+        }
+
+        // Inventory prepared check
+        if (nextAction == Action.CUT)
+        {
+            if (inventoryCount(KNIFE) == 0 || inventoryCount(item.logId) < item.logsPerAction)
+            { abortWith("inventory not prepared for cutting (knife=" + inventoryCount(KNIFE) + " logs=" + inventoryCount(item.logId) + ")"); return; }
+        }
+        else
+        {
+            if (inventoryCount(item.unstrungId) == 0 || inventoryCount(BOWSTRING) == 0)
+            { abortWith("inventory not prepared for stringing"); return; }
+        }
+
+        // Close bank
+        long now = System.currentTimeMillis();
+        if (now - lastBankActionMs < BANK_PACE_MS) { status.set("bank: pacing close"); return; }
+        status.set("bank: closing");
+        bank.tryCloseBank();
+        lastBankActionMs = now;
+        SequenceSleep.sleep(client, 400);
+        if (!Boolean.TRUE.equals(onClient(bank::isBankOpen)))
+        {
+            bankDone = true;
+            setState(State.PROCESSING);
+        }
     }
 
     private void tickProcessing() throws InterruptedException
