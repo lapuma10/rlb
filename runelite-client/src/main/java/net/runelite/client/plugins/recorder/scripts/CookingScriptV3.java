@@ -867,6 +867,11 @@ public final class CookingScriptV3
             status.set("light: dispatcher busy");
             return;
         }
+        if (!playerIsIdle())
+        {
+            status.set("light: waiting for player to stop walking");
+            return;
+        }
 
         status.set("light: right-click logs — Light");
         if (!cook.lightLogsViaClick(logs))
@@ -1083,6 +1088,11 @@ public final class CookingScriptV3
         if (!ensureInventoryTabOpen())
         {
             status.set("cook: waiting for inventory tab");
+            return;
+        }
+        if (!playerIsIdle())
+        {
+            status.set("cook: waiting for player to stop walking");
             return;
         }
 
@@ -1377,6 +1387,26 @@ public final class CookingScriptV3
         }
         if (s != State.WALK_TO_BANK && s != State.BANKING) tripBankPath = null;
         if (s != State.WALK_TO_COOK) tripCookPath = null;
+    }
+
+    /** True if the local player's pose is the idle pose. The walker
+     *  reports "arrived" on Chebyshev tolerance (~1-2 tiles), so the FSM
+     *  can land in LIGHTING_FIRE / COOKING while the player is still
+     *  taking the last step or two. Dispatching a model-hull click in
+     *  that window projects a pixel from the in-motion player+camera
+     *  position; by the time the cursor flight completes (200-400 ms)
+     *  the camera has followed the player and the target sprite is
+     *  elsewhere on the canvas — right-click menu then lacks the verb
+     *  ("Light" / "Use Raw {food} -> Fire") and the dispatch fails.
+     *  Gate every cook click on this so the bounds are read off a
+     *  stationary scene. */
+    private boolean playerIsIdle()
+    {
+        Boolean idle = onClient(() -> {
+            Player p = client.getLocalPlayer();
+            return p != null && p.getPoseAnimation() == p.getIdlePoseAnimation();
+        });
+        return Boolean.TRUE.equals(idle);
     }
 
     private <T> T onClient(Supplier<T> s)

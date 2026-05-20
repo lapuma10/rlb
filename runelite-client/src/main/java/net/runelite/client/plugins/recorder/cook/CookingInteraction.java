@@ -65,6 +65,17 @@ public final class CookingInteraction
      *  picking up noise from neighbouring rooms. */
     public static final int SEARCH_RADIUS = 12;
 
+    /** Heat-source object name "Fire" — used as the configured
+     *  {@code heatSourceName} for FIRE_FROM_LOGS cooking locations. */
+    private static final String HEAT_NAME_FIRE = "Fire";
+    /** Heat-source object name a fire converts to when another player adds
+     *  logs to it (Forestry communal fire). Same cookable mechanics — same
+     *  Use Raw {food} verb, same Cook-All flow — but a different object id
+     *  (49927-49932) and a different hover name. Our scene scan has to
+     *  accept it or it'll declare the adopted fire dead the moment a
+     *  passer-by drops a log. */
+    private static final String HEAT_NAME_FORESTERS_CAMPFIRE = "Forester's Campfire";
+
     private final Client client;
     private final ClientThread clientThread;
     private final HumanizedInputDispatcher dispatcher;
@@ -157,6 +168,21 @@ public final class CookingInteraction
     // Scene scans — heat source + ground logs
     // ────────────────────────────────────────────────────────────────
 
+    /** True if {@code objName} matches the heat-source the script is
+     *  looking for. Strict case-insensitive equality, except for the
+     *  "Fire" pattern: a regular Fire becomes a Forester's Campfire the
+     *  instant another player adds logs to it (and reverts after a while),
+     *  so both names are accepted for FIRE_FROM_LOGS locations. */
+    private static boolean matchesHeatName(String objName, String pattern)
+    {
+        if (objName == null || pattern == null) return false;
+        if (objName.equalsIgnoreCase(pattern)) return true;
+        if (HEAT_NAME_FIRE.equalsIgnoreCase(pattern)
+            && HEAT_NAME_FORESTERS_CAMPFIRE.equalsIgnoreCase(objName))
+            return true;
+        return false;
+    }
+
     /** Result of a scene scan. Alias for {@link SceneScanner.Match} —
      *  kept here so existing callers (CookingScriptV2 / CookingScriptV3)
      *  don't have to switch import paths. New code should reach for
@@ -210,11 +236,12 @@ public final class CookingInteraction
             scanner.findTileItemByIdRandomNear(itemId, SEARCH_RADIUS, jitter)));
     }
 
-    /** Find any GameObject named {@code namePattern} (case-insensitive)
-     *  whose tile lies inside {@code area}. Returns the closest such
-     *  match to the player, or null. Used to spot a still-burning fire
-     *  anywhere in the cookArea before falling through to the "find
-     *  logs and light a new one" branch. */
+    /** Find any GameObject named {@code namePattern} (via
+     *  {@link #matchesHeatName} — accepts a Forester's Campfire when
+     *  looking for "Fire") whose tile lies inside {@code area}. Returns
+     *  the closest such match to the player, or null. Used to spot a
+     *  still-burning fire anywhere in the cookArea before falling
+     *  through to the "find logs and light a new one" branch. */
     public Match findHeatSourceInArea(
         String namePattern, net.runelite.api.coords.WorldArea area)
         throws InterruptedException
@@ -265,7 +292,7 @@ public final class CookingInteraction
                             catch (Throwable ignored) { /* base def */ }
                         }
                         String name = def.getName();
-                        if (name == null || !name.equalsIgnoreCase(namePattern)) continue;
+                        if (!matchesHeatName(name, namePattern)) continue;
                         LocalPoint lp = go.getLocalLocation();
                         if (lp == null) continue;
                         WorldPoint wp = WorldPoint.fromLocal(client, lp);
@@ -289,10 +316,11 @@ public final class CookingInteraction
     }
 
     /** Find a Fire game object whose composition name matches
-     *  {@code namePattern} and whose tile equals {@code targetTile}.
-     *  Used to verify the fire we just lit actually appeared — vs.
-     *  picking up a random nearby fire that someone else lit. Returns
-     *  null if no fire is on that tile.
+     *  {@code namePattern} (via {@link #matchesHeatName} — accepts a
+     *  Forester's Campfire when looking for "Fire") and whose tile equals
+     *  {@code targetTile}. Used to verify the fire we just lit actually
+     *  appeared — vs. picking up a random nearby fire that someone else
+     *  lit. Returns null if no fire is on that tile.
      *
      *  <p>The OSRS engine sometimes spawns the fire on an adjacent tile
      *  if the click landed on a no-walk tile, so accept fires within 1
@@ -344,8 +372,7 @@ public final class CookingInteraction
                             catch (Throwable ignored) { /* base def */ }
                         }
                         String name = def.getName();
-                        if (name == null) continue;
-                        if (!name.equalsIgnoreCase(namePattern)) continue;
+                        if (!matchesHeatName(name, namePattern)) continue;
                         LocalPoint lp = go.getLocalLocation();
                         if (lp == null) continue;
                         WorldPoint wp = WorldPoint.fromLocal(client, lp);

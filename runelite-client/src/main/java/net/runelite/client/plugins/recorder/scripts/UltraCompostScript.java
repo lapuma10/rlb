@@ -291,7 +291,7 @@ public final class UltraCompostScript
             ashAmt, bankAsh, invAsh,
             ultraAmt, bankUltra, invUltra);
 
-        State next;
+        State next = null;
 
         // A: enough ingredients for at least one ultracompost → make.
         //    Need 1 supercompost + 2 ash minimum.
@@ -300,23 +300,54 @@ public final class UltraCompostScript
         {
             next = State.MAKING_ULTRACOMPOST;
         }
-        // B: have ultracompost stock → sell (if sell phase is enabled).
-        else if (ultraAmt > 0)
+        // B: can't craft right now, but the cycle goal (BATCH_QTY ultracompost
+        //    total) isn't met yet AND buy is enabled. Top up the missing
+        //    side (e.g. ash depleted but super still piled in the bank)
+        //    instead of bailing out. Without this, a partial run that drains
+        //    only ash prematurely DONEs under sell-disabled — leaving coins
+        //    + supercompost stranded. Stops buying once ultraAmt has reached
+        //    BATCH_QTY (the cycle goal), so this can't loop forever even
+        //    with sell off.
+        else if (buyEnabled.get() && ultraAmt < BATCH_QTY)
         {
-            if (!sellEnabled.get())
+            int totalCoins = (int) bank.bankItemAmount(COINS) + inventoryCount(COINS);
+            plannedTargetQty   = computeAffordableTarget(totalCoins, superAmt, ashAmt);
+            plannedBuySuperQty = Math.max(0, plannedTargetQty - superAmt);
+            plannedBuyAshQty   = Math.max(0, plannedTargetQty * 2 - ashAmt);
+            plannedBuyCost     = plannedBuySuperQty * BUY_PRICE_SUPERCOMPOST
+                               + plannedBuyAshQty   * BUY_PRICE_VOLCANIC_ASH;
+            // BUY only if there's actually something missing to buy. If both
+            // sides already cover the affordable target (or compute returned
+            // 0 = can't afford anything) we shouldn't round-trip the GE —
+            // fall through to sell / done.
+            if (plannedTargetQty > 0 && (plannedBuySuperQty > 0 || plannedBuyAshQty > 0))
             {
-                bank.tryCloseBank();
-                log.info("ultra-compost: sell disabled and {} ultracompost in stock — DONE", ultraAmt);
-                status.set("DONE: sell disabled — " + ultraAmt + " ultracompost banked");
-                setState(State.DONE);
-                return;
+                log.info("ultra-compost buy plan: target={} (coins={} ultraStock={}) → super+={} ash+={} cost={}",
+                    plannedTargetQty, totalCoins, ultraAmt,
+                    plannedBuySuperQty, plannedBuyAshQty, plannedBuyCost);
+                next = State.BUYING_SUPPLIES;
             }
-            next = State.SELLING_ULTRACOMPOST;
         }
-        // C: cold start / topped up → buy enough to fill a batch (if buy enabled).
-        else
+
+        // C: buy path didn't pick up. Either buy is disabled, we've already
+        //    bought enough, or we can't afford anything — pick from sell /
+        //    done / abort.
+        if (next == null)
         {
-            if (!buyEnabled.get())
+            if (ultraAmt > 0)
+            {
+                // Have stock — sell it (or done if sell is disabled).
+                if (!sellEnabled.get())
+                {
+                    bank.tryCloseBank();
+                    log.info("ultra-compost: sell disabled and {} ultracompost in stock — DONE", ultraAmt);
+                    status.set("DONE: sell disabled — " + ultraAmt + " ultracompost banked");
+                    setState(State.DONE);
+                    return;
+                }
+                next = State.SELLING_ULTRACOMPOST;
+            }
+            else if (!buyEnabled.get())
             {
                 bank.tryCloseBank();
                 log.info("ultra-compost: buy disabled and no ingredients — DONE");
@@ -324,21 +355,13 @@ public final class UltraCompostScript
                 setState(State.DONE);
                 return;
             }
-            int totalCoins = (int) bank.bankItemAmount(COINS) + inventoryCount(COINS);
-            plannedTargetQty   = computeAffordableTarget(totalCoins, superAmt, ashAmt);
-            plannedBuySuperQty = Math.max(0, plannedTargetQty - superAmt);
-            plannedBuyAshQty   = Math.max(0, plannedTargetQty * 2 - ashAmt);
-            plannedBuyCost     = plannedBuySuperQty * BUY_PRICE_SUPERCOMPOST
-                               + plannedBuyAshQty   * BUY_PRICE_VOLCANIC_ASH;
-            if (plannedTargetQty == 0)
+            else
             {
+                int totalCoins = (int) bank.bankItemAmount(COINS) + inventoryCount(COINS);
                 bank.tryCloseBank();
                 abortWith("not enough coins for one ultracompost (have " + totalCoins + ")");
                 return;
             }
-            log.info("ultra-compost buy plan: target={} (coins={}) → super+={} ash+={} cost={}",
-                plannedTargetQty, totalCoins, plannedBuySuperQty, plannedBuyAshQty, plannedBuyCost);
-            next = State.BUYING_SUPPLIES;
         }
 
         if (next == State.BUYING_SUPPLIES)
@@ -520,11 +543,31 @@ public final class UltraCompostScript
      * Skillmulti dialog, so Space confirms.
      *
      * <p>Ash is the use-item (stackable), supercompost is the target (occupies
-     * the slots converted into ultracompost). Per trip: withdraw {@link
-     * #ASH_PER_BATCH} ash (1 slot) + {@link #ULTRA_BATCH} supercompost.
+     * the slots converted into ultracompost). Per trip: ash stack (1 slot,
+     * carried across batches once filled) + {@link #ULTRA_BATCH} supercompost.
      */
     private void tickMakeUltraCompost() throws InterruptedException
     {
+        // Combining super+ash awards 1 Farming xp per craft, so the level-up
+        // popup will fire periodically and block Skillmulti. Dismiss with
+        // Space — same mechanism the engine maps for "Continue" on NPC
+        // dialogs. The popup *terminates* the in-flight Skillmulti, so on
+        // dismiss we have to RESET the click chain (use ash → click super)
+        // to re-open Skillmulti. Just pressing Space at the bottom-of-method
+        // re-press path doesn't work — there's no Skillmulti widget to press
+        // Space INTO once the level-up has closed it. Without this reset
+        // the script sits in the "wait for super depleted" branch with no
+        // active Make-All loop and times out at 90s.
+        if (dismissLevelUpIfVisible())
+        {
+            status.set("craft: dismissed level-up — resetting click chain");
+            craftClicksDone     = false;
+            skillmultiConfirmed = false;
+            skillmultiWaitMs    = 0;
+            craftWaitMs         = 0;
+            return;
+        }
+
         if (!craftBankDone)
         {
             tickCraftBanking();
@@ -665,12 +708,27 @@ public final class UltraCompostScript
 
         if (!craftDepositDone)
         {
-            status.set("craft bank: depositing inventory");
-            if (!bank.depositAllInventory())
+            // Selective deposit: ultracompost (output) + supercompost
+            // (leftover from an aborted batch) — leave the ash stack alone.
+            // Ash is stackable so the whole supply lives in a single inv
+            // slot; re-withdrawing it every batch is wasted bank trips.
+            // tryDepositAll is a no-op when the inv qty is 0, so calling
+            // both unconditionally is cheap.
+            status.set("craft bank: depositing ultracompost");
+            if (inventoryCount(ULTRACOMPOST) > 0 && !bank.tryDepositAll(ULTRACOMPOST))
             {
                 if (++bankFailures >= MAX_BANK_FAILURES)
                 {
-                    abortWith("deposit-all-inventory failed " + bankFailures + " consecutive times");
+                    abortWith("deposit ultracompost failed " + bankFailures + " consecutive times");
+                    return;
+                }
+                return;
+            }
+            if (inventoryCount(SUPERCOMPOST) > 0 && !bank.tryDepositAll(SUPERCOMPOST))
+            {
+                if (++bankFailures >= MAX_BANK_FAILURES)
+                {
+                    abortWith("deposit leftover supercompost failed " + bankFailures + " consecutive times");
                     return;
                 }
                 return;
@@ -698,18 +756,18 @@ public final class UltraCompostScript
 
         // Crafts achievable this trip = min(super-slots-we-can-fill, ash/2).
         int superThisTrip = Math.min(ULTRA_BATCH, Math.min(totalSuper, totalAsh / 2));
-        int ashThisTrip   = Math.min(ASH_PER_BATCH, totalAsh);
 
-        // 1. Withdraw ash first (stacks into 1 slot, never blocks the supercompost grab).
-        if (invAsh < ashThisTrip)
+        // 1. Withdraw ash: pull the WHOLE bank stack on first trip and keep
+        //    it across batches. Ash stacks (1 inv slot regardless of qty), so
+        //    holding 1000+ across batches costs nothing and removes a bank
+        //    round-trip from every subsequent batch. We re-withdraw only when
+        //    invAsh dips below this batch's stoichiometric need.
+        if (invAsh < ASH_PER_BATCH && bankAsh > 0)
         {
             long now = System.currentTimeMillis();
             if (now - lastBankActionMs < BANK_PACE_MS) { status.set("craft bank: pacing ash"); return; }
-            int need = ashThisTrip - invAsh;
-            status.set("craft bank: withdraw " + need + " ash");
-            boolean ok = (bankAsh <= need)
-                ? bank.tryWithdrawAll(VOLCANIC_ASH)
-                : bank.tryWithdrawX(VOLCANIC_ASH, need);
+            status.set("craft bank: withdraw-all ash (bank=" + bankAsh + ")");
+            boolean ok = bank.tryWithdrawAll(VOLCANIC_ASH);
             lastBankActionMs = System.currentTimeMillis();
             if (!ok)
             {
@@ -726,16 +784,20 @@ public final class UltraCompostScript
             return;
         }
 
-        // 2. Withdraw supercompost (each occupies its own slot).
+        // 2. Withdraw supercompost (each occupies its own slot). Use
+        //    Withdraw-All — OSRS caps unstackable Withdraw-All at the number
+        //    of free inv slots, which after step 1 is exactly ULTRA_BATCH
+        //    (28 slots − 1 ash stack). Saves the Withdraw-X chatbox round-
+        //    trip vs typing the qty, and works for any leftover-super
+        //    partial state (Withdraw-All tops up to inv-full regardless
+        //    of starting qty).
         if (invSuper < superThisTrip)
         {
             long now = System.currentTimeMillis();
             if (now - lastBankActionMs < BANK_PACE_MS) { status.set("craft bank: pacing super"); return; }
             int need = superThisTrip - invSuper;
-            status.set("craft bank: withdraw " + need + " supercompost");
-            boolean ok = (bankSuper <= need)
-                ? bank.tryWithdrawAll(SUPERCOMPOST)
-                : bank.tryWithdrawX(SUPERCOMPOST, need);
+            status.set("craft bank: withdraw-all supercompost (need=" + need + ", bank=" + bankSuper + ")");
+            boolean ok = bank.tryWithdrawAll(SUPERCOMPOST);
             lastBankActionMs = System.currentTimeMillis();
             if (!ok)
             {
@@ -913,6 +975,30 @@ public final class UltraCompostScript
             return true;
         if (dispatcher.isBusy()) return false;
         return sidebarTabs.openTabAndWait(SidebarTab.INVENTORY, 2_000L);
+    }
+
+    /** True if the engine-rendered LevelupDisplay.UNIVERSE widget is visible.
+     *  Same primitive {@code CookingInteraction.isLevelUpVisible} uses, kept
+     *  inline here so the script doesn't take a hard dependency on the
+     *  cooking package. */
+    private boolean isLevelUpVisible()
+    {
+        Boolean v = onClient(() -> {
+            Widget w = client.getWidget(InterfaceID.LevelupDisplay.UNIVERSE);
+            return w != null && !w.isHidden();
+        });
+        return Boolean.TRUE.equals(v);
+    }
+
+    /** Dismiss the level-up popup with VK_SPACE if visible. Returns true iff
+     *  a dismissal was dispatched — caller should typically {@code return}
+     *  so the next tick re-evaluates the FSM with the dialog cleared. */
+    private boolean dismissLevelUpIfVisible() throws InterruptedException
+    {
+        if (!isLevelUpVisible()) return false;
+        log.info("ultra-compost: level-up dialog visible — pressing Space");
+        dispatcher.tapKey(java.awt.event.KeyEvent.VK_SPACE);
+        return true;
     }
 
     private int inventoryCount(int itemId)
