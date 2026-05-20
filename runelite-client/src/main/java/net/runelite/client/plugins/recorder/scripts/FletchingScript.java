@@ -3,6 +3,7 @@ package net.runelite.client.plugins.recorder.scripts;
 import java.awt.Rectangle;
 import java.awt.event.KeyEvent;
 import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ThreadLocalRandom;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicReference;
@@ -38,6 +39,8 @@ public final class FletchingScript
     private static final long SKILLMULTI_TIMEOUT_MS = 5_000;
     private static final long CRAFT_TIMEOUT_MS      = 90_000;
     private static final int  MAX_BANK_FAILURES     = 3;
+    private static final long LEVEL_UP_DISMISS_MIN_MS = 3_000;
+    private static final long LEVEL_UP_DISMISS_MAX_MS = 34_000;
 
     // ─── State ───────────────────────────────────────────────────────────────────
     public enum State { IDLE, BANKING, PROCESSING, ABORTED }
@@ -186,6 +189,8 @@ public final class FletchingScript
     private boolean bankDone, depositDone, clicksDone, confirmed;
     private long    skillmultiWaitMs, craftWaitMs, lastBankActionMs;
     private int     bankFailures;
+    private long    levelUpFirstSeenAtMs;
+    private long    levelUpDismissAfterMs;
 
     // ─── Constructor ─────────────────────────────────────────────────────────────
 
@@ -408,12 +413,234 @@ public final class FletchingScript
 
     private void tickProcessing() throws InterruptedException
     {
-        status.set("processing not implemented yet");
+        if (nextAction == Action.CUT) tickCut();
+        else                          tickString();
+    }
+
+    private void tickCut() throws InterruptedException
+    {
+        FletchItem item = selectedItem.get();
+        safeDismissLevelUp();
+
+        if (!clicksDone)
+        {
+            if (!ensureInventoryTabOpen()) { status.set("cut: opening inventory tab"); return; }
+            if (dispatcher.isBusy())      { status.set("cut: dispatcher busy"); return; }
+
+            int knifeSlot = inventorySlotOf(KNIFE);
+            if (knifeSlot < 0) { abortWith("knife not in inventory"); return; }
+
+            // Step A: engage Use mode on knife (pattern copied from PieDishScript.tickCraftBatch
+            // lines 733-745: CLICK_INV_ITEM/MOUSE/slot/verb("Use") + awaitIdle + check lastErrorMessage).
+            dispatcher.dispatch(ActionRequest.builder()
+                .kind(ActionRequest.Kind.CLICK_INV_ITEM)
+                .channel(ActionRequest.Channel.MOUSE)
+                .slot(knifeSlot)
+                .verb("Use")
+                .build());
+            dispatcher.awaitIdle(3_000L);
+            String err = dispatcher.lastErrorMessage();
+            if (err != null)
+            {
+                log.warn("fletching cut: Use click error: {}", err);
+                return;
+            }
+
+            SequenceSleep.sleep(client, INTER_CLICK_SETTLE_MS);
+
+            // Step B: click a log slot
+            Rectangle bounds = onClient(() -> resolveInvItemBounds(item.logId));
+            if (bounds == null) { abortWith("logs not in inventory"); return; }
+            dispatcher.clickCanvas(bounds.x + bounds.width / 2, bounds.y + bounds.height / 2);
+            dispatcher.awaitIdle(3_000L);
+
+            clicksDone = true;
+            skillmultiWaitMs = System.currentTimeMillis();
+            status.set("cut: waiting for skillmulti");
+            return;
+        }
+
+        if (!confirmed)
+        {
+            boolean open = Boolean.TRUE.equals(onClient(() -> {
+                Widget w = client.getWidget(InterfaceID.Skillmulti.UNIVERSE);
+                return w != null && !w.isHidden();
+            }));
+            if (!open)
+            {
+                long elapsed = System.currentTimeMillis() - skillmultiWaitMs;
+                if (elapsed > SKILLMULTI_TIMEOUT_MS)
+                {
+                    log.warn("fletching cut: skillmulti did not open after {}ms — retrying", elapsed);
+                    dispatcher.dismissMenu();
+                    clicksDone = false; skillmultiWaitMs = 0;
+                }
+                else status.set("cut: waiting for skillmulti (" + elapsed + "ms)");
+                return;
+            }
+            status.set("cut: pressing key " + item.fletchKey);
+            dispatcher.tapKey(item.fletchKey);
+            confirmed = true;
+            craftWaitMs = System.currentTimeMillis();
+            return;
+        }
+
+        // Completion: done when fewer than logsPerAction logs remain
+        int logCount = inventoryCount(item.logId);
+        if (logCount < item.logsPerAction)
+        {
+            log.info("fletching cut: batch done ({} logs remaining)", logCount);
+            onBatchDone();
+            return;
+        }
+
+        // Re-confirm if dialog reopens
+        boolean dialogOpen = Boolean.TRUE.equals(onClient(() -> {
+            Widget w = client.getWidget(InterfaceID.Skillmulti.UNIVERSE);
+            return w != null && !w.isHidden();
+        }));
+        if (dialogOpen) dispatcher.tapKey(item.fletchKey);
+
+        long elapsed = System.currentTimeMillis() - craftWaitMs;
+        if (elapsed > CRAFT_TIMEOUT_MS) { abortWith("cut timeout — " + logCount + " logs left after " + elapsed + "ms"); return; }
+        status.set("cut: fletching (" + logCount + " logs, " + elapsed + "ms)");
+    }
+
+    private void tickString() throws InterruptedException
+    {
+        FletchItem item = selectedItem.get();
+        safeDismissLevelUp();
+
+        if (!clicksDone)
+        {
+            if (!ensureInventoryTabOpen()) { status.set("string: opening inventory tab"); return; }
+            if (dispatcher.isBusy())      { status.set("string: dispatcher busy"); return; }
+
+            int bowstringSlot = inventorySlotOf(BOWSTRING);
+            if (bowstringSlot < 0) { abortWith("bowstring not in inventory"); return; }
+
+            // Step A: engage Use mode on bowstring (pattern copied from PieDishScript.tickCraftBatch
+            // lines 733-745: CLICK_INV_ITEM/MOUSE/slot/verb("Use") + awaitIdle + check lastErrorMessage).
+            dispatcher.dispatch(ActionRequest.builder()
+                .kind(ActionRequest.Kind.CLICK_INV_ITEM)
+                .channel(ActionRequest.Channel.MOUSE)
+                .slot(bowstringSlot)
+                .verb("Use")
+                .build());
+            dispatcher.awaitIdle(3_000L);
+            String err = dispatcher.lastErrorMessage();
+            if (err != null)
+            {
+                log.warn("fletching string: Use click error: {}", err);
+                return;
+            }
+
+            SequenceSleep.sleep(client, INTER_CLICK_SETTLE_MS);
+
+            // Step B: click the unstrung bow slot
+            Rectangle bounds = onClient(() -> resolveInvItemBounds(item.unstrungId));
+            if (bounds == null) { abortWith("unstrung bow not in inventory"); return; }
+            dispatcher.clickCanvas(bounds.x + bounds.width / 2, bounds.y + bounds.height / 2);
+            dispatcher.awaitIdle(3_000L);
+
+            clicksDone = true;
+            skillmultiWaitMs = System.currentTimeMillis();
+            status.set("string: waiting for skillmulti");
+            return;
+        }
+
+        if (!confirmed)
+        {
+            boolean open = Boolean.TRUE.equals(onClient(() -> {
+                Widget w = client.getWidget(InterfaceID.Skillmulti.UNIVERSE);
+                return w != null && !w.isHidden();
+            }));
+            if (!open)
+            {
+                long elapsed = System.currentTimeMillis() - skillmultiWaitMs;
+                if (elapsed > SKILLMULTI_TIMEOUT_MS)
+                {
+                    log.warn("fletching string: skillmulti did not open after {}ms — retrying", elapsed);
+                    dispatcher.dismissMenu();
+                    clicksDone = false; skillmultiWaitMs = 0;
+                }
+                else status.set("string: waiting for skillmulti (" + elapsed + "ms)");
+                return;
+            }
+            dispatcher.tapKey(KeyEvent.VK_SPACE);
+            confirmed = true;
+            craftWaitMs = System.currentTimeMillis();
+            return;
+        }
+
+        int unstrungLeft = inventoryCount(item.unstrungId);
+        if (unstrungLeft == 0) { log.info("fletching string: batch done"); onBatchDone(); return; }
+
+        boolean dialogOpen = Boolean.TRUE.equals(onClient(() -> {
+            Widget w = client.getWidget(InterfaceID.Skillmulti.UNIVERSE);
+            return w != null && !w.isHidden();
+        }));
+        if (dialogOpen) dispatcher.tapKey(KeyEvent.VK_SPACE);
+
+        long elapsed = System.currentTimeMillis() - craftWaitMs;
+        if (elapsed > CRAFT_TIMEOUT_MS) { abortWith("string timeout — " + unstrungLeft + " unstrung left"); return; }
+        status.set("string: stringing (" + unstrungLeft + " left, " + elapsed + "ms)");
+    }
+
+    private void onBatchDone() throws InterruptedException
+    {
+        // AFK pause before returning to bank
+        long pause = POST_BATCH_MIN_MS + (long)(ThreadLocalRandom.current().nextDouble()
+            * (POST_BATCH_MAX_MS - POST_BATCH_MIN_MS));
+        status.set("batch done — pausing " + pause + "ms");
+        SequenceSleep.sleep(client, pause);
+
+        // Decide next action for CUT_AND_STRING
+        Mode m = mode.get();
+        if (m == Mode.CUT_AND_STRING)
+            nextAction = (nextAction == Action.CUT && selectedItem.get().canString)
+                ? Action.STRING : Action.CUT;
+        // FLETCH-only stays CUT, STRING-only stays STRING (already set by start())
+
+        setState(State.BANKING);
     }
 
     private void safeDismissLevelUp()
     {
-        // replaced in Task 4
+        // Inlined from CookingScriptV3.safeDismissLevelUp (same logic; cook.isLevelUpVisible()
+        // and cook.dismissLevelUp() are trivially inlined since we own the dispatcher here).
+        try
+        {
+            boolean visible = Boolean.TRUE.equals(onClient(() -> {
+                Widget w = client.getWidget(InterfaceID.LevelupDisplay.UNIVERSE);
+                return w != null && !w.isHidden();
+            }));
+            if (!visible)
+            {
+                levelUpFirstSeenAtMs = 0L;
+                return;
+            }
+            long now = System.currentTimeMillis();
+            if (levelUpFirstSeenAtMs == 0L)
+            {
+                long delay = LEVEL_UP_DISMISS_MIN_MS
+                    + ThreadLocalRandom.current().nextLong(
+                        LEVEL_UP_DISMISS_MAX_MS - LEVEL_UP_DISMISS_MIN_MS);
+                levelUpFirstSeenAtMs  = now;
+                levelUpDismissAfterMs = now + delay;
+                log.info("fletching: level-up — will dismiss in {}ms", delay);
+                return;
+            }
+            if (now >= levelUpDismissAfterMs)
+            {
+                log.info("fletching: level-up — pressing Space ({}ms after popup appeared)",
+                    now - levelUpFirstSeenAtMs);
+                dispatcher.tapKey(KeyEvent.VK_SPACE);
+                levelUpFirstSeenAtMs = 0L;
+            }
+        }
+        catch (InterruptedException ie) { Thread.currentThread().interrupt(); }
+        catch (Throwable th) { log.warn("fletching: dismissLevelUp threw", th); }
     }
 
     // ─── Helpers ─────────────────────────────────────────────────────────────────
