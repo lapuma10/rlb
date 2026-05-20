@@ -345,6 +345,19 @@ public final class RecorderPanel extends PluginPanel
     private final JLabel  pizzaStatusLabel = new JLabel("Pizza: idle");
     private final JLabel  pizzaCountsLabel = new JLabel("Made: 0");
     private final JLabel  pizzaBreakLabel  = new JLabel("breaks: idle");
+    // Fletching script.
+    private net.runelite.client.plugins.recorder.scripts.FletchingScript fletchingScript;
+    private final JComboBox<net.runelite.client.plugins.recorder.scripts.FletchingScript.Mode>
+        fletchModeCombo = new JComboBox<>(
+            net.runelite.client.plugins.recorder.scripts.FletchingScript.Mode.values());
+    private final JComboBox<net.runelite.client.plugins.recorder.scripts.FletchingScript.FletchItem>
+        fletchItemCombo = new JComboBox<>();
+    private final JCheckBox fletchBreaksCheck = new JCheckBox("Enable breaks", true);
+    private final JCheckBox fletchDevCheck    = new JCheckBox("Dev mode (show unverified)", false);
+    private final JButton   fletchStartBtn    = new JButton("Start");
+    private final JButton   fletchStopBtn     = new JButton("Stop");
+    private final JLabel    fletchStatusLabel = new JLabel("idle");
+    private final JLabel    fletchBreakLabel  = new JLabel("breaks: idle");
     // GE Core (Phase A): wired by RecorderPlugin via setGrandExchangeScript.
     private GrandExchangeTab grandExchangeTab;
     private final JTabbedPane tabs = new JTabbedPane();
@@ -406,6 +419,7 @@ public final class RecorderPanel extends PluginPanel
         tabs.addTab("Record", tabScroll(buildRecordTab()));
         tabs.addTab("Mining", tabScroll(buildMiningTab()));
         tabs.addTab("Cooking", tabScroll(buildCookingTab()));
+        tabs.addTab("Fletching", tabScroll(buildFletchingTab()));
         tabs.addTab("Quests", tabScroll(buildQuestsTab()));
         tabs.addTab("Moneymakers", tabScroll(buildMoneymakersTab()));
         tabs.addTab("Login",  tabScroll(buildLoginTab()));
@@ -2831,6 +2845,129 @@ public final class RecorderPanel extends PluginPanel
             + "</html>");
     }
 
+    // ----------------------------------------------------------------------
+    // Fletching tab
+    // ----------------------------------------------------------------------
+
+    private JPanel buildFletchingTab()
+    {
+        JPanel p = new JPanel();
+        p.setLayout(new BoxLayout(p, BoxLayout.Y_AXIS));
+        p.setBorder(BorderFactory.createTitledBorder("Fletching"));
+
+        JLabel modeLabel = new JLabel("Mode:");
+        JLabel itemLabel = new JLabel("Item:");
+        modeLabel.setAlignmentX(Component.LEFT_ALIGNMENT);
+        itemLabel.setAlignmentX(Component.LEFT_ALIGNMENT);
+        fletchModeCombo.setAlignmentX(Component.LEFT_ALIGNMENT);
+        fletchItemCombo.setAlignmentX(Component.LEFT_ALIGNMENT);
+        fletchBreaksCheck.setAlignmentX(Component.LEFT_ALIGNMENT);
+        fletchDevCheck.setAlignmentX(Component.LEFT_ALIGNMENT);
+        fletchStatusLabel.setAlignmentX(Component.LEFT_ALIGNMENT);
+        fletchBreakLabel.setAlignmentX(Component.LEFT_ALIGNMENT);
+        capHeight(fletchModeCombo);
+        capHeight(fletchItemCombo);
+        capHeight(fletchBreaksCheck);
+        capHeight(fletchDevCheck);
+        capHeight(fletchStatusLabel);
+        capHeight(fletchBreakLabel);
+
+        JPanel buttons = new JPanel(new java.awt.GridLayout(1, 2, 4, 0));
+        buttons.add(fletchStartBtn);
+        buttons.add(fletchStopBtn);
+        buttons.setAlignmentX(Component.LEFT_ALIGNMENT);
+        capHeight(buttons);
+
+        // Item combo refresh — run when mode or dev-toggle changes.
+        Runnable refreshItems = () -> {
+            var m = (net.runelite.client.plugins.recorder.scripts.FletchingScript.Mode)
+                fletchModeCombo.getSelectedItem();
+            boolean dev = fletchDevCheck.isSelected();
+            fletchItemCombo.removeAllItems();
+            for (var item :
+                net.runelite.client.plugins.recorder.scripts.FletchingScript.FletchItem.values())
+            {
+                if (!item.verified() && !dev) continue;
+                if (!item.supportsMode(m)) continue;
+                fletchItemCombo.addItem(item);
+            }
+        };
+        fletchModeCombo.addActionListener(e -> refreshItems.run());
+        fletchDevCheck.addActionListener(e -> refreshItems.run());
+        refreshItems.run();
+
+        fletchBreaksCheck.addActionListener(e -> {
+            if (fletchingScript != null)
+                fletchingScript.setAfkBreaksEnabled(fletchBreaksCheck.isSelected());
+        });
+
+        fletchStartBtn.addActionListener(e -> onFletchStart());
+        fletchStopBtn.addActionListener(e -> onFletchStop());
+
+        p.add(modeLabel);
+        p.add(fletchModeCombo);
+        p.add(Box.createVerticalStrut(4));
+        p.add(itemLabel);
+        p.add(fletchItemCombo);
+        p.add(Box.createVerticalStrut(4));
+        p.add(fletchBreaksCheck);
+        p.add(fletchDevCheck);
+        p.add(Box.createVerticalStrut(4));
+        p.add(buttons);
+        p.add(Box.createVerticalStrut(4));
+        p.add(fletchStatusLabel);
+        p.add(fletchBreakLabel);
+        p.add(Box.createVerticalGlue());
+        return p;
+    }
+
+    /** Wire the fletching script. Called by RecorderPlugin at startUp. */
+    public void setFletchingScript(
+        net.runelite.client.plugins.recorder.scripts.FletchingScript script)
+    {
+        this.fletchingScript = script;
+    }
+
+    private void onFletchStart()
+    {
+        if (fletchingScript == null)
+        {
+            fletchStatusLabel.setText("unavailable");
+            return;
+        }
+        var item = (net.runelite.client.plugins.recorder.scripts.FletchingScript.FletchItem)
+            fletchItemCombo.getSelectedItem();
+        var m = (net.runelite.client.plugins.recorder.scripts.FletchingScript.Mode)
+            fletchModeCombo.getSelectedItem();
+        if (item == null || m == null)
+        {
+            fletchStatusLabel.setText("select mode + item");
+            return;
+        }
+        fletchingScript.setItem(item);
+        fletchingScript.setMode(m);
+        fletchingScript.setAfkBreaksEnabled(fletchBreaksCheck.isSelected());
+        fletchingScript.start();
+        fletchStatusLabel.setText("starting…");
+    }
+
+    private void onFletchStop()
+    {
+        if (fletchingScript != null) fletchingScript.stop();
+    }
+
+    private void refreshFletching()
+    {
+        if (fletchingScript == null)
+        {
+            fletchStatusLabel.setText("unavailable");
+            fletchBreakLabel.setText("breaks: idle");
+            return;
+        }
+        fletchStatusLabel.setText(fletchingScript.state() + " — " + fletchingScript.status());
+        fletchBreakLabel.setText(fletchingScript.breakStatus());
+    }
+
     /** Wire the V2 cooking script. The plugin constructs the script in
      *  startUp and hands it here; the panel only owns the UI surface.
      *  Two start buttons (V2 + V3) share a Stop button. */
@@ -3530,6 +3667,7 @@ public final class RecorderPanel extends PluginPanel
         refreshPieDish();
         refreshUltraCompost();
         refreshPizza();
+        refreshFletching();
     }
 
     /** Mirror the bare chicken combat loop's state into the panel labels.
@@ -3666,6 +3804,8 @@ public final class RecorderPanel extends PluginPanel
             () -> ultraCompostScript != null && ultraCompostScript.isRunning());
         sessionTracker.registerScript("pizza", "Pizza",
             () -> pizzaScript != null && pizzaScript.isRunning());
+        sessionTracker.registerScript("fletching", "Fletching",
+            () -> fletchingScript != null && fletchingScript.isRunning());
         sessionTracker.registerScript("mining", "Mining",
             () -> miningLoop != null && miningLoop.isRunning());
 
