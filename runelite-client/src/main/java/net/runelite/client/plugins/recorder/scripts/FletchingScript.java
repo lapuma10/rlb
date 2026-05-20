@@ -1,12 +1,46 @@
 package net.runelite.client.plugins.recorder.scripts;
 
+import java.awt.Rectangle;
 import java.awt.event.KeyEvent;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicReference;
+import java.util.function.Supplier;
+import lombok.extern.slf4j.Slf4j;
+import net.runelite.api.Client;
+import net.runelite.api.Item;
+import net.runelite.api.ItemContainer;
+import net.runelite.api.widgets.Widget;
+import net.runelite.api.gameval.InterfaceID;
+import net.runelite.api.gameval.InventoryID;
 import net.runelite.api.gameval.ItemID;
+import net.runelite.client.callback.ClientThread;
+import net.runelite.client.plugins.recorder.farm.BankInteraction;
+import net.runelite.client.plugins.recorder.widget.SidebarTab;
+import net.runelite.client.plugins.recorder.widget.SidebarTabActions;
+import net.runelite.client.sequence.dispatch.HumanizedInputDispatcher;
+import net.runelite.client.sequence.dispatch.SequenceSleep;
+import net.runelite.client.sequence.internal.ActionRequest;
 
+@Slf4j
 public final class FletchingScript
 {
     private static final int BOWSTRING = ItemID.BOW_STRING;  // 1777
     private static final int KNIFE     = ItemID.KNIFE;        // 946
+
+    // ─── Timing ──────────────────────────────────────────────────────────────────
+    private static final long TICK_MS               = 600;
+    private static final long BANK_PACE_MS          = 1_500;
+    private static final long INTER_CLICK_SETTLE_MS = 100;
+    private static final long POST_BATCH_MIN_MS     = 2_000;
+    private static final long POST_BATCH_MAX_MS     = 8_000;
+    private static final long SKILLMULTI_TIMEOUT_MS = 5_000;
+    private static final long CRAFT_TIMEOUT_MS      = 90_000;
+    private static final int  MAX_BANK_FAILURES     = 3;
+
+    // ─── State ───────────────────────────────────────────────────────────────────
+    public enum State { IDLE, BANKING, PROCESSING, ABORTED }
 
     public enum Mode { FLETCH, STRING, CUT_AND_STRING }
     private enum Action { CUT, STRING }
@@ -127,5 +161,245 @@ public final class FletchingScript
         }
 
         @Override public String toString() { return label; }
+    }
+
+    // ─── Dependencies ────────────────────────────────────────────────────────────
+    private final Client                   client;
+    private final ClientThread             clientThread;
+    private final HumanizedInputDispatcher dispatcher;
+    private final BankInteraction          bank;
+    private final SidebarTabActions        sidebarTabs;
+
+    // ─── Configuration (set before start()) ──────────────────────────────────────
+    private final AtomicReference<FletchItem> selectedItem = new AtomicReference<>(FletchItem.SHORTBOW_U);
+    private final AtomicReference<Mode>       mode         = new AtomicReference<>(Mode.FLETCH);
+
+    // ─── Runtime ─────────────────────────────────────────────────────────────────
+    private final AtomicReference<State>  state   = new AtomicReference<>(State.IDLE);
+    private final AtomicReference<String> status  = new AtomicReference<>("idle");
+    private final AtomicBoolean           running = new AtomicBoolean(false);
+    private final AtomicReference<Thread> worker  = new AtomicReference<>();
+
+    private Action nextAction = Action.CUT;
+
+    // Per-state flags — reset in setState()
+    private boolean bankDone, depositDone, clicksDone, confirmed;
+    private long    skillmultiWaitMs, craftWaitMs, lastBankActionMs;
+    private int     bankFailures;
+
+    // ─── Constructor ─────────────────────────────────────────────────────────────
+
+    public FletchingScript(Client client, ClientThread clientThread,
+                           HumanizedInputDispatcher dispatcher)
+    {
+        this.client      = client;
+        this.clientThread = clientThread;
+        this.dispatcher  = dispatcher;
+        this.bank        = new BankInteraction(client, clientThread, dispatcher);
+        this.sidebarTabs = new SidebarTabActions(client, clientThread, dispatcher);
+    }
+
+    // ─── Public API ──────────────────────────────────────────────────────────────
+
+    public State     state()        { return state.get(); }
+    public String    status()       { return status.get(); }
+    public boolean   isRunning()    { return running.get(); }
+    public FletchItem selectedItem(){ return selectedItem.get(); }
+    public Mode      mode()         { return mode.get(); }
+
+    public void setItem(FletchItem item) { selectedItem.set(item); }
+    public void setMode(Mode m)          { mode.set(m); }
+
+    public void start()
+    {
+        Thread existing = worker.get();
+        if (existing != null && existing.isAlive()) { status.set("already running"); return; }
+        if (!running.compareAndSet(false, true)) return;
+
+        FletchItem item = selectedItem.get();
+        Mode m         = mode.get();
+
+        // Preflight: mode+item compatibility
+        if ((m == Mode.STRING || m == Mode.CUT_AND_STRING) && !item.canString)
+        {
+            status.set("ABORTED: " + item.label + " cannot be strung");
+            running.set(false);
+            return;
+        }
+
+        // Preflight: level check
+        Integer level = onClient(() -> client.getRealSkillLevel(net.runelite.api.Skill.FLETCHING));
+        if (level == null || level < item.levelReq)
+        {
+            status.set("ABORTED: need level " + item.levelReq + " (have " + level + ")");
+            running.set(false);
+            return;
+        }
+
+        nextAction = (m == Mode.STRING) ? Action.STRING : Action.CUT;
+        setState(State.BANKING);
+
+        Thread t = new Thread(this::tickLoop, "fletching-script");
+        t.setDaemon(true);
+        worker.set(t);
+        t.start();
+    }
+
+    public void stop()
+    {
+        running.set(false);
+        Thread t = worker.getAndSet(null);
+        if (t != null) { t.interrupt(); try { t.join(2_000); } catch (InterruptedException ie) { Thread.currentThread().interrupt(); } }
+        setState(State.IDLE);
+        status.set("stopped");
+    }
+
+    // ─── Tick loop ───────────────────────────────────────────────────────────────
+
+    private void tickLoop()
+    {
+        try
+        {
+            ensureInventoryTabOpen();
+            while (running.get() && !Thread.currentThread().isInterrupted())
+            {
+                switch (state.get())
+                {
+                    case BANKING    -> tickBanking();
+                    case PROCESSING -> tickProcessing();
+                    case IDLE, ABORTED -> running.set(false);
+                }
+                SequenceSleep.sleep(client, TICK_MS);
+            }
+        }
+        catch (InterruptedException ie) { Thread.currentThread().interrupt(); }
+        finally { running.set(false); }
+    }
+
+    // ─── Compile stubs (replaced in Tasks 3 and 4) ───────────────────────────────
+
+    private void tickBanking() throws InterruptedException
+    {
+        status.set("banking not implemented yet");
+    }
+
+    private void tickProcessing() throws InterruptedException
+    {
+        status.set("processing not implemented yet");
+    }
+
+    private void safeDismissLevelUp()
+    {
+        // replaced in Task 4
+    }
+
+    // ─── Helpers ─────────────────────────────────────────────────────────────────
+
+    private void setState(State s)
+    {
+        log.info("fletching: {} → {}", state.get(), s);
+        state.set(s);
+        bankDone = false; depositDone = false; clicksDone = false; confirmed = false;
+        skillmultiWaitMs = 0; craftWaitMs = 0; lastBankActionMs = 0; bankFailures = 0;
+    }
+
+    private void abortWith(String reason)
+    {
+        log.warn("fletching: {}", reason);
+        status.set("ABORTED: " + reason);
+        setState(State.ABORTED);
+    }
+
+    /** Worker-thread guard: ensures the inventory side-panel is the active
+     *  tab, dispatching a click + waiting up to 2s if not. Returns true if
+     *  the tab is open afterwards. */
+    private boolean ensureInventoryTabOpen() throws InterruptedException
+    {
+        if (Boolean.TRUE.equals(onClient(() -> sidebarTabs.isOpen(SidebarTab.INVENTORY))))
+            return true;
+        if (dispatcher.isBusy()) return false;
+        return sidebarTabs.openTabAndWait(SidebarTab.INVENTORY, 2_000L);
+    }
+
+    private int inventoryCount(int itemId)
+    {
+        Integer n = onClient(() -> {
+            ItemContainer inv = client.getItemContainer(InventoryID.INV);
+            if (inv == null) return 0;
+            int total = 0;
+            for (Item it : inv.getItems())
+                if (it != null && it.getId() == itemId)
+                    total += Math.max(1, it.getQuantity());
+            return total;
+        });
+        return n == null ? 0 : n;
+    }
+
+    private int inventorySlotOf(int itemId)
+    {
+        Integer s = onClient(() -> {
+            ItemContainer inv = client.getItemContainer(InventoryID.INV);
+            if (inv == null) return -1;
+            Item[] items = inv.getItems();
+            for (int i = 0; i < items.length; i++)
+            {
+                Item it = items[i];
+                if (it != null && it.getId() == itemId) return i;
+            }
+            return -1;
+        });
+        return s == null ? -1 : s;
+    }
+
+    /** Resolve the inventory widget bounds for the first slot holding {@code itemId}.
+     *  Must be called on the client thread (or via {@link #onClient}). */
+    private Rectangle resolveInvItemBounds(int itemId)
+    {
+        ItemContainer inv = client.getItemContainer(InventoryID.INV);
+        if (inv == null) return null;
+        Item[] items = inv.getItems();
+        int slot = -1;
+        for (int i = 0; i < items.length; i++)
+        {
+            Item it = items[i];
+            if (it != null && it.getId() == itemId) { slot = i; break; }
+        }
+        if (slot < 0) return null;
+        Widget parent = client.getWidget(InterfaceID.Inventory.ITEMS);
+        if (parent == null || parent.isHidden()) return null;
+        Widget child = parent.getChild(slot);
+        if (child == null || child.isSelfHidden()) return null;
+        Rectangle r = child.getBounds();
+        return r == null || r.isEmpty() ? null : r;
+    }
+
+    private <T> T onClient(Supplier<T> s)
+    {
+        if (client != null && client.isClientThread())
+        {
+            try { return s.get(); }
+            catch (Throwable th) { log.warn("fletching onClient threw (inline)", th); return null; }
+        }
+        CountDownLatch latch = new CountDownLatch(1);
+        AtomicReference<T> ref = new AtomicReference<>();
+        clientThread.invokeLater(() -> {
+            try   { ref.set(s.get()); }
+            catch (Throwable th) { log.warn("fletching onClient threw", th); }
+            finally { latch.countDown(); }
+        });
+        try
+        {
+            if (!latch.await(2_000, TimeUnit.MILLISECONDS))
+            {
+                log.warn("fletching: onClient timed out");
+                return null;
+            }
+        }
+        catch (InterruptedException ie)
+        {
+            Thread.currentThread().interrupt();
+            return null;
+        }
+        return ref.get();
     }
 }
