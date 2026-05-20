@@ -50,77 +50,83 @@ public final class FletchingScript
 
     public enum FletchItem
     {
+        // Skillmulti option widgets: Normal logs have 5 options (arrow shafts,
+        // javelin shafts, shortbow, longbow, wooden stock) → A,B,C,D,E.
+        // Oak+ have arrow shafts at A, shortbow at B, longbow at C (stock/shield
+        // are deferred to v2). Pattern copied from PieDishScript.tickCraftBatch
+        // which dispatches CLICK_WIDGET on a specific Skillmulti.X option —
+        // left-clicking the recipe IS the "Make-All" action.
         // Normal logs
         ARROW_SHAFTS(
             ItemID.LOGS, -1, -1,
-            1, KeyEvent.VK_1, 1, 15, 5.0, false, true, "Arrow shafts"),
+            1, InterfaceID.Skillmulti.A, 1, 15, 5.0, false, true, "Arrow shafts"),
         SHORTBOW_U(
             ItemID.LOGS, ItemID.UNSTRUNG_SHORTBOW, ItemID.SHORTBOW,
-            5, KeyEvent.VK_3, 1, 1, 5.0, true, true, "Shortbow (u)"),
+            5, InterfaceID.Skillmulti.C, 1, 1, 5.0, true, true, "Shortbow (u)"),
         LONGBOW_U(
             ItemID.LOGS, ItemID.UNSTRUNG_LONGBOW, ItemID.LONGBOW,
-            10, KeyEvent.VK_4, 1, 1, 10.0, true, true, "Longbow (u)"),
+            10, InterfaceID.Skillmulti.D, 1, 1, 10.0, true, true, "Longbow (u)"),
 
         // Oak logs
         OAK_ARROW_SHAFTS(
             ItemID.OAK_LOGS, -1, -1,
-            15, KeyEvent.VK_1, 1, 30, 10.0, false, true, "Oak arrow shafts"),
+            15, InterfaceID.Skillmulti.A, 1, 30, 10.0, false, true, "Oak arrow shafts"),
         OAK_SHORTBOW_U(
             ItemID.OAK_LOGS, ItemID.UNSTRUNG_OAK_SHORTBOW, ItemID.OAK_SHORTBOW,
-            20, KeyEvent.VK_2, 1, 1, 16.5, true, true, "Oak shortbow (u)"),
+            20, InterfaceID.Skillmulti.B, 1, 1, 16.5, true, true, "Oak shortbow (u)"),
         OAK_LONGBOW_U(
             ItemID.OAK_LOGS, ItemID.UNSTRUNG_OAK_LONGBOW, ItemID.OAK_LONGBOW,
-            25, KeyEvent.VK_3, 1, 1, 25.0, true, true, "Oak longbow (u)"),
+            25, InterfaceID.Skillmulti.C, 1, 1, 25.0, true, true, "Oak longbow (u)"),
 
         // Willow logs
         WILLOW_ARROW_SHAFTS(
             ItemID.WILLOW_LOGS, -1, -1,
-            30, KeyEvent.VK_1, 1, 45, 15.0, false, true, "Willow arrow shafts"),
+            30, InterfaceID.Skillmulti.A, 1, 45, 15.0, false, true, "Willow arrow shafts"),
         WILLOW_SHORTBOW_U(
             ItemID.WILLOW_LOGS, ItemID.UNSTRUNG_WILLOW_SHORTBOW, ItemID.WILLOW_SHORTBOW,
-            35, KeyEvent.VK_2, 1, 1, 33.3, true, true, "Willow shortbow (u)"),
+            35, InterfaceID.Skillmulti.B, 1, 1, 33.3, true, true, "Willow shortbow (u)"),
         WILLOW_LONGBOW_U(
             ItemID.WILLOW_LOGS, ItemID.UNSTRUNG_WILLOW_LONGBOW, ItemID.WILLOW_LONGBOW,
-            40, KeyEvent.VK_3, 1, 1, 41.5, true, true, "Willow longbow (u)"),
+            40, InterfaceID.Skillmulti.C, 1, 1, 41.5, true, true, "Willow longbow (u)"),
 
         // Maple logs
         MAPLE_ARROW_SHAFTS(
             ItemID.MAPLE_LOGS, -1, -1,
-            45, KeyEvent.VK_1, 1, 60, 20.0, false, true, "Maple arrow shafts"),
+            45, InterfaceID.Skillmulti.A, 1, 60, 20.0, false, true, "Maple arrow shafts"),
         MAPLE_SHORTBOW_U(
             ItemID.MAPLE_LOGS, ItemID.UNSTRUNG_MAPLE_SHORTBOW, ItemID.MAPLE_SHORTBOW,
-            50, KeyEvent.VK_2, 1, 1, 50.0, true, true, "Maple shortbow (u)"),
+            50, InterfaceID.Skillmulti.B, 1, 1, 50.0, true, true, "Maple shortbow (u)"),
         MAPLE_LONGBOW_U(
             ItemID.MAPLE_LOGS, ItemID.UNSTRUNG_MAPLE_LONGBOW, ItemID.MAPLE_LONGBOW,
-            55, KeyEvent.VK_3, 1, 1, 58.3, true, true, "Maple longbow (u)"),
+            55, InterfaceID.Skillmulti.C, 1, 1, 58.3, true, true, "Maple longbow (u)"),
 
         // Yew logs
         YEW_ARROW_SHAFTS(
             ItemID.YEW_LOGS, -1, -1,
-            60, KeyEvent.VK_1, 1, 75, 25.0, false, true, "Yew arrow shafts"),
+            60, InterfaceID.Skillmulti.A, 1, 75, 25.0, false, true, "Yew arrow shafts"),
         YEW_SHORTBOW_U(
             ItemID.YEW_LOGS, ItemID.UNSTRUNG_YEW_SHORTBOW, ItemID.YEW_SHORTBOW,
-            65, KeyEvent.VK_2, 1, 1, 67.5, true, true, "Yew shortbow (u)"),
+            65, InterfaceID.Skillmulti.B, 1, 1, 67.5, true, true, "Yew shortbow (u)"),
         YEW_LONGBOW_U(
             ItemID.YEW_LOGS, ItemID.UNSTRUNG_YEW_LONGBOW, ItemID.YEW_LONGBOW,
-            70, KeyEvent.VK_3, 1, 1, 75.0, true, true, "Yew longbow (u)"),
+            70, InterfaceID.Skillmulti.C, 1, 1, 75.0, true, true, "Yew longbow (u)"),
 
         // Magic logs
         MAGIC_ARROW_SHAFTS(
             ItemID.MAGIC_LOGS, -1, -1,
-            75, KeyEvent.VK_1, 1, 90, 30.0, false, true, "Magic arrow shafts"),
+            75, InterfaceID.Skillmulti.A, 1, 90, 30.0, false, true, "Magic arrow shafts"),
         MAGIC_SHORTBOW_U(
             ItemID.MAGIC_LOGS, ItemID.UNSTRUNG_MAGIC_SHORTBOW, ItemID.MAGIC_SHORTBOW,
-            80, KeyEvent.VK_2, 1, 1, 83.3, true, true, "Magic shortbow (u)"),
+            80, InterfaceID.Skillmulti.B, 1, 1, 83.3, true, true, "Magic shortbow (u)"),
         MAGIC_LONGBOW_U(
             ItemID.MAGIC_LOGS, ItemID.UNSTRUNG_MAGIC_LONGBOW, ItemID.MAGIC_LONGBOW,
-            85, KeyEvent.VK_3, 1, 1, 91.5, true, true, "Magic longbow (u)");
+            85, InterfaceID.Skillmulti.C, 1, 1, 91.5, true, true, "Magic longbow (u)");
 
         final int     logId;
         final int     unstrungId;
         final int     strungId;
         final int     levelReq;
-        final int     fletchKey;
+        final int     skillmultiWidget;
         final int     logsPerAction;
         final int     outputPerLog;
         final double  xp;
@@ -129,21 +135,21 @@ public final class FletchingScript
         final String  label;
 
         FletchItem(int logId, int unstrungId, int strungId,
-                   int levelReq, int fletchKey,
+                   int levelReq, int skillmultiWidget,
                    int logsPerAction, int outputPerLog, double xp,
                    boolean canString, boolean verified, String label)
         {
-            this.logId         = logId;
-            this.unstrungId    = unstrungId;
-            this.strungId      = strungId;
-            this.levelReq      = levelReq;
-            this.fletchKey     = fletchKey;
-            this.logsPerAction = logsPerAction;
-            this.outputPerLog  = outputPerLog;
-            this.xp            = xp;
-            this.canString     = canString;
-            this.verified      = verified;
-            this.label         = label;
+            this.logId            = logId;
+            this.unstrungId       = unstrungId;
+            this.strungId         = strungId;
+            this.levelReq         = levelReq;
+            this.skillmultiWidget = skillmultiWidget;
+            this.logsPerAction    = logsPerAction;
+            this.outputPerLog     = outputPerLog;
+            this.xp               = xp;
+            this.canString        = canString;
+            this.verified         = verified;
+            this.label            = label;
         }
 
         /** 26 for 2-log items (shields), 27 otherwise. */
@@ -550,8 +556,23 @@ public final class FletchingScript
                 else status.set("cut: waiting for skillmulti (" + elapsed + "ms)");
                 return;
             }
-            status.set("cut: pressing key " + item.fletchKey);
-            dispatcher.tapKey(item.fletchKey);
+            // Left-click the recipe option widget — same pattern as
+            // PieDishScript: left-click on Skillmulti.X IS "Make-All".
+            // Avoids the dynamic "Space=last used" keybind that silently
+            // mis-picks on a fresh batch.
+            status.set("cut: clicking recipe option");
+            dispatcher.dispatch(ActionRequest.builder()
+                .kind(ActionRequest.Kind.CLICK_WIDGET)
+                .channel(ActionRequest.Channel.MOUSE)
+                .widgetId(item.skillmultiWidget)
+                .build());
+            dispatcher.awaitIdle(3_000L);
+            String werr = dispatcher.lastErrorMessage();
+            if (werr != null)
+            {
+                log.warn("fletching cut: recipe option click error: {} — retrying", werr);
+                return;
+            }
             confirmed = true;
             craftWaitMs = System.currentTimeMillis();
             return;
@@ -571,7 +592,14 @@ public final class FletchingScript
             Widget w = client.getWidget(InterfaceID.Skillmulti.UNIVERSE);
             return w != null && !w.isHidden();
         }));
-        if (dialogOpen) dispatcher.tapKey(item.fletchKey);
+        if (dialogOpen)
+        {
+            dispatcher.dispatch(ActionRequest.builder()
+                .kind(ActionRequest.Kind.CLICK_WIDGET)
+                .channel(ActionRequest.Channel.MOUSE)
+                .widgetId(item.skillmultiWidget)
+                .build());
+        }
 
         long elapsed = System.currentTimeMillis() - craftWaitMs;
         if (elapsed > CRAFT_TIMEOUT_MS) { abortWith("cut timeout — " + logCount + " logs left after " + elapsed + "ms"); return; }
@@ -651,10 +679,22 @@ public final class FletchingScript
                 else status.set("string: waiting for skillmulti (" + elapsed + "ms)");
                 return;
             }
-            // Stringing dialog is single-option (just the matching strung bow). Press the
-            // numeric position-1 key explicitly rather than VK_SPACE — Space is dynamically
-            // rebound to "last used", so it's not safe to assume on a fresh batch.
-            dispatcher.tapKey(KeyEvent.VK_1);
+            // Stringing dialog is single-option (just the matching strung bow).
+            // Click Skillmulti.A directly — same widget-click pattern as
+            // tickCut, no dynamic Space-rebinding to worry about.
+            status.set("string: clicking recipe option");
+            dispatcher.dispatch(ActionRequest.builder()
+                .kind(ActionRequest.Kind.CLICK_WIDGET)
+                .channel(ActionRequest.Channel.MOUSE)
+                .widgetId(InterfaceID.Skillmulti.A)
+                .build());
+            dispatcher.awaitIdle(3_000L);
+            String werr = dispatcher.lastErrorMessage();
+            if (werr != null)
+            {
+                log.warn("fletching string: recipe option click error: {} — retrying", werr);
+                return;
+            }
             confirmed = true;
             craftWaitMs = System.currentTimeMillis();
             return;
@@ -667,7 +707,14 @@ public final class FletchingScript
             Widget w = client.getWidget(InterfaceID.Skillmulti.UNIVERSE);
             return w != null && !w.isHidden();
         }));
-        if (dialogOpen) dispatcher.tapKey(KeyEvent.VK_1);
+        if (dialogOpen)
+        {
+            dispatcher.dispatch(ActionRequest.builder()
+                .kind(ActionRequest.Kind.CLICK_WIDGET)
+                .channel(ActionRequest.Channel.MOUSE)
+                .widgetId(InterfaceID.Skillmulti.A)
+                .build());
+        }
 
         long elapsed = System.currentTimeMillis() - craftWaitMs;
         if (elapsed > CRAFT_TIMEOUT_MS) { abortWith("string timeout — " + unstrungLeft + " unstrung left"); return; }
