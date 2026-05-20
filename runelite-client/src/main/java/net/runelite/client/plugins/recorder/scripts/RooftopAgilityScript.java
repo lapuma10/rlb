@@ -86,6 +86,7 @@ public final class RooftopAgilityScript
     private long          nextActionAt;
     private long          nextRunToggleAt;
     private int           runOnAtLeast;
+    private boolean       lastRunOn;   // for falling-edge reseed of runOnAtLeast
 
     // ─── Last-click bookkeeping ──────────────────────────────────────────────────
     private RooftopNode lastClickedNode;
@@ -133,6 +134,11 @@ public final class RooftopAgilityScript
 
     // ─── Lifecycle ───────────────────────────────────────────────────────────────
 
+    /** Panel entry point — safe to call from the Swing EDT. All
+     *  client-state reads (gameState, realSkillLevel, localPlayer,
+     *  WorldPoint) are marshaled to the client thread, which is the only
+     *  thread allowed to touch RuneLite scene/varbit/widget state under
+     *  {@code -ea}. */
     public void start()
     {
         if (running.get())
@@ -140,6 +146,14 @@ public final class RooftopAgilityScript
             log.info("[rooftop-agility] start() called while already running — ignored");
             return;
         }
+        status.set("starting…");
+        clientThread.invokeLater(this::startOnClient);
+    }
+
+    private void startOnClient()
+    {
+        if (running.get()) return;   // double-fire guard
+
         if (client.getGameState() != GameState.LOGGED_IN)
         {
             status.set("Not logged in");
@@ -189,6 +203,7 @@ public final class RooftopAgilityScript
         this.nextActionAt         = 0L;
         this.nextRunToggleAt      = 0L;
         this.runOnAtLeast         = 20 + ThreadLocalRandom.current().nextInt(21);   // 20..40
+        this.lastRunOn            = client.getVarpValue(VARP_RUN) == 1;
         this.lastClickedNode      = null;
         this.lastClickedStage     = UNKNOWN;
         this.lastObstacleClickAt  = 0L;
@@ -242,13 +257,14 @@ public final class RooftopAgilityScript
 
         if (handleObstacleTimeout(now))                return;
         if (handleFallOrInvalidPosition(now))          return;
+        if (handleLapEnd(now))                         return;
         if (handleUnmappedValidTile(now))              return;
 
         if (tryPickupReachableMark(now))               return;
 
         int stage = detectCurrentStage();
         // detectCurrentStage is guaranteed != UNKNOWN here because the
-        // three handlers above have classified the player tile.
+        // four handlers above have classified the player tile.
         clickObstacle(stage, course.nodes.get(stage), now);
     }
 
@@ -266,7 +282,7 @@ public final class RooftopAgilityScript
 
     private boolean handleBlockingDialog(long now)
     {
-        if (!client.getMenu().isOpen()) return false;
+        if (!client.isMenuOpen()) return false;
         log.info("[rooftop-agility] menu open at tick start — dispatching Escape");
         dispatcher.dispatch(ActionRequest.builder()
             .kind(ActionRequest.Kind.KEY)
@@ -291,7 +307,11 @@ public final class RooftopAgilityScript
             state.set(State.IDLE);
             return true;
         }
+
+        // Locate first edible slot before deciding what to do.
         Item[] items = inv.getItems();
+        int edibleSlot = -1;
+        int edibleId   = -1;
         for (int slot = 0; slot < items.length; slot++)
         {
             Item it = items[slot];
@@ -302,27 +322,45 @@ public final class RooftopAgilityScript
             if (actions == null) continue;
             for (String a : actions)
             {
-                if (a == null) continue;
-                if ("Eat".equalsIgnoreCase(a))
+                if (a != null && "Eat".equalsIgnoreCase(a))
                 {
-                    dispatcher.dispatch(ActionRequest.builder()
-                        .kind(ActionRequest.Kind.CLICK_INV_ITEM)
-                        .channel(ActionRequest.Channel.MOUSE)
-                        .slot(slot)
-                        .verb("Eat")
-                        .build());
-                    long delay = 900L + ThreadLocalRandom.current().nextLong(500L);   // 900..1400
-                    nextActionAt = now + delay;
-                    status.set("Eating slot " + slot + " (id " + it.getId() + ") at hp " + hp);
-                    log.info("[rooftop-agility] eating slot {} (id {}) at hp {}", slot, it.getId(), hp);
-                    return true;
+                    edibleSlot = slot;
+                    edibleId   = it.getId();
+                    break;
                 }
             }
+            if (edibleSlot >= 0) break;
         }
-        status.set("Low HP and no food");
-        log.info("[rooftop-agility] low HP {} <= {} and no food — stopping", hp, eatAtHp);
-        running.set(false);
-        state.set(State.IDLE);
+
+        if (edibleSlot < 0)
+        {
+            status.set("Low HP and no food");
+            log.info("[rooftop-agility] low HP {} <= {} and no food — stopping", hp, eatAtHp);
+            running.set(false);
+            state.set(State.IDLE);
+            return true;
+        }
+
+        // Throttle: don't re-dispatch an eat while the previous one is still
+        // in flight or the food's heal hasn't been applied yet. The tick
+        // still exits (return true) because we don't want to obstacle-click
+        // at low HP.
+        if (now < nextActionAt)
+        {
+            status.set("Low HP — waiting on heal");
+            return true;
+        }
+
+        dispatcher.dispatch(ActionRequest.builder()
+            .kind(ActionRequest.Kind.CLICK_INV_ITEM)
+            .channel(ActionRequest.Channel.MOUSE)
+            .slot(edibleSlot)
+            .verb("Eat")
+            .build());
+        long delay = 900L + ThreadLocalRandom.current().nextLong(500L);   // 900..1400
+        nextActionAt = now + delay;
+        status.set("Eating slot " + edibleSlot + " (id " + edibleId + ") at hp " + hp);
+        log.info("[rooftop-agility] eating slot {} (id {}) at hp {}", edibleSlot, edibleId, hp);
         return true;
     }
 
@@ -330,7 +368,18 @@ public final class RooftopAgilityScript
 
     private boolean maybeEnableRun(long now)
     {
-        if (client.getVarpValue(VARP_RUN) == 1) return false;
+        boolean runOn = client.getVarpValue(VARP_RUN) == 1;
+
+        // Falling edge: run just turned off → reseed the next threshold so
+        // each off→on cycle uses a fresh roll. Spec §13.
+        if (lastRunOn && !runOn)
+        {
+            runOnAtLeast = 20 + ThreadLocalRandom.current().nextInt(21);
+            log.info("[rooftop-agility] run wore off — next toggle threshold {}%", runOnAtLeast);
+        }
+        lastRunOn = runOn;
+
+        if (runOn)                              return false;
         if (now < nextRunToggleAt)              return false;
 
         int energyPercent = client.getEnergy() / 100;   // getEnergy() is 0..10000
@@ -354,9 +403,6 @@ public final class RooftopAgilityScript
             .widgetId(orb.getId())
             .build());
         nextRunToggleAt = now + RUN_TOGGLE_THROTTLE_MS;
-        // Reseed threshold for the next on→off→on cycle so back-to-back toggles
-        // don't repeat the same point.
-        runOnAtLeast = 20 + ThreadLocalRandom.current().nextInt(21);
         log.info("[rooftop-agility] enabling run (energy {}% >= threshold)", energyPercent);
         return true;
     }
@@ -526,16 +572,41 @@ public final class RooftopAgilityScript
         return false;
     }
 
+    private boolean handleLapEnd(long now)
+    {
+        Player p = client.getLocalPlayer();
+        if (p == null) return false;
+        WorldPoint here = p.getWorldLocation();
+        if (!course.lapEndTiles.contains(here)) return false;
+
+        // Lap completion — count it once, immediately on landing. Spec §15:
+        // every clear-on-success must check lap-end first; this is the
+        // single non-timeout success path.
+        boolean finalNodeClicked = lastClickedNode != null
+            && lastClickedNode == course.nodes.get(course.nodes.size() - 1);
+        if (finalNodeClicked)
+        {
+            lapsCompleted++;
+            lastLapCompletedAt = now;
+            log.info("[rooftop-agility] lap {} complete (landed at {})", lapsCompleted, here);
+            clearLastObstacle();
+        }
+
+        // Player still on lap-end tile (just landed, or hasn't walked off yet)
+        // → walk back to nearest start tile. Next tick's detectCurrentStage
+        // will find stage 0 once the walk lands on a startTile.
+        status.set("Lap done — walking to start");
+        walkToNearestStartTile();
+        long delay = 1_200L + ThreadLocalRandom.current().nextLong(1_300L);
+        nextActionAt = now + delay;
+        return true;
+    }
+
     private boolean handleUnmappedValidTile(long now)
     {
         Player p = client.getLocalPlayer();
         if (p == null) return false;
         WorldPoint here = p.getWorldLocation();
-
-        // lapEndTile after the final obstacle is "no stage", but legitimate —
-        // the next obstacle-click loop will see player at stage 0 on the
-        // next tile transition. Don't flag as unmapped.
-        if (course.lapEndTiles.contains(here)) { unknownStageTile = null; return false; }
 
         if (course.stageByTile.containsKey(here))
         {
