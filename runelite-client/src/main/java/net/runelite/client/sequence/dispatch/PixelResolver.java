@@ -551,10 +551,20 @@ public final class PixelResolver
         if (isHiddenIncludingAncestors(w)) return null;
         Rectangle r = w.getBounds();
         if (r == null || r.width < 2 || r.height < 2) return null;
-        // Reject samples too near the edge (clicks can land on adjacent slots)
-        // and too near the centre (looks mechanical).
-        int marginX = Math.max(1, r.width / 8);
-        int marginY = Math.max(1, r.height / 8);
+        // Reject samples too near the edge (clicks can land on adjacent
+        // widgets when the engine's hit-test polygon is tighter than
+        // getBounds(), observed live on the GE COLLECTALL button of
+        // 2026-05-20: reported bounds 85×22 but ~80% of random samples
+        // resolved to a sibling widget's menu actions ('Cancel' / the
+        // slot row) — only the well-centred ~12% hit the actual click
+        // target). Use a 1/4 inset on each axis so the sampler clusters
+        // near the widget centre; for very small widgets (under 4 px on
+        // an axis) collapse the margin so we still have ≥ 2 px of sample
+        // range.
+        int marginX = Math.max(1, r.width / 4);
+        int marginY = Math.max(1, r.height / 4);
+        if (r.width  - 2 * marginX < 2) marginX = Math.max(1, (r.width  - 2) / 2);
+        if (r.height - 2 * marginY < 2) marginY = Math.max(1, (r.height - 2) / 2);
         int cx = r.x + r.width / 2;
         int cy = r.y + r.height / 2;
         for (int attempt = 0; attempt < 8; attempt++)

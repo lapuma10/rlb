@@ -132,4 +132,20 @@ public class ActionRequest {
      *  the executor picks a different tile (not a different modality).
      *  Default {@code false} preserves V1 / legacy behavior. */
     boolean strictWalk;
+    /** Opt-in: when {@code true}, the dispatcher's internal camera
+     *  rotation for this click verifies the target ended up comfortably
+     *  inside the viewport after the wide humanized first pass; if not,
+     *  it runs a tight corrective pass (≤30°) before attempting pixel
+     *  resolution. Default {@code false} preserves the legacy single-pass
+     *  behavior — opt in only when the next operation depends on the
+     *  target being on-screen and the off-screen failure mode would
+     *  silently waste the caller's settle window.
+     *
+     *  <p>Currently honored by {@link Kind#CLICK_GAME_OBJECT}. Pizza
+     *  staircase regression 2026-05-19: the wide jitter band can land
+     *  the far-away staircase tile past the FOV edge, where
+     *  {@link PixelResolver} returns null for both HULL and TILE_POLY
+     *  strategies; the caller's settle then burns ~6 s per no-op
+     *  retry. */
+    boolean ensureVisibleRotation;
 }

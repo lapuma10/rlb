@@ -249,6 +249,50 @@ public class HumanizedInputDispatcher implements InputDispatcher
                 return;
             }
         }
+        doRotateOnce(target, ROTATION_OFFSET_MIN_UNITS, ROTATION_OFFSET_MAX_UNITS);
+    }
+
+    /** Verify-and-retry variant of {@link #rotateCameraToward(WorldPoint, boolean)}.
+     *  Runs the same humanized off-axis first pass, then checks whether
+     *  the target ended up comfortably inside the viewport. If not, runs
+     *  one tight corrective pass (≤30°) so the next operation that
+     *  depends on the target being on-screen (e.g. {@link PixelResolver}
+     *  pixel resolution for a verb-click on a far-away transport tile)
+     *  actually has the geometry it needs.
+     *
+     *  <p>Opt-in: do not call from naturalistic-rotation contexts (ambient
+     *  camera drift, walking-heading tracking) — the second pass actively
+     *  frames the target, which changes their intended "off-axis but
+     *  in-view" semantics. Lumby pizza→bank staircase 2026-05-19: wide
+     *  humanized jitter landed the staircase past the FOV edge, causing
+     *  ~6 unresolvable retries × 6.5 s settle = 40 s lockup. */
+    public void rotateCameraTowardEnsuringVisible(WorldPoint target, boolean force) throws InterruptedException
+    {
+        if (target == null) return;
+        if (!force)
+        {
+            Boolean alreadyVisible = onClient(() -> isTileComfortablyVisible(target));
+            if (Boolean.TRUE.equals(alreadyVisible))
+            {
+                log.debug("rotate camera skipped (ensure-visible) — target {} already on screen", target);
+                return;
+            }
+        }
+        doRotateOnce(target, ROTATION_OFFSET_MIN_UNITS, ROTATION_OFFSET_MAX_UNITS);
+        Boolean nowVisible = onClient(() -> isTileComfortablyVisible(target));
+        if (Boolean.FALSE.equals(nowVisible))
+        {
+            log.debug("rotate camera (ensure-visible): target {} still off-screen — tight corrective", target);
+            doRotateOnce(target, ROTATION_OFFSET_TIGHT_MIN_UNITS, ROTATION_OFFSET_TIGHT_MAX_UNITS);
+        }
+    }
+
+    /** One yaw + pitch rotation pass toward {@code target}. The off-axis
+     *  offset is randomly picked in {@code [minOffset, maxOffset]} yaw
+     *  units (CW or CCW). Caller handles the already-visible early-exit
+     *  and the verify-and-retry. */
+    private void doRotateOnce(WorldPoint target, int minOffset, int maxOffset) throws InterruptedException
+    {
         // Read player tile, compute base yaw + chebyshev distance to
         // target in ONE client-thread marshal. The chebyshev value is
         // what {@link #pickPitchForDistance} uses to decide how steep
@@ -266,15 +310,9 @@ public class HumanizedInputDispatcher implements InputDispatcher
             return new RotationInput(yaw, cheb);
         });
         if (rotIn == null) return;
-        // Signed offset 40°–120° (228–683 yaw units), CW or CCW. The
-        // camera should never land bolt-centred on the target — a real
-        // player rotates so the destination is off-axis but well in
-        // view. Wider than a small jitter so the character visibly
-        // walks "up the screen" at an angle, never head-on or directly
-        // away from the camera.
         int sign = rng.nextBoolean() ? 1 : -1;
-        int jitterMag = ROTATION_OFFSET_MIN_UNITS
-            + rng.nextInt(ROTATION_OFFSET_MAX_UNITS - ROTATION_OFFSET_MIN_UNITS + 1);
+        int range = Math.max(0, maxOffset - minOffset);
+        int jitterMag = minOffset + (range > 0 ? rng.nextInt(range + 1) : 0);
         final int desiredYaw = (rotIn.baseYaw() + sign * jitterMag + 2048) & 0x7FF;
 
         // Pitch target picked from target distance (or null when the
@@ -405,6 +443,17 @@ public class HumanizedInputDispatcher implements InputDispatcher
      *  behind, defeating the point of rotating toward it. */
     private static final int ROTATION_OFFSET_MAX_UNITS = 683;
 
+    /** Minimum offset for the verify-and-retry tight pass. 28 units ≈ 5° —
+     *  preserves the "never bolt-centred on target" rule so the camera
+     *  doesn't land head-on with the player walking dead-away from view. */
+    private static final int ROTATION_OFFSET_TIGHT_MIN_UNITS = 28;
+
+    /** Maximum offset for the verify-and-retry tight pass when the first
+     *  humanized pass leaves the target off-screen. 171 units ≈ 30° —
+     *  comfortably inside OSRS's ~85° horizontal FOV at all pitches we
+     *  use, so the target ends up well-framed for pixel resolution. */
+    private static final int ROTATION_OFFSET_TIGHT_MAX_UNITS = 171;
+
     /** Linear rotation cadence: ms per yaw unit. 2 ms × 2048 units ≈
      *  4.1 s for a full 360°, matching OSRS arrow-key pan speed at
      *  default {@code cameraSpeed=1.0} (≈90°/s). */
@@ -471,12 +520,17 @@ public class HumanizedInputDispatcher implements InputDispatcher
             case WALK, CLICK_TILE -> walkClick(req.getTile(), req.getKind() == ActionRequest.Kind.WALK && req.isStrictWalk());
             case CLICK_NPC -> npcClick(req.getNpcIndex(),
                 req.getVerb() == null || req.getVerb().isBlank() ? "Attack" : req.getVerb());
-            case CLICK_GAME_OBJECT -> gameObjectClick(req.getTile(), req.getVerb(), req.isLiveTracked());
+            case CLICK_GAME_OBJECT -> gameObjectClick(req.getTile(), req.getVerb(), req.isLiveTracked(), req.isEnsureVisibleRotation());
             case CLICK_GROUND_ITEM -> groundItemClick(req.getTile(), req.getItemId(), req.getVerb());
             case CLICK_WIDGET -> {
                 String verb = req.getVerb();
-                if (verb != null && !verb.isBlank()) widgetVerbClick(req.getWidgetId(), verb);
-                else widgetClick(req.getWidgetId());
+                if (verb == null || verb.isBlank()) widgetClick(req.getWidgetId());
+                else if (verb.indexOf('|') < 0) widgetVerbClick(req.getWidgetId(), verb);
+                else widgetAnyVerbClick(req.getWidgetId(),
+                    java.util.Arrays.stream(verb.split("\\|"))
+                        .map(String::trim)
+                        .filter(s -> !s.isEmpty())
+                        .toList());
             }
             case CLICK_INV_ITEM -> invSlotClick(Math.max(0, req.getSlot()), req.getVerb());
             case CLICK_BOUNDS -> boundsClick(req.getBounds(), req.getVerb());
@@ -1130,7 +1184,8 @@ public class HumanizedInputDispatcher implements InputDispatcher
      *  right-clicks to open the context menu, finds the matching entry, and
      *  left-clicks that entry's row — exactly like a human would.
      */
-    private void gameObjectClick(WorldPoint tile, String verb, boolean liveTracked) throws InterruptedException
+    private void gameObjectClick(WorldPoint tile, String verb, boolean liveTracked,
+                                 boolean ensureVisibleRotation) throws InterruptedException
     {
         if (tile == null) { lastError.set("null tile for gameObjectClick"); return; }
         if (verb == null || verb.isBlank())
@@ -1163,8 +1218,13 @@ public class HumanizedInputDispatcher implements InputDispatcher
                 match == null ? "null match" : match.failure());
             return;
         }
-        // Camera rotation toward the tile keeps the object visible.
-        rotateCameraToward(tile);
+        // Camera rotation toward the tile keeps the object visible. For
+        // far-away transport tiles whose pixel resolution would fail if
+        // the wide humanized jitter lands the target past the FOV edge,
+        // the caller can opt into the verify-and-retry variant via
+        // {@link ActionRequest#isEnsureVisibleRotation()}.
+        if (ensureVisibleRotation) rotateCameraTowardEnsuringVisible(tile, false);
+        else rotateCameraToward(tile);
 
         if (liveTracked && match.gameObject() != null)
         {
@@ -2109,7 +2169,7 @@ public class HumanizedInputDispatcher implements InputDispatcher
     public void gameObjectClickOnWorker(WorldPoint tile, String verb)
         throws InterruptedException
     {
-        gameObjectClick(tile, verb, false);
+        gameObjectClick(tile, verb, false, false);
     }
 
     /** Click inside a pre-resolved canvas rectangle with optional verb match.
@@ -2130,8 +2190,17 @@ public class HumanizedInputDispatcher implements InputDispatcher
             lastError.set("boundsClick: null or empty bounds");
             return;
         }
-        int marginX = Math.max(1, bounds.width / 6);
-        int marginY = Math.max(1, bounds.height / 6);
+        // 1/4 inset (matches PixelResolver.resolveWidget) — keeps the click
+        // well inside the engine's hit-test polygon. Observed live on the
+        // GE search-results row of 2026-05-20: 1/6 inset on a 161×32 row
+        // landed on a sibling result row badge (cornflour) often enough
+        // that the wrong item got selected and the whole buy aborted. With
+        // very small widgets (under 4 px on an axis) collapse the margin
+        // so we still have ≥ 2 px of sample range.
+        int marginX = Math.max(1, bounds.width / 4);
+        int marginY = Math.max(1, bounds.height / 4);
+        if (bounds.width  - 2 * marginX < 2) marginX = Math.max(1, (bounds.width  - 2) / 2);
+        if (bounds.height - 2 * marginY < 2) marginY = Math.max(1, (bounds.height - 2) / 2);
         int x = bounds.x + marginX
             + rng.nextInt(Math.max(1, bounds.width - 2 * marginX));
         int y = bounds.y + marginY
@@ -2180,24 +2249,137 @@ public class HumanizedInputDispatcher implements InputDispatcher
     private void widgetVerbClick(int widgetId, String verb) throws InterruptedException
     {
         Point pixel = onClient(() -> resolver.resolveWidget(widgetId));
-        if (pixel == null) { lastError.set("widget " + widgetId + " not found"); return; }
+        if (pixel == null)
+        {
+            log.info("widgetVerbClick: widget 0x{} unresolved at click time (verb='{}')",
+                Integer.toHexString(widgetId), verb);
+            lastError.set("widget " + widgetId + " not found");
+            return;
+        }
         moveCursorTo(pixel.getX(), pixel.getY());
         // Give the engine ~2 render frames to populate hover-state menu entries.
         SequenceSleep.sleep(client, 60);
+        String topVerb = onClient(this::topMenuVerbForDiag);
         boolean isTop = onClient(() -> isTopMenuVerb(verb));
         if (isTop)
         {
+            log.info("widgetVerbClick: widget 0x{} left-click (verb='{}' top='{}')",
+                Integer.toHexString(widgetId), verb, topVerb);
             clickPress(MouseEvent.BUTTON1);
             return;
         }
+        log.info("widgetVerbClick: widget 0x{} right-click fallback (wanted='{}' top='{}')",
+            Integer.toHexString(widgetId), verb, topVerb);
         clickPress(MouseEvent.BUTTON3);
         SequenceSleep.sleep(client, 120);
         boolean ok = selectMenuVerb(verb);
         if (!ok)
         {
+            log.info("widgetVerbClick: widget 0x{} menu select FAILED (verb='{}' not in menu)",
+                Integer.toHexString(widgetId), verb);
             lastError.set("widget " + widgetId + " menu open but verb '" + verb + "' not present");
             dismissMenu();
         }
+    }
+
+    /** Verb-routed CLICK_WIDGET that accepts ANY of {@code verbs} as the
+     *  matching top entry / selected menu row. Use when multiple default
+     *  actions would satisfy the caller — e.g. GE COLLECTALL where both
+     *  "Collect to inventory" and "Collect to bank" drain the slot and
+     *  the user's toggle decides which one is top. Iterates verbs in
+     *  priority order: first one matched (left- or right-click path) wins.
+     *  Encoded over CLICK_WIDGET by joining verbs with "|" — the handle()
+     *  router splits and dispatches here. */
+    private void widgetAnyVerbClick(int widgetId, java.util.List<String> verbs)
+        throws InterruptedException
+    {
+        if (verbs == null || verbs.isEmpty())
+        {
+            log.info("widgetAnyVerbClick: widget 0x{} no candidate verbs supplied",
+                Integer.toHexString(widgetId));
+            lastError.set("widget " + widgetId + " no candidate verbs");
+            return;
+        }
+        Point pixel = onClient(() -> resolver.resolveWidget(widgetId));
+        if (pixel == null)
+        {
+            log.info("widgetAnyVerbClick: widget 0x{} unresolved at click time (verbs={})",
+                Integer.toHexString(widgetId), verbs);
+            lastError.set("widget " + widgetId + " not found");
+            return;
+        }
+        moveCursorTo(pixel.getX(), pixel.getY());
+        SequenceSleep.sleep(client, 60);
+        String topVerb = onClient(this::topMenuVerbForDiag);
+        String topMatch = onClient(() -> {
+            for (String v : verbs)
+            {
+                if (v != null && !v.isBlank() && isTopMenuVerb(v)) return v;
+            }
+            return null;
+        });
+        if (topMatch != null)
+        {
+            log.info("widgetAnyVerbClick: widget 0x{} left-click (matched='{}' top='{}')",
+                Integer.toHexString(widgetId), topMatch, topVerb);
+            clickPress(MouseEvent.BUTTON1);
+            return;
+        }
+        log.info("widgetAnyVerbClick: widget 0x{} right-click fallback (wanted={} top='{}')",
+            Integer.toHexString(widgetId), verbs, topVerb);
+        clickPress(MouseEvent.BUTTON3);
+        SequenceSleep.sleep(client, 120);
+        String[] matched = new String[1];
+        MenuRow row = onClient(() -> {
+            for (String v : verbs)
+            {
+                if (v == null || v.isBlank()) continue;
+                MenuRow r = findMenuRow(v);
+                if (r != null) { matched[0] = v; return r; }
+            }
+            return null;
+        });
+        if (row == null)
+        {
+            log.info("widgetAnyVerbClick: widget 0x{} menu select FAILED (none of {} in menu)",
+                Integer.toHexString(widgetId), verbs);
+            lastError.set("widget " + widgetId + " menu open but none of " + verbs + " present");
+            dismissMenu();
+            return;
+        }
+        log.info("widgetAnyVerbClick: widget 0x{} menu pick='{}'",
+            Integer.toHexString(widgetId), matched[0]);
+        moveCursorTo(row.x, row.y);
+        SequenceSleep.sleep(client, 40 + rng.nextInt(60));
+        input.mousePress(MouseEvent.BUTTON1);
+        SequenceSleep.sleep(client, 40 + rng.nextInt(40));
+        input.mouseRelease(MouseEvent.BUTTON1);
+        SequenceSleep.sleep(client, 80 + rng.nextInt(180));
+    }
+
+    /** Diagnostic snapshot of the current cursor-position top menu entry. Used
+     *  for log lines only — the real verb-routing path uses
+     *  {@link #isTopMenuVerb(String)} which normalizes via VerbMatcher. Returns
+     *  the raw option (no target / colour-tag stripping) for human reading.
+     *  Must run on the client thread. */
+    private String topMenuVerbForDiag()
+    {
+        try
+        {
+            MenuEntry[] entries = client.getMenu() == null ? null
+                : client.getMenu().getMenuEntries();
+            if (entries == null || entries.length == 0) return "(empty)";
+            MenuEntry top = entries[entries.length - 1];
+            String opt = top.getOption();
+            String tgt = top.getTarget();
+            if (tgt != null && !tgt.isEmpty())
+            {
+                String tgtClean = tgt.replaceAll("<[^>]+>", "").trim();
+                if (!tgtClean.isEmpty()) return opt + " " + tgtClean;
+            }
+            return opt == null ? "(null)" : opt;
+        }
+        catch (Throwable th) { return "(err)"; }
     }
 
     private void keyTap(int keyCode) throws InterruptedException
