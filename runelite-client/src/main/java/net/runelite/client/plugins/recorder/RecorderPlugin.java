@@ -416,10 +416,11 @@ public class RecorderPlugin extends Plugin
         ultraCompostScript = new UltraCompostScript(client, clientThread, ultraDispatcher, grandExchangeScript);
         panel.setUltraCompostScript(ultraCompostScript);
 
-        // Pizza script — three batched bank↔bank loops (combine inputs)
-        // plus one bank → kitchen-range round trip to cook the uncooked
-        // pizzas. Independent dispatcher so it never collides with the
-        // other scripts on the dispatcher busy flag.
+        // Pizza script — uses a hardcoded Lumbridge bank↔kitchen walk
+        // (no Navigator / NavigatorFactory). V2.1 stair-tracking proved
+        // unreliable for the Top-floor staircase (2026-05-19), so the
+        // route is now expressed as two waypoints + one verb-click in
+        // PizzaScript.tickWalk directly.
         HumanizedInputDispatcher pizzaDispatcher = new HumanizedInputDispatcher(client, clientThread);
         pizzaScript = new PizzaScript(client, clientThread, pizzaDispatcher, trailRegistry);
         panel.setPizzaScript(pizzaScript);

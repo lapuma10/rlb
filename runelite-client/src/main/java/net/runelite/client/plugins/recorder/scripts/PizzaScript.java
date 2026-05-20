@@ -1,8 +1,7 @@
 package net.runelite.client.plugins.recorder.scripts;
 
 import java.awt.Rectangle;
-import java.util.EnumMap;
-import java.util.Map;
+import java.util.List;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.ThreadLocalRandom;
@@ -11,6 +10,7 @@ import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.Supplier;
 import lombok.extern.slf4j.Slf4j;
 import net.runelite.api.Client;
+import net.runelite.api.GameState;
 import net.runelite.api.Item;
 import net.runelite.api.ItemContainer;
 import net.runelite.api.Player;
@@ -23,14 +23,14 @@ import net.runelite.api.widgets.Widget;
 import net.runelite.client.callback.ClientThread;
 import net.runelite.client.plugins.recorder.cook.CookingInteraction;
 import net.runelite.client.plugins.recorder.farm.BankInteraction;
-import net.runelite.client.plugins.recorder.trail.Route;
 import net.runelite.client.plugins.recorder.trail.TrailRegistry;
-import net.runelite.client.plugins.recorder.trail.TrailWalker;
 import net.runelite.client.plugins.recorder.widget.SidebarTab;
 import net.runelite.client.plugins.recorder.widget.SidebarTabActions;
 import net.runelite.client.sequence.dispatch.HumanizedInputDispatcher;
 import net.runelite.client.sequence.dispatch.SequenceSleep;
 import net.runelite.client.sequence.internal.ActionRequest;
+import net.runelite.client.sequence.login.LoginAssistantV2;
+import net.runelite.client.sequence.login.LoginCredentials;
 
 /**
  * Pizza maker — three (optionally four) batched loops at the Lumbridge
@@ -115,25 +115,69 @@ public final class PizzaScript
     private static final int ANCHOVY_PIZZA     = ItemID.ANCHOVIE_PIZZA;    // 2297
 
     // ─── Areas ──────────────────────────────────────────────────────────
-    /** Lumbridge Castle plane-2 bank room.  Mirrors
-     *  {@code CookingLocations.LUMBRIDGE_CASTLE_P2.bankArea()} — every
-     *  tile in the box has line-of-sight to a bank booth, verified by
-     *  the chicken-farm and cooking scripts. */
-    private static final WorldArea BANK_AREA   = new WorldArea(3208, 3218, 3, 3, 2);
+    /** Lumbridge Castle plane-2 bank room — booth-front strip only.
+     *  Tiles directly south of the two booths at (3208,3221) and
+     *  (3209,3221). Stops at x=3209 / y=3220 so the picker can never
+     *  roll the NE corner (3210,3220) the user flagged 2026-05-20 —
+     *  from there the bot still chains bank-booth clicks but each
+     *  retry has a longer walk attached, raising race odds (one click
+     *  opens the bank, the next walks past it and closes it). */
+    private static final WorldArea BANK_AREA   = new WorldArea(3208, 3219, 2, 2, 2);
     /** Lumbridge kitchen plane 0 — covers the cook NPC, the range tile
-     *  in front of it, and the food crates.  The recorded
-     *  {@code lumby_bank_to_cook} trail ends inside this area. */
+     *  in front of it, and the food crates. */
     private static final WorldArea KITCHEN_AREA = new WorldArea(3207, 3213, 5, 5, 0);
 
-    // ─── Trail prefixes ─────────────────────────────────────────────────
-    /** Walk: bank (p=2) → kitchen (p=0).  Recorded as part of the
-     *  Cook's Assistant flow; reused here verbatim. */
-    private static final String TRAIL_BANK_TO_COOK = "lumby_bank_to_cook";
-    /** Walk: kitchen (p=0) → bank (p=2).  User must record this once
-     *  (save as {@code ~/.runelite/recorder/trails/cook_to_lumby_bank.json}).
-     *  If missing, the script aborts with the prefix in the status so
-     *  the user knows what to record. */
-    private static final String TRAIL_COOK_TO_BANK = "cook_to_lumby_bank";
+    // ─── Hardcoded Lumbridge walk waypoints ─────────────────────────────
+    // Staircase between bank (p=2) and kitchen (p=0). Same model;
+    // standing tile to click differs by direction.
+    /** Tile the staircase verb-click is dispatched on (plane=2 → climb down). */
+    private static final WorldPoint STAIRCASE_DOWN_TILE =
+        new WorldPoint(3205, 3208, 2);
+    /** Tile the staircase verb-click is dispatched on (plane=0 → climb up). */
+    private static final WorldPoint STAIRCASE_UP_TILE   =
+        new WorldPoint(3204, 3207, 0);
+    /** Approach TILES for the descend leg — a small box east of the
+     *  staircase on plane=2. Each approach walk picks a random tile
+     *  from the list so we don't click the exact same minimap pixel
+     *  every trip. (3206..3207, 3208..3209) = 4 walkable tiles. */
+    private static final List<WorldPoint> APPROACH_DOWN_TILES = List.of(
+        new WorldPoint(3206, 3208, 2),
+        new WorldPoint(3206, 3209, 2),
+        new WorldPoint(3207, 3208, 2),
+        new WorldPoint(3207, 3209, 2));
+    /** Approach TILES for the ascend leg — east of the staircase on
+     *  plane=0. Mirrors the in-game "p0 south staircase lumby" area
+     *  marker (~/.runelite/sequencer/routes/test.txt): 8 walkable tiles
+     *  east-northeast of {@link #STAIRCASE_UP_TILE}, picked because
+     *  the original 2-tile column was unreliable — from certain camera
+     *  yaws the cursor over those tiles resolved to the staircase hull
+     *  ("Climb-up") instead of "Walk here", triggering the dispatcher's
+     *  minimap fallback and leaving the player stuck outside chebyshev
+     *  2 of the stair tile (2026-05-20 failed-bank-return). The wider
+     *  list gives the planner room to retry from a different angle. */
+    private static final List<WorldPoint> APPROACH_UP_TILES = List.of(
+        new WorldPoint(3205, 3209, 0),
+        new WorldPoint(3206, 3208, 0),
+        new WorldPoint(3206, 3209, 0),
+        new WorldPoint(3206, 3210, 0),
+        new WorldPoint(3207, 3209, 0),
+        new WorldPoint(3207, 3210, 0),
+        new WorldPoint(3208, 3209, 0),
+        new WorldPoint(3208, 3210, 0));
+    /** Tile to point the camera at when looking for the range on p=0.
+     *  Center of the kitchen — the cooking range model sits ~here. */
+    private static final WorldPoint RANGE_LOOK_TILE =
+        new WorldPoint(3209, 3215, 0);
+    /** Minimum ms between consecutive walk-tile dispatches so we don't
+     *  spam clicks while the player is mid-step. Each dispatch picks a
+     *  fresh random tile inside the relevant area. */
+    private static final long WALK_DISPATCH_PACE_MS = 1_500L;
+    /** Settle after dispatching a staircase verb-click. Real cost is
+     *  cursor flight + HULL→TILE_POLY retry chain + climb animation +
+     *  plane-swap signal — ~5 s observed on Lumby staircase 2026-05-19.
+     *  Short values caused redundant second clicks before the first
+     *  finished. */
+    private static final long TRANSPORT_SETTLE_MS   = 6_500L;
 
     // ─── Batch sizes ────────────────────────────────────────────────────
     /** Combine recipes consume both inputs into one output, so 14+14 fits
@@ -160,14 +204,37 @@ public final class PizzaScript
     // Replaces the hardcoded 400 ms post-close verify sleep.
     private static final long BANK_CLOSE_VERIFY_MIN_MS = 200L;
     private static final long BANK_CLOSE_VERIFY_MAX_MS = 380L;
+    // After dispatching a booth-open click, give the server enough time
+    // to process it (≥ 2 game ticks) before considering another click.
+    // BANK_IN_USE (220-520ms) was used here; it's too tight — 520 ms
+    // can fire before the server tick (600 ms), so isBankOpen() still
+    // reads false and we dispatched a 2nd booth click. The 2nd click on
+    // a now-open bank toggled it closed → "bank closed mid-deposit" 3×
+    // in a row → ABORTED (2026-05-20).
+    private static final long BANK_OPEN_WAIT_MIN_MS  = 1_500L;
+    private static final long BANK_OPEN_WAIT_MAX_MS  = 2_500L;
     private static final long BANK_LOAD_GRACE_MS     = 1_500L;
     private static final long SKILLMULTI_TIMEOUT_MS  = 5_000L;
     private static final long CRAFT_TIMEOUT_MS       = 90_000L;
     private static final long COOK_BATCH_SETTLE_MS   = 5_000L;
     private static final long COOK_STUCK_MS          = 30_000L;
-    private static final long COOK_PACE_MS           = 1_500L;
+    /** Randomized minimum delay between a cook click and the next
+     *  cook-tick decision. Picks a fresh value per click — 1.5 s
+     *  used to fall through before {@code isCooking()} flipped true,
+     *  causing a double-fire of the range click before the first batch
+     *  even started. Real player reaction + animation observation is
+     *  several seconds, well within this range. */
+    private static final long COOK_PACE_MIN_MS       = 5_000L;
+    private static final long COOK_PACE_MAX_MS       = 9_000L;
     private static final long LEVEL_UP_DISMISS_MIN_MS = 3_000L;
     private static final long LEVEL_UP_DISMISS_MAX_MS = 34_000L;
+
+    // Randomized reaction delay before pressing Space on a Skillmulti
+    // / Cook-All dialog. Real players don't slam Space at frame 0 — they
+    // see the dialog, register it, and press. Constant 0-ms timing was
+    // the most visible tell.
+    private static final long COOK_CONFIRM_MIN_MS = 220L;
+    private static final long COOK_CONFIRM_MAX_MS = 680L;
 
     private static final int MAX_BANK_FAILURES   = 3;
     private static final int WALKER_MAX_STUCK    = 3;
@@ -206,10 +273,8 @@ public final class PizzaScript
     private final Client                   client;
     private final ClientThread             clientThread;
     private final HumanizedInputDispatcher dispatcher;
-    private final TrailRegistry            trailRegistry;
     private final BankInteraction          bank;
     private final CookingInteraction       cook;
-    private final TrailWalker              trailWalker;
     private final SidebarTabActions        sidebarTabs;
 
     // ─── Runtime state ──────────────────────────────────────────────────
@@ -274,6 +339,21 @@ public final class PizzaScript
      *  schedule yet (next gate primes a humanized pre-open delay). */
     private long nextBankClickAtMs;
     private long lastCookActionMs;
+    /** Randomized pace, rolled at each cook-click dispatch in
+     *  {@link #COOK_PACE_MIN_MS}..{@link #COOK_PACE_MAX_MS}. The next
+     *  cook-tick blocks until {@code now - lastCookActionMs >= cookPaceDelayMs}.
+     *  Reset (0) in {@link #setState}. */
+    private long cookPaceDelayMs;
+    /** Wall-clock of the most recent {@code rawLeft} decrease while at
+     *  the range. Anchors the batch-settle gate to actual inventory
+     *  progress instead of click time — so a normal animation gap
+     *  between cooked pieces doesn't trigger a re-dispatch. Mirrors
+     *  {@code CookingScriptV3.lastRawDecreaseAtMs}. */
+    private long lastRawDecreaseMs;
+    /** Hardcoded-walk pacing — last walk-tile click + last staircase
+     *  verb-click. Both reset in {@link #setState}. */
+    private long lastWalkDispatchMs;
+    private long lastTransportDispatchMs;
     private long lastInventoryChangeMs;
     private long bankOpenedAtMs;
     private int  bankFailures;
@@ -300,20 +380,31 @@ public final class PizzaScript
     private long levelUpFirstSeenAtMs;
     private long levelUpDismissAfterMs;
 
-    // Lazy Route cache (keyed by State; built on first walk tick).
-    private final Map<State, Route> routeCache = new EnumMap<>(State.class);
+    // ─── Auto-login (optional) ──────────────────────────────────────────
+    // If wired by the panel before {@link #start()}, the tick loop will
+    // attempt LoginAssistantV2 when the game state drops to a non-
+    // LOGGED_IN value (OSRS auto-kick after >5min idle, manual logout,
+    // etc.). Null = leave alone, status-only wait for manual recovery.
+    private LoginAssistantV2 loginAssistant;
+    private Supplier<LoginCredentials> credsSupplier;
+    private Integer targetWorldId;
+    private boolean jagexAccount;
+    /** Wall-clock at which the next auto-login attempt is allowed.
+     *  Throttles retries when login fails (network blip / world full). */
+    private long nextLoginAttemptAtMs;
 
     public PizzaScript(Client client, ClientThread clientThread,
                        HumanizedInputDispatcher dispatcher,
                        TrailRegistry trailRegistry)
     {
+        // trailRegistry kept on the constructor for call-site stability
+        // and so a future variant can fall back to recorded-trail
+        // replay if the hardcoded waypoints ever drift. Currently unused.
         this.client        = client;
         this.clientThread  = clientThread;
         this.dispatcher    = dispatcher;
-        this.trailRegistry = trailRegistry;
         this.bank          = new BankInteraction(client, clientThread, dispatcher);
         this.cook          = new CookingInteraction(client, clientThread, dispatcher);
-        this.trailWalker   = new TrailWalker(client, clientThread, dispatcher);
         this.sidebarTabs   = new SidebarTabActions(client, clientThread, dispatcher);
     }
 
@@ -351,6 +442,22 @@ public final class PizzaScript
     public int anchovyMade()    { return anchovyMade.get(); }
     public int burntMade()      { return burntMade.get(); }
 
+    /** Wire optional auto-login. Call before {@link #start()}. When set,
+     *  the tick loop attempts {@link LoginAssistantV2#login} whenever the
+     *  game state isn't LOGGED_IN (OSRS auto-kick after long idle, etc.)
+     *  so the script resumes without manual intervention. Pass null
+     *  credsSupplier to disable. */
+    public void setAutoLogin(LoginAssistantV2 la,
+                             Supplier<LoginCredentials> credsSupplier,
+                             Integer worldId,
+                             boolean jagex)
+    {
+        this.loginAssistant = la;
+        this.credsSupplier  = credsSupplier;
+        this.targetWorldId  = worldId;
+        this.jagexAccount   = jagex;
+    }
+
     public void start()
     {
         Thread existing = worker.get();
@@ -381,6 +488,8 @@ public final class PizzaScript
             ThreadLocalRandom.current(),
             afkBreaksEnabled.get());
 
+        nextLoginAttemptAtMs = 0L;
+
         State decided = decideResume();
         log.info("pizza: resume → {} ({})", decided, status.get());
         setState(decided);
@@ -405,6 +514,10 @@ public final class PizzaScript
             try { t.join(2_000); }
             catch (InterruptedException ie) { Thread.currentThread().interrupt(); }
         }
+        // Halt the scheduler explicitly — otherwise the panel's refresh
+        // timer keeps polling breaks.statusLine() and the countdown
+        // visually ticks forward even though the worker has exited.
+        if (breaks != null) breaks.disable();
         setState(State.IDLE);
         status.set("stopped");
     }
@@ -465,6 +578,19 @@ public final class PizzaScript
 
             while (running.get() && !Thread.currentThread().isInterrupted())
             {
+                // Auto-login gate. If the OSRS auto-kick fired during a
+                // long idle (or the user manually logged out) we'll see
+                // GameState != LOGGED_IN. With creds wired by the panel,
+                // attempt LoginAssistantV2; otherwise just wait for a
+                // manual login and let the worker resume in place.
+                GameState gs = onClient(client::getGameState);
+                if (gs != null && gs != GameState.LOGGED_IN)
+                {
+                    handleLoggedOut(gs);
+                    SequenceSleep.sleep(client, TICK_MS);
+                    continue;
+                }
+
                 if (playerPos() == null)
                 {
                     status.set("waiting for player (loading?)");
@@ -520,28 +646,9 @@ public final class PizzaScript
                         tickCombineAtBank(INCOMPLETE_PIZZA, CHEESE, UNCOOKED_PIZZA);
                     case COMBINE_PLAIN_ANCHOVIES   ->
                         tickCombineAtBank(PLAIN_PIZZA, ANCHOVIES_COOKED, ANCHOVY_PIZZA);
-                    case WALK_TO_RANGE             ->
-                        // Tried a P0 shortcut on 2026-05-06 (skip leg-2
-                        // walk if findHeatSource returns non-null on
-                        // plane 0).  Backed it out: the range is in
-                        // scene radius from the staircase-landing tile
-                        // (3206, 3208) but a wall sits between player
-                        // and range — the convex-hull projection
-                        // clips off-canvas (negative x bounds), the
-                        // verb-click verification fails ("top='Cancel'"
-                        // — cursor not over the object), cook stalls
-                        // for COOK_STUCK_MS.  The trail's leg-2 walk
-                        // to (3207, 3215) puts the player inside the
-                        // kitchen with a clean line-of-sight; that's
-                        // the cheapest "make the range clickable"
-                        // path.  If a smarter shortcut is wanted,
-                        // gate it on the projected hull actually
-                        // landing on-canvas — not just findHeatSource
-                        // returning a Match.
-                        tickWalk(State.WALK_TO_RANGE, TRAIL_BANK_TO_COOK, State.COOK_AT_RANGE);
+                    case WALK_TO_RANGE             -> tickWalkToRange();
                     case COOK_AT_RANGE             -> tickCookAtRange();
-                    case WALK_TO_BANK              ->
-                        tickWalk(State.WALK_TO_BANK, TRAIL_COOK_TO_BANK, State.DECIDE);
+                    case WALK_TO_BANK              -> tickWalkToBank();
                     case DONE, ABORTED, IDLE       -> running.set(false);
                 }
                 SequenceSleep.sleep(client, TICK_MS);
@@ -602,7 +709,7 @@ public final class PizzaScript
             }
             status.set("decide: opening bank");
             bank.tryClickBankBoothRandom();
-            scheduleInBankAction();
+            scheduleOpenWait();
             bankOpenedAtMs = now;
             return;
         }
@@ -670,11 +777,15 @@ public final class PizzaScript
         // uncooked pizza in the bank without cooking yet.
         if (cookPizza.get() && bankUncook > 0)
         {
-            int qty = (int) Math.min(COOK_BATCH, bankUncook);
-            status.set("decide: withdrawing " + qty + " uncooked pizza for the range");
-            boolean ok = (bankUncook <= qty)
-                ? bank.tryWithdrawAll(UNCOOKED_PIZZA)
-                : bank.tryWithdrawX(UNCOOKED_PIZZA, qty);
+            // Always Withdraw-All. Cooking fills the inventory (no
+            // by-products); the bank caps it at free slots (28) so we
+            // never spill. Withdraw-X for a 252-stack would type "28"
+            // in the chatbox every single trip, which is both slow and
+            // an obvious bot tell. The verb-scan retry overhead on
+            // partial withdraws (seen in logs at 21:16:11-13) also
+            // disappears — Withdraw-All is a single right-click pick.
+            status.set("decide: withdraw-all uncooked pizza (bank=" + bankUncook + ")");
+            boolean ok = bank.tryWithdrawAll(UNCOOKED_PIZZA);
             scheduleInBankAction();
             if (!ok)
             {
@@ -830,6 +941,7 @@ public final class PizzaScript
             // recipe-option widget click needed (vs. the 4-option flour
             // + water dialog that PieDishScript navigates).
             status.set("craft: Make dialog open — Space");
+            sleepCookConfirmReaction();
             dispatcher.tapKey(java.awt.event.KeyEvent.VK_SPACE);
             skillmultiConfirmed = true;
             craftWaitMs         = now;
@@ -869,6 +981,7 @@ public final class PizzaScript
         }));
         if (dialogStillOpen)
         {
+            sleepCookConfirmReaction();
             dispatcher.tapKey(java.awt.event.KeyEvent.VK_SPACE);
         }
 
@@ -920,7 +1033,7 @@ public final class PizzaScript
             }
             status.set("bank: opening");
             bank.tryClickBankBoothRandom();
-            scheduleInBankAction();
+            scheduleOpenWait();
             bankOpenedAtMs = now;
             return;
         }
@@ -1043,90 +1156,221 @@ public final class PizzaScript
         }
     }
 
-    // ─── Walks ──────────────────────────────────────────────────────────
-    /** Generic recorded-trail walk tick.  Looks up the route lazily,
-     *  walks it, transitions on ARRIVED, aborts after WALKER_MAX_STUCK
-     *  consecutive STUCK / ERROR.  Mirrors
-     *  {@link CooksAssistantScript#tickRouteWalk}. */
-    private void tickWalk(State curState, String prefix, State onArrival) throws InterruptedException
+    // ─── Walks — two explicit modes ─────────────────────────────────────
+    // Each mode is a short stateless tick: arrived? → transition;
+    // wrong plane? → staircase leg; right plane? → in-plane walk to a
+    // varied tile in the destination area. The dispatcher picks
+    // canvas-vs-minimap from the tile distance and visibility — short
+    // walks inside the kitchen / bank stay on canvas, the long
+    // bank↔staircase haul falls through to minimap.
+    //
+    // No Navigator / TrailWalker — v2.1 had repeated trouble keeping
+    // the cursor on the staircase hull during camera follow (logged
+    // 2026-05-19). Two waypoints + one verb-click is simpler and more
+    // reliable than any smart planner second-guessing the same route.
+
+    /** Bank (plane=2) → kitchen range (plane=0).
+     *
+     *  <p>On p=2: descend the staircase (approach-walk + verb-click).
+     *
+     *  <p>On p=0: short walk into {@link #KITCHEN_AREA}. Camera-only
+     *  doesn't work here — the player lands ~7 tiles south of the
+     *  range, the model's projected hull sits below the world-view
+     *  area of the canvas (overlapping the side-panel UI), and the
+     *  cook tick's verify-click lands on UI instead of the model
+     *  (logged 2026-05-19 22:46 — bounds y≈1281, cursor over UI tabs,
+     *  menu='Cancel'). A 5-tile walk north puts the player inside the
+     *  kitchen with the range in the middle of the canvas. */
+    private void tickWalkToRange() throws InterruptedException
     {
-        Route route = routeFor(curState, prefix);
-        if (route == null) return;     // routeFor already aborted with a reason
-        TrailWalker.Status st = trailWalker.walkRoute(route);
-        status.set("walk[" + prefix + "]: " + st);
-        switch (st)
+        WorldPoint here = playerPos();
+        if (here == null) { status.set("→range: waiting for player"); return; }
+
+        if (areaContains(KITCHEN_AREA, here))
         {
-            case ARRIVED ->
-            {
-                walkerStuckCount = 0;
-                setState(onArrival);
-            }
-            case STUCK, ERROR ->
-            {
-                walkerStuckCount++;
-                log.info("pizza walk: stuck #{} on '{}'", walkerStuckCount, prefix);
-                if (walkerStuckCount > WALKER_MAX_STUCK)
-                    abortWith("walker stuck " + walkerStuckCount + "× on '" + prefix + "'");
-            }
-            default -> {}
+            log.info("pizza →range: ARRIVED at {} in kitchen", here);
+            walkerStuckCount = 0;
+            setState(State.COOK_AT_RANGE);
+            return;
         }
+        if (here.getPlane() != 0)
+        {
+            tickStaircase(here, STAIRCASE_DOWN_TILE, APPROACH_DOWN_TILES, "Bottom-floor");
+            return;
+        }
+        // On p=0 but not yet in kitchen — short walk via engine
+        // pathfinding (no walls between staircase landing and kitchen).
+        tickInPlaneWalk(KITCHEN_AREA, "→ kitchen");
     }
 
-    /** Lazy {@link Route} builder — globs trails from
-     *  {@link #trailRegistry} matching the prefix.  Aborts loudly if no
-     *  trail matches: the pizza loop can't run without recorded paths
-     *  for both legs, and silently spinning a broken walker is worse
-     *  than a clear "go record this trail" message. */
-    private Route routeFor(State curState, String prefix)
+    /** Kitchen range (plane=0) → bank (plane=2).
+     *
+     *  <p>On p=0: approach-walk to {@link #APPROACH_UP_TILES}, then
+     *  verb-click "Top-floor" on {@link #STAIRCASE_UP_TILE}. Same
+     *  shape as the descend leg — clicking from the kitchen (~8 tiles
+     *  away) produced unresolvable pixel loops because the staircase
+     *  tile failed to project, no matter how the camera was rotated.
+     *
+     *  <p>On p=2: walk to a bank booth in {@link #BANK_AREA}. */
+    private void tickWalkToBank() throws InterruptedException
     {
-        Route cached = routeCache.get(curState);
-        if (cached != null) return cached;
-        try
+        WorldPoint here = playerPos();
+        if (here == null) { status.set("→bank: waiting for player"); return; }
+
+        if (areaContains(BANK_AREA, here))
         {
-            // Trail goes through tight indoor spaces (Lumbridge castle
-            // kitchen, stairwells).  The reachability BFS that filters
-            // corridor picks accepts ANY reachable tile within the
-            // distance budget — including tiles that require routing
-            // OUT a door and back IN.  At radius=3 that lets picks
-            // land on (3204, y) which is reachable via the kitchen
-            // exit, and the bot visibly dances around the kitchen
-            // then steps outside before coming back.  Radius=1 keeps
-            // jitter to immediate neighbors of the centerline; the
-            // 9-tile pool is small but every tile is geometrically
-            // adjacent so no detour is possible.  Trade some variety
-            // for staying inside the building.  noRepeat=false matches
-            // — with only 9 picks, forcing a different one each trip
-            // tends to produce the same 2-3 tiles in rotation anyway.
-            Route.Builder b = Route.builder()
-                .corridorRadius(1)
-                .noRepeat(false);
-            int matched = 0;
-            for (net.runelite.client.plugins.recorder.trail.Trail t : trailRegistry.all())
-            {
-                if (t != null && t.name() != null && t.name().startsWith(prefix))
-                {
-                    b.trail(t);
-                    matched++;
-                }
-            }
-            if (matched == 0)
-            {
-                abortWith("no recorded trail starts with '" + prefix
-                    + "' — record one (save as " + prefix + ".json under "
-                    + "~/.runelite/recorder/trails/) and restart");
-                return null;
-            }
-            Route built = b.build();
-            routeCache.put(curState, built);
-            log.info("pizza: route '{}' loaded with {} trail(s) for state {} (corridorRadius=1, noRepeat=false)",
-                prefix, matched, curState);
-            return built;
+            log.info("pizza →bank: ARRIVED at {} in bank", here);
+            walkerStuckCount = 0;
+            setState(State.DECIDE);
+            return;
         }
-        catch (IllegalArgumentException e)
+        if (here.getPlane() == 0)
         {
-            abortWith("route '" + prefix + "' build failed: " + e.getMessage());
-            return null;
+            tickStaircase(here, STAIRCASE_UP_TILE, APPROACH_UP_TILES, "Top-floor");
+            return;
         }
+        // On p=2 — walk to a bank booth.
+        tickInPlaneWalk(BANK_AREA, "→ bank");
+    }
+
+    /** Shared staircase leg: approach via a varied tile in
+     *  {@code approachZone}, then dispatch the verb-click on
+     *  {@code stairTile}. Settle after click; skip re-dispatch while
+     *  the player is mid-step or busy. */
+    private void tickStaircase(WorldPoint here, WorldPoint stairTile,
+                                List<WorldPoint> approachTiles, String verb) throws InterruptedException
+    {
+        long now = System.currentTimeMillis();
+
+        if (now - lastTransportDispatchMs < TRANSPORT_SETTLE_MS)
+        {
+            status.set("walk: " + verb + " settle ("
+                + (now - lastTransportDispatchMs) + "ms)");
+            return;
+        }
+        if (dispatcher.isBusy()) { status.set("walk: dispatcher busy"); return; }
+
+        int dist = (here.getPlane() == stairTile.getPlane())
+            ? chebyshev(here, stairTile)
+            : Integer.MAX_VALUE;
+
+        if (dist > 2)
+        {
+            if (now - lastWalkDispatchMs < WALK_DISPATCH_PACE_MS)
+            {
+                status.set("walk: approach " + verb);
+                return;
+            }
+            if (!playerIsIdle())
+            {
+                status.set("walk: walking → " + verb);
+                return;
+            }
+            // Only pick tiles that put the player within chebyshev 2 of
+            // the stair tile — otherwise the dist>2 gate above kicks
+            // back in after arrival and we burn another walk-dispatch
+            // round trip. Observed 3-walk sequence 2026-05-20: 8-tile
+            // marker had only 3 close enough. The user's marker is the
+            // safe-walk zone (no hull-overlap); we further filter to
+            // the stair-clickable subset.
+            List<WorldPoint> reachable = approachTiles.stream()
+                .filter(t -> chebyshev(t, stairTile) <= 2)
+                .toList();
+            if (reachable.isEmpty()) reachable = approachTiles;
+            WorldPoint pick = randomTileIn(reachable);
+            log.info("pizza walk: approaching '{}' staircase → {}", verb, pick);
+            dispatchWalk(pick);
+            status.set("walk: → " + verb + " staircase " + pick);
+            return;
+        }
+
+        // Don't dispatch the verb-click while the player is still walking
+        // the last tile into the approach zone. dist≤2 holds during that
+        // walk-through, so the click would resolve a hull pixel against
+        // the camera's current frame, then by the time cursor flight
+        // (~200-500ms) lands, the camera has tracked the still-walking
+        // player and the staircase has shifted on screen. Symptom: cursor
+        // ends up on a 'Walk here' tile or an unrelated NPC. Same gate
+        // tickCookAtRange uses before the range click — 2026-05-20.
+        if (!playerIsIdle())
+        {
+            status.set("walk: arriving at " + verb);
+            return;
+        }
+
+        log.info("pizza walk: clicking '{}' on staircase tile {}", verb, stairTile);
+        dispatcher.dispatch(ActionRequest.builder()
+            .kind(ActionRequest.Kind.CLICK_GAME_OBJECT)
+            .channel(ActionRequest.Channel.MOUSE)
+            .tile(stairTile)
+            .verb(verb)
+            .ensureVisibleRotation(true)
+            .build());
+        lastTransportDispatchMs = now;
+        lastWalkDispatchMs      = 0L;
+        status.set("walk: clicked " + verb);
+    }
+
+    /** Same-plane walk leg: pick a fresh random tile inside the
+     *  destination area each dispatch. Throttled so we don't refresh
+     *  the click target every tick while the player is walking. */
+    private void tickInPlaneWalk(WorldArea destArea, String label) throws InterruptedException
+    {
+        long now = System.currentTimeMillis();
+        if (now - lastWalkDispatchMs < WALK_DISPATCH_PACE_MS)
+        {
+            status.set("walk: pacing " + label);
+            return;
+        }
+        if (dispatcher.isBusy()) { status.set("walk: dispatcher busy"); return; }
+        if (!playerIsIdle())
+        {
+            status.set("walk: walking " + label);
+            return;
+        }
+
+        WorldPoint target = randomTileIn(destArea);
+        dispatchWalk(target);
+        status.set("walk: " + label + " " + target);
+    }
+
+    /** Uniform random pick inside {@code area} (single-tile areas pick
+     *  themselves). Used by both the staircase approach and the
+     *  in-plane walks so neither ever clicks the exact same tile two
+     *  trips in a row. */
+    private static WorldPoint randomTileIn(WorldArea area)
+    {
+        int dx = ThreadLocalRandom.current().nextInt(Math.max(1, area.getWidth()));
+        int dy = ThreadLocalRandom.current().nextInt(Math.max(1, area.getHeight()));
+        return new WorldPoint(area.getX() + dx, area.getY() + dy, area.getPlane());
+    }
+
+    /** Uniform random pick from {@code tiles}. Used by the staircase
+     *  approach where the safe-walk zone is an irregular tile set marked
+     *  in-game (cannot be expressed as a single {@link WorldArea}). */
+    private static WorldPoint randomTileIn(List<WorldPoint> tiles)
+    {
+        return tiles.get(ThreadLocalRandom.current().nextInt(tiles.size()));
+    }
+
+    /** Chebyshev (king-move) distance, ignoring plane. */
+    private static int chebyshev(WorldPoint a, WorldPoint b)
+    {
+        return Math.max(Math.abs(a.getX() - b.getX()),
+                        Math.abs(a.getY() - b.getY()));
+    }
+
+    /** Walk-click dispatch + book-keep. Kind.WALK lets the dispatcher
+     *  prefer a canvas (tile) click when the target is visible and
+     *  walkable, falling through to minimap for off-canvas targets. */
+    private void dispatchWalk(WorldPoint target) throws InterruptedException
+    {
+        dispatcher.dispatch(ActionRequest.builder()
+            .kind(ActionRequest.Kind.WALK)
+            .channel(ActionRequest.Channel.MOUSE)
+            .tile(target)
+            .build());
+        lastWalkDispatchMs = System.currentTimeMillis();
     }
 
     // ─── COOK_AT_RANGE ──────────────────────────────────────────────────
@@ -1146,6 +1390,10 @@ public final class PizzaScript
         if (cook.isCookMenuOpen())
         {
             cookMenuConfirmAttempts++;
+            // Humanized reaction time before the Space tap — see
+            // {@link #sleepCookConfirmReaction}. Same window for the
+            // widget-click fallback.
+            sleepCookConfirmReaction();
             if (cookMenuConfirmAttempts <= COOK_MENU_FALLBACK_AFTER)
             {
                 status.set("cook: confirming Cook All (Space)");
@@ -1161,9 +1409,16 @@ public final class PizzaScript
         }
         cookMenuConfirmAttempts = 0;
 
-        // Track inventory change to detect stuck/no-progress.
+        // Track inventory change to detect stuck/no-progress AND to
+        // anchor the batch-settle gate. A real cook reduces rawLeft by 1
+        // every ~3-5 s; stamping lastRawDecreaseMs each time means we
+        // can tell "still cooking" apart from "animation gap, time to
+        // re-fire" without depending on the cook-pose pose-id (which
+        // briefly drops to idle between pieces).
         if (rawLeft != lastUncookedCount)
         {
+            if (lastUncookedCount >= 0 && rawLeft < lastUncookedCount)
+                lastRawDecreaseMs = now;
             lastUncookedCount     = rawLeft;
             lastInventoryChangeMs = now;
             cookStuckCount        = 0;
@@ -1236,9 +1491,15 @@ public final class PizzaScript
             return;
         }
 
-        if (lastCookActionMs > 0 && (now - lastCookActionMs) < COOK_BATCH_SETTLE_MS)
+        // Settle gate — block re-dispatch while the inventory is still
+        // showing recent cook progress. Anchoring on lastRawDecreaseMs
+        // (set when rawLeft drops) instead of lastCookActionMs (click
+        // time) means a 5+s batch keeps gating itself as long as raw
+        // count is dropping. CookingScriptV3 does the same.
+        if (lastRawDecreaseMs > 0 && (now - lastRawDecreaseMs) < COOK_BATCH_SETTLE_MS)
         {
-            status.set("cook: batch in progress (" + rawLeft + " raw, " + (now - lastCookActionMs) + "ms ago)");
+            status.set("cook: batch in progress (" + rawLeft + " raw, last cook "
+                + (now - lastRawDecreaseMs) + "ms ago)");
             return;
         }
 
@@ -1261,9 +1522,10 @@ public final class PizzaScript
             status.set("cook: dispatcher busy");
             return;
         }
-        if (lastCookActionMs > 0 && (now - lastCookActionMs) < COOK_PACE_MS)
+        if (lastCookActionMs > 0 && (now - lastCookActionMs) < cookPaceDelayMs)
         {
-            status.set("cook: pacing (" + (now - lastCookActionMs) + "ms)");
+            status.set("cook: pacing (" + (now - lastCookActionMs)
+                + "/" + cookPaceDelayMs + "ms)");
             return;
         }
 
@@ -1339,6 +1601,12 @@ public final class PizzaScript
             return;
         }
         lastCookActionMs = System.currentTimeMillis();
+        // Roll a fresh wait window before the next cook-tick decision.
+        // Per-click randomization means consecutive batches don't fire
+        // at a constant cadence.
+        cookPaceDelayMs = ThreadLocalRandom.current().nextLong(
+            COOK_PACE_MIN_MS, COOK_PACE_MAX_MS + 1);
+        log.info("pizza cook: dispatched — next gate in {}ms", cookPaceDelayMs);
     }
 
     // ─── Helpers ────────────────────────────────────────────────────────
@@ -1374,6 +1642,58 @@ public final class PizzaScript
         int newBurnt    = Math.max(0, burntInvNow - cookSnapshotBurntInv);
         plainMade.set(cookEntryPlainMade + newPlain);
         burntMade.set(cookEntryBurntMade + newBurnt);
+    }
+
+    /** Called from the top of {@link #tickLoop} when the game state
+     *  isn't LOGGED_IN. With creds wired by the panel, fire
+     *  {@link LoginAssistantV2#login}; otherwise just update the
+     *  status string and let the user log in manually. Throttled by
+     *  {@link #nextLoginAttemptAtMs} so a failing login doesn't
+     *  hammer the server. */
+    private void handleLoggedOut(GameState gs)
+    {
+        long now = System.currentTimeMillis();
+        if (loginAssistant == null || credsSupplier == null)
+        {
+            status.set("logged out (" + gs + ") — waiting for manual login");
+            return;
+        }
+        if (now < nextLoginAttemptAtMs)
+        {
+            long left = (nextLoginAttemptAtMs - now) / 1000L;
+            status.set("auto-login backoff (" + left + "s)");
+            return;
+        }
+        LoginCredentials creds;
+        try { creds = credsSupplier.get(); }
+        catch (Throwable th)
+        {
+            log.warn("pizza: creds supplier threw", th);
+            status.set("auto-login: no credentials available");
+            nextLoginAttemptAtMs = now + 10_000L;
+            return;
+        }
+        if (creds == null)
+        {
+            status.set("auto-login: no character selected");
+            nextLoginAttemptAtMs = now + 10_000L;
+            return;
+        }
+        status.set("auto-login: " + gs + " — attempting");
+        log.info("pizza: auto-login attempt (gameState={})", gs);
+        boolean ok = loginAssistant.login(creds, targetWorldId, status::set, jagexAccount);
+        if (ok)
+        {
+            log.info("pizza: auto-login success");
+            nextLoginAttemptAtMs = 0L;
+        }
+        else
+        {
+            log.warn("pizza: auto-login FAILED — backing off");
+            // 30 s backoff so repeated failures (world full, captcha,
+            // network blip) don't spam the login screen.
+            nextLoginAttemptAtMs = System.currentTimeMillis() + 30_000L;
+        }
     }
 
     private void safeDismissLevelUp()
@@ -1423,6 +1743,17 @@ public final class PizzaScript
         scheduleBankClick(BANK_IN_USE_MIN_MS, BANK_IN_USE_MAX_MS);
     }
 
+    /** Longer pacing after dispatching a booth-open click — waits for
+     *  the server to actually open the bank (≥ 2 ticks) before letting
+     *  the tick loop consider another click. Critical: the in-use pace
+     *  (220-520ms) can expire BEFORE the bank-open packet round-trips,
+     *  which dispatches a 2nd booth click on a now-open bank → closes
+     *  it → deposit aborts. */
+    private void scheduleOpenWait()
+    {
+        scheduleBankClick(BANK_OPEN_WAIT_MIN_MS, BANK_OPEN_WAIT_MAX_MS);
+    }
+
     /** Long humanized pacing — used once per trip, before the FIRST
      *  booth click after walking up to the bank. */
     private void schedulePreOpen()
@@ -1435,6 +1766,17 @@ public final class PizzaScript
     {
         return ThreadLocalRandom.current().nextLong(
             BANK_CLOSE_VERIFY_MIN_MS, BANK_CLOSE_VERIFY_MAX_MS + 1);
+    }
+
+    /** Humanized reaction delay before pressing Space on a Skillmulti /
+     *  Cook-All dialog. Each call rolls a fresh value in
+     *  [COOK_CONFIRM_MIN_MS, COOK_CONFIRM_MAX_MS] so the dispatch
+     *  cadence never repeats. */
+    private void sleepCookConfirmReaction() throws InterruptedException
+    {
+        long d = ThreadLocalRandom.current().nextLong(
+            COOK_CONFIRM_MIN_MS, COOK_CONFIRM_MAX_MS + 1);
+        SequenceSleep.sleep(client, d);
     }
 
     private boolean ensureInventoryTabOpen() throws InterruptedException
@@ -1548,6 +1890,10 @@ public final class PizzaScript
         // gate will schedulePreOpen() before the first booth click.
         nextBankClickAtMs   = 0L;
         lastCookActionMs    = 0L;
+        cookPaceDelayMs     = 0L;
+        lastRawDecreaseMs   = 0L;
+        lastWalkDispatchMs  = 0L;
+        lastTransportDispatchMs = 0L;
         lastInventoryChangeMs = 0L;
         bankOpenedAtMs      = 0L;
         bankFailures        = 0;
@@ -1565,9 +1911,6 @@ public final class PizzaScript
         // the live plain/burnt counter against the fresh inv state.
         cookSnapshotPlainInv = -1;
         cookSnapshotBurntInv = -1;
-        // trailWalker.reset() drops its currentPath; the next walkRoute
-        // call rebuilds activeRoutePath from a fresh weighted pick.
-        trailWalker.reset();
     }
 
     private void abortWith(String reason)
