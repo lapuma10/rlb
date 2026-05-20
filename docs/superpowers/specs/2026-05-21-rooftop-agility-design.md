@@ -1,6 +1,6 @@
 # Rooftop Agility Script — v1 Design
 
-**Status:** approved 2026-05-21. Implementation pending plan.
+**Status:** design ready 2026-05-21. Pending Draynor tile/object capture before implementation.
 **Scope:** Draynor Rooftop only. Single-course operation. Manual user-driven
 course selection. Stop at configurable target level. Pick up marks of grace
 on the current rooftop only. Eat food if HP drops, else stop.
@@ -85,9 +85,10 @@ static final class RooftopCourse {
     final String          label;
     final int             levelReq;
 
-    final Set<WorldPoint>           startTiles;     // recovery destinations
+    final Set<WorldPoint>           startTiles;     // recovery destinations; ⊆ node[0].stageTiles
     final Set<WorldPoint>           validTiles;     // every tile that is "on route"
     final Set<WorldPoint>           fallTiles;      // street-level landing tiles after a failure
+    final Set<WorldPoint>           lapEndTiles;    // where the final obstacle lands the player
     final List<RooftopNode>         nodes;          // ordered: first obstacle → last obstacle
     final Map<WorldPoint, Integer>  stageByTile;    // built from nodes; player tile → stage index
 }
@@ -96,8 +97,9 @@ static final class RooftopNode {
     final String              label;                // "Rough wall", "Tightrope", ...
     final int                 objectId;
     final String              action;               // verb on right-click, e.g. "Climb"
+    final Set<WorldPoint>     objectTiles;          // exact tile(s) of the obstacle object — disambiguates repeats
     final Set<WorldPoint>     stageTiles;           // player ∈ these → we are at this stage
-    final Set<WorldPoint>     successTiles;         // optional; empty → next node's stageTiles
+    final Set<WorldPoint>     successTiles;         // optional; empty → next node's stageTiles / lapEndTiles
     final Set<WorldPoint>     reachableMarkTiles;   // marks pickable from this stage
     final long                timeoutMs;            // per-node, longer for tightropes
 }
@@ -129,9 +131,34 @@ Set<WorldPoint> expectedSuccessTiles(int stage) {
     RooftopNode n = course.nodes.get(stage);
     if (!n.successTiles.isEmpty()) return n.successTiles;
     if (stage + 1 < course.nodes.size()) return course.nodes.get(stage + 1).stageTiles;
-    return course.startTiles;   // lap wrap
+    return course.lapEndTiles;  // final obstacle landed the player at lap end
 }
 ```
+
+## 6a. Course construction validation
+
+Course profiles are hand-pasted tile data; one typo can produce confusing
+runtime behavior. `validateCourse(course)` runs once during course
+construction (in the static initializer) and throws
+`IllegalStateException` with a precise message on any of:
+
+- `nodes.isEmpty()`.
+- Any node with `objectId <= 0`, blank `action`, or empty `stageTiles`,
+  `objectTiles`.
+- `startTiles.isEmpty()` or `lapEndTiles.isEmpty()`.
+- A `startTile` that is **not** in `nodes.get(0).stageTiles` — recovery
+  must land us where the script will click the first obstacle. (We don't
+  introduce a separate `recoveryTiles` field; we enforce the simpler
+  invariant.)
+- Any `reachableMarkTiles` entry that is not in `validTiles`.
+- Any tile that appears in **two different** node `stageTiles` (built via
+  `stageByTile.put(t, i) != null` returning a different stage). Duplicate
+  stage tiles silently break stage detection — fail loud at startup.
+- Any `successTiles` entry that is also in the **same** node's
+  `stageTiles` (would prevent timeout from clearing).
+
+The script refuses to start if validation throws — the panel surfaces the
+exception message as `status`.
 
 ## 7. Click throttling
 
@@ -162,15 +189,14 @@ Pseudocode of `onTick`, in execution order:
 ```
 if (!running)                          return
 
-maybeEnableRun()                       # fire-and-forget; independent of throttle
+if (handleTargetLevel())               return   # cheap; reads varbit, no dispatch
+if (dispatcher.isBusy())               return   # gate ALL dispatch-enqueueing branches below
+if (handleBlockingDialog())            return   # Escape stuck menus; only if dispatcher free
+if (handleLowHp())                     return   # eat or stop; respects throttle internally
 
-if (now < nextActionAt)                return
+if (maybeEnableRun())                  return   # at most ONE ActionRequest per tick; returns true if it enqueued
+if (now < nextActionAt)                return   # throttle gate; everything below dispatches
 
-if (handleBlockingDialog())            return   # Escape stuck menus, close stray dialogs
-if (handleLowHp())                     return   # eat or stop
-if (handleTargetLevel())               return   # stop if realAgilityLevel >= targetLevel
-
-if (dispatcher.isBusy())               return
 if (isPlayerBusy())                    return   # pose != idle, moving, animating
 
 if (state == PICKING_MARK):
@@ -179,29 +205,34 @@ if (state == PICKING_MARK):
 
 if (handleObstacleTimeout())           return   # may walk to recovery; sets nextActionAt
 if (handleFallOrInvalidPosition())     return   # may walk to recovery; sets nextActionAt
+if (handleUnmappedValidTile())         return   # valid tile, no stage match — waits or stops
 
 if (tryPickupReachableMark())          return   # sets PICKING_MARK + nextActionAt
 
 int stage = detectCurrentStage()
-if (stage == UNKNOWN):                          # on a validTile but no stage match
-    status = "Waiting for known stage"
-    nextActionAt = now + 600
-    return
-
-clickObstacle(course.nodes.get(stage))          # sets lastClicked* + nextActionAt
+clickObstacle(stage, course.nodes.get(stage))   # sets lastClicked* + nextActionAt
 ```
 
-Three things to note:
+Five things to note:
 
-1. `maybeEnableRun` runs **before** the `nextActionAt` gate because it's an
-   independent fire-and-forget that doesn't conflict with throttling.
-2. `handleObstacleTimeout` is a first-class step in the loop, before fall
-   detection — a stuck obstacle is the most common failure mode and must be
-   resolved before classifying the player's tile.
-3. The three-way classification in `handleFallOrInvalidPosition` (fall tile
-   vs outside-route vs valid-but-no-stage) means a player on a valid rooftop
-   that we forgot to mark as a stage tile waits one tick rather than
-   triggering a panicked recovery walk.
+1. **One `ActionRequest` per tick.** `maybeEnableRun` returns `true` if it
+   enqueued a run-toggle, and the function returns immediately — no other
+   branch dispatches in the same tick. The same `return-on-dispatch`
+   discipline holds for every other branch.
+2. **`dispatcher.isBusy()` gates everything that dispatches.** It comes
+   *before* `handleBlockingDialog` because dialog Escapes are dispatched
+   too. `handleTargetLevel` is the only check above it because it does no
+   dispatch (just `stop()`).
+3. **`handleObstacleTimeout` runs before fall detection** — a stuck
+   obstacle is the most common failure mode and must be resolved before
+   classifying the player's tile.
+4. **`handleUnmappedValidTile`** (new) — separates the "we forgot to mark
+   this tile" case from the "fell" case. Waits one tick; if the same
+   unmapped tile persists for more than 8 seconds, the script stops with
+   the exact coordinates so we can extend the stage tile lists.
+5. **`detectCurrentStage` is safe to call without an `UNKNOWN` guard at
+   the bottom** because `handleFallOrInvalidPosition` and
+   `handleUnmappedValidTile` have already handled every non-stage case.
 
 ## 9. Stage detection
 
@@ -245,17 +276,67 @@ targeting the closest tile in `course.startTiles`. The dispatcher's normal
 pipeline handles tile-click → minimap-fallback if the direct click resolves
 to a different verb (per CLAUDE.md §"Dispatcher quirks").
 
-## 11. Obstacle click & timeout
+### 10a. Unmapped-valid-tile handler
 
-`clickObstacle(node)` enqueues a `GAME_OBJECT_CLICK` request (verb =
-`node.action`, object id matched against the loaded scene at click time),
-records:
+Carved out of the fall/invalid handler so a tile we forgot to mark doesn't
+silently freeze the script.
 
 ```java
-lastClickedNode      = node;
-lastClickedStage     = stage;
-lastObstacleClickAt  = now;
-nextActionAt         = now + randomBetween(600, 1200);
+WorldPoint unknownStageTile;        // last tile that returned UNKNOWN-on-valid
+long       unknownStageSince;
+
+private boolean handleUnmappedValidTile() {
+    WorldPoint p = playerLocation();
+    if (course.stageByTile.containsKey(p)) {
+        unknownStageTile = null;     // reset
+        return false;                // detectCurrentStage will resolve it normally
+    }
+
+    // We're on a validTile (fall/invalid was handled before us) but no stage match.
+    if (!p.equals(unknownStageTile)) {
+        unknownStageTile  = p;
+        unknownStageSince = now;
+    }
+
+    if (now - unknownStageSince > 8_000) {
+        stop("Unmapped valid course tile: " + p);
+        return true;
+    }
+
+    status       = "Waiting for known stage (at " + p + ")";
+    nextActionAt = now + 600;
+    return true;
+}
+```
+
+The stop message includes the exact tile coords so adding it to the course
+data is a single paste.
+
+## 11. Obstacle click & timeout
+
+`clickObstacle(stage, node)` enqueues a `GAME_OBJECT_CLICK` request and
+records the click. The scene-object selection is constrained to **both**
+`objectId` and `objectTiles` so repeated obstacle types (Draynor has two
+tightropes) cannot be confused:
+
+```java
+private void clickObstacle(int stage, RooftopNode node) {
+    GameObject target = sceneObjectsByTile(node.objectTiles).stream()
+        .filter(o -> o.getId() == node.objectId)
+        .findFirst()
+        .orElse(null);
+    if (target == null) {
+        status = "Obstacle not on scene: " + node.label;
+        nextActionAt = now + 600;
+        return;
+    }
+    dispatcher.enqueueGameObjectClick(target, node.action);
+
+    lastClickedNode      = node;
+    lastClickedStage     = stage;
+    lastObstacleClickAt  = now;
+    nextActionAt         = now + randomBetween(600, 1200);
+}
 ```
 
 Timeout check runs **before** fall detection:
@@ -326,7 +407,7 @@ of the tick loop. Three exit conditions, any of which clears the state back
 to `RUNNING`:
 
 1. The mark tile no longer has a `MARK_OF_GRACE` ground item — pickup
-   succeeded (or someone else got it).
+   succeeded, the mark despawned, or scene state changed.
 2. `inventoryCount(MARK_OF_GRACE) > markCountBefore` — explicit confirm.
 3. `now - markClickAt > 6_000` — timeout; we'll resync naturally on the
    next tick via stage detection.
@@ -356,18 +437,28 @@ item with the `"Eat"` menu action; on first hit, enqueues an
 `INV_SLOT_CLICK` `ActionRequest` with verb `"Eat"` and returns true. No
 food preference, no priority — first edible item wins.
 
-Run energy:
+Run energy. Returns `true` if it enqueued a toggle; the tick loop returns
+immediately on `true` so no second `ActionRequest` is enqueued in the same
+tick. A small post-toggle throttle prevents repeated toggles if the first
+request is ignored.
 
 ```java
-private void maybeEnableRun() {
-    if (isRunEnabled()) return;
-    if (client.getEnergy() / 100 < runOnAtLeast) return;   // randomized each time it drops
+long nextRunToggleAt;          // earliest time we may attempt another run-toggle
+
+private boolean maybeEnableRun() {
+    if (isRunEnabled())                            return false;
+    if (now < nextRunToggleAt)                     return false;
+    if (client.getEnergy() / 100 < runOnAtLeast)   return false;
+
     dispatcher.enqueueRunToggle();
+    nextRunToggleAt = now + 2_000;
+    return true;
 }
 ```
 
 `runOnAtLeast` is reseeded to a fresh `randomBetween(20, 40)` each time the
-script toggles run off.
+script observes run off (i.e. it's re-rolled on the falling edge of
+`isRunEnabled`).
 
 ## 14. Target level stop
 
@@ -389,9 +480,18 @@ int  lapsCompleted;
 long lastLapCompletedAt;
 ```
 
-Incremented when `expectedSuccessTiles(stage)` for the **final** node's
-`stage` is observed and `lastClickedNode == final node`. Used only for
-status display and debugging.
+Incremented when:
+
+```java
+lastClickedNode == course.nodes.get(course.nodes.size() - 1)
+&& course.lapEndTiles.contains(playerLocation())
+```
+
+i.e. we clicked the final obstacle and the player has landed on a
+`lapEndTile`. Hooked into `handleObstacleTimeout`'s success branch and
+into the regular post-success clear in `clickObstacle` flow — wherever
+`clearLastObstacle()` is about to run, we first check the lap-end
+condition. Used only for status display and debugging.
 
 ## 16. Panel UI
 
@@ -402,7 +502,7 @@ Added to `RecorderPanel`, same layout style as the fletching section:
 Course:           [ Draynor ▾ ]      // v1: only DRAYNOR in dropdown
 Target level:     [ 20  ]            // stop when real Agility level ≥ target
 Pick up marks:    [✓]
-Eat below HP:     [ 8  ]
+Eat below HP:     [ 8  ]              // eats first inventory item with an "Eat" action
 [ Start ] [ Stop ]
 
 Status: Running — stage 3/7 (Tightrope) — 12 laps — 4 marks
@@ -410,11 +510,13 @@ Status: Running — stage 3/7 (Tightrope) — 12 laps — 4 marks
 
 Pre-flight validation in `Start`:
 
-1. Course selected (only `DRAYNOR` available in v1).
-2. `targetLevel > client.getRealSkillLevel(Skill.AGILITY)`.
-3. Player tile ∈ `validTiles ∪ startTiles ∪ fallTiles` (anywhere we can
-   recover from).
-4. `client.getGameState() == LOGGED_IN`.
+1. Course profile passes `validateCourse(course)` (already enforced at
+   construction; surfaced again here so a profile reload would catch it).
+2. Course selected (only `DRAYNOR` available in v1).
+3. `targetLevel > client.getRealSkillLevel(Skill.AGILITY)`.
+4. Player tile ∈ `validTiles ∪ startTiles ∪ fallTiles ∪ lapEndTiles`
+   (anywhere we can recover from).
+5. `client.getGameState() == LOGGED_IN`.
 
 If validation fails, the panel sets `status` to the reason and refuses to
 start. No exception thrown.
@@ -424,19 +526,28 @@ start. No exception thrown.
 To populate Draynor's tile sets, you (the user) use the existing
 tile-marker workflow:
 
-1. Mark every player tile that constitutes stage 1 (where you stand before
-   clicking the first obstacle). Right-click → "Mark group" → name
-   `draynor.stage.0`. Repeat for stages 1..6.
-2. Mark every street-level tile the player can land on after a failed
-   obstacle. Name group `draynor.fall`.
-3. Mark every tile that's "on the rooftop route" (catch-all for valid
-   non-fall positions including landing tiles between obstacles). Name
-   group `draynor.valid`.
-4. Mark every tile the player can stand on at the lap-start spot. Name
-   group `draynor.start`.
-5. For each obstacle, walk a couple of laps, note where marks of grace
-   spawn that you'd actually pick up from that stage, mark those tiles.
-   Name group `draynor.marks.0`..`draynor.marks.6`.
+1. **Stage tiles** — Mark every player tile that constitutes stage 0
+   (where you stand before clicking the first obstacle). Right-click →
+   "Mark group" → name `draynor.stage.0`. Repeat for stages 1..6.
+2. **Object tiles** — Stand off the obstacle, use the click-inspector to
+   read each obstacle's world tile, mark it. Name group
+   `draynor.object.0`..`draynor.object.6`. This is what disambiguates the
+   two tightropes.
+3. **Fall tiles** — Mark every street-level tile the player can land on
+   after a failed obstacle. Name group `draynor.fall`.
+4. **Valid tiles** — Mark every tile that's "on the rooftop route"
+   (catch-all for valid non-fall positions including landing tiles
+   between obstacles). Name group `draynor.valid`. Must be a superset
+   of every `stage.N` group.
+5. **Start tiles** — Mark every tile the player can stand on at the
+   lap-start spot. Name group `draynor.start`. Must be a subset of
+   `draynor.stage.0` (enforced by `validateCourse`).
+6. **Lap-end tiles** — After the final crate, mark where the player
+   lands. Name group `draynor.lapend`.
+7. **Reachable mark tiles** — For each obstacle, walk a couple of laps,
+   note where marks of grace spawn that you'd pick up from that stage,
+   mark those tiles. Name group `draynor.marks.0`..`draynor.marks.6`.
+   Every entry must be in `draynor.valid` (enforced).
 
 Export the tile-marker JSON; the user pastes the coords into a
 `tiles(int... xyp)` call per group inside `RooftopAgilityScript`. No new
@@ -482,9 +593,10 @@ What we expect to go wrong and how the script handles it:
 | Obstacle click landed but action failed (rare) | `lastObstacleClickAt + timeoutMs` exceeded, player not on success tiles | recover to start |
 | Player fell | tile ∈ `fallTiles` | recover to start |
 | Player walked off route manually | tile ∉ `validTiles` | recover to start |
-| Player tile on rooftop we forgot to mark | tile ∈ `validTiles` but ∉ `stageByTile` | wait one tick; user reports → we extend the stage tile lists |
+| Player tile on rooftop we forgot to mark | tile ∈ `validTiles` but ∉ `stageByTile` | `handleUnmappedValidTile`: wait up to 8s, then stop with the exact tile coords for paste-back |
 | Mark of grace on unreachable rooftop | plane mismatch or not in `reachableMarkTiles` | ignored |
-| Mark of grace picked up by another player | mark tile empty + inv count unchanged + 6s timeout | exit `PICKING_MARK`, normal flow |
+| Mark of grace disappeared during pickup | mark tile empty + inv count unchanged + 6s timeout | exit `PICKING_MARK`, normal flow (despawn, scene change, or pickup failed) |
+| Course profile typo (duplicate stage tile, etc.) | `validateCourse` throws at construction | script refuses to start; panel shows the exception message |
 | Low HP with food | `currentHp ≤ eatAtHp` and inv has edible | eat |
 | Low HP without food | `currentHp ≤ eatAtHp` and no edible | stop with explicit reason |
 | Stuck right-click menu | `handleBlockingDialog` at top of tick | `tapKey(VK_ESCAPE)` via dispatcher |
@@ -506,6 +618,10 @@ pass criterion. Failure halts the test plan; we fix and rerun.
 10. **Target level reached** — set target to current level + 1, gain a level. Pass: bot stops with `"Target level reached"`.
 11. **Click throttle** — eyeball during one lap. Pass: no obstacle re-clicked within 600 ms.
 12. **Stuck menu** — open a right-click menu manually, press Start. Pass: `handleBlockingDialog` Escapes the menu before the first obstacle click.
+13. **Unmapped valid tile** — manually walk to a `validTiles` tile that is not in any `stageByTile`. Pass: bot waits up to 8 s, then stops with `"Unmapped valid course tile: <x,y,p>"` matching the player's tile.
+14. **Course validation** — temporarily duplicate a tile across two stage groups in the course profile, attempt Start. Pass: panel shows the `IllegalStateException` message; script does not start.
+15. **Repeated-obstacle disambiguation** — stand between the two tightropes (both share `objectId` and verb). Pass: bot picks the obstacle whose tile matches the current stage's `objectTiles`, not the wrong one.
+16. **One ActionRequest per tick** — instrument the dispatcher (or eyeball logs) during a lap with run disabled. Pass: never two enqueues from `RooftopAgilityScript` in the same tick.
 
 ## 22. Out of scope (named explicitly to prevent scope creep)
 
