@@ -102,6 +102,12 @@ public final class RooftopAgilityScript
     private WorldPoint unknownStageTile;
     private long       unknownStageSince;
 
+    // ─── Lap-end residency bookkeeping ───────────────────────────────────────────
+    // If the player is on a lapEndTile we keep walking back to start, but cap
+    // the time spent there so a stuck walker doesn't loop forever.
+    private WorldPoint lapEndTileSeen;
+    private long       lapEndSince;
+
     // ─── Lap tracking ────────────────────────────────────────────────────────────
     private int  lapsCompleted;
     private long lastLapCompletedAt;
@@ -212,6 +218,8 @@ public final class RooftopAgilityScript
         this.markCountBefore      = 0;
         this.unknownStageTile     = null;
         this.unknownStageSince    = 0L;
+        this.lapEndTileSeen       = null;
+        this.lapEndSince          = 0L;
         this.lapsCompleted        = 0;
         this.lastLapCompletedAt   = 0L;
         this.marksPicked          = 0;
@@ -506,12 +514,18 @@ public final class RooftopAgilityScript
         boolean finalNodeClicked =
             lastClickedNode == course.nodes.get(course.nodes.size() - 1);
 
-        // Lap completion: final obstacle clicked + player landed on lapEndTiles.
+        // Lap completion (backstop, timeout path): final obstacle clicked +
+        // player landed on lapEndTiles but the player hasn't been observed
+        // on lapEnd until timeoutMs elapsed (rare — e.g. lagged frame).
+        // Normally handleLapEnd counts the lap first. Either way, clearing
+        // lastClickedNode here means handleLapEnd's check below skips its
+        // own increment on this tick → single count guaranteed.
         if (finalNodeClicked && course.lapEndTiles.contains(here))
         {
             lapsCompleted++;
             lastLapCompletedAt = now;
-            log.info("[rooftop-agility] lap {} complete (landed at {})", lapsCompleted, here);
+            log.info("[rooftop-agility] lap {} complete via timeout backstop (landed at {})",
+                lapsCompleted, here);
             clearLastObstacle();
             return false;
         }
@@ -577,11 +591,21 @@ public final class RooftopAgilityScript
         Player p = client.getLocalPlayer();
         if (p == null) return false;
         WorldPoint here = p.getWorldLocation();
-        if (!course.lapEndTiles.contains(here)) return false;
+        if (!course.lapEndTiles.contains(here))
+        {
+            lapEndTileSeen = null;     // reset residency counter
+            return false;
+        }
 
         // Lap completion — count it once, immediately on landing. Spec §15:
         // every clear-on-success must check lap-end first; this is the
         // single non-timeout success path.
+        //
+        // Dual-increment invariant: handleObstacleTimeout's final-node branch
+        // also increments lapsCompleted, but only after calling
+        // clearLastObstacle(). When that branch fires first (timeout path),
+        // it nulls lastClickedNode, so handleLapEnd's `finalNodeClicked`
+        // check below evaluates false on the same tick — no double-count.
         boolean finalNodeClicked = lastClickedNode != null
             && lastClickedNode == course.nodes.get(course.nodes.size() - 1);
         if (finalNodeClicked)
@@ -590,6 +614,26 @@ public final class RooftopAgilityScript
             lastLapCompletedAt = now;
             log.info("[rooftop-agility] lap {} complete (landed at {})", lapsCompleted, here);
             clearLastObstacle();
+        }
+
+        // Track residency. If we've been on this lapEnd tile (or any lapEnd
+        // tile) for more than 8s, the walk-to-start is failing — stop with
+        // a diagnostic instead of looping forever. Covers the cold-start
+        // case (operator presses Start while standing on lapEnd) and the
+        // pathfinder-fails case.
+        if (lapEndTileSeen == null)
+        {
+            lapEndTileSeen = here;
+            lapEndSince    = now;
+        }
+        if (now - lapEndSince > UNMAPPED_TILE_TIMEOUT_MS)
+        {
+            status.set("Stuck on lapEndTile " + here + " — walk-to-start failing");
+            log.warn("[rooftop-agility] stranded on lapEndTile {} for >{} ms — stopping",
+                here, UNMAPPED_TILE_TIMEOUT_MS);
+            running.set(false);
+            state.set(State.IDLE);
+            return true;
         }
 
         // Player still on lap-end tile (just landed, or hasn't walked off yet)
