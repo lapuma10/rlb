@@ -1,25 +1,32 @@
 # Fletching Script Design
 
-**Date:** 2026-05-20
-**Branch:** v21-trail-guided-nav (feature branch to be cut from master)
+**Date:** 2026-05-20  
+**Revised:** 2026-05-20 (post-review pass)
 
 ---
 
 ## Goal
 
-A bank-standing fletching script covering the full 1–99 grind: cutting logs into bows/shafts/stocks
-and stringing unstrung bows, with optional auto-advance on level-up and scheduled AFK breaks.
+A bank-standing fletching script covering the main 1–99 grind: cutting logs into bows/shafts
+and stringing unstrung bows, with scheduled AFK breaks.
 
 ---
 
-## Scope
+## V1 Scope
 
-- Modes: **Fletch** (knife+logs → output), **String** (bowstring+unstrung → strung bow), **Cut+String** (both phases in loop)
-- All common log types: normal, oak, willow, teak, maple, mahogany, yew, magic (redwood TBD)
+**Included:**
+
+- Modes: Fletch, String, Cut+String
+- Items: arrow shafts + shortbow/longbow for normal, oak, willow, maple, yew, magic logs
 - Nearest bank — no location picker, no walking
-- Auto-advance checkbox (off by default)
 - Break scheduler (on by default), same `BreakScheduler`/`BreakConfig` as PizzaScript
 - One file: `scripts/FletchingScript.java` — inline everything, no new subpackage
+
+**Deferred to v2:**
+
+- Auto-advance on level-up (present in UI but not implemented — adds edge cases; ship core loop first)
+- Stocks, shields, teak, mahogany, redwood (unverified key mappings; wrong key = silent wrong item)
+- Javelin shafts, crossbow stocks (unverified; also not main training items)
 
 ---
 
@@ -27,120 +34,117 @@ and stringing unstrung bows, with optional auto-advance on level-up and schedule
 
 | Path | Action |
 |---|---|
-| `recorder/scripts/FletchingScript.java` | New — FSM, item catalog, interaction logic |
+| `recorder/scripts/FletchingScript.java` | New |
 | `recorder/RecorderPanel.java` | Wire UI controls |
-| `recorder/RecorderPlugin.java` | Instantiate + register script |
+| `recorder/RecorderPlugin.java` | Instantiate + register |
 
 ---
 
 ## Item Catalog (inner enum `FletchItem`)
 
-Each entry stores:
-- `logId` — ItemID of the input log (for FLETCH mode)
-- `unstrungId` — ItemID of the unstrung bow (for STRING mode; also the output of FLETCH for bows)
-- `strungId` — ItemID of the strung bow (for STRING mode output; -1 for non-bow items)
-- `levelReq` — fletching level required
-- `fletchKey` — `KeyEvent.VK_*` pressed after skillmulti opens in FLETCH mode (`VK_SPACE` for default item)
-- `stackable` — true for arrow shafts, javelin shafts (affects batch size math)
-- `canString` — true if a bowstring can be applied (false for shafts/stocks/shields)
-- `label` — display name for the panel dropdown
+### Fields
 
-### Normal logs (knife+logs skillmulti — 5 options)
+```java
+final int    logId;           // ItemID of input log (-1 for STRING-only entries)
+final int    unstrungId;      // ItemID of unstrung bow output (-1 for shafts/stocks/shields)
+final int    strungId;        // ItemID of strung bow (-1 for non-stringable items)
+final int    levelReq;        // fletching level required
+final int    fletchKey;       // KeyEvent.VK_* pressed after skillmulti opens (VK_SPACE = default)
+final int    logsPerAction;   // 1 normally, 2 for shields
+final int    outputPerLog;    // 1 for bows/stocks, 15/30/45/etc for shafts
+final double xp;              // XP per action (for panel display)
+final boolean canString;      // true if a bowstring can be applied
+final boolean verified;       // false = hidden unless dev checkbox is on
+final String label;           // panel dropdown text
+```
 
-| Option | Item | Level | Key | Stackable | Can string |
-|---|---|---|---|---|---|
-| 1 | Arrow shafts | 1 | `VK_1` | yes (15/log) | no |
-| 2 | Javelin shafts | 3 | `VK_2` | yes (15/log) | no |
-| 3 | Shortbow (u) | 5 | `VK_SPACE` | no | yes |
-| 4 | Longbow (u) | 10 | `VK_4` | no | yes |
-| 5 | Crossbow stock | 9 | `VK_5` | no | no |
+`logWithdrawCount()` helper on the enum:
 
-### Oak logs (5 options)
+```java
+int logWithdrawCount() {
+    return logsPerAction == 2 ? 26 : 27;
+}
+```
 
-| Slot | Key | Item | Level | XP | Stackable | Item ID | Can string |
+Banking uses `bank.tryWithdrawX(item.logId, item.logWithdrawCount())` — never `tryWithdrawAll`.
+
+### V1 items (verified = true)
+
+#### Normal logs
+
+| Enum | Item | Level | Key | logsPerAction | outputPerLog | XP | canString |
 |---|---|---|---|---|---|---|---|
-| 1 | `VK_1` | Arrow shafts | 15 | 10 | yes (30/log) | 52 | no |
-| 2 | `VK_2` | Oak shortbow (u) | 20 | 16.5 | no | 54 | yes |
-| 3 | `VK_SPACE` | Oak longbow (u) | 25 | 25 | no | 56 | yes |
-| 4 | `VK_4` | Oak shield | 27 | 50 | no | 22251 | no — needs **2 logs** |
-| 5 | `VK_5` | Oak stock | 24 | 16 | no | 9442 | no |
+| `ARROW_SHAFTS` | Arrow shafts | 1 | `VK_1` | 1 | 15 | 5 | false |
+| `SHORTBOW_U` | Shortbow (u) | 5 | `VK_SPACE` | 1 | 1 | 5 | true |
+| `LONGBOW_U` | Longbow (u) | 10 | `VK_4` | 1 | 1 | 10 | true |
 
-### Willow logs (5 options)
+#### Oak logs
 
-| Slot | Key | Item | Level | XP | Stackable | Item ID | Can string |
+| Enum | Item | Level | Key | logsPerAction | outputPerLog | XP | canString |
 |---|---|---|---|---|---|---|---|
-| 1 | `VK_1` | Arrow shafts | 30 | 15 | yes (45/log) | 52 | no |
-| 2 | `VK_2` | Willow shortbow (u) | 35 | 33.3 | no | 60 | yes |
-| 3 | `VK_SPACE` | Willow longbow (u) | 40 | 41.5 | no | 58 | yes |
-| 4 | `VK_4` | Willow stock | 39 | 22 | no | 9444 | no |
-| 5 | `VK_5` | Willow shield | 42 | 83 | no | 22254 | no — needs **2 logs** |
+| `OAK_ARROW_SHAFTS` | Oak arrow shafts | 15 | `VK_1` | 1 | 30 | 10 | false |
+| `OAK_SHORTBOW_U` | Oak shortbow (u) | 20 | `VK_2` | 1 | 1 | 16.5 | true |
+| `OAK_LONGBOW_U` | Oak longbow (u) | 25 | `VK_SPACE` | 1 | 1 | 25 | true |
 
-### Teak logs (1 option — single-item dialog)
+#### Willow logs
 
-| Slot | Key | Item | Level | XP | Stackable | Item ID | Can string |
+| Enum | Item | Level | Key | logsPerAction | outputPerLog | XP | canString |
 |---|---|---|---|---|---|---|---|
-| 1 | `VK_SPACE` | Teak stock | 46 | 27 | no | 9446 | no |
+| `WILLOW_ARROW_SHAFTS` | Willow arrow shafts | 30 | `VK_1` | 1 | 45 | 15 | false |
+| `WILLOW_SHORTBOW_U` | Willow shortbow (u) | 35 | `VK_2` | 1 | 1 | 33.3 | true |
+| `WILLOW_LONGBOW_U` | Willow longbow (u) | 40 | `VK_SPACE` | 1 | 1 | 41.5 | true |
 
-### Maple logs (5 options)
+#### Maple logs
 
-| Slot | Key | Item | Level | XP | Stackable | Item ID | Can string |
+| Enum | Item | Level | Key | logsPerAction | outputPerLog | XP | canString |
 |---|---|---|---|---|---|---|---|
-| 1 | `VK_1` | Arrow shafts | 45 | 20 | yes (60/log) | 52 | no |
-| 2 | `VK_2` | Maple shortbow (u) | 50 | 50 | no | 64 | yes |
-| 3 | `VK_SPACE` | Maple longbow (u) | 55 | 58.3 | no | 62 | yes |
-| 4 | `VK_4` | Maple stock | 54 | 32 | no | 9448 | no |
-| 5 | `VK_5` | Maple shield | 57 | 116.5 | no | 22257 | no — needs **2 logs** |
+| `MAPLE_ARROW_SHAFTS` | Maple arrow shafts | 45 | `VK_1` | 1 | 60 | 20 | false |
+| `MAPLE_SHORTBOW_U` | Maple shortbow (u) | 50 | `VK_2` | 1 | 1 | 50 | true |
+| `MAPLE_LONGBOW_U` | Maple longbow (u) | 55 | `VK_SPACE` | 1 | 1 | 58.3 | true |
 
-### Mahogany logs (1 option — single-item dialog)
+#### Yew logs
 
-| Slot | Key | Item | Level | XP | Stackable | Item ID | Can string |
+| Enum | Item | Level | Key | logsPerAction | outputPerLog | XP | canString |
 |---|---|---|---|---|---|---|---|
-| 1 | `VK_SPACE` | Mahogany stock | 61 | 41 | no | 9450 | no |
+| `YEW_ARROW_SHAFTS` | Yew arrow shafts | 60 | `VK_1` | 1 | 75 | 25 | false |
+| `YEW_SHORTBOW_U` | Yew shortbow (u) | 65 | `VK_2` | 1 | 1 | 67.5 | true |
+| `YEW_LONGBOW_U` | Yew longbow (u) | 70 | `VK_SPACE` | 1 | 1 | 75 | true |
 
-### Yew logs (5 options)
+#### Magic logs
 
-| Slot | Key | Item | Level | XP | Stackable | Item ID | Can string |
+| Enum | Item | Level | Key | logsPerAction | outputPerLog | XP | canString |
 |---|---|---|---|---|---|---|---|
-| 1 | `VK_1` | Arrow shafts | 60 | 25 | yes (75/log) | 52 | no |
-| 2 | `VK_2` | Yew shortbow (u) | 65 | 67.5 | no | 68 | yes |
-| 3 | `VK_SPACE` | Yew longbow (u) | 70 | 75 | no | 66 | yes |
-| 4 | `VK_4` | Yew stock | 69 | 50 | no | 9452 | no |
-| 5 | `VK_5` | Yew shield | 72 | 150 | no | 22260 | no — needs **2 logs** |
+| `MAGIC_ARROW_SHAFTS` | Magic arrow shafts | 75 | `VK_1` | 1 | 90 | 30 | false |
+| `MAGIC_SHORTBOW_U` | Magic shortbow (u) | 80 | `VK_2` | 1 | 1 | 83.3 | true |
+| `MAGIC_LONGBOW_U` | Magic longbow (u) | 85 | `VK_SPACE` | 1 | 1 | 91.5 | true |
 
-### Magic logs (5 options)
+### Deferred items (verified = false — hidden unless dev mode)
 
-| Slot | Key | Item | Level | XP | Stackable | Item ID | Can string |
-|---|---|---|---|---|---|---|---|
-| 1 | `VK_1` | Arrow shafts | 75 | 30 | yes (90/log) | 52 | no |
-| 2 | `VK_2` | Magic shortbow (u) | 80 | 83.3 | no | 72 | yes |
-| 3 | `VK_SPACE` | Magic longbow (u) | 85 | 91.5 | no | 70 | yes |
-| 4 | `VK_4` | Magic stock | 85 | 70 | no | 21952 | no |
-| 5 | `VK_5` | Magic shield | 87 | 183 | no | 22263 | no — needs **2 logs** |
+Full data is in the reference tables below. These are excluded from v1 because wrong key = silent
+wrong item. Add them after in-game key verification.
 
-### Redwood logs (3 options)
+| Item group | Log | logsPerAction | Notes |
+|---|---|---|---|
+| Wooden stock | Normal | 1 | key `VK_5` [VERIFY] |
+| Javelin shafts | Normal | 1 | key `VK_2`; same slot as oak shortbow on normal logs |
+| Oak stock | Oak | 1 | key `VK_5` [VERIFY] |
+| Oak shield | Oak | **2** | key `VK_4` [VERIFY] |
+| Willow stock | Willow | 1 | key `VK_4` [VERIFY] |
+| Willow shield | Willow | **2** | key `VK_5` [VERIFY] |
+| Teak stock | Teak | 1 | `VK_SPACE`, single-option dialog |
+| Maple stock | Maple | 1 | key `VK_4` [VERIFY] |
+| Maple shield | Maple | **2** | key `VK_5` [VERIFY] |
+| Mahogany stock | Mahogany | 1 | `VK_SPACE`, single-option dialog |
+| Yew stock | Yew | 1 | key `VK_4` [VERIFY] |
+| Yew shield | Yew | **2** | key `VK_5` [VERIFY] |
+| Magic stock | Magic | 1 | key `VK_4` [VERIFY] |
+| Magic shield | Magic | **2** | key `VK_5` [VERIFY] |
+| Redwood (all) | Redwood | varies | different dialog shape, no bow path |
 
-| Slot | Key | Item | Level | XP | Stackable | Item ID | Can string |
-|---|---|---|---|---|---|---|---|
-| 1 | `VK_1` | Arrow shafts | 90 | 35 | yes (105/log) | 52 | no |
-| 2 | `VK_2` | Redwood hiking staff | 90 | 10.5 | no | 31049 | no |
-| 3 | `VK_SPACE` | Redwood shield | 92 | 216 | no | 22266 | no — needs **2 logs** |
+### Stringing bows (STRING mode)
 
-### Shield implementation note
-
-Shields consume **2 logs per shield**, so a 27-log inventory yields 13 shields with 1 log left over.
-Banking: withdraw **26 logs** (not 27) when the selected item is a shield. The leftover from
-odd-lot situations (bank has an odd number) gets deposited on the next trip as waste.
-
-### Normal logs correction
-
-The wiki confirms wooden stock (level 9) appears as slot 5 even though shortbow (level 5) and
-longbow (level 10) bracket it — the game groups bows first, then stocks. Item IDs confirmed:
-wooden stock = 9440, shortbow (u) = 50, longbow (u) = 48.
-
-### Stringing bows
-
-All stringing uses bowstring (item ID 1777) on unstrung bow → single-option skillmulti → `VK_SPACE`.
-Batch size: 14 bowstrings + 14 unstrung bows = 28 slots.
+Bowstring item ID = 1777. All stringing: single-option skillmulti → `VK_SPACE`.
+Batch: 14 bowstrings + 14 unstrung = 28 slots.
 
 | Level | Unstrung | Unstrung ID | Strung | Strung ID | XP |
 |---|---|---|---|---|---|
@@ -157,6 +161,9 @@ Batch size: 14 bowstrings + 14 unstrung bows = 28 slots.
 | 80 | Magic shortbow (u) | 72 | Magic shortbow | 861 | 83.3 |
 | 85 | Magic longbow (u) | 70 | Magic longbow | 859 | 91.5 |
 
+Arrow shafts (`outputPerLog > 1`, `canString = false`) are automatically excluded from
+Cut+String mode and String mode item dropdowns.
+
 ---
 
 ## Modes
@@ -168,90 +175,83 @@ enum Mode { FLETCH, STRING, CUT_AND_STRING }
 - **FLETCH:** withdraw knife + logs, cut, bank output, repeat.
 - **STRING:** withdraw 14 bowstrings + 14 unstrung bows, string, bank output, repeat.
 - **CUT_AND_STRING:** FLETCH phase → STRING phase → FLETCH phase → …
-  - If bowstrings exhausted during STRING phase: fall back to FLETCH-only loop.
-  - Arrow shafts and crossbow stocks cannot be selected in CUT_AND_STRING (no string counterpart); panel should filter these out of the item dropdown when this mode is active.
+  - If bowstrings exhausted: fall back to FLETCH-only.
+  - Panel filters item dropdown to `canString == true` when this mode is active.
 
 ---
 
 ## State Machine
 
 ```
-States: IDLE, BANKING, FLETCHING, ABORTED
+States: IDLE, BANKING, PROCESSING, ABORTED
 ```
 
-A `nextAction` field (`CUT | STRING`) drives what BANKING withdraws and what FLETCHING does.
-`setState()` resets all per-state flags (same pattern as PieDishScript).
+`setState()` resets all per-state flags (same pattern as PieDishScript).  
+A `nextAction` field (`CUT | STRING`) drives what BANKING withdraws and what PROCESSING does.
+
+### Preflight validation (on `start()`, before spawning worker)
+
+```java
+if (mode == STRING && !item.canString)           → reject "item cannot be strung"
+if (mode == CUT_AND_STRING && !item.canString)   → reject "item cannot be strung"
+if (level < item.levelReq)                       → reject "level too low (need X, have Y)"
+```
 
 ### BANKING tick
 
 1. Open nearest bank (`bank.tryClickBankBoothRandom()`).
-2. Wait for `bank.bankReady()`.
+2. Gate `bank.bankReady()`.
 3. `bank.depositAllInventory()`.
-4. If `nextAction == CUT`:
-   - If knife not in inv: `bank.tryWithdrawX(KNIFE, 1)`. If bank has no knife → abort.
-   - `bank.tryWithdrawAll(logId)` — fills remaining 27 slots.
-5. If `nextAction == STRING`:
-   - `bank.tryWithdrawX(unstrungId, 14)`. If none in bank → check mode:
-     - CUT_AND_STRING: flip `nextAction = CUT`, go back to BANKING.
-     - STRING only: abort "no unstrung bows".
-   - `bank.tryWithdrawX(BOWSTRING, 14)`. If none → abort "no bowstrings" OR (CUT_AND_STRING) flip to CUT.
-6. `bank.tryCloseBank()` → `setState(FLETCHING)`.
+4. **CUT path:**
+   - If knife not in inv: `bank.tryWithdrawX(KNIFE, 1)`. No knife in bank → abort.
+   - `bank.tryWithdrawX(item.logId, item.logWithdrawCount())` — 26 for shields, 27 otherwise.
+5. **STRING path:**
+   - `bank.tryWithdrawX(item.unstrungId, 14)`. None in bank:
+     CUT_AND_STRING → flip `nextAction = CUT`, restart BANKING. STRING-only → abort.
+   - `bank.tryWithdrawX(BOWSTRING, 14)`. None in bank:
+     CUT_AND_STRING → flip `nextAction = CUT`, restart BANKING. STRING-only → abort.
+6. **Inventory prepared check** (after all withdrawals, before close):
+   - CUT: assert `knifePresentInInv && invLogCount >= item.logsPerAction`. Fail → abort.
+   - STRING: assert `bowstringCount > 0 && unstrungCount > 0`. Fail → abort.
+7. `bank.tryCloseBank()` → `setState(PROCESSING)`.
 
-Banking failures tracked with `bankFailures` counter; abort after 3 consecutive failures (same as PieDishScript).
+`bankFailures` counter; abort after 3 consecutive failures.
 
-### FLETCHING tick
+### PROCESSING tick
 
-**CUT path (`nextAction == CUT`):**
+**CUT path:**
 
-1. `ensureInventoryTabOpen()`.
-2. `dispatcher.isBusy()` guard.
-3. Step A — engage use-mode on knife: `CLICK_INV_ITEM` verb="Use", slot=knifeSlot.
-4. `dispatcher.awaitIdle(3_000)`.
-5. Sleep 100ms (lean settle, down from PieDishScript's 350ms).
-6. Step B — click any log slot bounds (resolved fresh on client thread).
-7. `dispatcher.awaitIdle(3_000)`.
-8. Set `clicksDone = true`, `skillmultiWaitMs = now`.
+1. `ensureInventoryTabOpen()` + `dispatcher.isBusy()` guard.
+2. `CLICK_INV_ITEM` verb="Use" on knife slot → `awaitIdle(3_000)`.
+3. Sleep 100ms (lean settle).
+4. Click log slot bounds (resolved fresh on client thread) → `awaitIdle(3_000)`.
+5. Set `clicksDone = true`, `skillmultiWaitMs = now`.
 
 Once `clicksDone`:
-9. Poll `InterfaceID.Skillmulti.UNIVERSE` visible. If not open after 5s → `dismissMenu()` + retry clicks.
-10. `dispatcher.tapKey(item.fletchKey)` — selects item and confirms Make-All in one keypress.
-11. Set `skillmultiConfirmed = true`, `craftWaitMs = now`.
+6. Poll `InterfaceID.Skillmulti.UNIVERSE` visible. Not open after 5s → `dismissMenu()` + reset clicks.
+7. `tapKey(item.fletchKey)` — selects and confirms Make-All in one keypress.
+8. Set `processingConfirmed = true`, `craftWaitMs = now`.
 
-Once confirmed: poll inventory until logs gone (count drops to 0). On stackable items (shafts)
-poll on knife being the only item left. Timeout 90s → abort.
+**Completion check** (replaces `stackable` polling):
 
-When done: random AFK pause 2–8s → determine next state:
-- CUT_ONLY: `setState(BANKING)` with `nextAction = CUT`.
-- CUT_AND_STRING: if `item.canString` → `nextAction = STRING`, `setState(BANKING)`.
-  Else → `nextAction = CUT`, `setState(BANKING)`.
+```java
+int logCount = inventoryCount(item.logId);
+boolean done = logCount < item.logsPerAction;  // 0 for bows, <2 for shields, 0 for shafts
+```
 
-**STRING path (`nextAction == STRING`):**
+On done: random AFK pause 2–8s → `setState(BANKING)` with `nextAction` for next phase.  
+Timeout after 90s → abort.
 
-Exact PieDishScript use-on shape:
-1. `ensureInventoryTabOpen()`.
-2. Step A — `CLICK_INV_ITEM` verb="Use" on bowstring slot.
-3. Await idle + 100ms settle.
-4. Click unstrung bow slot bounds.
-5. Await idle.
-6. Wait for skillmulti → `tapKey(VK_SPACE)` (always single option).
-7. Wait until unstrung bows gone.
-8. AFK pause 2–8s → `setState(BANKING)` with `nextAction` depending on mode.
+**STRING path:**
 
----
-
-## Auto-Advance
-
-Toggled by checkbox, **off by default**.
-
-Trigger: `isLevelUpVisible()` (polled every tick, same as CookingScriptV3).
-
-On level up:
-1. Read `client.getRealSkillLevel(Skill.FLETCHING)` on client thread.
-2. Scan `FletchItem` values upward from current `selectedItem`.
-3. Pick first entry where `levelReq <= newLevel` AND bank contains `logId` (for FLETCH/CUT_AND_STRING)
-   or `unstrungId` (for STRING).
-4. Arrow shafts are excluded from auto-advance (they don't have a natural progression path).
-5. If no higher-tier material found: stay on current item.
+1. `ensureInventoryTabOpen()` + `dispatcher.isBusy()` guard.
+2. `CLICK_INV_ITEM` verb="Use" on bowstring slot → `awaitIdle(3_000)`.
+3. Sleep 100ms.
+4. Click unstrung bow slot bounds → `awaitIdle(3_000)`.
+5. Set `clicksDone = true`.
+6. Skillmulti visible → `tapKey(VK_SPACE)` → `processingConfirmed = true`.
+7. Completion: `inventoryCount(item.unstrungId) == 0`.
+8. AFK pause 2–8s → `setState(BANKING)`.
 
 ---
 
@@ -260,22 +260,21 @@ On level up:
 Exact PizzaScript wiring:
 
 ```java
-private final AtomicBoolean afkBreaksEnabled = new AtomicBoolean(true);
+private final AtomicBoolean afkBreaksEnabled = new AtomicBoolean(true);  // on by default
 private BreakScheduler breaks;
 ```
 
 - Constructed fresh on each `start()`.
-- Safe boundary: entering BANKING state (between batches, never mid-fletch).
-- Tick loop gate (at BANKING entry):
-  ```
-  breaks.endBreakIfDue(now)
-  if breaks.isInBreak(now) → status = breaks.statusLine; continue
-  if breaks.isBreakDue(now, atBankBoundary) → breaks.startBreak(now); continue
-  ```
-- `breaks.disable()` called in `stop()`.
-- `BreakConfig` shared (no per-script overrides needed).
+- Safe boundary: entering BANKING (between batches, never mid-fletch).
+- Tick loop gate at BANKING entry:
 
-Panel exposes: checkbox "Enable breaks" + `breaks.statusLine()` label.
+```
+breaks.endBreakIfDue(now)
+if breaks.isInBreak(now) → status = breaks.statusLine(now); continue
+if breaks.isBreakDue(now, state == BANKING) → breaks.startBreak(now); continue
+```
+
+- `breaks.disable()` in `stop()`.
 
 ---
 
@@ -284,8 +283,8 @@ Panel exposes: checkbox "Enable breaks" + `breaks.statusLine()` label.
 ```java
 static final long TICK_MS               = 600;
 static final long BANK_PACE_MS          = 1_500;
-static final long INTER_CLICK_SETTLE_MS = 100;   // fast (vs 350ms in PieDishScript)
-static final long POST_BATCH_MIN_MS     = 2_000;  // AFK pause after each batch
+static final long INTER_CLICK_SETTLE_MS = 100;    // lean (vs 350ms in PieDishScript)
+static final long POST_BATCH_MIN_MS     = 2_000;
 static final long POST_BATCH_MAX_MS     = 8_000;
 static final long SKILLMULTI_TIMEOUT_MS = 5_000;
 static final long CRAFT_TIMEOUT_MS      = 90_000;
@@ -297,45 +296,53 @@ static final int  MAX_BANK_FAILURES     = 3;
 ## Panel Controls
 
 - **Mode** dropdown: Fletch / String / Cut+String
-- **Item** dropdown: filtered by mode (Cut+String hides non-stringable items)
-- **Auto-advance** checkbox (off by default)
-- **Enable breaks** checkbox (on by default) + status line
+- **Item** dropdown: filtered by mode (`canString` filter for String/Cut+String); unverified items hidden unless dev checkbox ticked
+- **Auto-advance** checkbox — present but greyed out / no-op in v1 (deferred)
+- **Enable breaks** checkbox (on by default) + `breaks.statusLine()` label
+- **Dev mode** checkbox — unhides unverified items for testing
 - **Start / Stop** button
-
-The panel reads the current `FletchItem` selection and `Mode` before calling `script.start()`.
-The `RecorderPlugin` instantiates `FletchingScript` the same way it instantiates `CookingScriptV3`.
 
 ---
 
 ## Error Handling & Abort Conditions
 
-- No knife in bank (CUT mode) → abort with message.
-- No logs in bank → abort.
-- No unstrung bows in bank (STRING-only mode) → abort.
-- No bowstrings in bank (STRING-only) → abort; (CUT_AND_STRING) → fall back to CUT-only.
-- `MAX_BANK_FAILURES` consecutive bank primitive failures → abort.
-- `CRAFT_TIMEOUT_MS` exceeded with items still in inventory → abort.
-- Level up popup: auto-dismiss after 3–34s random delay (same as CookingScriptV3's `safeDismissLevelUp`).
+- Preflight: wrong mode+item combo or level too low → reject before starting.
+- No knife in bank (CUT mode) → abort.
+- Bank supplies exhausted → abort (or CUT_AND_STRING fallback as described).
+- Inventory prepared check fails after withdrawals → abort.
+- 3× consecutive bank primitive failures → abort.
+- 90s craft timeout → abort.
+- Level-up popup: auto-dismiss after 3–34s random delay (same as CookingScriptV3).
 
 ---
 
-## What Needs In-Game Verification Before Implementation
+## Auto-Advance (deferred — v2)
 
-1. **Skillmulti key positions** — the wiki does not publish dialog slot order directly. The tables
-   above follow ascending-level ordering which matches wiki data, but **verify in-game** for any
-   log type where you intend to use a non-Space key before trusting a wrong key would silently
-   fletch the wrong item. Normal logs are confirmed from screenshot; others need checking.
-2. **Shield item IDs** — wiki-sourced IDs (22251, 22254, 22257, 22260, 22263, 22266) should be
-   cross-checked via click-inspector on the actual items.
-3. **Stringing skillmulti** — confirm it is always a single option (Space) for all bow types in-game.
-4. **Teak/Mahogany single-option dialog** — confirm whether a single-item dialog auto-confirms
-   on open or still requires a keypress / click.
+Spec placeholder only. Not implemented in v1.
+
+When implemented:
+- Trigger on `isLevelUpVisible()`.
+- Read `client.getRealSkillLevel(Skill.FLETCHING)`.
+- Advance only to `verified == true` items where bank has the required log/unstrung.
+- Arrow shafts excluded from auto-advance.
+- CUT_AND_STRING: both phases must have materials for the new tier.
+
+---
+
+## What Needs In-Game Verification Before Enabling Deferred Items
+
+1. **Skillmulti key slot positions** for oak/willow/maple/yew/magic stocks and shields — verify
+   each [VERIFY] row before setting `verified = true`. Wrong key = silent wrong item.
+2. **Shield item IDs** (22251, 22254, 22257, 22260, 22263, 22266) — cross-check via click-inspector.
+3. **Teak/Mahogany single-option dialog** — does it auto-confirm on open or require `VK_SPACE`?
+4. **Stringing skillmulti** — confirm single option (Space) for all bow types.
 
 ---
 
 ## Out of Scope
 
-- Arrow tips / feathering / dart tips / bolt tips — not covered
+- Arrow tips / feathering / dart tips / bolt tips
 - Walking to a specific location
 - GE supply buying
 - Logout / re-login plumbing
+- Redwood logs (different dialog shape, no bow path — separate ticket if needed)
