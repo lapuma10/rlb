@@ -1308,17 +1308,17 @@ public final class GeInteraction implements GeActions {
 
     @Override
     public void collectAll() {
-        // GeOffers.COLLECTALL toolbar button. Default verb captured from
-        // click-inspector 2026-05-01: actions=['Collect to inventory',
-        // 'Collect to bank'], entryId=1 → left-click = "Collect to inventory".
-        // Verb-routed: the dispatcher pre-checks that the engine's hover-menu
-        // actually shows "Collect to inventory" on top before clicking.
-        // Catches silent misses where the bounds click would land on a
-        // non-COLLECTALL pixel (e.g. Walk-here behind a stale rect, an
-        // overlay) — we'd repeatedly fire walks instead of draining the
-        // slot. The verb-mismatch right-click fallback now uses dismissMenu()
-        // (move-cursor-away), so a miss no longer closes the GE.
-        clickWidgetVerb(InterfaceID.GeOffers.COLLECTALL, "Collect to inventory", "collectAll");
+        // GeOffers.COLLECTALL toolbar button. Click-inspector 2026-05-01:
+        // actions=['Collect to inventory', 'Collect to bank'], entryId=1 →
+        // left-click defaults to whichever the in-game "Toggle: Collect to
+        // bank/inventory" was last set to. EITHER drains the slot, which is
+        // CollectOfferStep's success signal — so we accept both verbs via the
+        // dispatcher's pipe-separated multi-verb path. Verb-routed (not
+        // bounds-click) so the engine's hover-menu pre-check rejects clicks
+        // that would land on a non-COLLECTALL pixel (overlay / stale rect)
+        // before we'd otherwise fire a wrong action 18 times.
+        clickWidgetVerb(InterfaceID.GeOffers.COLLECTALL,
+            "Collect to inventory|Collect to bank", "collectAll");
     }
 
     @Override

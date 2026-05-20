@@ -68,6 +68,16 @@ public final class CollectOfferStep implements Step {
         BlackboardKey.of("collectOffer.strategy", Strategy.class);
     private static final BlackboardKey<Phase> K_PHASE =
         BlackboardKey.of("collectOffer.phase", Phase.class);
+    /** Set true in onStart when we wanted to dispatch the first click but the
+     *  dispatcher worker was still parking from the prior confirm step. tick()
+     *  fires the dispatch once the worker releases — mirrors SetPriceStep's
+     *  K_NEEDS_DISPATCH gate. Without this the first dispatch silently drops
+     *  via the busy guard and we lose 1–2 ticks before the redispatch path in
+     *  check() picks it up. */
+    private static final BlackboardKey<Boolean> K_PENDING_DISPATCH =
+        BlackboardKey.of("collectOffer.pendingDispatch", Boolean.class);
+    private static final BlackboardKey<Boolean> K_PENDING_FORCE_COLLECT_ALL =
+        BlackboardKey.of("collectOffer.pendingForceCollectAll", Boolean.class);
     /** SEQUENCE-scope so it survives Retry(N) STEP-scope clears: the expected
      *  item id from the FIRST attempt. Used when a retry encounters an
      *  already-empty slot — we still need to verify delta from the original
@@ -228,9 +238,10 @@ public final class CollectOfferStep implements Step {
         dispatchStrategy(ctx, s, slot, /* forceCollectAll= */ false);
     }
 
-    /** Pick COLLECT_ALL vs PER_SLOT and dispatch the first click.
-     *  {@code COLLECT_ALL} is the canonical path from the main GE grid; the
-     *  detail view uses PER_SLOT because the toolbar button is hidden there. */
+    /** Pick COLLECT_ALL vs PER_SLOT and stage the first click. Actual dispatch
+     *  is deferred to {@link #fireStagedDispatch} once the dispatcher worker
+     *  is idle — preserves the FIRST click from being eaten by the prior
+     *  confirm-step's busy-guard tail. */
     private void dispatchStrategy(StepContext ctx, WorldSnapshot s, int slot, boolean forceCollectAll) {
         Blackboard step = ctx.bb().scope(BlackboardScope.STEP);
         // COLLECT_ALL clicks the toolbar button on the main GE grid — it is
@@ -241,7 +252,23 @@ public final class CollectOfferStep implements Step {
             : (forceCollectAll || useCollectAll.getAsBoolean()) ? Strategy.COLLECT_ALL
             : Strategy.PER_SLOT;
         step.put(K_STRATEGY, strategy);
+        step.put(K_PENDING_DISPATCH, true);
+        step.put(K_PENDING_FORCE_COLLECT_ALL, forceCollectAll);
+        // tick() runs every engine tick once onStart returns; the first one
+        // after the dispatcher releases will fire the staged dispatch.
+        if (dispatcher == null || !dispatcher.isBusy()) {
+            fireStagedDispatch(ctx, s, slot);
+        }
+    }
 
+    /** Issue the click that {@link #dispatchStrategy} staged. Called from
+     *  {@link #dispatchStrategy} when the worker is already idle and from
+     *  {@link #tick} otherwise. */
+    private void fireStagedDispatch(StepContext ctx, WorldSnapshot s, int slot) {
+        Blackboard step = ctx.bb().scope(BlackboardScope.STEP);
+        Strategy strategy = step.get(K_STRATEGY).orElse(null);
+        if (strategy == null) return;
+        boolean forceCollectAll = Boolean.TRUE.equals(step.get(K_PENDING_FORCE_COLLECT_ALL).orElse(false));
         int slotItemId = s.grandExchange().offers().get(slot).itemId();
         String itemName = ItemNames.nameOrId(client, slotItemId);
         if (strategy == Strategy.COLLECT_ALL) {
@@ -250,6 +277,7 @@ public final class CollectOfferStep implements Step {
             ge.collectAll();
             step.put(K_PHASE, Phase.AWAIT_DRAIN);
             step.put(K_LAST_DISPATCH_TICK, s.tick());
+            step.put(K_PENDING_DISPATCH, false);
             return;
         }
 
@@ -259,20 +287,32 @@ public final class CollectOfferStep implements Step {
                 itemName, slot);
             step.put(K_PHASE, Phase.CLICK_COLLECT_INV);
             ge.collect(slot);
-            step.put(K_LAST_DISPATCH_TICK, s.tick());
         } else {
             log.info("collect: opening offer detail view for slot {} \"{}\" (PER_SLOT path)", slot, itemName);
             step.put(K_PHASE, Phase.OPEN_COLLECT);
             ge.openOfferDetail(slot);
-            step.put(K_LAST_DISPATCH_TICK, s.tick());
         }
+        step.put(K_LAST_DISPATCH_TICK, s.tick());
+        step.put(K_PENDING_DISPATCH, false);
     }
 
     @Override public void onEvent(Object event, StepContext ctx) {}
 
     @Override public void tick(StepContext ctx) {
-        // PER_SLOT phase machine only.
         Blackboard step = ctx.bb().scope(BlackboardScope.STEP);
+        // Deferred first-dispatch: dispatchStrategy staged the request because
+        // the dispatcher worker was busy parking the previous step's cursor.
+        // Flush as soon as it frees so we don't lose a tick to the redispatch
+        // window in check().
+        if (Boolean.TRUE.equals(step.get(K_PENDING_DISPATCH).orElse(false))) {
+            if (dispatcher == null || !dispatcher.isBusy()) {
+                Integer slotBox = ctx.bb().scope(BlackboardScope.SEQUENCE)
+                    .get(GeBlackboardKeys.K_GE_OFFER_SLOT).orElse(null);
+                if (slotBox != null) fireStagedDispatch(ctx, ctx.snapshot(), slotBox);
+            }
+            return;
+        }
+        // PER_SLOT phase machine only.
         if (step.get(K_STRATEGY).orElse(null) != Strategy.PER_SLOT) return;
         if (step.get(K_PHASE).orElse(null) == Phase.AWAIT_COLLECT_VIEW
             && ctx.snapshot().grandExchange().collectOpen()) {
@@ -354,6 +394,12 @@ public final class CollectOfferStep implements Step {
             return Completion.RUNNING;
         }
 
+        // While the deferred first dispatch is still staged, defer all
+        // downstream evaluation to tick() — it will fire the click the moment
+        // the dispatcher frees.
+        if (Boolean.TRUE.equals(step.get(K_PENDING_DISPATCH).orElse(false))) {
+            return Completion.RUNNING;
+        }
         // PER_SLOT phase progression must NOT advance while the prior
         // dispatch (openOfferDetail click chain) is still parking the
         // cursor — tick() would dispatch the second click into the busy
