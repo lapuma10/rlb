@@ -861,30 +861,41 @@ public final class FletchingScript
      *  inventory before withdrawing the new tier's. */
     private FletchItem pickAutoLevelTarget(FletchItem current) throws InterruptedException
     {
-        if (!current.canString) return null;  // on arrow shafts — leave alone
         Integer level = onClient(() -> client.getRealSkillLevel(net.runelite.api.Skill.FLETCHING));
         if (level == null) return null;
         Mode m = mode.get();
-        FletchItem best = current;
+        // Stay in the same "category" as current: bow ↔ bow or shaft ↔ shaft.
+        // Cross-category (bow → shaft) is too big a behavior change to do
+        // silently; the user would have explicitly selected shafts if that's
+        // what they wanted.
+        boolean wantBows = current.canString;
+        FletchItem best = null;
         for (FletchItem candidate : FletchItem.values())
         {
             if (!candidate.verified) continue;
-            if (!candidate.canString) continue;
+            if (candidate.canString != wantBows) continue;
             if (candidate.levelReq > level) continue;
-            if (candidate.xp <= best.xp) continue;
-            // Bank availability: required materials must be present.
-            if (m != Mode.STRING)
-            {
-                if (bank.bankItemAmount(candidate.logId) <= 0) continue;
-            }
-            if (m != Mode.FLETCH)
-            {
-                if (bank.bankItemAmount(candidate.unstrungId) <= 0) continue;
-                if (bank.bankItemAmount(BOWSTRING) <= 0) continue;
-            }
-            best = candidate;
+            if (!hasBankMaterialsFor(candidate, m)) continue;
+            if (best == null || candidate.xp > best.xp) best = candidate;
         }
-        return best == current ? null : best;
+        return (best == null || best == current) ? null : best;
+    }
+
+    /** Materials check for {@link #pickAutoLevelTarget}: confirms the bank
+     *  has whatever the candidate needs for the active mode. */
+    private boolean hasBankMaterialsFor(FletchItem candidate, Mode m) throws InterruptedException
+    {
+        if (m != Mode.STRING)
+        {
+            if (bank.bankItemAmount(candidate.logId) <= 0) return false;
+        }
+        if (m != Mode.FLETCH)
+        {
+            if (candidate.unstrungId <= 0) return false;  // shafts can't be strung
+            if (bank.bankItemAmount(candidate.unstrungId) <= 0) return false;
+            if (bank.bankItemAmount(BOWSTRING) <= 0) return false;
+        }
+        return true;
     }
 
     // ─── Helpers ─────────────────────────────────────────────────────────────────
