@@ -377,6 +377,24 @@ public final class FletchingScript
 
         FletchItem item = selectedItem.get();
 
+        // Auto-level: scan bank for a better-tier item we can switch to.
+        // Gated on !depositDone so this evaluates ONCE per banking cycle
+        // (right after the bank opens, before we deposit anything). If a
+        // switch happens, the old tier's logs/bows still in inventory will
+        // be cleared by depositAllInventory (the keep-knife fast-path
+        // requires inventoryOnlyContains for the NEW item's ids, which
+        // fails when the old tier's contents are present).
+        if (autoLevelEnabled.get() && !depositDone)
+        {
+            FletchItem advanced = pickAutoLevelTarget(item);
+            if (advanced != null)
+            {
+                log.info("fletching: autolevel switch — {} → {}", item.label(), advanced.label());
+                selectedItem.set(advanced);
+                item = advanced;
+            }
+        }
+
         if (!depositDone)
         {
             // Subsequent-batch optimization: on the CUT path, if we already have a knife
@@ -817,7 +835,8 @@ public final class FletchingScript
                     now - levelUpFirstSeenAtMs);
                 dispatcher.tapKey(KeyEvent.VK_SPACE);
                 levelUpFirstSeenAtMs = 0L;
-                if (autoLevelEnabled.get()) maybeAdvanceItem();
+                // Auto-level evaluation happens at the next BANKING entry,
+                // when the bank is open and bankItemAmount() is queryable.
                 return true;
             }
         }
@@ -826,37 +845,46 @@ public final class FletchingScript
         return false;
     }
 
-    /** Auto-advance: when level-up dismisses, switch {@link #selectedItem} to
-     *  the highest-level verified bow we can now make on the SAME log type.
-     *  Stays within one log tier (no cross-tier jump — that would require a
-     *  bank scan for the new logs). Skips arrow shafts: if the user picked
-     *  shafts they probably want shafts XP, not bow XP.
-     *  <p>Called only when {@link #autoLevelEnabled} is true. */
-    private void maybeAdvanceItem()
+    /** Auto-advance evaluation, called from {@link #tickBanking} once per
+     *  banking cycle when the bank is open AND {@link #autoLevelEnabled}
+     *  is true. Picks the highest-XP verified bow tier we can now make,
+     *  based on:
+     *   - current Fletching level (must satisfy {@code levelReq})
+     *   - bank availability: logs (FLETCH/CUT_AND_STRING), unstrung +
+     *     bowstrings (STRING/CUT_AND_STRING). Cross-tier jumps are
+     *     allowed — at level 20 with oak logs in the bank, willow at 35
+     *     etc., the script switches forward automatically.
+     *  Arrow shafts are excluded: if the user picked shafts they probably
+     *  want shafts XP, not bow XP.
+     *  <p>Caller must reset {@code depositDone=false} after a switch so
+     *  the next deposit clears the previous tier's logs/bows from
+     *  inventory before withdrawing the new tier's. */
+    private FletchItem pickAutoLevelTarget(FletchItem current) throws InterruptedException
     {
-        FletchItem current = selectedItem.get();
-        if (!current.canString) return;  // on arrow shafts — leave alone
+        if (!current.canString) return null;  // on arrow shafts — leave alone
         Integer level = onClient(() -> client.getRealSkillLevel(net.runelite.api.Skill.FLETCHING));
-        if (level == null) return;
+        if (level == null) return null;
+        Mode m = mode.get();
         FletchItem best = current;
         for (FletchItem candidate : FletchItem.values())
         {
             if (!candidate.verified) continue;
-            if (candidate.logId != current.logId) continue;
             if (!candidate.canString) continue;
             if (candidate.levelReq > level) continue;
-            if (mode.get() != Mode.FLETCH && !candidate.canString) continue;
-            if (candidate.levelReq > best.levelReq) best = candidate;
+            if (candidate.xp <= best.xp) continue;
+            // Bank availability: required materials must be present.
+            if (m != Mode.STRING)
+            {
+                if (bank.bankItemAmount(candidate.logId) <= 0) continue;
+            }
+            if (m != Mode.FLETCH)
+            {
+                if (bank.bankItemAmount(candidate.unstrungId) <= 0) continue;
+                if (bank.bankItemAmount(BOWSTRING) <= 0) continue;
+            }
+            best = candidate;
         }
-        if (best != current)
-        {
-            log.info("fletching: autolevel — advancing {} → {} (level {})",
-                current.label(), best.label(), level);
-            selectedItem.set(best);
-            // Click chain is reset by the caller (tickCut/tickString) after
-            // dismissLevelUp returns true, so the next tick re-engages with
-            // the new item's skillmultiWidget.
-        }
+        return best == current ? null : best;
     }
 
     // ─── Helpers ─────────────────────────────────────────────────────────────────
