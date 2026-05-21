@@ -864,21 +864,22 @@ public final class FletchingScript
         Integer level = onClient(() -> client.getRealSkillLevel(net.runelite.api.Skill.FLETCHING));
         if (level == null) return null;
         Mode m = mode.get();
-        // Stay in the same "category" as current: bow ↔ bow or shaft ↔ shaft.
-        // Cross-category (bow → shaft) is too big a behavior change to do
-        // silently; the user would have explicitly selected shafts if that's
-        // what they wanted.
-        boolean wantBows = current.canString;
-        FletchItem best = null;
+        // Upward-only: only switch to a STRICTLY higher-XP candidate in the
+        // same category (bow ↔ bow or shaft ↔ shaft). If current's logs run
+        // out and only lower tiers are available, we DO NOT downshift — the
+        // user prefers a clean abort to a silent XP cut. Cross-category
+        // (bow → shaft) is also disallowed.
+        FletchItem best = current;
         for (FletchItem candidate : FletchItem.values())
         {
             if (!candidate.verified) continue;
-            if (candidate.canString != wantBows) continue;
+            if (candidate.canString != current.canString) continue;
             if (candidate.levelReq > level) continue;
+            if (candidate.xp <= best.xp) continue;  // upward only
             if (!hasBankMaterialsFor(candidate, m)) continue;
-            if (best == null || candidate.xp > best.xp) best = candidate;
+            best = candidate;
         }
-        return (best == null || best == current) ? null : best;
+        return best == current ? null : best;
     }
 
     /** Materials check for {@link #pickAutoLevelTarget}: confirms the bank
