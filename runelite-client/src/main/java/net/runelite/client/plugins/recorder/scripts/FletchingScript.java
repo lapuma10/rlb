@@ -32,7 +32,11 @@ public final class FletchingScript
 
     // ─── Timing ──────────────────────────────────────────────────────────────────
     private static final long TICK_MS               = 600;
-    private static final long BANK_PACE_MS          = 1_500;
+    // 2.5s mirrors PizzaScript's BANK_OPEN_WAIT_MAX_MS — booth right-click +
+    // menu pick + bank widget render can take ~2s on a heavy tick. 1.5s was
+    // expiring before the bank actually opened, causing a re-click THROUGH the
+    // already-open bank window onto a slot/button → wrong item withdrawn.
+    private static final long BANK_PACE_MS          = 2_500;
     private static final long INTER_CLICK_SETTLE_MS = 100;
     private static final long POST_BATCH_MIN_MS     = 2_000;
     private static final long POST_BATCH_MAX_MS     = 8_000;
@@ -378,13 +382,17 @@ public final class FletchingScript
             // Subsequent-batch optimization: on the CUT path, if we already have a knife
             // AND the inventory holds the just-made bows, deposit just the bows so the knife
             // stays — avoids the next-cycle "withdraw knife" trip. Falls back to deposit-all
-            // for: the first bank visit (no knife yet), arrow shafts (no unstrung id), and
-            // anything in the STRING / CUT_AND_STRING-string-phase path.
-            boolean keepKnife = nextAction == Action.CUT
+            // for: the first bank visit (no knife yet), arrow shafts (no unstrung id),
+            // STRING / CUT_AND_STRING-string-phase paths, AND when a rogue item is present
+            // (e.g. from a bank-open-lag mis-click that withdrew the wrong thing) — in that
+            // case keep-knife would leave the rogue item lurking and we'd lose a slot each
+            // cycle, so depositAllInventory is the right reset.
+            boolean canKeepKnife = nextAction == Action.CUT
                 && item.unstrungId > 0
                 && inventoryCount(KNIFE) > 0
-                && inventoryCount(item.unstrungId) > 0;
-            if (keepKnife)
+                && inventoryCount(item.unstrungId) > 0
+                && inventoryOnlyContains(KNIFE, item.logId, item.unstrungId);
+            if (canKeepKnife)
             {
                 status.set("bank: depositing " + item.label() + " (keep knife)");
                 if (!bank.tryDepositAll(item.unstrungId))
@@ -891,6 +899,31 @@ public final class FletchingScript
             return total;
         });
         return n == null ? 0 : n;
+    }
+
+    /** True iff every non-empty inventory slot holds one of the supplied item IDs.
+     *  Empty slots (id ≤ 0) are ignored. Used to detect "rogue" items from a
+     *  bank-window mis-click (the bank-open-lag race): if a wrong item slipped
+     *  in, the keep-knife fast-path can't deposit it, so the next bank visit
+     *  must fall back to depositAllInventory to clean up. */
+    private boolean inventoryOnlyContains(int... allowedIds)
+    {
+        Boolean r = onClient(() -> {
+            ItemContainer inv = client.getItemContainer(InventoryID.INV);
+            if (inv == null) return Boolean.TRUE;
+            for (Item it : inv.getItems())
+            {
+                if (it == null) continue;
+                int id = it.getId();
+                if (id <= 0) continue;
+                boolean match = false;
+                for (int allowed : allowedIds)
+                    if (allowed > 0 && allowed == id) { match = true; break; }
+                if (!match) return Boolean.FALSE;
+            }
+            return Boolean.TRUE;
+        });
+        return Boolean.TRUE.equals(r);
     }
 
     private int inventorySlotOf(int itemId)
