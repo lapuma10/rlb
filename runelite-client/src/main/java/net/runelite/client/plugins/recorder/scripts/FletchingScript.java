@@ -10,6 +10,7 @@ import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.Supplier;
 import lombok.extern.slf4j.Slf4j;
 import net.runelite.api.Client;
+import net.runelite.api.GameState;
 import net.runelite.api.Item;
 import net.runelite.api.ItemContainer;
 import net.runelite.api.widgets.Widget;
@@ -326,6 +327,25 @@ public final class FletchingScript
             ensureInventoryTabOpen();
             while (running.get() && !Thread.currentThread().isInterrupted())
             {
+                // Login-state gate. If OSRS auto-kicked us during an AFK
+                // break (idle > 5 min) or the user logged out manually, the
+                // bank-booth scan in tickBanking returns null silently and
+                // the FSM busy-loops between "bank: opening" / "bank: pacing"
+                // forever — exactly the 2026-05-21 GE incident. Hold here
+                // until LOGGED_IN. No auto-login wired (parity with the
+                // smaller scripts; PizzaScript has the LoginAssistantV2
+                // path if we ever want it).
+                GameState gs = onClient(client::getGameState);
+                if (gs != null && gs != GameState.LOGGED_IN)
+                {
+                    status.set("logged out (" + gs + ") — waiting for login");
+                    // Reset the bank pace timer so the first tick after
+                    // re-login goes straight to "bank: opening" instead
+                    // of sitting on a stale pace window.
+                    lastBankActionMs = 0L;
+                    SequenceSleep.sleep(client, TICK_MS);
+                    continue;
+                }
                 switch (state.get())
                 {
                     case BANKING    -> tickBanking();
@@ -368,9 +388,34 @@ public final class FletchingScript
         {
             long now = System.currentTimeMillis();
             if (now - lastBankActionMs < BANK_PACE_MS) { status.set("bank: pacing"); return; }
+            // Fix 3: don't fire a second CLICK_NPC while the previous
+            // right-click / Bank-pick chain is still running. Without
+            // this gate every bank visit produces a duplicate
+            // "dispatcher busy, dropping CLICK_NPC" log line.
+            if (dispatcher.isBusy())
+            {
+                status.set("bank: opening (dispatcher busy)");
+                return;
+            }
             status.set("bank: opening");
-            bank.tryClickBankBoothRandom();
+            boolean clicked = bank.tryClickBankBoothRandom();
             lastBankActionMs = now;
+            if (!clicked)
+            {
+                // No banker / booth in scene (player walked too far,
+                // banker despawned, scene didn't reload). Same bankFailures
+                // escalation as depositAllInventory / tryWithdrawX below.
+                // Login-screen case is caught earlier in tickLoop, so this
+                // path is genuinely "we're logged in but can't see a booth".
+                if (++bankFailures >= MAX_BANK_FAILURES)
+                {
+                    abortWith("no booth/banker in scene (" + bankFailures + "× scan miss)");
+                    return;
+                }
+                status.set("bank: no booth/banker in scene (" + bankFailures + "/" + MAX_BANK_FAILURES + ")");
+                return;
+            }
+            bankFailures = 0;
             return;
         }
         if (!bank.bankReady()) { status.set("bank: waiting for contents"); return; }
