@@ -73,14 +73,37 @@ public final class BreakScheduler
      *  is responsible for having checked {@link #isBreakDue} first. */
     public void startBreak(long nowMs)
     {
+        startBreak(nowMs, Long.MAX_VALUE);
+    }
+
+    /** Roll a tier + duration like {@link #startBreak(long)} but cap
+     *  the duration at {@code maxDurationMs}. Used by scripts whose
+     *  last dispatched input was a long time ago — a fresh MEDIUM
+     *  break on top of a 1-minute idle would push the total idle past
+     *  the OSRS 5-minute auto-kick. The script computes "how much
+     *  idle budget is left" and passes it here.
+     *
+     *  <p>If the cap is smaller than the rolled MICRO/MEDIUM minimum,
+     *  the floor stays at the cap rather than zero — the break still
+     *  happens, just short. The MICRO/MEDIUM tier label is preserved
+     *  for the panel status; a 25-second "MEDIUM break" reads weirdly
+     *  but the alternative (no break at all when the cap is tight) is
+     *  what {@link #isBreakDue} should be filtering. Callers that
+     *  don't want sub-minimum breaks should check the cap before
+     *  invoking this and skip the break entirely. */
+    public void startBreak(long nowMs, long maxDurationMs)
+    {
         Tier tier = rng.nextInt(100) < BreakConfig.MICRO_PROB ? Tier.MICRO : Tier.MEDIUM;
         long min = tier == Tier.MICRO ? BreakConfig.MICRO_MIN_MS : BreakConfig.MEDIUM_MIN_MS;
         long max = tier == Tier.MICRO ? BreakConfig.MICRO_MAX_MS : BreakConfig.MEDIUM_MAX_MS;
         long duration = min + (long) (rng.nextDouble() * (max - min + 1));
+        if (maxDurationMs > 0L && duration > maxDurationMs) duration = maxDurationMs;
+        if (duration < 1L) duration = 1L;   // belt-and-braces; never store a 0-length break
         currentTier = tier;
         breakEndMs = nowMs + duration;
-        log.info("afk break starting — tier={} duration={}s",
-            tier, duration / 1000L);
+        log.info("afk break starting — tier={} duration={}s (cap={}ms)",
+            tier, duration / 1000L,
+            maxDurationMs == Long.MAX_VALUE ? "none" : Long.toString(maxDurationMs));
     }
 
     public boolean isInBreak(long nowMs)

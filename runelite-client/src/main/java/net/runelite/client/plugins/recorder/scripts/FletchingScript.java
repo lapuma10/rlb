@@ -47,6 +47,21 @@ public final class FletchingScript
     private static final long LEVEL_UP_DISMISS_MIN_MS = 3_000;
     private static final long LEVEL_UP_DISMISS_MAX_MS = 34_000;
 
+    // ─── Idle-aware break cap ────────────────────────────────────────────────────
+    // OSRS auto-kicks the player after ~5 min of input idle. A MEDIUM break
+    // (2.5–4.5 min) on top of an already-30+s-idle script pushes total idle
+    // past that line — exactly what happened at 14:02 on 2026-05-21 (last
+    // dispatch ~14:01:18, MEDIUM break ended 14:06:24, AFK timer fired
+    // ~14:06:18 just before the worker came back). Track lastDispatchAtMs
+    // and clamp the break duration so total idle stays under
+    // AFK_THRESHOLD_MS - SAFETY_MARGIN_MS = 4:30.
+    private static final long AFK_THRESHOLD_MS  = 5L * 60L * 1000L;   // OSRS auto-kick
+    private static final long SAFETY_MARGIN_MS  =        30L * 1000L; // 30s headroom
+    /** Skip the break entirely if the cap would shrink it below this floor —
+     *  a 5-second "break" isn't useful and the BreakScheduler floors to 1ms
+     *  if we let it. */
+    private static final long MIN_USEFUL_BREAK_MS = 30L * 1000L;
+
     // ─── State ───────────────────────────────────────────────────────────────────
     public enum State { IDLE, BANKING, PROCESSING, ABORTED }
 
@@ -217,6 +232,19 @@ public final class FletchingScript
     private int     useClickFailures;
     private long    levelUpFirstSeenAtMs;
     private long    levelUpDismissAfterMs;
+    /** Wall-clock of the last dispatched input. Bumped via {@link #markDispatched}
+     *  at every call site that dispatches mouse/key input (directly or via
+     *  {@link BankInteraction} / {@link SidebarTabActions}). Used to clamp
+     *  the AFK-break duration so total input idle stays below the OSRS
+     *  auto-kick threshold (see the constants above). NOT reset in
+     *  {@link #setState}; survives state transitions so the break gate
+     *  remembers idle time across cycles. */
+    private volatile long lastDispatchAtMs;
+    /** Throttle the "deferring AFK break" log to once every ~5s while the
+     *  defer condition persists. Otherwise every 600ms tick that stays
+     *  in banking-but-dispatcher-busy floods the log with a duplicate
+     *  defer message. */
+    private long lastBreakDeferLogMs;
 
     // ─── Constructor ─────────────────────────────────────────────────────────────
 
@@ -290,6 +318,11 @@ public final class FletchingScript
 
         nextAction = (m == Mode.STRING) ? Action.STRING : Action.CUT;
         setState(State.BANKING);
+
+        // Treat "user pressed Start" as a fresh dispatch event so the
+        // first break cap is computed from now, not from epoch 0
+        // (which would clamp every break to 1ms forever).
+        lastDispatchAtMs = System.currentTimeMillis();
 
         // Fresh scheduler each Start — clean activity window.  start()
         // is guarded by running.compareAndSet so the construct/set isn't
@@ -376,9 +409,36 @@ public final class FletchingScript
         }
         if (breaks != null && breaks.isBreakDue(breakNow, state.get() == State.BANKING))
         {
-            breaks.startBreak(breakNow);
-            status.set(breaks.statusLine(breakNow));
-            return;
+            // Cap the break so total input idle stays under the OSRS
+            // auto-kick threshold. tickBanking is the only break entry
+            // point and we just transitioned from PROCESSING, where the
+            // last dispatched click was usually 30s+ ago (cutting takes
+            // most of the PROCESSING window). A fresh MEDIUM break on
+            // top of that would exceed the 5-min logout — exactly the
+            // 2026-05-21 incident.
+            long idleMs = Math.max(0L, breakNow - lastDispatchAtMs);
+            long maxBreakDurationMs = AFK_THRESHOLD_MS - SAFETY_MARGIN_MS - idleMs;
+            if (maxBreakDurationMs < MIN_USEFUL_BREAK_MS)
+            {
+                // Not enough budget for a useful break right now — fall
+                // through to normal banking work. The scheduler's
+                // activityEndMs stays past, so isBreakDue keeps returning
+                // true; the next cycle (after we've dispatched fresh
+                // clicks) will have a larger budget and the break can
+                // start then. No status spam — we want banking to proceed.
+                if (breakNow - lastBreakDeferLogMs > 5_000L)
+                {
+                    log.info("fletching: deferring AFK break — idle {}ms leaves only {}ms budget (< {}ms floor)",
+                        idleMs, maxBreakDurationMs, MIN_USEFUL_BREAK_MS);
+                    lastBreakDeferLogMs = breakNow;
+                }
+            }
+            else
+            {
+                breaks.startBreak(breakNow, maxBreakDurationMs);
+                status.set(breaks.statusLine(breakNow));
+                return;
+            }
         }
 
         if (Boolean.TRUE.equals(onClient(bank::isBankPinUp)))
@@ -415,6 +475,7 @@ public final class FletchingScript
                 status.set("bank: no booth/banker in scene (" + bankFailures + "/" + MAX_BANK_FAILURES + ")");
                 return;
             }
+            markDispatched();
             bankFailures = 0;
             return;
         }
@@ -463,6 +524,7 @@ public final class FletchingScript
                     if (++bankFailures >= MAX_BANK_FAILURES) { abortWith("tryDepositAll bows failed " + bankFailures + "×"); return; }
                     return;
                 }
+                markDispatched();
             }
             else
             {
@@ -472,6 +534,7 @@ public final class FletchingScript
                     if (++bankFailures >= MAX_BANK_FAILURES) { abortWith("depositAllInventory failed " + bankFailures + "×"); return; }
                     return;
                 }
+                markDispatched();
             }
             depositDone = true; bankFailures = 0; lastBankActionMs = System.currentTimeMillis();
             return;
@@ -490,6 +553,7 @@ public final class FletchingScript
                     if (++bankFailures >= MAX_BANK_FAILURES) { abortWith("withdraw knife failed"); return; }
                     return;
                 }
+                markDispatched();
                 bankFailures = 0; lastBankActionMs = System.currentTimeMillis();
                 return;
             }
@@ -507,6 +571,7 @@ public final class FletchingScript
                     if (++bankFailures >= MAX_BANK_FAILURES) { abortWith("withdraw logs failed"); return; }
                     return;
                 }
+                markDispatched();
                 bankFailures = 0; lastBankActionMs = System.currentTimeMillis();
                 return;
             }
@@ -528,6 +593,7 @@ public final class FletchingScript
                     if (++bankFailures >= MAX_BANK_FAILURES) { abortWith("withdraw unstrung failed"); return; }
                     return;
                 }
+                markDispatched();
                 bankFailures = 0; lastBankActionMs = System.currentTimeMillis();
                 return;
             }
@@ -546,6 +612,7 @@ public final class FletchingScript
                     if (++bankFailures >= MAX_BANK_FAILURES) { abortWith("withdraw bowstrings failed"); return; }
                     return;
                 }
+                markDispatched();
                 bankFailures = 0; lastBankActionMs = System.currentTimeMillis();
                 return;
             }
@@ -568,6 +635,7 @@ public final class FletchingScript
         if (now - lastBankActionMs < BANK_PACE_MS) { status.set("bank: pacing close"); return; }
         status.set("bank: closing");
         bank.tryCloseBank();
+        markDispatched();
         lastBankActionMs = now;
         SequenceSleep.sleep(client, 400);
         if (!Boolean.TRUE.equals(onClient(bank::isBankOpen)))
@@ -611,6 +679,7 @@ public final class FletchingScript
                 .slot(knifeSlot)
                 .verb("Use")
                 .build());
+            markDispatched();
             dispatcher.awaitIdle(3_000L);
             String err = dispatcher.lastErrorMessage();
             if (err != null)
@@ -631,6 +700,7 @@ public final class FletchingScript
             Rectangle bounds = onClient(() -> resolveInvItemBounds(item.logId));
             if (bounds == null) { abortWith("logs not in inventory"); return; }
             dispatcher.clickCanvas(bounds.x + bounds.width / 2, bounds.y + bounds.height / 2);
+            markDispatched();
             dispatcher.awaitIdle(3_000L);
 
             clicksDone = true;
@@ -652,6 +722,7 @@ public final class FletchingScript
                 {
                     log.warn("fletching cut: skillmulti did not open after {}ms — retrying", elapsed);
                     dispatcher.dismissMenu();
+                    markDispatched();
                     clicksDone = false; skillmultiWaitMs = 0;
                 }
                 else status.set("cut: waiting for skillmulti (" + elapsed + "ms)");
@@ -667,6 +738,7 @@ public final class FletchingScript
                 .channel(ActionRequest.Channel.MOUSE)
                 .widgetId(item.skillmultiWidget)
                 .build());
+            markDispatched();
             dispatcher.awaitIdle(3_000L);
             String werr = dispatcher.lastErrorMessage();
             if (werr != null)
@@ -700,6 +772,7 @@ public final class FletchingScript
                 .channel(ActionRequest.Channel.MOUSE)
                 .widgetId(item.skillmultiWidget)
                 .build());
+            markDispatched();
         }
 
         long elapsed = System.currentTimeMillis() - craftWaitMs;
@@ -734,6 +807,7 @@ public final class FletchingScript
                 .slot(bowstringSlot)
                 .verb("Use")
                 .build());
+            markDispatched();
             dispatcher.awaitIdle(3_000L);
             String err = dispatcher.lastErrorMessage();
             if (err != null)
@@ -754,6 +828,7 @@ public final class FletchingScript
             Rectangle bounds = onClient(() -> resolveInvItemBounds(item.unstrungId));
             if (bounds == null) { abortWith("unstrung bow not in inventory"); return; }
             dispatcher.clickCanvas(bounds.x + bounds.width / 2, bounds.y + bounds.height / 2);
+            markDispatched();
             dispatcher.awaitIdle(3_000L);
 
             clicksDone = true;
@@ -775,6 +850,7 @@ public final class FletchingScript
                 {
                     log.warn("fletching string: skillmulti did not open after {}ms — retrying", elapsed);
                     dispatcher.dismissMenu();
+                    markDispatched();
                     clicksDone = false; skillmultiWaitMs = 0;
                 }
                 else status.set("string: waiting for skillmulti (" + elapsed + "ms)");
@@ -789,6 +865,7 @@ public final class FletchingScript
                 .channel(ActionRequest.Channel.MOUSE)
                 .widgetId(InterfaceID.Skillmulti.A)
                 .build());
+            markDispatched();
             dispatcher.awaitIdle(3_000L);
             String werr = dispatcher.lastErrorMessage();
             if (werr != null)
@@ -815,6 +892,7 @@ public final class FletchingScript
                 .channel(ActionRequest.Channel.MOUSE)
                 .widgetId(InterfaceID.Skillmulti.A)
                 .build());
+            markDispatched();
         }
 
         long elapsed = System.currentTimeMillis() - craftWaitMs;
@@ -879,6 +957,7 @@ public final class FletchingScript
                 log.info("fletching: level-up — pressing Space ({}ms after popup appeared)",
                     now - levelUpFirstSeenAtMs);
                 dispatcher.tapKey(KeyEvent.VK_SPACE);
+                markDispatched();
                 levelUpFirstSeenAtMs = 0L;
                 // Auto-level evaluation happens at the next BANKING entry,
                 // when the bank is open and bankItemAmount() is queryable.
@@ -961,6 +1040,19 @@ public final class FletchingScript
         setState(State.ABORTED);
     }
 
+    /** Bump {@link #lastDispatchAtMs}. Call AFTER any input-dispatch
+     *  site (direct {@code dispatcher.dispatch} / {@code clickCanvas} /
+     *  {@code tapKey}, or a {@link BankInteraction} / {@link SidebarTabActions}
+     *  call that internally dispatches and returned success). Conservative
+     *  philosophy: false positives (calling after a dispatch that ended up
+     *  no-op) just keep us in normal activity longer, which is safe; the
+     *  break cap is only there to prevent over-long idles, not to mandate
+     *  them. */
+    private void markDispatched()
+    {
+        lastDispatchAtMs = System.currentTimeMillis();
+    }
+
     /** Worker-thread guard: ensures the inventory side-panel is the active
      *  tab, dispatching a click + waiting up to 2s if not. Returns true if
      *  the tab is open afterwards. */
@@ -969,7 +1061,9 @@ public final class FletchingScript
         if (Boolean.TRUE.equals(onClient(() -> sidebarTabs.isOpen(SidebarTab.INVENTORY))))
             return true;
         if (dispatcher.isBusy()) return false;
-        return sidebarTabs.openTabAndWait(SidebarTab.INVENTORY, 2_000L);
+        boolean ok = sidebarTabs.openTabAndWait(SidebarTab.INVENTORY, 2_000L);
+        if (ok) markDispatched();
+        return ok;
     }
 
     private int inventoryCount(int itemId)
