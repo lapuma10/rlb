@@ -431,7 +431,9 @@ public final class UltraCompostScript
         }
         if (geSt == SequenceState.FAILED)
         {
-            abortWith("GE buy failed: " + geScript.status());
+            String detail = geScript.lastFailedStepDescription();
+            abortWith("GE buy failed: " + geScript.status()
+                + (detail.isEmpty() ? "" : " | failing step: " + detail));
             return;
         }
 
@@ -841,7 +843,12 @@ public final class UltraCompostScript
 
         SequenceState geSt = geScript.state();
         if (geSt == SequenceState.RUNNING) { status.set("sell: " + geScript.status()); return; }
-        if (geSt == SequenceState.FAILED)  { abortWith("GE sell failed: " + geScript.status()); return; }
+        if (geSt == SequenceState.FAILED)  {
+            String detail = geScript.lastFailedStepDescription();
+            abortWith("GE sell failed: " + geScript.status()
+                + (detail.isEmpty() ? "" : " | failing step: " + detail));
+            return;
+        }
 
         if (!sellStarted)
         {

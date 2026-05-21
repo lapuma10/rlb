@@ -427,6 +427,26 @@ public interface RecorderConfig extends Config
 	}
 
 	@ConfigSection(
+		name = "GE Core overlay",
+		description = "Debug overlay for the Grand Exchange main interface. Tints the 8 slot widgets by status (gray=empty, yellow=in progress, green=completed buy, red=completed sell) and outlines the 'Collect to inventory' toolbar button.",
+		position = 205,
+		closedByDefault = true
+	)
+	String geCoreOverlaySection = "geCoreOverlay";
+
+	@ConfigItem(
+		keyName = "geCoreOverlay",
+		name = "Show GE Core overlay",
+		description = "Master toggle. When on, every visible GE slot is filled with a status colour (gray empty, yellow in-progress, green bought, red sold) and the Collect-to-inventory toolbar button is outlined. Off by default — debug-only. State persists across restarts.",
+		section = geCoreOverlaySection,
+		position = 0
+	)
+	default boolean geCoreOverlay()
+	{
+		return false;
+	}
+
+	@ConfigSection(
 		name = "WorldMap overlay (V2 inspect)",
 		description = "Minimap debug overlay for the V2 navigator's world memory: walkable tiles, transport endpoints, the active planned route, and (toggleable) blocked tiles, stale edges, entity sightings.",
 		position = 210,

@@ -497,7 +497,16 @@ public final class PieDishScript
         }
         if (geSt == SequenceState.FAILED)
         {
-            abortWith("GE buy failed: " + geScript.status());
+            // geScript.status() reports the OUTER LinearSequence's last
+            // RECOVERY (e.g. "BuyItemAtGECore RECOVERY FinishWithFailure:
+            // retry exhausted") — useful but it doesn't name the inner
+            // step that actually failed. Append lastFailedStepDescription
+            // (walks the telemetry ring buffer for CHECK FAILED records)
+            // so the abort log identifies the real culprit (EnsureAtGE,
+            // OpenGE, CollectAll, etc.).
+            String detail = geScript.lastFailedStepDescription();
+            abortWith("GE buy failed: " + geScript.status()
+                + (detail.isEmpty() ? "" : " | failing step: " + detail));
             return;
         }
 
@@ -1007,7 +1016,12 @@ public final class PieDishScript
         // Phase 2: sell at GE.
         SequenceState geSt = geScript.state();
         if (geSt == SequenceState.RUNNING) { status.set("sell: " + geScript.status()); return; }
-        if (geSt == SequenceState.FAILED)  { abortWith("GE sell failed: " + geScript.status()); return; }
+        if (geSt == SequenceState.FAILED)  {
+            String detail = geScript.lastFailedStepDescription();
+            abortWith("GE sell failed: " + geScript.status()
+                + (detail.isEmpty() ? "" : " | failing step: " + detail));
+            return;
+        }
 
         if (!sellStarted)
         {

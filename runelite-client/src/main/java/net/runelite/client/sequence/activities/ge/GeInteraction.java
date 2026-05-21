@@ -539,15 +539,31 @@ public final class GeInteraction implements GeActions {
         // fail the verb match, right-click, and ESCAPE the GE shut.
         int cw = client.getCanvasWidth();
         int ch = client.getCanvasHeight();
+        // ALSO clip by the scrollcontents' own bounds — children at y past
+        // the container's bottom are scrolled out of view; their getBounds()
+        // still reports the laid-out position (within canvas) but they
+        // aren't rendered, so a click there hits whatever IS rendered at
+        // that pixel (frequently a different result row, producing a
+        // wrong-item buy). Observed live 2026-05-21 on "pot of" / "tuna"
+        // queries that returned matches at scrolled positions.
+        Rectangle containerB = container.getBounds();
         String wantedNorm = VerbMatcher.normalise(wantedName);
+        ResultRow first = null;
+        int matchCount = 0;
         for (Widget k : kids) {
             if (k == null || k.isHidden()) continue;
             if (!rowMatches(k, wantedNorm)) continue;
             Rectangle b = k.getBounds();
             if (!boundsClickable(b, cw, ch)) continue;
-            return new ResultRow("Select", b);
+            boolean withinContainer = containerB == null || containerB.isEmpty()
+                || containerB.contains(b.x + b.width / 2, b.y + b.height / 2);
+            matchCount++;
+            log.info("findResultRow: candidate #{} bounds={} withinScroll={} forWanted=\"{}\"",
+                matchCount, b, withinContainer, wantedName);
+            if (!withinContainer) continue;
+            if (first == null) first = new ResultRow("Select", b);
         }
-        return null;
+        return first;
     }
 
     /** True only when {@code b} is a non-empty rectangle that lies on the
@@ -771,8 +787,8 @@ public final class GeInteraction implements GeActions {
             List<ButtonClick> plan = planAdditiveClicks(diff, qtyButtons,
                 new String[]{"+1000", "+100", "+10", "+1"});
             if (plan != null && plan.size() <= MAX_BUTTON_CLICKS && !plan.isEmpty()) {
-                log.info("setQuantity: button-stepping diff={} via {} clicks: {}",
-                    diff, plan.size(), summarize(plan));
+                log.info("setQuantity: button-stepping diff={} via {} clicks: {} | resolved bounds: {}",
+                    diff, plan.size(), summarize(plan), qtyButtons);
                 runHumanizedClickPlan(plan);
                 return;
             }
@@ -1308,17 +1324,103 @@ public final class GeInteraction implements GeActions {
 
     @Override
     public void collectAll() {
-        // GeOffers.COLLECTALL toolbar button. Click-inspector 2026-05-01:
-        // actions=['Collect to inventory', 'Collect to bank'], entryId=1 →
-        // left-click defaults to whichever the in-game "Toggle: Collect to
-        // bank/inventory" was last set to. EITHER drains the slot, which is
-        // CollectOfferStep's success signal — so we accept both verbs via the
-        // dispatcher's pipe-separated multi-verb path. Verb-routed (not
-        // bounds-click) so the engine's hover-menu pre-check rejects clicks
-        // that would land on a non-COLLECTALL pixel (overlay / stale rect)
-        // before we'd otherwise fire a wrong action 18 times.
-        clickWidgetVerb(InterfaceID.GeOffers.COLLECTALL,
-            "Collect to inventory|Collect to bank", "collectAll");
+        // The widget at GeOffers.COLLECTALL (0x01d10006) is actually the
+        // WHOLE GE toolbar in some game states (472×20 row covering
+        // "Repeat Offer | instructions | Collect"), not just the button.
+        // Click-inspector 2026-05-01 happened to capture it in the
+        // narrow-bounds state (85×22) but the wide-bar state confirmed
+        // live with the GE debug overlay 2026-05-21. Dispatching by widget
+        // id routes through resolveWidget → parent bounds, so /4 margins
+        // sample clicks at X=129..365 (across the instruction text), the
+        // engine routes those to its background's Cancel pseudo-action,
+        // and the bot loops 12+ ticks before getting lucky.
+        //
+        // Find the actual button child (one whose default action is
+        // Collect-to-inventory or Collect-to-bank) on the client thread,
+        // then dispatch CLICK_BOUNDS at THAT widget's bounds — so the
+        // cursor lands inside the visible button regardless of how the
+        // parent's bounds change between revisions.
+        Rectangle btn;
+        try {
+            btn = dispatcher.runOnClient(this::resolveCollectButtonBounds);
+        } catch (InterruptedException ie) {
+            Thread.currentThread().interrupt();
+            return;
+        }
+        if (btn == null) {
+            log.warn("collectAll: no Collect-to-inventory/bank action widget "
+                + "found in GeOffers.COLLECTALL subtree");
+            return;
+        }
+        clickBoundsVerb(btn, "Collect to inventory|Collect to bank", "collectAll");
+    }
+
+    /** Walk the COLLECTALL widget subtree on the client thread for the
+     *  first visible descendant whose default action is one of the Collect-*
+     *  verbs. Returns its bounds, or null when nothing matches. Falls back
+     *  to COLLECTALL's own bounds only if COLLECTALL itself carries the
+     *  action (rare — the per-revision narrow-bounds state).
+     *
+     *  <p>Must run on the client thread. */
+    private Rectangle resolveCollectButtonBounds() {
+        Widget root = client.getWidget(InterfaceID.GeOffers.COLLECTALL);
+        if (root == null || root.isHidden()) return null;
+        // BFS so we prefer the shallowest narrower match. A DFS would dive
+        // into a static-children chain before checking dynamic children that
+        // hold the actual button on some revisions.
+        java.util.Deque<Widget> queue = new java.util.ArrayDeque<>();
+        queue.add(root);
+        Widget rootMatch = hasCollectAction(root) ? root : null;
+        while (!queue.isEmpty()) {
+            Widget w = queue.poll();
+            if (w == null || w.isHidden()) continue;
+            if (w != root && hasCollectAction(w)) {
+                Rectangle b = w.getBounds();
+                if (b != null && !b.isEmpty()) return b;
+            }
+            addAll(queue, w.getDynamicChildren());
+            addAll(queue, w.getStaticChildren());
+            addAll(queue, w.getNestedChildren());
+        }
+        if (rootMatch != null) {
+            Rectangle b = rootMatch.getBounds();
+            if (b != null && !b.isEmpty()) return b;
+        }
+        return null;
+    }
+
+    private static boolean hasCollectAction(Widget w) {
+        String[] actions = w.getActions();
+        if (actions == null) return false;
+        for (String a : actions) {
+            if (a == null) continue;
+            String an = VerbMatcher.normalise(a);
+            if (an.contains("collect-to-inventory") || an.contains("collect-to-bank")) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private static void addAll(java.util.Deque<Widget> queue, Widget[] arr) {
+        if (arr == null) return;
+        for (Widget c : arr) if (c != null) queue.add(c);
+    }
+
+    /** Dispatch CLICK_BOUNDS with verb-routing. The dispatcher's boundsClick
+     *  handles single-verb {@code verb}; when {@code verb} contains "|" it
+     *  routes through {@code boundsAnyVerbClick} (parsed identically to the
+     *  CLICK_WIDGET multi-verb path). */
+    private void clickBoundsVerb(Rectangle bounds, String verb, String purpose) {
+        ActionRequest req = ActionRequest.builder()
+            .kind(ActionRequest.Kind.CLICK_BOUNDS)
+            .channel(ActionRequest.Channel.MOUSE)
+            .bounds(bounds)
+            .verb(verb)
+            .build();
+        log.info("{}: dispatching CLICK_BOUNDS bounds={} verb=\"{}\"",
+            purpose, bounds, verb);
+        dispatcher.dispatch(req);
     }
 
     @Override
