@@ -13,8 +13,10 @@ import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicReference;
 import lombok.extern.slf4j.Slf4j;
 import net.runelite.api.Client;
+import net.runelite.api.DecorativeObject;
 import net.runelite.api.GameObject;
 import net.runelite.api.GameState;
+import net.runelite.api.GroundObject;
 import net.runelite.api.Item;
 import net.runelite.api.ItemComposition;
 import net.runelite.api.ItemContainer;
@@ -23,6 +25,7 @@ import net.runelite.api.Scene;
 import net.runelite.api.Skill;
 import net.runelite.api.Tile;
 import net.runelite.api.TileItem;
+import net.runelite.api.WallObject;
 import net.runelite.api.coords.WorldPoint;
 import net.runelite.api.events.GameTick;
 import net.runelite.api.gameval.InterfaceID;
@@ -476,8 +479,17 @@ public final class RooftopAgilityScript
             node.label, stage, targetTile, node.action);
     }
 
-    /** Returns the tile of a scene GameObject whose id matches {@code node.objectId}
-     *  and whose worldLocation is in {@code node.objectTiles}. Null if none. */
+    /** Returns the world tile of a scene object whose id matches
+     *  {@code node.objectId} and whose location is in {@code node.objectTiles}.
+     *
+     *  <p>Agility obstacles are split across four scene-object kinds in
+     *  RuneLite: {@link GameObject} (tightropes, gaps, crates),
+     *  {@link WallObject} (rough wall, narrow wall, wall), {@link GroundObject}
+     *  (some platforms), and {@link DecorativeObject}. All four are checked
+     *  here — matching the pattern in {@link
+     *  net.runelite.client.plugins.recorder.transport.TransportResolver} and
+     *  the spawn-event subscribers in RuneLite's built-in
+     *  {@code AgilityPlugin}. */
     private WorldPoint findOnSceneObjectTile(RooftopNode node)
     {
         Scene scene = client.getScene();
@@ -494,10 +506,27 @@ public final class RooftopAgilityScript
             if (sx < 0 || sy < 0 || sx >= Constants.SCENE_SIZE || sy >= Constants.SCENE_SIZE) continue;
             Tile t = tiles[plane][sx][sy];
             if (t == null) continue;
-            for (GameObject go : t.getGameObjects())
+
+            // GameObject[] — tightropes, gaps, crates
+            GameObject[] gos = t.getGameObjects();
+            if (gos != null)
             {
-                if (go != null && go.getId() == node.objectId) return wp;
+                for (GameObject go : gos)
+                {
+                    if (go != null && go.getId() == node.objectId) return wp;
+                }
             }
+            // WallObject — rough wall, narrow wall, jump-up wall
+            WallObject wo = t.getWallObject();
+            if (wo != null && wo.getId() == node.objectId) return wp;
+
+            // GroundObject — some platforms / floor obstacles
+            GroundObject groundObj = t.getGroundObject();
+            if (groundObj != null && groundObj.getId() == node.objectId) return wp;
+
+            // DecorativeObject — rope/ladder decorations on some courses
+            DecorativeObject decoObj = t.getDecorativeObject();
+            if (decoObj != null && decoObj.getId() == node.objectId) return wp;
         }
         return null;
     }
