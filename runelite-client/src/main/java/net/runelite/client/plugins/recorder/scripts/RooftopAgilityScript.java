@@ -991,40 +991,96 @@ public final class RooftopAgilityScript
 
         // ── Draynor Rooftop ──────────────────────────────────────────────────────
         //
-        // POPULATE WITH CAPTURED TILE DATA — see plan Task 4/5 and spec §17.
-        // Until then, COURSES is empty and start() will refuse with
-        // "No course profile for DRAYNOR". This is intentional: the script
-        // ships without speculative tile data; the user delivers Draynor
-        // groups via the tile-marker plugin + click-inspector, then we
-        // paste them into the List.of(...) below and call validateCourse().
+        // Captured 2026-05-21 from the user's:
+        //   • Recorded route at ~/.runelite/sequencer/routes/
+        //       draynor_agility_rooftop_course.txt  (stage areas per obstacle)
+        //   • ClickInspector log entries (objectIds + verbs + obstacle scene coords)
+        //   • TransportObserver entries in worldmap/transports.json (5 obstacles
+        //     with full id/verb/from/to records — Climb/Cross/Jump/Climb-down)
         //
-        // Skeleton for the eventual paste — DO NOT uncomment until coords
-        // are real:
+        // Scene→world base computed from click-inspector vs. observer:
+        //   baseX=3056, baseY=3200 (Draynor agility scene at capture time).
         //
-        // List<RooftopNode> draynorNodes = List.of(
-        //     new RooftopNode("Rough wall",  /*objectId*/ ___, "Climb",
-        //         tiles(/*draynor.object.0*/ ),
-        //         tiles(/*draynor.stage.0*/  ),
-        //         Set.of(),
-        //         tiles(/*draynor.marks.0*/  ),
-        //         4_000L),
-        //     new RooftopNode("Tightrope",   /*objectId*/ ___, "Cross",
-        //         tiles(/*draynor.object.1*/ ),
-        //         tiles(/*draynor.stage.1*/  ),
-        //         Set.of(),
-        //         tiles(/*draynor.marks.1*/  ),
-        //         7_000L),
-        //     // ... nodes 2..6 (Tightrope, Narrow wall, Wall, Gap, Crate)
-        // );
-        // RooftopCourse draynor = new RooftopCourse(
-        //     RooftopCourseId.DRAYNOR, "Draynor Rooftop", 1,
-        //     tiles(/*draynor.start*/  ),
-        //     tiles(/*draynor.valid*/  ),
-        //     tiles(/*draynor.fall*/   ),
-        //     tiles(/*draynor.lapend*/ ),
-        //     draynorNodes);
-        // validateCourse(draynor);
-        // m.put(RooftopCourseId.DRAYNOR, draynor);
+        // Per-node objectTiles use the OBJECT's world tile (the obstacle's own
+        // GameObject location). For Draynor obstacles these usually sit on or
+        // adjacent to the player's stage tile, and the dispatcher's
+        // CLICK_GAME_OBJECT with .tile(objectTile) + .verb(action) resolves the
+        // GameObject from the scene. findOnSceneObjectTile filters by both
+        // tile membership and objectId, so the two tightropes (Cross at 11405
+        // and Cross at 11406) cannot be confused.
+
+        List<RooftopNode> draynorNodes = List.of(
+            new RooftopNode("Rough wall", 11404, "Climb",
+                tiles(3103, 3279, 0),
+                tiles(3102, 3279, 0,  3103, 3278, 0,  3103, 3279, 0,  3103, 3280, 0,
+                      3104, 3278, 0,  3104, 3279, 0,  3104, 3280, 0),
+                Set.of(),                       // successTiles → defaults to next.stageTiles
+                Set.of(),                       // reachableMarkTiles — empty for v1
+                4_000L),
+
+            new RooftopNode("Tightrope 1", 11405, "Cross",
+                tiles(3098, 3277, 3),
+                tiles(3098, 3277, 3,  3099, 3277, 3,  3099, 3278, 3,
+                      3100, 3277, 3,  3100, 3278, 3),
+                Set.of(), Set.of(),
+                7_000L),
+
+            new RooftopNode("Tightrope 2", 11406, "Cross",
+                tiles(3092, 3276, 3),
+                tiles(3090, 3276, 3,  3091, 3276, 3,  3092, 3276, 3),
+                Set.of(), Set.of(),
+                7_000L),
+
+            new RooftopNode("Narrow wall", 11430, "Balance",
+                tiles(3089, 3264, 3),
+                tiles(3089, 3264, 3,  3089, 3265, 3),
+                Set.of(), Set.of(),
+                5_000L),
+
+            new RooftopNode("Wall", 11630, "Jump-up",
+                tiles(3088, 3256, 3),
+                tiles(3088, 3256, 3,  3088, 3257, 3),
+                Set.of(), Set.of(),
+                4_000L),
+
+            new RooftopNode("Gap", 11631, "Jump",
+                tiles(3095, 3255, 3),
+                tiles(3094, 3255, 3,  3095, 3255, 3),
+                Set.of(), Set.of(),
+                4_000L),
+
+            new RooftopNode("Crate", 11632, "Climb-down",
+                tiles(3102, 3261, 3),
+                tiles(3100, 3260, 3,  3100, 3261, 3,
+                      3101, 3260, 3,  3101, 3261, 3,
+                      3102, 3261, 3),
+                Set.of(), Set.of(),
+                4_000L)
+        );
+
+        // validTiles = union of every stage tile + lapEnd tile.
+        // (validateCourse enforces stageTiles ⊆ validTiles and lapEnd ⊆ validTiles.)
+        Set<WorldPoint> draynorValid = new java.util.HashSet<>();
+        for (RooftopNode n : draynorNodes) draynorValid.addAll(n.stageTiles);
+        draynorValid.add(new WorldPoint(3102, 3261, 1));   // lapEnd at plane=1
+
+        RooftopCourse draynor = new RooftopCourse(
+            RooftopCourseId.DRAYNOR, "Draynor Rooftop", 1,
+            // startTiles — subset of node[0].stageTiles, used for recovery walks.
+            // We use the full stage 0 set so the nearest-tile pick can always find one.
+            tiles(3102, 3279, 0,  3103, 3278, 0,  3103, 3279, 0,  3103, 3280, 0,
+                  3104, 3278, 0,  3104, 3279, 0,  3104, 3280, 0),
+            draynorValid,
+            // fallTiles — empty for v1. The off-route branch in
+            // handleFallOrInvalidPosition catches falls (player not in
+            // validTiles/startTiles/lapEndTiles) and dispatches recovery.
+            Set.of(),
+            // lapEndTiles — single tile where the Crate Climb-down lands the
+            // player. TransportObserver logged dest at (3102, 3261, plane=1).
+            tiles(3102, 3261, 1),
+            draynorNodes);
+        validateCourse(draynor);
+        m.put(RooftopCourseId.DRAYNOR, draynor);
 
         COURSES = Collections.unmodifiableMap(m);
     }
