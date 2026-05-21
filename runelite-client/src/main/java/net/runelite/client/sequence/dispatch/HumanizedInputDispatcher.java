@@ -37,6 +37,7 @@ import net.runelite.api.Perspective;
 import net.runelite.api.Point;
 import net.runelite.api.Tile;
 import net.runelite.api.TileItem;
+import net.runelite.api.TileObject;
 import net.runelite.api.WorldView;
 import net.runelite.api.WallObject;
 import net.runelite.api.coords.LocalPoint;
@@ -51,6 +52,7 @@ import java.awt.Polygon;
 import java.awt.Rectangle;
 import java.awt.Shape;
 import java.awt.event.MouseEvent;
+import java.util.List;
 import java.util.Random;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.atomic.AtomicBoolean;
@@ -419,9 +421,13 @@ public class HumanizedInputDispatcher implements InputDispatcher
             int vh = client.getViewportHeight();
             // Margin keeps us from skipping when the tile is right at the
             // edge of the screen — those are the cases where panning a
-            // little still looks natural. ~40px ≈ a tile diagonal at
-            // default zoom.
-            int margin = 40;
+            // little still looks natural. 16 px is roughly half a tile
+            // at default zoom; if the tile poly sits half a tile inside
+            // the viewport, a click can resolve cleanly without panning.
+            // The original 40 px ≈ one tile was too generous and triggered
+            // wide off-axis rotation in scripts where the target was
+            // already plainly visible (rooftop agility — every obstacle).
+            int margin = 16;
             return bb.x >= vx + margin
                 && bb.y >= vy + margin
                 && bb.x + bb.width <= vx + vw - margin
@@ -438,10 +444,14 @@ public class HumanizedInputDispatcher implements InputDispatcher
      *  destination never sits dead-centre. 228 units ≈ 40°. */
     private static final int ROTATION_OFFSET_MIN_UNITS = 228;
 
-    /** Maximum random offset applied to the rotation target. 683 units
-     *  ≈ 120° — beyond this the target would be near-perpendicular or
-     *  behind, defeating the point of rotating toward it. */
-    private static final int ROTATION_OFFSET_MAX_UNITS = 683;
+    /** Maximum random offset applied to the rotation target. 342 units
+     *  ≈ 60°. The original 683 (~120°) was wide enough to swing the
+     *  target past the FOV edge — symptomatic on rooftop agility, where
+     *  the camera would rotate "to the wrong side", the obstacle would
+     *  fall out of view, and the next click would need another rotation
+     *  to bring it back. 60° still keeps the target off dead-centre
+     *  (min is 40°) but never throws it across the screen. */
+    private static final int ROTATION_OFFSET_MAX_UNITS = 342;
 
     /** Minimum offset for the verify-and-retry tight pass. 28 units ≈ 5° —
      *  preserves the "never bolt-centred on target" rule so the camera
@@ -533,7 +543,18 @@ public class HumanizedInputDispatcher implements InputDispatcher
                         .toList());
             }
             case CLICK_INV_ITEM -> invSlotClick(Math.max(0, req.getSlot()), req.getVerb());
-            case CLICK_BOUNDS -> boundsClick(req.getBounds(), req.getVerb());
+            case CLICK_BOUNDS -> {
+                String verb = req.getVerb();
+                if (verb != null && !verb.isBlank() && verb.indexOf('|') >= 0)
+                {
+                    boundsAnyVerbClick(req.getBounds(),
+                        java.util.Arrays.stream(verb.split("\\|"))
+                            .map(String::trim)
+                            .filter(s -> !s.isEmpty())
+                            .toList());
+                }
+                else boundsClick(req.getBounds(), verb);
+            }
             case TYPE_CHATBOX -> typeChatboxInternal(
                 req.getTypeText(),
                 req.getTypeAwaitMs(),
@@ -1232,29 +1253,17 @@ public class HumanizedInputDispatcher implements InputDispatcher
             return;
         }
 
-        // Try the convex-hull pixel first (matches the visible model
-        // body — works for most objects). If the hover doesn't produce
-        // the verb in the engine's menu, retry inside the same call
-        // with the tile-footprint polygon, which is the actual hit-test
-        // region for transport-style GameObjects (Lumbridge stairs,
-        // ladders, doors). This avoids the 2-3 s walker-driven retry
-        // burning ticks while the staircase model is right under the
-        // cursor — the engine just doesn't accept clicks on the upper
-        // hull region.
-        if (tryGameObjectAttempt(match, tile, verb,
-                PixelResolver.GameObjectStrategy.HULL))
-        {
-            return;
-        }
-        log.info("gameObjectClick {} verb='{}' — HULL miss, retrying TILE_POLY",
-            tile, verb);
-        if (tryGameObjectAttempt(match, tile, verb,
-                PixelResolver.GameObjectStrategy.TILE_POLY))
-        {
-            lastError.set(null);  // HULL partial failure; TILE_POLY succeeded — no net error
-            return;
-        }
-        log.info("gameObjectClick {} verb='{}' — TILE_POLY miss, giving up",
+        // Sample candidate pixels from the engine's own hit-test geometry
+        // — {@link TileObject#getClickbox()} first (same Shape RuneLite's
+        // own AgilityOverlay draws and tests against the mouse), then
+        // convex hulls and the tile poly as fallbacks. The candidates
+        // are ordered best-first; we hover each one and ask the engine
+        // what the left-click would do. First candidate where the
+        // engine reports the expected verb wins. No more "compute one
+        // clever pixel and pray" — the engine's hit-test is the source
+        // of truth, we just search it.
+        if (tryGameObjectClickbox(match, tile, verb)) return;
+        log.info("gameObjectClick {} verb='{}' — all candidates exhausted, giving up",
             tile, verb);
     }
 
@@ -1451,76 +1460,177 @@ public class HumanizedInputDispatcher implements InputDispatcher
         return hull.contains(x, y);
     }
 
-    /** One resolve+hover+click attempt for a GameObject under the
-     *  requested {@link PixelResolver.GameObjectStrategy}. Returns
-     *  {@code true} when the click landed (left-click default OR
-     *  right-click menu match); {@code false} when the verb is missing
-     *  from the menu under this strategy and the caller should retry
-     *  with a different strategy. On a {@code false} return, any open
-     *  right-click menu has been dismissed and the cursor is settled
-     *  for the next attempt. */
-    private boolean tryGameObjectAttempt(TransportResolver.Match match,
-                                         WorldPoint tile, String verb,
-                                         PixelResolver.GameObjectStrategy strategy)
+    /** Click the tile object referenced by {@code match} by searching
+     *  the engine's own hit-test geometry until we land on a pixel the
+     *  engine accepts.
+     *
+     *  <p>Flow:
+     *  <ol>
+     *    <li>Ask {@link PixelResolver#objectClickCandidates(TileObject)}
+     *        for an ordered list of pixels — {@link TileObject#getClickbox()}
+     *        centre first, then hull samples, then tile-poly samples.</li>
+     *    <li>For each candidate: move cursor, settle ~2 frames, read
+     *        the engine's current top menu entry via {@link
+     *        #isTopMenuVerb(String)}. If it matches the requested verb,
+     *        left-click. Done.</li>
+     *    <li>If no candidate produced the verb at the top, right-click
+     *        on the first candidate (clickbox centre — the best single
+     *        guess) and look for the verb anywhere in the open menu.</li>
+     *    <li>Otherwise give up; caller decides whether to retry next tick.</li>
+     *  </ol>
+     *
+     *  <p>This replaces the old "try HULL strategy, then try TILE_POLY
+     *  strategy" two-shot. The old code committed to one pixel per
+     *  strategy — fine for short objects, but tall walls and rooftop
+     *  obstacles project hulls whose centroid lands off the engine's
+     *  hit region. The new search uses the engine's own clickbox as
+     *  the source of truth and walks several pixels inside it, so a
+     *  bad first guess doesn't kill the obstacle.
+     *
+     *  <p>Returns {@code true} when a click landed; {@code false} after
+     *  the right-click fallback also missed. On a {@code false} return
+     *  any open menu has been dismissed and the cursor is settled.
+     */
+    private boolean tryGameObjectClickbox(TransportResolver.Match match,
+                                          WorldPoint tile, String verb)
         throws InterruptedException
     {
-        Point pixel = onClient(() -> {
-            if (match.wallObject() != null) return resolver.resolveWallObject(match.wallObject());
-            if (match.gameObject() != null)
-                return resolver.resolveGameObject(match.gameObject(), strategy);
-            // Decorative + Ground objects: use their tile polygon directly.
-            // PixelResolver doesn't have a custom path for these, but the
-            // generic walk-target resolver will pick a clean pixel inside
-            // the tile, which is good enough.
-            return resolver.resolveWalkTarget(tile);
-        });
-        if (pixel == null)
+        TileObject obj = pickTileObject(match);
+        if (obj == null)
         {
-            lastError.set("transport pixel unresolvable (off-screen?) at " + tile
-                + " strategy=" + strategy);
-            log.info("gameObjectClick {} — pixel unresolvable (strategy={})",
-                tile, strategy);
+            // Match has no classified TileObject (rare degraded path) —
+            // degrade to a single tile-polygon sample so we at least try
+            // once instead of bailing.
+            Point fb = onClient(() -> resolver.resolveWalkTarget(tile));
+            if (fb == null)
+            {
+                lastError.set("no click candidates at " + tile + " (off-screen?)");
+                log.info("gameObjectClick {} — no candidates resolvable", tile);
+                return false;
+            }
+            log.info("gameObjectClick → world {} verb='{}' (matched '{}', id={}) — "
+                    + "tile-poly fallback at ({},{})",
+                tile, verb, match.matchedVerb(), match.matchedObjectId(),
+                fb.getX(), fb.getY());
+            moveCursorTo(fb.getX(), fb.getY());
+            SequenceSleep.sleep(client, 60);
+            if (onClient(() -> isTopMenuVerb(verb)))
+            {
+                clickPress(MouseEvent.BUTTON1);
+                return true;
+            }
+            log.info("  tile-poly fallback ({},{}) — top='{}' (miss)",
+                fb.getX(), fb.getY(), onClient(this::topMenuLabel));
             return false;
         }
-        log.info("gameObjectClick → world {} via screen ({},{}) verb='{}' "
-                + "(matched '{}', id={}, strategy={})",
-            tile, pixel.getX(), pixel.getY(), verb,
-            match.matchedVerb(), match.matchedObjectId(), strategy);
-        moveCursorTo(pixel.getX(), pixel.getY());
-        // Give the engine ~2 render frames to compute hover-state menu entries.
-        SequenceSleep.sleep(client, 60);
 
-        // Left-click default? Single-click and we're done.
-        boolean isTop = onClient(() -> isTopMenuVerb(verb));
-        if (isTop)
+        log.info("gameObjectClick → world {} verb='{}' (matched '{}', id={}) — "
+                + "live-sampling from {}",
+            tile, verb, match.matchedVerb(), match.matchedObjectId(),
+            obj.getClass().getSimpleName());
+
+        // Live-sample the object's clickbox on EVERY attempt. The previous
+        // implementation computed a 12-candidate list once and hovered each
+        // pixel in sequence — that's a stale snapshot. The engine
+        // interpolates the camera toward setCameraYawTarget over multiple
+        // frames after we set it, so the camera is often still drifting
+        // when we hover candidate 1, and by candidate 12 the clickbox has
+        // re-projected to a different screen region. Every cached candidate
+        // ends up pointing at the same wrong tile and every hover misses.
+        // Re-sampling per iteration tracks the live screen-space position.
+        final int maxAttempts = 12;
+        java.util.List<Point> tried = new java.util.ArrayList<>(maxAttempts);
+        Point firstSample = null;
+        int attemptsUsed = 0;
+        for (int i = 0; i < maxAttempts; i++)
         {
-            log.info("verb '{}' is left-click default — single click (strategy={})",
-                verb, strategy);
-            clickPress(MouseEvent.BUTTON1);
-            return true;
+            Point p = onClient(() -> {
+                List<Point> fresh = resolver.objectClickCandidates(obj);
+                if (fresh.isEmpty()) return null;
+                // Walk the freshly-sampled candidates and skip near-
+                // duplicates of pixels we've already hovered. Without
+                // dedup, attempt #1 (centroid) would repeat forever
+                // since the resolver's centroid sample is deterministic
+                // when the clickbox hasn't moved.
+                for (Point fp : fresh)
+                {
+                    boolean dup = false;
+                    for (Point t : tried)
+                    {
+                        int dx = fp.getX() - t.getX();
+                        int dy = fp.getY() - t.getY();
+                        if (dx * dx + dy * dy < 36) { dup = true; break; }
+                    }
+                    if (!dup) return fp;
+                }
+                return null;
+            });
+            if (p == null)
+            {
+                log.info("  no fresh candidate (attempt {}/{}) — sampling exhausted",
+                    i + 1, maxAttempts);
+                break;
+            }
+            if (firstSample == null) firstSample = p;
+            tried.add(p);
+            attemptsUsed = i + 1;
+            moveCursorTo(p.getX(), p.getY());
+            // ~2 render frames for the engine to recompute hover state.
+            SequenceSleep.sleep(client, 60);
+            boolean isTop = onClient(() -> isTopMenuVerb(verb));
+            if (isTop)
+            {
+                log.info("  attempt {}/{} ({},{}) — verb at top, left-click",
+                    i + 1, maxAttempts, p.getX(), p.getY());
+                clickPress(MouseEvent.BUTTON1);
+                return true;
+            }
+            String topLbl = onClient(this::topMenuLabel);
+            log.info("  attempt {}/{} ({},{}) — top='{}' (miss)",
+                i + 1, maxAttempts, p.getX(), p.getY(), topLbl);
         }
-        // Verb is somewhere else in the menu — right-click to open it.
-        String topLbl = onClient(this::topMenuLabel);
-        log.info("verb '{}' not at top of menu (top='{}') — right-click flow (strategy={})",
-            verb, topLbl, strategy);
+
+        if (firstSample == null)
+        {
+            lastError.set("no click candidates at " + tile + " (off-screen?)");
+            log.info("gameObjectClick {} — no candidates resolvable", tile);
+            return false;
+        }
+
+        // Phase 2 — right-click the most recent fresh sample. Some verbs
+        // are never the engine's default (Climb-up on a staircase that has
+        // a left-click "Climb" dialogue, e.g.) so the right-click menu is
+        // the legitimate path even when no attempt produced the verb at
+        // the top. Using the LAST tried pixel (not the first) means the
+        // right-click happens on the most up-to-date projection.
+        Point best = tried.isEmpty() ? firstSample : tried.get(tried.size() - 1);
+        log.info("  right-click fallback at ({},{})", best.getX(), best.getY());
+        moveCursorTo(best.getX(), best.getY());
+        SequenceSleep.sleep(client, 60);
         clickPress(MouseEvent.BUTTON3);
-        // Wait one render frame so the engine actually populates / opens the
-        // mini-menu. Engine ticks are ~50ms; one or two should be plenty.
         SequenceSleep.sleep(client, 120);
         if (selectMenuVerb(verb)) return true;
 
-        // Verb missing from the right-click menu under this strategy.
-        // Dismiss the open menu so the next attempt can hover cleanly,
-        // and report enough context for diagnosis.
         String menuDump = onClient(this::fullMenuDump);
-        lastError.set("menu open but verb '" + verb + "' not present (strategy="
-            + strategy + ")");
-        log.info("right-click menu did not contain verb '{}' (strategy={}, top='{}', {})",
-            verb, strategy, topLbl, menuDump);
+        lastError.set("verb '" + verb + "' not in menu after "
+            + attemptsUsed + " attempts (" + menuDump + ")");
+        log.info("  right-click fallback missed verb '{}' ({})", verb, menuDump);
         dismissMenu();
-        // Let the right-click menu actually close before the next hover.
         SequenceSleep.sleep(client, 120);
         return false;
+    }
+
+    /** Pick whichever concrete TileObject subtype the resolver found.
+     *  Match guarantees exactly one of these is non-null on success;
+     *  returns {@code null} for a degraded fallback Match. */
+    @javax.annotation.Nullable
+    private static TileObject pickTileObject(TransportResolver.Match m)
+    {
+        if (m.gameObject() != null) return m.gameObject();
+        if (m.wallObject() != null) return m.wallObject();
+        if (m.decorativeObject() != null) return m.decorativeObject();
+        if (m.groundObject() != null) return m.groundObject();
+        return null;
     }
 
     /** True if the engine's left-click action at the current cursor position
@@ -2205,6 +2315,12 @@ public class HumanizedInputDispatcher implements InputDispatcher
             + rng.nextInt(Math.max(1, bounds.width - 2 * marginX));
         int y = bounds.y + marginY
             + rng.nextInt(Math.max(1, bounds.height - 2 * marginY));
+        // Diagnostic — log the actual click pixel + bounds so we can
+        // compare against the in-game widget overlay. If the click pixel
+        // is inside the bounds but the engine routes it to the wrong
+        // widget, the bounds-vs-hit-test polygon don't agree (e.g. the
+        // GE COLLECTALL "whole toolbar" issue).
+        log.info("boundsClick: bounds={} pixel=({},{}) verb={}", bounds, x, y, verb);
         moveCursorTo(x, y);
         if (verb == null || verb.isBlank())
         {
@@ -2349,6 +2465,84 @@ public class HumanizedInputDispatcher implements InputDispatcher
         }
         log.info("widgetAnyVerbClick: widget 0x{} menu pick='{}'",
             Integer.toHexString(widgetId), matched[0]);
+        moveCursorTo(row.x, row.y);
+        SequenceSleep.sleep(client, 40 + rng.nextInt(60));
+        input.mousePress(MouseEvent.BUTTON1);
+        SequenceSleep.sleep(client, 40 + rng.nextInt(40));
+        input.mouseRelease(MouseEvent.BUTTON1);
+        SequenceSleep.sleep(client, 80 + rng.nextInt(180));
+    }
+
+    /** Bounds-based mirror of {@link #widgetAnyVerbClick}: accepts a list
+     *  of acceptable verbs and clicks at a humanized pixel inside {@code
+     *  bounds}, taking the left-click fast path if any of the verbs is the
+     *  engine's top menu entry at the cursor, otherwise right-click +
+     *  selectMenuVerb with the same verb list. Used when the caller has
+     *  already resolved bounds on the client thread (e.g. a child of a
+     *  larger toolbar widget) and doesn't want the dispatcher to re-resolve
+     *  the parent's widget id. */
+    private void boundsAnyVerbClick(java.awt.Rectangle bounds, java.util.List<String> verbs)
+        throws InterruptedException
+    {
+        if (bounds == null || bounds.isEmpty())
+        {
+            lastError.set("boundsAnyVerbClick: null or empty bounds");
+            return;
+        }
+        if (verbs == null || verbs.isEmpty())
+        {
+            lastError.set("boundsAnyVerbClick: no candidate verbs");
+            return;
+        }
+        int marginX = Math.max(1, bounds.width / 4);
+        int marginY = Math.max(1, bounds.height / 4);
+        if (bounds.width  - 2 * marginX < 2) marginX = Math.max(1, (bounds.width  - 2) / 2);
+        if (bounds.height - 2 * marginY < 2) marginY = Math.max(1, (bounds.height - 2) / 2);
+        int x = bounds.x + marginX
+            + rng.nextInt(Math.max(1, bounds.width - 2 * marginX));
+        int y = bounds.y + marginY
+            + rng.nextInt(Math.max(1, bounds.height - 2 * marginY));
+        log.info("boundsAnyVerbClick: bounds={} pixel=({},{}) verbs={}",
+            bounds, x, y, verbs);
+        moveCursorTo(x, y);
+        SequenceSleep.sleep(client, 60);
+        String topVerb = onClient(this::topMenuVerbForDiag);
+        String topMatch = onClient(() -> {
+            for (String v : verbs)
+            {
+                if (v != null && !v.isBlank() && isTopMenuVerb(v)) return v;
+            }
+            return null;
+        });
+        if (topMatch != null)
+        {
+            log.info("boundsAnyVerbClick: left-click (matched='{}' top='{}')",
+                topMatch, topVerb);
+            clickPress(MouseEvent.BUTTON1);
+            return;
+        }
+        log.info("boundsAnyVerbClick: right-click fallback (wanted={} top='{}')",
+            verbs, topVerb);
+        clickPress(MouseEvent.BUTTON3);
+        SequenceSleep.sleep(client, 120);
+        String[] matched = new String[1];
+        MenuRow row = onClient(() -> {
+            for (String v : verbs)
+            {
+                if (v == null || v.isBlank()) continue;
+                MenuRow r = findMenuRow(v);
+                if (r != null) { matched[0] = v; return r; }
+            }
+            return null;
+        });
+        if (row == null)
+        {
+            log.info("boundsAnyVerbClick: menu select FAILED (none of {} in menu)", verbs);
+            lastError.set("bounds menu open but none of " + verbs + " present");
+            dismissMenu();
+            return;
+        }
+        log.info("boundsAnyVerbClick: menu pick='{}'", matched[0]);
         moveCursorTo(row.x, row.y);
         SequenceSleep.sleep(client, 40 + rng.nextInt(60));
         input.mousePress(MouseEvent.BUTTON1);

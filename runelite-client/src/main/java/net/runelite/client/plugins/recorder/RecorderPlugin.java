@@ -445,7 +445,7 @@ public class RecorderPlugin extends Plugin
         // Own dispatcher to avoid busy-flag collisions with other scripts.
         HumanizedInputDispatcher rooftopDispatcher = new HumanizedInputDispatcher(client, clientThread);
         rooftopAgilityScript = new net.runelite.client.plugins.recorder.scripts.RooftopAgilityScript(
-            client, clientThread, rooftopDispatcher);
+            client, clientThread, rooftopDispatcher, () -> this.v2Components);
         eventBus.register(rooftopAgilityScript);
         panel.setRooftopAgilityScript(rooftopAgilityScript);
 

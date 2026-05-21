@@ -34,6 +34,7 @@ import net.runelite.api.gameval.ItemID;
 import net.runelite.api.widgets.Widget;
 import net.runelite.client.callback.ClientThread;
 import net.runelite.client.eventbus.Subscribe;
+import net.runelite.client.plugins.recorder.scene.SceneScanner;
 import net.runelite.client.sequence.dispatch.HumanizedInputDispatcher;
 import net.runelite.client.sequence.internal.ActionRequest;
 
@@ -59,6 +60,15 @@ public final class RooftopAgilityScript
     static final int  DEFAULT_EAT_AT_HP          = 8;
     static final long UNMAPPED_TILE_TIMEOUT_MS   = 8_000L;
     static final long MARK_PICKUP_TIMEOUT_MS     = 6_000L;
+    /** Chebyshev tile-radius around the player searched for Mark of Grace
+     *  ground items. Per-node {@code reachableMarkTiles} was the original
+     *  data model but populating it requires the operator to record every
+     *  spawn tile per course, and v1 ships with empty sets. A live scene
+     *  scan picks up any mark inside the rendered scene that's within
+     *  reach of the running path. 10 covers all Draynor inter-obstacle
+     *  gaps; OSRS only spawns marks in the scene around the player so a
+     *  bigger radius doesn't help. */
+    static final int  MARK_SCAN_RADIUS           = 10;
     static final long RUN_TOGGLE_THROTTLE_MS     = 2_000L;
     static final int  ITEM_MARK_OF_GRACE         = ItemID.GRACE;
     static final int  VARP_RUN                   = 173;
@@ -71,6 +81,30 @@ public final class RooftopAgilityScript
     private final Client                   client;
     private final ClientThread             clientThread;
     private final HumanizedInputDispatcher dispatcher;
+    private final SceneScanner             sceneScanner;
+    /** Supplier of the precomputed static-collision connected components.
+     *  Used by {@link #tryPickupReachableMark} to skip marks that are
+     *  geometrically near (Chebyshev distance) but not actually reachable
+     *  from the player's current rooftop section. Each rooftop on Draynor
+     *  is its own component because the obstacle between them is a
+     *  transport (Climb / Cross / Jump / etc.), not a static walkable
+     *  link. Without this, the radius scan happily clicks a mark on the
+     *  next rooftop and the bot loops trying to walk into a wall.
+     *  May return null during the ~4-second precompute window after
+     *  plugin start — caller falls back to radius-only matching. */
+    private final java.util.function.Supplier<
+        net.runelite.client.plugins.recorder.nav.v2.collision.ConnectivityComponents>
+                                           componentsSupplier;
+
+    /** Chebyshev tile-radius used by {@link #findObstacleTile(RooftopNode)}.
+     *  Author-recorded {@code objectTiles} are advisory; the actual obstacle
+     *  may render on an adjacent tile (walls in particular attach to one
+     *  side of the boundary, not the other), so we search out to this many
+     *  tiles around the player. 14 covers the worst inter-obstacle hop on
+     *  Draynor (Tightrope 2 → Narrow wall is ~12 tiles); a smaller radius
+     *  silently failed to find the next obstacle right after a landing
+     *  zone and stalled the script. */
+    static final int OBSTACLE_SCAN_RADIUS = 14;
 
     // ─── Run state ───────────────────────────────────────────────────────────────
     private final AtomicBoolean             running = new AtomicBoolean(false);
@@ -95,6 +129,14 @@ public final class RooftopAgilityScript
     private RooftopNode lastClickedNode;
     private int         lastClickedStage  = UNKNOWN;
     private long        lastObstacleClickAt;
+    /** Stage index of the most recently completed obstacle. Set by
+     *  {@link #clearLastObstacle()} before zeroing the active-click
+     *  fields, so we still remember "what was the last obstacle I
+     *  finished" after the active-click bookkeeping has been wiped.
+     *  Used by {@link #detectCurrentStage()} to advance to the next
+     *  stage when the player has just landed on a transport's
+     *  un-mapped landing tile (Climb-up, Jump-up, Climb-down). */
+    private int         lastSuccessfulStage = UNKNOWN;
 
     // ─── Mark-pickup bookkeeping ─────────────────────────────────────────────────
     private WorldPoint markTileClicked;
@@ -117,11 +159,16 @@ public final class RooftopAgilityScript
     private int  marksPicked;
 
     public RooftopAgilityScript(Client client, ClientThread clientThread,
-                                HumanizedInputDispatcher dispatcher)
+                                HumanizedInputDispatcher dispatcher,
+                                java.util.function.Supplier<
+                                    net.runelite.client.plugins.recorder.nav.v2.collision.ConnectivityComponents>
+                                    componentsSupplier)
     {
-        this.client       = client;
-        this.clientThread = clientThread;
-        this.dispatcher   = dispatcher;
+        this.client             = client;
+        this.clientThread       = clientThread;
+        this.dispatcher         = dispatcher;
+        this.sceneScanner       = new SceneScanner(client);
+        this.componentsSupplier = componentsSupplier;
     }
 
     // ─── Public API ──────────────────────────────────────────────────────────────
@@ -215,6 +262,7 @@ public final class RooftopAgilityScript
         this.lastRunOn            = client.getVarpValue(VARP_RUN) == 1;
         this.lastClickedNode      = null;
         this.lastClickedStage     = UNKNOWN;
+        this.lastSuccessfulStage  = UNKNOWN;
         this.lastObstacleClickAt  = 0L;
         this.markTileClicked      = null;
         this.markClickAt          = 0L;
@@ -432,7 +480,30 @@ public final class RooftopAgilityScript
     {
         Player p = client.getLocalPlayer();
         if (p == null) return UNKNOWN;
-        return course.stageByTile.getOrDefault(p.getWorldLocation(), UNKNOWN);
+        Integer mapped = course.stageByTile.get(p.getWorldLocation());
+        if (mapped != null) return mapped;
+        // Tile not in any node's recorded stageTiles. This is normal
+        // between obstacles — transport landings (Climb-up, Jump-up,
+        // Climb-down) drop the player on tiles we never recorded, and
+        // it's wasteful to require the user to mark every landing
+        // tile when the next-stage obstacle is right there to be
+        // clicked. Use progression bookkeeping to infer which stage
+        // to look at next:
+        //   • lastClickedNode != null → in-flight from the previous
+        //     click, advance to the next index.
+        //   • lastSuccessfulStage set → previous click already cleared
+        //     (handleObstacleTimeout success branch); same fallback.
+        //   • Else → genuine "I don't know where I am". Caller
+        //     handles UNKNOWN via the recovery flow.
+        if (lastClickedNode != null)
+        {
+            return (lastClickedStage + 1) % course.nodes.size();
+        }
+        if (lastSuccessfulStage != UNKNOWN)
+        {
+            return (lastSuccessfulStage + 1) % course.nodes.size();
+        }
+        return UNKNOWN;
     }
 
     private Set<WorldPoint> expectedSuccessTiles(int stage)
@@ -445,6 +516,10 @@ public final class RooftopAgilityScript
 
     private void clearLastObstacle()
     {
+        // Persist the just-finished stage so detectCurrentStage() can
+        // infer the next stage when the player has landed on a
+        // transport's un-mapped landing zone.
+        if (lastClickedStage != UNKNOWN) lastSuccessfulStage = lastClickedStage;
         lastClickedNode      = null;
         lastClickedStage     = UNKNOWN;
         lastObstacleClickAt  = 0L;
@@ -452,13 +527,13 @@ public final class RooftopAgilityScript
 
     private void clickObstacle(int stage, RooftopNode node, long now)
     {
-        WorldPoint targetTile = findOnSceneObjectTile(node);
+        WorldPoint targetTile = findObstacleTile(node);
         if (targetTile == null)
         {
             status.set("Obstacle off-scene: " + node.label);
             nextActionAt = now + 600;
-            log.warn("[rooftop-agility] obstacle {} (objectId {}) not found on scene at any of {} tiles",
-                node.label, node.objectId, node.objectTiles.size());
+            log.warn("[rooftop-agility] obstacle {} (objectId {}) not found on scene within {} tiles of player",
+                node.label, node.objectId, OBSTACLE_SCAN_RADIUS);
             return;
         }
 
@@ -479,56 +554,27 @@ public final class RooftopAgilityScript
             node.label, stage, targetTile, node.action);
     }
 
-    /** Returns the world tile of a scene object whose id matches
-     *  {@code node.objectId} and whose location is in {@code node.objectTiles}.
+    /** Returns the actual scene tile of the obstacle for {@code node} —
+     *  scene-wide, by object id, across all four object kinds.
      *
-     *  <p>Agility obstacles are split across four scene-object kinds in
-     *  RuneLite: {@link GameObject} (tightropes, gaps, crates),
-     *  {@link WallObject} (rough wall, narrow wall, wall), {@link GroundObject}
-     *  (some platforms), and {@link DecorativeObject}. All four are checked
-     *  here — matching the pattern in {@link
-     *  net.runelite.client.plugins.recorder.transport.TransportResolver} and
-     *  the spawn-event subscribers in RuneLite's built-in
-     *  {@code AgilityPlugin}. */
-    private WorldPoint findOnSceneObjectTile(RooftopNode node)
+     *  <p>Why scan instead of trusting {@code node.objectTiles}: walls
+     *  in particular attach to one side of a tile boundary in OSRS,
+     *  and the side the engine reports often disagrees with what a
+     *  recorded route ended up writing down. Looking for the object
+     *  on a specific tile is fragile; finding it by id within a
+     *  proximity radius mirrors how a player thinks ("the wall is
+     *  right there, I just look at it"). The dispatcher then re-resolves
+     *  the click on whichever tile we hand it.
+     *
+     *  <p>Agility obstacles live across {@link GameObject} (tightropes,
+     *  gaps, crates), {@link WallObject} (rough wall, narrow wall,
+     *  wall), {@link GroundObject} (some platforms), and
+     *  {@link DecorativeObject} (rope/ladder decorations on a few
+     *  courses). {@link SceneScanner#findObjectTileById} checks all
+     *  four. */
+    private WorldPoint findObstacleTile(RooftopNode node)
     {
-        Scene scene = client.getScene();
-        Tile[][][] tiles = scene.getTiles();
-        int plane = client.getPlane();
-        int baseX = client.getBaseX();
-        int baseY = client.getBaseY();
-
-        for (WorldPoint wp : node.objectTiles)
-        {
-            if (wp.getPlane() != plane) continue;
-            int sx = wp.getX() - baseX;
-            int sy = wp.getY() - baseY;
-            if (sx < 0 || sy < 0 || sx >= Constants.SCENE_SIZE || sy >= Constants.SCENE_SIZE) continue;
-            Tile t = tiles[plane][sx][sy];
-            if (t == null) continue;
-
-            // GameObject[] — tightropes, gaps, crates
-            GameObject[] gos = t.getGameObjects();
-            if (gos != null)
-            {
-                for (GameObject go : gos)
-                {
-                    if (go != null && go.getId() == node.objectId) return wp;
-                }
-            }
-            // WallObject — rough wall, narrow wall, jump-up wall
-            WallObject wo = t.getWallObject();
-            if (wo != null && wo.getId() == node.objectId) return wp;
-
-            // GroundObject — some platforms / floor obstacles
-            GroundObject groundObj = t.getGroundObject();
-            if (groundObj != null && groundObj.getId() == node.objectId) return wp;
-
-            // DecorativeObject — rope/ladder decorations on some courses
-            DecorativeObject decoObj = t.getDecorativeObject();
-            if (decoObj != null && decoObj.getId() == node.objectId) return wp;
-        }
-        return null;
+        return sceneScanner.findObjectTileById(node.objectId, OBSTACLE_SCAN_RADIUS);
     }
 
     private boolean handleObstacleTimeout(long now)
@@ -565,13 +611,42 @@ public final class RooftopAgilityScript
             return false;
         }
 
-        int stage = detectCurrentStage();
-        if (stage != UNKNOWN)
+        // Real success via mapped tile lookup: player landed on a tile that
+        // belongs to a DIFFERENT stage. We deliberately do NOT call
+        // detectCurrentStage() here — its in-transit fallback returns
+        // (lastClickedStage + 1) whenever lastClickedNode is set, which
+        // would treat a stalled/dropped click as success and loop forever.
+        // A direct mapped-tile lookup is the genuine "engine moved me to a
+        // recognised next-stage tile" signal.
+        Integer mappedStage = course.stageByTile.get(here);
+        if (mappedStage != null && mappedStage != lastClickedStage)
         {
             clearLastObstacle();
             return false;
         }
 
+        // Player has moved off the clicked obstacle's own stageTiles but
+        // hasn't landed on a mapped tile yet. This is the dominant
+        // rooftop case: an obstacle's timeoutMs (e.g. 7s for Tightrope 2)
+        // is shorter than the post-obstacle walk to the next obstacle's
+        // approach (~10 tiles). The click succeeded — we're just walking
+        // the gap. Don't fire recovery (that would minimap-click a
+        // plane-0 startTile from a rooftop and the engine ignores it,
+        // leaving the cursor parked off-canvas and the next obstacle
+        // unresolvable). Just clear the active click; main loop's
+        // fallback chain (detectCurrentStage / handleFallOrInvalidPosition)
+        // will route the next tick.
+        boolean stillOnClickedStage = course.nodes.get(lastClickedStage)
+            .stageTiles.contains(here);
+        if (!stillOnClickedStage)
+        {
+            clearLastObstacle();
+            return false;
+        }
+
+        // Player is still standing on the clicked obstacle's own stageTiles
+        // after timeoutMs — click really didn't take. Recovery walk to the
+        // start is the right move here.
         status.set("Obstacle timeout — recovering to start");
         log.info("[rooftop-agility] obstacle timeout on {} (tile {}) — recovering",
             lastClickedNode.label, here);
@@ -604,6 +679,35 @@ public final class RooftopAgilityScript
             && !course.startTiles.contains(here)
             && !course.lapEndTiles.contains(here))
         {
+            // Fall detection: any mid-course drop to plane 0 that doesn't
+            // land on a recorded start/lap-end/fall tile is, by elimination,
+            // a fall. Without this, the in-transit guard below would say
+            // "we're between obstacles, keep going" and the main tick would
+            // try to click rooftop objects from ground level forever. Reset
+            // progression so the standard off-route recovery fires.
+            boolean fellToGround = here.getPlane() == 0
+                && (lastClickedNode != null || lastSuccessfulStage != UNKNOWN);
+            if (fellToGround)
+            {
+                log.info("[rooftop-agility] fell to ground at {} — resetting progression", here);
+                clearLastObstacle();
+                lastSuccessfulStage = UNKNOWN;
+                // fall through to the off-route recovery branch below
+            }
+            // Tile membership says "off-route", but this is also the
+            // shape of a transport landing zone — Climb-up lands the
+            // player on a roof-top tile we never recorded, ditto
+            // Jump-up and Climb-down. If we have any progression
+            // record (active click in flight, or a freshly-cleared
+            // successful click), keep going: detectCurrentStage()
+            // will fall through to the next stage and clickObstacle()
+            // will find that obstacle on the scene from wherever the
+            // player ended up. The obstacle-timeout handler is the
+            // backstop for genuine stalls.
+            else if (lastClickedNode != null || lastSuccessfulStage != UNKNOWN)
+            {
+                return false;
+            }
             status.set("Outside course — recovering to start");
             log.info("[rooftop-agility] off-route at {} — recovering", here);
             walkToNearestStartTile();
@@ -687,6 +791,17 @@ public final class RooftopAgilityScript
             return false;
         }
 
+        // In-transit between obstacles: tile not in stageByTile but we
+        // know which stage to look at next (active click in flight, or
+        // freshly-cleared successful click). detectCurrentStage()'s
+        // fallback gives the main tick the right node; no need to time
+        // out on the landing zone.
+        if (lastClickedNode != null || lastSuccessfulStage != UNKNOWN)
+        {
+            unknownStageTile = null;
+            return false;
+        }
+
         // We're on a validTile (fall/invalid handlers cleared their cases),
         // but no stage match.
         if (!here.equals(unknownStageTile))
@@ -713,55 +828,88 @@ public final class RooftopAgilityScript
     private boolean tryPickupReachableMark(long now)
     {
         if (!pickupMarks) return false;
-        int stage = detectCurrentStage();
-        if (stage == UNKNOWN) return false;
-
-        RooftopNode node = course.nodes.get(stage);
         Player p = client.getLocalPlayer();
         if (p == null) return false;
         WorldPoint player = p.getWorldLocation();
+        int plane = client.getPlane();
+        if (player.getPlane() != plane) return false;
 
         Scene scene = client.getScene();
         Tile[][][] tiles = scene.getTiles();
-        int plane = client.getPlane();
         int baseX = client.getBaseX();
         int baseY = client.getBaseY();
 
-        for (WorldPoint mt : node.reachableMarkTiles)
+        // Components let us reject marks that are geometrically close
+        // (Chebyshev) but live on a different rooftop section — the static
+        // collision data treats each rooftop as its own component because
+        // the obstacle is a TRANSPORT, not walkable terrain. Without this
+        // filter, the bot spots a mark on the next rooftop, dispatches a
+        // Take, the engine walks to the closest reachable tile (which is
+        // somewhere along the edge), the mark stays put, pickup times out,
+        // we re-dispatch, and we never actually do the next obstacle.
+        var components = componentsSupplier != null ? componentsSupplier.get() : null;
+        int playerComponent = components != null ? components.componentOf(player) : -1;
+
+        // Scan a Chebyshev radius around the player for Mark of Grace
+        // ground items on the same plane and same connected component.
+        // A scene scan generalises across courses; the component filter
+        // makes it safe on rooftops.
+        WorldPoint best = null;
+        int bestDist = Integer.MAX_VALUE;
+        for (int dx = -MARK_SCAN_RADIUS; dx <= MARK_SCAN_RADIUS; dx++)
         {
-            if (mt.getPlane() != player.getPlane()) continue;
-            if (mt.getPlane() != plane)             continue;
-            int sx = mt.getX() - baseX;
-            int sy = mt.getY() - baseY;
-            if (sx < 0 || sy < 0 || sx >= Constants.SCENE_SIZE || sy >= Constants.SCENE_SIZE) continue;
-            Tile t = tiles[plane][sx][sy];
-            if (t == null) continue;
-            List<TileItem> items = t.getGroundItems();
-            if (items == null) continue;
-            for (TileItem ti : items)
+            for (int dy = -MARK_SCAN_RADIUS; dy <= MARK_SCAN_RADIUS; dy++)
             {
-                if (ti == null || ti.getId() != ITEM_MARK_OF_GRACE) continue;
-
-                dispatcher.dispatch(ActionRequest.builder()
-                    .kind(ActionRequest.Kind.CLICK_GROUND_ITEM)
-                    .channel(ActionRequest.Channel.MOUSE)
-                    .tile(mt)
-                    .itemId(ITEM_MARK_OF_GRACE)
-                    .verb("Take")
-                    .build());
-
-                state.set(State.PICKING_MARK);
-                markTileClicked = mt;
-                markClickAt     = now;
-                markCountBefore = inventoryCount(ITEM_MARK_OF_GRACE);
-                long delay = 600L + ThreadLocalRandom.current().nextLong(400L);   // 600..1000
-                nextActionAt = now + delay;
-                status.set("Picking up mark at " + mt);
-                log.info("[rooftop-agility] picking mark at {} from stage {}", mt, stage);
-                return true;
+                int wx = player.getX() + dx;
+                int wy = player.getY() + dy;
+                int sx = wx - baseX;
+                int sy = wy - baseY;
+                if (sx < 0 || sy < 0 || sx >= Constants.SCENE_SIZE || sy >= Constants.SCENE_SIZE) continue;
+                Tile t = tiles[plane][sx][sy];
+                if (t == null) continue;
+                List<TileItem> items = t.getGroundItems();
+                if (items == null || items.isEmpty()) continue;
+                boolean has = false;
+                for (TileItem ti : items)
+                {
+                    if (ti != null && ti.getId() == ITEM_MARK_OF_GRACE) { has = true; break; }
+                }
+                if (!has) continue;
+                // Reachability filter: same static-collision component as
+                // the player. If components are not yet built (precompute
+                // still running), fall back to the radius-only check.
+                if (components != null && playerComponent >= 0)
+                {
+                    int markComponent = components.componentOf(wx, wy, plane);
+                    if (markComponent != playerComponent) continue;
+                }
+                int d = Math.max(Math.abs(dx), Math.abs(dy));
+                if (d < bestDist)
+                {
+                    bestDist = d;
+                    best = new WorldPoint(wx, wy, plane);
+                }
             }
         }
-        return false;
+        if (best == null) return false;
+
+        dispatcher.dispatch(ActionRequest.builder()
+            .kind(ActionRequest.Kind.CLICK_GROUND_ITEM)
+            .channel(ActionRequest.Channel.MOUSE)
+            .tile(best)
+            .itemId(ITEM_MARK_OF_GRACE)
+            .verb("Take")
+            .build());
+
+        state.set(State.PICKING_MARK);
+        markTileClicked = best;
+        markClickAt     = now;
+        markCountBefore = inventoryCount(ITEM_MARK_OF_GRACE);
+        long delay = 600L + ThreadLocalRandom.current().nextLong(400L);   // 600..1000
+        nextActionAt = now + delay;
+        status.set("Picking up mark at " + best);
+        log.info("[rooftop-agility] picking mark at {} (dist {})", best, bestDist);
+        return true;
     }
 
     private void handlePickingMark(long now)
@@ -1030,13 +1178,11 @@ public final class RooftopAgilityScript
         // Scene→world base computed from click-inspector vs. observer:
         //   baseX=3056, baseY=3200 (Draynor agility scene at capture time).
         //
-        // Per-node objectTiles use the OBJECT's world tile (the obstacle's own
-        // GameObject location). For Draynor obstacles these usually sit on or
-        // adjacent to the player's stage tile, and the dispatcher's
-        // CLICK_GAME_OBJECT with .tile(objectTile) + .verb(action) resolves the
-        // GameObject from the scene. findOnSceneObjectTile filters by both
-        // tile membership and objectId, so the two tightropes (Cross at 11405
-        // and Cross at 11406) cannot be confused.
+        // Per-node objectTiles is advisory only — kept for documentation /
+        // validateCourse, but obstacle lookup at run time goes through
+        // SceneScanner.findObjectTileById(node.objectId, OBSTACLE_SCAN_RADIUS).
+        // Object ids alone are enough to disambiguate (every Draynor obstacle
+        // has a distinct id — the two tightropes are 11405 and 11406, etc.).
 
         List<RooftopNode> draynorNodes = List.of(
             new RooftopNode("Rough wall", 11404, "Climb",

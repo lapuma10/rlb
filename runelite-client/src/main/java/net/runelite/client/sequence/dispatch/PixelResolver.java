@@ -27,7 +27,9 @@ package net.runelite.client.sequence.dispatch;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import net.runelite.api.Client;
+import net.runelite.api.DecorativeObject;
 import net.runelite.api.GameObject;
+import net.runelite.api.GroundObject;
 import net.runelite.api.ItemLayer;
 import net.runelite.api.Model;
 import net.runelite.api.NPC;
@@ -36,6 +38,7 @@ import net.runelite.api.Player;
 import net.runelite.api.Point;
 import net.runelite.api.Tile;
 import net.runelite.api.TileItem;
+import net.runelite.api.TileObject;
 import net.runelite.api.WallObject;
 import net.runelite.api.coords.LocalPoint;
 import net.runelite.api.coords.WorldPoint;
@@ -421,20 +424,28 @@ public final class PixelResolver
      *  verb (see in-call retry in {@code HumanizedInputDispatcher.gameObjectClick}). */
     public enum GameObjectStrategy
     {
-        /** Sample inside the object's convex hull. The hull tracks the
-         *  visible 3D model — correct for objects whose entire body is
-         *  the click target (saplings, lecterns, banks-as-clickable-bodies).
-         *  Wrong for tall multi-segment models (Lumbridge stairs, ladders,
-         *  banister-topped staircases) whose hull also covers decorative
-         *  geometry the engine does NOT accept clicks on; in those cases
-         *  the menu comes back without the verb. Falls back to tile-poly
-         *  when the hull isn't available. */
+        /** Sample inside the engine's actual menu hit-test region —
+         *  {@link net.runelite.api.TileObject#getClickbox()} on the
+         *  underlying object, falling back to the visible 3D convex
+         *  hull, then the tile-footprint polygon. This is the
+         *  region RuneLite's own overlays draw to indicate "what you
+         *  can click" (see the built-in AgilityOverlay, HerbiboarOverlay,
+         *  PyramidPlunderOverlay — all of which call getClickbox).
+         *
+         *  <p>Use as the first attempt for any object click. The
+         *  earlier convex-hull-first behaviour was wrong for tall
+         *  multi-storey models (Draynor "Rough wall", Lumbridge
+         *  stairs): the hull spans the model's entire vertical
+         *  extent — into the sky and beyond — so random samples
+         *  often landed off the engine's hit polygon and the menu
+         *  came back as "Walk here" on adjacent grass. */
         HULL,
         /** Sample inside the object's tile-footprint polygon
-         *  ({@link GameObject#getCanvasTilePoly()}). The engine's per-tile
-         *  hit-test for GameObjects always fires inside this footprint —
-         *  use this for stair / ladder / door / transport objects whose
-         *  hull is wider than the actual click region. */
+         *  ({@link GameObject#getCanvasTilePoly()}). Useful as a
+         *  retry strategy when the clickbox didn't produce the verb
+         *  (rare — usually means the model has a null clickbox or
+         *  the engine routed the click to a stacked object on the
+         *  same tile). */
         TILE_POLY
     }
 
@@ -471,37 +482,242 @@ public final class PixelResolver
         {
             case TILE_POLY -> poly = obj.getCanvasTilePoly();
             case HULL -> {
+                // Convex hull first — it's a tight wrap around the
+                // model's actually-rendered vertices. Clickbox is the
+                // engine's coarser AABB-derived 8-vertex hull which
+                // overshoots tall models (Draynor "Rough wall" projects
+                // far above the visible brick body). Tile poly is the
+                // final fallback when nothing renders a hull.
                 poly = shapeToPolygon(obj.getConvexHull());
+                if (poly == null || poly.npoints < 3) poly = shapeToPolygon(obj.getClickbox());
                 if (poly == null || poly.npoints < 3) poly = obj.getCanvasTilePoly();
             }
             default -> poly = null;
         }
         if (poly == null || poly.npoints < 3) return null;
-        Point p = sampleInsidePolygon(poly);
+        Point p = sampleNearCentroid(poly);
         if (p != null && isOnCanvas(p)) { record(p); return p; }
         return null;
     }
 
-    /** Pick a pixel inside the wall object's convex hull. Walls are typically
-     *  doors / gates / fences — the hull spans only the wall sliver, not the
-     *  whole tile, so this is what the human eye targets. Falls back to
-     *  {@code getConvexHull2()} (some walls expose two segments) and finally
-     *  to the underlying tile polygon. */
+    /** Convenience: legacy callers default to {@link GameObjectStrategy#HULL}. */
     @Nullable
     public Point resolveWallObject(WallObject wall)
     {
+        return resolveWallObject(wall, GameObjectStrategy.HULL);
+    }
+
+    /** Pick a pixel inside the wall object, sampling either the visible
+     *  3D model's convex hull or the underlying tile floor polygon.
+     *
+     *  <p>HULL → samples {@code wall.getConvexHull()} (falling back to
+     *  {@code getConvexHull2()} for walls that expose two segments).
+     *  Works for short doors / gates whose hull stays compact over the
+     *  wall's own tile.
+     *
+     *  <p>TILE_POLY → samples the wall's underlying floor tile polygon
+     *  ({@code Perspective.getCanvasTilePoly(client, wall.getLocalLocation())}).
+     *  This is the canonical wall hit-target in the OSRS engine: any
+     *  click inside the wall's tile poly that doesn't hit something
+     *  closer is routed to the wall's menu. Use this when HULL produced
+     *  a pixel the engine didn't accept — the common failure mode for
+     *  tall agility-style walls (Draynor "Rough wall", "Narrow wall",
+     *  "Wall") whose hull projects into adjacent tiles when the player
+     *  stands right next to them, and random hull samples then resolve
+     *  to "Walk here" on neighboring grass.
+     *
+     *  <p>The dispatcher's {@code tryGameObjectAttempt} drives the
+     *  HULL → TILE_POLY retry already used for {@link GameObject}; this
+     *  method extends that same retry to walls so the second attempt
+     *  actually samples a different region. */
+    @Nullable
+    public Point resolveWallObject(WallObject wall, GameObjectStrategy strategy)
+    {
         if (wall == null) return null;
-        Polygon poly = shapeToPolygon(wall.getConvexHull());
-        if (poly == null || poly.npoints < 3) poly = shapeToPolygon(wall.getConvexHull2());
-        if (poly == null || poly.npoints < 3)
+        Polygon poly;
+        switch (strategy)
         {
-            LocalPoint lp = wall.getLocalLocation();
-            poly = lp == null ? null : Perspective.getCanvasTilePoly(client, lp);
+            case TILE_POLY -> {
+                LocalPoint lp = wall.getLocalLocation();
+                poly = lp == null ? null : Perspective.getCanvasTilePoly(client, lp);
+            }
+            case HULL -> {
+                // Convex hull first (tight wrap around rendered wall
+                // geometry); walls expose getConvexHull /
+                // getConvexHull2 for two segments. Clickbox is the
+                // coarse engine AABB hull — only used as fallback.
+                // Tile floor poly is the last resort.
+                poly = shapeToPolygon(wall.getConvexHull());
+                if (poly == null || poly.npoints < 3) poly = shapeToPolygon(wall.getConvexHull2());
+                if (poly == null || poly.npoints < 3) poly = shapeToPolygon(wall.getClickbox());
+                if (poly == null || poly.npoints < 3)
+                {
+                    LocalPoint lp = wall.getLocalLocation();
+                    poly = lp == null ? null : Perspective.getCanvasTilePoly(client, lp);
+                }
+            }
+            default -> poly = null;
         }
         if (poly == null || poly.npoints < 3) return null;
-        Point p = sampleInsidePolygon(poly);
+        Point p = sampleNearCentroid(poly);
         if (p != null && isOnCanvas(p)) { record(p); return p; }
         return null;
+    }
+
+    /** Generate candidate click pixels for a tile object using the engine's
+     *  own hit-test geometry as the source of truth.
+     *
+     *  <p>Use case: the dispatcher hovers each candidate in order and asks
+     *  the engine what the left-click verb would be at that pixel. The
+     *  first candidate where the engine reports the expected verb wins.
+     *  So the question this method answers is "give me a list of pixels
+     *  that are plausibly inside the object's clickable region, ordered
+     *  best-first" — not "compute the one right pixel".
+     *
+     *  <p>Shape preference, in order:
+     *  <ol>
+     *    <li>{@link TileObject#getClickbox()} — the engine's own
+     *        click-test region. Same {@link Shape} that RuneLite's
+     *        built-in {@code AgilityOverlay} draws and tests against
+     *        the mouse via {@code clickbox.contains(mouseX, mouseY)}.
+     *        If non-null, this is the most reliable target.</li>
+     *    <li>Convex hull(s) — visible model silhouette. Wall and
+     *        decorative objects can have two segments (corner walls
+     *        and diagonal decoratives); both are tried.</li>
+     *    <li>{@link TileObject#getCanvasTilePoly()} — floor footprint.
+     *        Last resort, used when neither clickbox nor hull is
+     *        available.</li>
+     *  </ol>
+     *
+     *  <p>Each shape contributes its bounding-box centre first (best
+     *  single guess), then up to {@code maxPerShape - 1} additional
+     *  rejection-sampled pixels inside. Recent-click history is NOT
+     *  consulted — for stationary obstacles the same pixel is the
+     *  right pixel every lap, and the dispatcher's per-pixel
+     *  hover-verify is a stronger correctness signal than spatial
+     *  dedup against a click made minutes ago.
+     *
+     *  <p>Must be called on the client thread (reads scene state).
+     */
+    public java.util.List<Point> objectClickCandidates(TileObject obj, int maxPerShape)
+    {
+        if (obj == null) return java.util.List.of();
+        java.util.List<Shape> shapes = new ArrayList<>(4);
+        Shape clickbox = null;
+        try { clickbox = obj.getClickbox(); }
+        catch (Throwable ignored) { /* engine race; treat as null */ }
+        if (clickbox != null) shapes.add(clickbox);
+        // TileObject supertype doesn't expose convex hulls; the concrete
+        // kinds do, with corner walls / diagonals carrying a second hull.
+        if (obj instanceof GameObject g)
+        {
+            Shape h = g.getConvexHull();
+            if (h != null) shapes.add(h);
+        }
+        else if (obj instanceof WallObject w)
+        {
+            Shape h1 = w.getConvexHull();
+            if (h1 != null) shapes.add(h1);
+            Shape h2 = w.getConvexHull2();
+            if (h2 != null) shapes.add(h2);
+        }
+        else if (obj instanceof DecorativeObject d)
+        {
+            Shape h1 = d.getConvexHull();
+            if (h1 != null) shapes.add(h1);
+            Shape h2 = d.getConvexHull2();
+            if (h2 != null) shapes.add(h2);
+        }
+        else if (obj instanceof GroundObject gnd)
+        {
+            Shape h = gnd.getConvexHull();
+            if (h != null) shapes.add(h);
+        }
+        Polygon tilePoly = obj.getCanvasTilePoly();
+        if (tilePoly != null) shapes.add(tilePoly);
+
+        java.util.List<Point> out = new ArrayList<>();
+        for (Shape s : shapes)
+        {
+            out.addAll(sampleInsideShape(s, maxPerShape));
+        }
+        return out;
+    }
+
+    /** Default candidate budget — 4 per shape × up to 4 shapes = up to
+     *  16 candidates per object. Enough to cover the engine's hit-test
+     *  region from corner to corner without the dispatcher's hover loop
+     *  being visibly slow (~60ms hover + ~150ms cursor hop per
+     *  candidate, ~3-4s worst case before the right-click fallback). */
+    public java.util.List<Point> objectClickCandidates(TileObject obj)
+    {
+        return objectClickCandidates(obj, 4);
+    }
+
+    /** Distance below which two candidate pixels for the same object
+     *  are considered duplicates. 6 px is large enough that consecutive
+     *  hovers visibly move the cursor; small enough that a 30-px wide
+     *  clickbox still yields ~4-5 usable spread samples. */
+    private static final int MIN_CANDIDATE_SPREAD_PX = 6;
+
+    /** Pixels inside the given AWT shape, ordered with the bbox centre
+     *  first and rejection-sampled randoms after. Used by
+     *  {@link #objectClickCandidates(TileObject, int)}. The bbox-centre
+     *  pixel gets the smallest jitter that still varies between laps
+     *  ({@code ± CENTROID_JITTER_PX}); subsequent samples spread across
+     *  the whole shape, deduplicated against each other so the
+     *  dispatcher doesn't hover the same spot twice. */
+    private java.util.List<Point> sampleInsideShape(Shape s, int max)
+    {
+        if (s == null || max <= 0) return java.util.List.of();
+        Rectangle bb = s.getBounds();
+        if (bb == null || bb.width < 2 || bb.height < 2) return java.util.List.of();
+        java.util.List<Point> pts = new ArrayList<>(max);
+        int cx = bb.x + bb.width / 2;
+        int cy = bb.y + bb.height / 2;
+        // Centre first. attempt=0 is the exact bbox centre; subsequent
+        // attempts jitter slightly so two laps don't pixel-match. We
+        // accept the first sample that's both inside the shape and on
+        // canvas — the bbox centre is virtually always inside for
+        // convex-ish hulls and clickboxes.
+        for (int attempt = 0; attempt < 6 && pts.isEmpty(); attempt++)
+        {
+            int jx = attempt == 0 ? 0
+                : rng.nextInt(CENTROID_JITTER_PX * 2 + 1) - CENTROID_JITTER_PX;
+            int jy = attempt == 0 ? 0
+                : rng.nextInt(CENTROID_JITTER_PX * 2 + 1) - CENTROID_JITTER_PX;
+            int x = cx + jx, y = cy + jy;
+            if (!s.contains(x, y)) continue;
+            Point p = new Point(x, y);
+            if (!isOnCanvas(p)) continue;
+            pts.add(p);
+        }
+        // Spread samples across the shape, dedup'd against existing
+        // candidates by {@link #MIN_CANDIDATE_SPREAD_PX}. Six attempts
+        // per slot is enough budget for a clickbox; rejection rate is
+        // low because clickboxes are roughly convex.
+        for (int attempt = 0; attempt < max * 6 && pts.size() < max; attempt++)
+        {
+            int x = bb.x + rng.nextInt(bb.width);
+            int y = bb.y + rng.nextInt(bb.height);
+            if (!s.contains(x, y)) continue;
+            Point p = new Point(x, y);
+            if (!isOnCanvas(p)) continue;
+            boolean dup = false;
+            for (Point ex : pts)
+            {
+                int dx = ex.getX() - x, dy = ex.getY() - y;
+                if (dx * dx + dy * dy
+                        < MIN_CANDIDATE_SPREAD_PX * MIN_CANDIDATE_SPREAD_PX)
+                {
+                    dup = true;
+                    break;
+                }
+            }
+            if (dup) continue;
+            pts.add(p);
+        }
+        return pts;
     }
 
     /** Convert an arbitrary {@link Shape} (typically a convex hull) to a
@@ -631,6 +847,45 @@ public final class PixelResolver
             if (poly.contains(x, y)) return new Point(x, y);
         }
         return new Point(cx, cy);
+    }
+
+    /** Half-width of the symmetric jitter applied around the polygon
+     *  centroid by {@link #sampleNearCentroid}. Small enough that the
+     *  sample stays well inside the visible model on any standard zoom,
+     *  large enough to avoid pixel-perfect chain-clicking. */
+    private static final int CENTROID_JITTER_PX = 6;
+
+    /** Pick a pixel near the polygon's bounding-box centroid, with a
+     *  small symmetric jitter for humanization. Used for object clicks
+     *  (game objects, walls) where uniform-random sampling across the
+     *  whole hull is unreliable — tall models (Draynor "Rough wall",
+     *  Lumbridge stairs) have hulls whose corners project to pixels
+     *  far from the visible model body, and random samples there
+     *  resolve to "Walk here" on adjacent grass instead of the object's
+     *  menu. The centroid is virtually always on the rendered model
+     *  itself, and ±{@value #CENTROID_JITTER_PX}px jitter is enough
+     *  variety for click-cadence robustness without leaving the body.
+     *
+     *  <p>Falls back to {@link #sampleInsidePolygon} for degenerate
+     *  hulls whose centroid is outside the polygon (rare — concave
+     *  hulls or numerically-collapsed projections). */
+    private Point sampleNearCentroid(Polygon poly)
+    {
+        Rectangle bbox = poly.getBounds();
+        if (bbox.width < 2 || bbox.height < 2) return null;
+        int cx = bbox.x + bbox.width / 2;
+        int cy = bbox.y + bbox.height / 2;
+        for (int attempt = 0; attempt < 12; attempt++)
+        {
+            int jx = rng.nextInt(CENTROID_JITTER_PX * 2 + 1) - CENTROID_JITTER_PX;
+            int jy = rng.nextInt(CENTROID_JITTER_PX * 2 + 1) - CENTROID_JITTER_PX;
+            int x = cx + jx, y = cy + jy;
+            if (!poly.contains(x, y)) continue;
+            Point p = new Point(x, y);
+            if (!conflictsWithRecent(p)) return p;
+        }
+        if (poly.contains(cx, cy)) return new Point(cx, cy);
+        return sampleInsidePolygon(poly);
     }
 
     /** Polar-coordinate jitter on a ring around a centre point. minR..maxR

@@ -3,12 +3,15 @@ package net.runelite.client.plugins.recorder.scene;
 import java.util.List;
 import lombok.extern.slf4j.Slf4j;
 import net.runelite.api.Client;
+import net.runelite.api.DecorativeObject;
 import net.runelite.api.GameObject;
+import net.runelite.api.GroundObject;
 import net.runelite.api.ObjectComposition;
 import net.runelite.api.Player;
 import net.runelite.api.Scene;
 import net.runelite.api.Tile;
 import net.runelite.api.TileItem;
+import net.runelite.api.WallObject;
 import net.runelite.api.WorldView;
 import net.runelite.api.coords.LocalPoint;
 import net.runelite.api.coords.WorldPoint;
@@ -165,6 +168,115 @@ public final class SceneScanner
                     WorldPoint wp = WorldPoint.fromLocal(client, lp);
                     bestDist = cheb;
                     best = new Match(wp, go, null);
+                }
+            }
+        }
+        return best;
+    }
+
+    /** Find the closest object on the loaded scene matching {@code objectId},
+     *  searching ALL four scene-object kinds —
+     *  {@link GameObject}, {@link WallObject}, {@link DecorativeObject},
+     *  {@link GroundObject} — within {@code radius} tiles (Chebyshev) of
+     *  the player. Returns the object's tile {@link WorldPoint}, or null
+     *  if no match in range.
+     *
+     *  <p>This is the right lookup for "click that specific obstacle by
+     *  id" use cases (agility courses, scripted shortcuts, recorded
+     *  transports) where the authoring data only knows the object id
+     *  and a rough proximity. Trusting per-tile authoring is brittle —
+     *  walls and decoratives in particular routinely attach to a
+     *  neighboring tile than the one a human would point at. Scanning
+     *  by id finds the actual rendered instance, then the dispatcher's
+     *  {@link net.runelite.client.plugins.recorder.transport.TransportResolver}
+     *  re-resolves it against the same tile when building the click.
+     *
+     *  <p>Plane comes from the player; mixed-plane obstacles (e.g. a
+     *  staircase the player isn't on) are not returned because they
+     *  wouldn't be clickable from the player's current floor anyway. */
+    @javax.annotation.Nullable
+    public WorldPoint findObjectTileById(int objectId, int radius)
+    {
+        Player self = client.getLocalPlayer();
+        if (self == null) return null;
+        WorldPoint here = self.getWorldLocation();
+        if (here == null) return null;
+        WorldView wv = client.getTopLevelWorldView();
+        if (wv == null) return null;
+        Scene scene = wv.getScene();
+        if (scene == null) return null;
+        Tile[][][] tiles = scene.getTiles();
+        int plane = here.getPlane();
+        if (tiles == null || plane < 0 || plane >= tiles.length) return null;
+        Tile[][] planeTiles = tiles[plane];
+
+        int hereSx = here.getX() - wv.getBaseX();
+        int hereSy = here.getY() - wv.getBaseY();
+
+        WorldPoint best = null;
+        int bestDist = Integer.MAX_VALUE;
+        for (int dx = -radius; dx <= radius; dx++)
+        {
+            for (int dy = -radius; dy <= radius; dy++)
+            {
+                int sx = hereSx + dx, sy = hereSy + dy;
+                if (sx < 0 || sy < 0
+                    || sx >= planeTiles.length
+                    || sy >= planeTiles[0].length) continue;
+                Tile t = planeTiles[sx][sy];
+                if (t == null) continue;
+                int cheb = Math.max(Math.abs(dx), Math.abs(dy));
+                if (cheb >= bestDist) continue;
+
+                // GameObject[] — tightropes, gaps, crates, most interactive scenery.
+                GameObject[] gos = t.getGameObjects();
+                if (gos != null)
+                {
+                    for (GameObject go : gos)
+                    {
+                        if (go == null || go.getId() != objectId) continue;
+                        LocalPoint lp = go.getLocalLocation();
+                        if (lp == null) continue;
+                        best = WorldPoint.fromLocal(client, lp);
+                        bestDist = cheb;
+                        break;
+                    }
+                    if (bestDist == cheb) continue;   // already matched here
+                }
+                // WallObject — rough wall, narrow wall, doors, gates.
+                WallObject wo = t.getWallObject();
+                if (wo != null && wo.getId() == objectId)
+                {
+                    LocalPoint lp = wo.getLocalLocation();
+                    if (lp != null)
+                    {
+                        best = WorldPoint.fromLocal(client, lp);
+                        bestDist = cheb;
+                        continue;
+                    }
+                }
+                // DecorativeObject — rope/ladder decorations on some courses.
+                DecorativeObject deco = t.getDecorativeObject();
+                if (deco != null && deco.getId() == objectId)
+                {
+                    LocalPoint lp = deco.getLocalLocation();
+                    if (lp != null)
+                    {
+                        best = WorldPoint.fromLocal(client, lp);
+                        bestDist = cheb;
+                        continue;
+                    }
+                }
+                // GroundObject — some platforms / floor obstacles.
+                GroundObject ground = t.getGroundObject();
+                if (ground != null && ground.getId() == objectId)
+                {
+                    LocalPoint lp = ground.getLocalLocation();
+                    if (lp != null)
+                    {
+                        best = WorldPoint.fromLocal(client, lp);
+                        bestDist = cheb;
+                    }
                 }
             }
         }
