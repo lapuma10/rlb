@@ -169,6 +169,8 @@ public class RecorderPlugin extends Plugin
     private PizzaScript pizzaScript;
     private net.runelite.client.plugins.recorder.scripts.FletchingScript fletchingScript;
     private net.runelite.client.plugins.recorder.scripts.RooftopAgilityScript rooftopAgilityScript;
+    private net.runelite.client.plugins.recorder.agility.AgilityCaptureSession agilityCaptureSession;
+    private net.runelite.client.plugins.recorder.agility.AgilityCaptureOverlay agilityCaptureOverlay;
     private AreaSelector areaSelector;
     private net.runelite.client.plugins.recorder.inspector.ClickInspector clickInspector;
 
@@ -452,6 +454,12 @@ public class RecorderPlugin extends Plugin
             client, clientThread, rooftopDispatcher, () -> this.v2Components);
         eventBus.register(rooftopAgilityScript);
         panel.setRooftopAgilityScript(rooftopAgilityScript);
+
+        // Agility Course Recorder — passive capture session + canvas overlay.
+        agilityCaptureSession = new net.runelite.client.plugins.recorder.agility.AgilityCaptureSession(client, eventBus);
+        agilityCaptureOverlay = new net.runelite.client.plugins.recorder.agility.AgilityCaptureOverlay(client, agilityCaptureSession);
+        panel.setAgilityCaptureSession(agilityCaptureSession);
+        overlayManager.add(agilityCaptureOverlay);
 
         // Click inspector — toggleable diagnostic. Subscribes itself to the
         // EventBus only when enabled; safe to leave off by default.
@@ -937,6 +945,8 @@ public class RecorderPlugin extends Plugin
         if (objectDebugOverlay != null) overlayManager.remove(objectDebugOverlay);
         if (geDebugOverlay != null) overlayManager.remove(geDebugOverlay);
         if (chatDebugOverlay != null) overlayManager.remove(chatDebugOverlay);
+        if (agilityCaptureOverlay != null) { overlayManager.remove(agilityCaptureOverlay); agilityCaptureOverlay = null; }
+        if (agilityCaptureSession != null) { agilityCaptureSession.stop(); agilityCaptureSession = null; }
         if (worldMapMinimapOverlay != null)
         {
             overlayManager.remove(worldMapMinimapOverlay);

@@ -414,6 +414,10 @@ public final class RecorderPanel extends PluginPanel
     private SessionTracker sessionTracker;
     private SessionStore sessionStore;
     private StatsPanel statsPanel;
+    // Agility Course Recorder — wired by RecorderPlugin via setAgilityCaptureSession().
+    private net.runelite.client.plugins.recorder.agility.AgilityCaptureSession agilityCaptureSession;
+    private net.runelite.client.plugins.recorder.agility.AgilityCaptureTab agilityCaptureTab;
+    private final JPanel agilityCaptureTabHolder = new JPanel(new java.awt.BorderLayout());
 
     public RecorderPanel(RecorderManager manager, Client client)
     {
@@ -442,6 +446,7 @@ public final class RecorderPanel extends PluginPanel
         tabs.addTab("Cooking", tabScroll(buildCookingTab()));
         tabs.addTab("Fletching", tabScroll(buildFletchingTab()));
         tabs.addTab("Agility", tabScroll(buildAgilityTab()));
+        tabs.addTab("Agility Capture", tabScroll(agilityCaptureTabHolder));
         tabs.addTab("Quests", tabScroll(buildQuestsTab()));
         tabs.addTab("Moneymakers", tabScroll(buildMoneymakersTab()));
         tabs.addTab("Login",  tabScroll(buildLoginTab()));
@@ -3071,6 +3076,20 @@ public final class RecorderPanel extends PluginPanel
         net.runelite.client.plugins.recorder.scripts.RooftopAgilityScript script)
     {
         this.rooftopAgilityScript = script;
+    }
+
+    /** Wire the Agility Course Recorder session. Called by RecorderPlugin at startUp.
+     *  Idempotent — safe to call twice; second call is a no-op. */
+    public void setAgilityCaptureSession(
+        net.runelite.client.plugins.recorder.agility.AgilityCaptureSession session)
+    {
+        this.agilityCaptureSession = session;
+        if (session == null) return;
+        if (agilityCaptureTab != null) return;     // idempotent
+        agilityCaptureTab = new net.runelite.client.plugins.recorder.agility.AgilityCaptureTab(session, clientThread);
+        agilityCaptureTabHolder.add(agilityCaptureTab, java.awt.BorderLayout.CENTER);
+        agilityCaptureTabHolder.revalidate();
+        agilityCaptureTabHolder.repaint();
     }
 
     private void onRooftopStart()
