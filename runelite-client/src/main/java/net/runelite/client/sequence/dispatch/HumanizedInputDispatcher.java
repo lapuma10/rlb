@@ -690,7 +690,13 @@ public class HumanizedInputDispatcher implements InputDispatcher
      *  a 200–700ms settle on the target before pressing and a 100–400ms
      *  hold after release before the cursor moves again — both are
      *  conspicuously absent from naïve "moveTo + click" code, which is one
-     *  of the easiest tells for a bot. */
+     *  of the easiest tells for a bot.
+     *
+     *  @deprecated Migrating to {@link #press(int, ClickIntent, PressTiming)}.
+     *  Phase 2 will replace every {@code clickPress(BUTTON1)} site with the
+     *  appropriate {@code press(B1, intent, timing)} call. Do not add new
+     *  callers. */
+    @Deprecated
     private void clickPress(int button) throws InterruptedException
     {
         // Settle on target before pressing. Wider pre-click window than
@@ -701,6 +707,91 @@ public class HumanizedInputDispatcher implements InputDispatcher
         SequenceSleep.sleep(client, 40 + rng.nextInt(40));     // 40..80ms button-down
         input.mouseRelease(button);
         SequenceSleep.sleep(client, 100 + rng.nextInt(250));   // 100..350ms post-click hold
+    }
+
+    /** The single chokepoint every press should go through. Combines
+     *  off-canvas rejection, UI dead-zone rejection (WORLD intent only),
+     *  and timing-driven sleeps that mirror humanized cursor traces.
+     *  Returns {@code true} when the press fired; {@code false} when a
+     *  guard blocked it ({@link #lastError} is set with the reason).
+     *
+     *  <p>See the spec at
+     *  {@code docs/superpowers/specs/2026-05-22-chatbox-deadzone-click-guard.md}.
+     *
+     *  <p>Guards by intent:
+     *  <ul>
+     *    <li>{@link ClickIntent#WORLD} — off-canvas + UI dead-zone
+     *        ({@link UiDeadZones#worldIntersectsAt}). Refuses to press
+     *        when the cursor is inside chatbox / side panel / compass /
+     *        orb cluster / minimap.</li>
+     *    <li>{@link ClickIntent#MINIMAP}, {@link ClickIntent#UI},
+     *        {@link ClickIntent#MENU_ROW} — off-canvas only. These
+     *        intents legitimately click into UI surfaces.</li>
+     *    <li>{@link ClickIntent#RAW} — no guards. Reserved for test
+     *        hooks and low-level escape hatches.</li>
+     *  </ul>
+     *
+     *  <p>Phase 1: built but not yet called from existing sites.
+     *  Phase 2 mechanically migrates every press path here and deletes
+     *  the old {@link #clickPress(int)} and direct
+     *  {@code input.mousePress / input.mouseRelease} pairs. After Phase 2
+     *  grep gate: {@code input.mousePress} and {@code input.mouseRelease}
+     *  appear in exactly this one method. */
+    private boolean press(int button, ClickIntent intent, PressTiming timing)
+        throws InterruptedException
+    {
+        int cx = input.cursorX();
+        int cy = input.cursorY();
+
+        // Off-canvas: applies to every intent, including RAW.
+        // (A test hook that wants to fire outside the canvas can
+        // call input.mousePress / mouseRelease directly — but that
+        // path is exactly what we're closing off in production code.)
+        if (!onCanvas(cx, cy))
+        {
+            lastError.set("press blocked: off-canvas at (" + cx + "," + cy
+                + ") intent=" + intent);
+            log.info("press blocked off-canvas at ({},{}) intent={}",
+                cx, cy, intent);
+            return false;
+        }
+
+        // WORLD-intent dead-zone: chatbox, sidebars, compass, orb
+        // cluster, minimap drawable area. Other intents legitimately
+        // click into these surfaces and bypass.
+        if (intent == ClickIntent.WORLD)
+        {
+            java.awt.Rectangle hit = onClient(
+                () -> UiDeadZones.worldIntersectsAt(client, cx, cy));
+            if (hit != null)
+            {
+                lastError.set("press blocked: cursor in UI dead-zone " + hit
+                    + " at (" + cx + "," + cy + ") intent=WORLD");
+                log.info("press blocked dead-zone {} at ({},{}) intent=WORLD",
+                    hit, cx, cy);
+                return false;
+            }
+        }
+
+        // Timing-driven sleeps. Pre-dwell only applies when the caller
+        // hasn't already settled (STANDARD profile); the FAST-COMMIT
+        // profiles dial it down because the caller's last move/menu
+        // step already gave the engine settle time.
+        SequenceSleep.sleep(client, timing.samplePreMs());
+        input.mousePress(button);
+        SequenceSleep.sleep(client, timing.sampleHoldMs());
+        input.mouseRelease(button);
+        SequenceSleep.sleep(client, timing.samplePostMs());
+        return true;
+    }
+
+    /** True when {@code (x, y)} is inside the canvas with a small
+     *  inset margin (matches {@link PixelResolver}'s on-canvas rule). */
+    private boolean onCanvas(int x, int y)
+    {
+        java.awt.Canvas c = client.getCanvas();
+        if (c == null) return false;
+        return x >= 4 && y >= 4 && x < c.getWidth() - 4 && y < c.getHeight() - 4;
     }
 
     /** True if the engine's would-be left-click action at the current cursor

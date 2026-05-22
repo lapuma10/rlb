@@ -45,6 +45,10 @@ import net.runelite.api.coords.WorldPoint;
 import net.runelite.api.gameval.VarbitID;
 import net.runelite.api.widgets.Widget;
 import net.runelite.api.widgets.WidgetInfo;
+// UiDeadZones: pixel-rejection regions (chatbox, sidebars, compass,
+// orbs, minimap). Sampling loops reject candidates here; fallback
+// centroid sites also gate their returns through it so a leaked
+// dead-zone pixel can never escape the resolver.
 import javax.annotation.Nullable;
 import java.awt.Polygon;
 import java.awt.Rectangle;
@@ -222,14 +226,22 @@ public final class PixelResolver
             Point p = new Point(x, y);
             if (!isOnCanvas(p)) continue;
             if (conflictsWithRecent(p)) continue;
+            if (inWorldDeadZone(x, y)) continue;
             record(p);
             return p;
         }
         // Fallback: tile centre. Always inside the poly for non-degenerate
-        // tiles and on-canvas if the bbox check passed.
+        // tiles and on-canvas if the bbox check passed. Now gated by the
+        // same rejection rules as the loop above — the previous unguarded
+        // return was a latent bypass: a tile under the chatbox would
+        // exhaust the 24-attempt budget on rejection samples, then leak
+        // the centroid past every filter.
         Point centre = new Point(bb.x + bb.width / 2, bb.y + bb.height / 2);
-        if (isOnCanvas(centre)) { record(centre); return centre; }
-        return null;
+        if (!isOnCanvas(centre)) return null;
+        if (conflictsWithRecent(centre)) return null;
+        if (inWorldDeadZone(centre)) return null;
+        record(centre);
+        return centre;
     }
 
     /** Pick a click pixel that actually lands on the ground-item pile at
@@ -287,11 +299,23 @@ public final class PixelResolver
                             Point p = new Point(x, y);
                             if (!isOnCanvas(p)) continue;
                             if (conflictsWithRecent(p)) continue;
+                            if (inWorldDeadZone(x, y)) continue;
                             record(p);
                             return p;
                         }
+                        // Centre fallback now gated — previously a chatbox-
+                        // occluded loot pile would leak the centroid pixel
+                        // here even though every sample inside the 24-attempt
+                        // loop was correctly rejected.
                         Point centre = new Point(bb.x + bb.width / 2, bb.y + bb.height / 2);
-                        if (isOnCanvas(centre)) { record(centre); return centre; }
+                        if (isOnCanvas(centre)
+                            && !conflictsWithRecent(centre)
+                            && !inWorldDeadZone(centre))
+                        {
+                            record(centre);
+                            return centre;
+                        }
+                        // Fall through to Strategy 2.
                     }
                 }
             }
@@ -310,11 +334,20 @@ public final class PixelResolver
                 Point p = new Point(projected.getX() + jx, projected.getY() + jy);
                 if (!isOnCanvas(p)) continue;
                 if (conflictsWithRecent(p)) continue;
+                if (inWorldDeadZone(p)) continue;
                 record(p);
                 return p;
             }
-            record(projected);
-            return projected;
+            // Projected-centre fallback now gated. Previously this returned
+            // the un-jittered centre even when every jittered sample was
+            // dead-zone-rejected — exactly the kind of fallback leak the
+            // bypass fix is closing.
+            if (!conflictsWithRecent(projected) && !inWorldDeadZone(projected))
+            {
+                record(projected);
+                return projected;
+            }
+            // Fall through to Strategy 3 if even the centre is occluded.
         }
 
         // Strategy 3 — tile polygon fallback (legacy behaviour).
@@ -351,6 +384,11 @@ public final class PixelResolver
             if (!isOnCanvas(candidate)) continue;
             if (conflictsWithRecent(candidate)) continue;
             if (intersectsAny(avoid, x, y)) continue;
+            // Dead-zone reject — walks landing inside chatbox / sidebar /
+            // minimap / orb cluster get blocked at press time anyway;
+            // returning null here triggers the caller's minimap fallback
+            // immediately instead of burning the cursor-move budget.
+            if (inWorldDeadZone(x, y)) continue;
             return candidate;
         }
         return null;
@@ -393,6 +431,38 @@ public final class PixelResolver
         int x = p.getX(), y = p.getY();
         // Small margin so we don't pick a literal corner pixel.
         return x >= 4 && y >= 4 && x < c.getWidth() - 4 && y < c.getHeight() - 4;
+    }
+
+    /** True iff {@code (x, y)} falls inside any UI dead-zone for WORLD-
+     *  intent clicks — chatbox, side panels, compass, orb cluster, or
+     *  the minimap drawable area. WORLD-target sampling methods
+     *  (NPCs, game objects, walls, ground items, walk main-view
+     *  samples) all reject candidates that fail this check.
+     *
+     *  <p>Read on the client thread — every {@code getBounds()} call
+     *  inside {@link UiDeadZones} reads widget state. The resolver
+     *  methods are already called via {@code onClient(...)}, so this
+     *  is fine inline. */
+    private boolean inWorldDeadZone(int x, int y)
+    {
+        return UiDeadZones.worldIntersectsAt(client, x, y) != null;
+    }
+
+    private boolean inWorldDeadZone(Point p)
+    {
+        return p != null && inWorldDeadZone(p.getX(), p.getY());
+    }
+
+    /** True iff {@code (x, y)} hits an overlay that sits on top of the
+     *  minimap (orbs, world-map button, compass) or any general UI
+     *  overlay (chatbox, sidebars) — but NOT the minimap drawable
+     *  area itself. Used by minimap clamping so a legitimate
+     *  minimap walk pixel isn't rejected just for being on the
+     *  minimap, while still pushing it off the world-map / compass /
+     *  orb hit-rects that steal the click. */
+    private boolean inMinimapOverlay(int x, int y)
+    {
+        return UiDeadZones.hitsMinimapOverlay(client, x, y);
     }
 
     /** Pick a pixel inside the NPC's clickable area, with rejection against
@@ -678,8 +748,10 @@ public final class PixelResolver
         // Centre first. attempt=0 is the exact bbox centre; subsequent
         // attempts jitter slightly so two laps don't pixel-match. We
         // accept the first sample that's both inside the shape and on
-        // canvas — the bbox centre is virtually always inside for
-        // convex-ish hulls and clickboxes.
+        // canvas AND not in a dead-zone — the bbox centre is virtually
+        // always inside for convex-ish hulls and clickboxes, but a
+        // tall obstacle whose hull projects into the chatbox would
+        // previously seed the entire candidate list with leaked pixels.
         for (int attempt = 0; attempt < 6 && pts.isEmpty(); attempt++)
         {
             int jx = attempt == 0 ? 0
@@ -690,6 +762,7 @@ public final class PixelResolver
             if (!s.contains(x, y)) continue;
             Point p = new Point(x, y);
             if (!isOnCanvas(p)) continue;
+            if (inWorldDeadZone(x, y)) continue;
             pts.add(p);
         }
         // Spread samples across the shape, dedup'd against existing
@@ -703,6 +776,7 @@ public final class PixelResolver
             if (!s.contains(x, y)) continue;
             Point p = new Point(x, y);
             if (!isOnCanvas(p)) continue;
+            if (inWorldDeadZone(x, y)) continue;
             boolean dup = false;
             for (Point ex : pts)
             {
@@ -836,16 +910,27 @@ public final class PixelResolver
             if (!poly.contains(x, y)) continue;
             // Reject the literal centre band — looks mechanical otherwise.
             if (Math.abs(x - cx) <= 1 && Math.abs(y - cy) <= 1) continue;
+            if (inWorldDeadZone(x, y)) continue;
             Point p = new Point(x, y);
             if (!conflictsWithRecent(p)) return p;
         }
-        // Last-resort: anything inside the polygon, even if it collides.
+        // Last-resort: anything inside the polygon, EXCEPT pixels that
+        // fall in a dead-zone. The previous unconditional "any point
+        // inside the polygon" was the latent bypass — an NPC whose hull
+        // overlapped the chatbox would leak a chatbox-bound pixel here
+        // even though the rejection-sampling loop above worked correctly.
         for (int attempt = 0; attempt < 12; attempt++)
         {
             int x = bbox.x + rng.nextInt(bbox.width);
             int y = bbox.y + rng.nextInt(bbox.height);
-            if (poly.contains(x, y)) return new Point(x, y);
+            if (!poly.contains(x, y)) continue;
+            if (inWorldDeadZone(x, y)) continue;
+            return new Point(x, y);
         }
+        // Bare centroid only if it is itself clear. Otherwise null —
+        // caller's existing null-handling (resolveNpc, sampleNearCentroid)
+        // already aborts cleanly.
+        if (inWorldDeadZone(cx, cy)) return null;
         return new Point(cx, cy);
     }
 
@@ -881,10 +966,19 @@ public final class PixelResolver
             int jy = rng.nextInt(CENTROID_JITTER_PX * 2 + 1) - CENTROID_JITTER_PX;
             int x = cx + jx, y = cy + jy;
             if (!poly.contains(x, y)) continue;
+            if (inWorldDeadZone(x, y)) continue;
             Point p = new Point(x, y);
             if (!conflictsWithRecent(p)) return p;
         }
-        if (poly.contains(cx, cy)) return new Point(cx, cy);
+        // Bare centroid only when it's both inside the polygon AND
+        // clear of every dead-zone. Previously this returned the
+        // centroid unconditionally — a tall wall obstacle whose
+        // centroid projects under the chatbox would leak a chatbox-
+        // bound pixel here, and the dispatcher's hover-and-verify
+        // loop would then spin through every candidate pretending
+        // to look for the verb.
+        if (poly.contains(cx, cy) && !inWorldDeadZone(cx, cy))
+            return new Point(cx, cy);
         return sampleInsidePolygon(poly);
     }
 
@@ -974,7 +1068,17 @@ public final class PixelResolver
      *  radial visibility distance; the projected pixel can still land in the
      *  corner gap of the rectangular widget where the engine resolves to
      *  'Cancel' instead of WALK. If the minimap widget is unavailable, the
-     *  point is returned unchanged. */
+     *  point is returned unchanged.
+     *
+     *  <p>After the disc clamp, the result is re-checked against the
+     *  minimap-overlay dead-zones (orbs, world-map button, compass, wiki).
+     *  These sit visually on top of the minimap and steal clicks even
+     *  though the pixel is technically inside the inscribed circle — the
+     *  exact bug behind the lap-end → Rough Wall recovery walk opening
+     *  the world map. If the pixel hits an overlay, we pull it inward
+     *  along its radial vector by 4-px increments until it clears, all
+     *  the way to the disc centre if necessary. The centre is virtually
+     *  never overlay-occluded; the orbs cluster on the rim. */
     private Point clampToMinimapDisc(Point p)
     {
         if (p == null) return null;
@@ -998,14 +1102,65 @@ public final class PixelResolver
         int dy = p.getY() - cy;
         long d2 = (long) dx * dx + (long) dy * dy;
         long r2 = (long) r * r;
-        if (d2 <= r2) return p;
-        double dist = Math.sqrt(d2);
-        double scale = (r - 1) / dist;
-        Point clamped = new Point(
-            cx + (int) Math.round(dx * scale),
-            cy + (int) Math.round(dy * scale));
-        log.debug("minimap clamp: ({},{}) → ({},{})", p.getX(), p.getY(), clamped.getX(), clamped.getY());
-        return clamped;
+        Point clamped;
+        if (d2 <= r2) clamped = p;
+        else
+        {
+            double dist = Math.sqrt(d2);
+            double scale = (r - 1) / dist;
+            clamped = new Point(
+                cx + (int) Math.round(dx * scale),
+                cy + (int) Math.round(dy * scale));
+            log.debug("minimap clamp: ({},{}) → ({},{})",
+                p.getX(), p.getY(), clamped.getX(), clamped.getY());
+        }
+        return pullOffMinimapOverlay(clamped, cx, cy);
+    }
+
+    /** Step the point inward toward the disc centre in 4-px increments
+     *  until it no longer hits any minimap-overlay dead-zone (orbs,
+     *  world-map button, compass, wiki). Returns the original point
+     *  if it's already clear; returns the centre if every step along
+     *  the radial vector was occluded (vanishingly rare — the disc
+     *  centre is empty space on every layout). */
+    private Point pullOffMinimapOverlay(Point p, int cx, int cy)
+    {
+        if (p == null) return null;
+        if (!inMinimapOverlay(p.getX(), p.getY())) return p;
+        int dx = p.getX() - cx;
+        int dy = p.getY() - cy;
+        double len = Math.sqrt((double) dx * dx + (double) dy * dy);
+        if (len < 1.0)
+        {
+            // Already at centre and somehow occluded — return as-is;
+            // press primitive will block under WORLD intent but MINIMAP
+            // intent walks won't (which is what we wanted).
+            return p;
+        }
+        double ux = dx / len;
+        double uy = dy / len;
+        final int stepPx = 4;
+        final int maxSteps = (int) Math.ceil(len / stepPx) + 1;
+        for (int i = 1; i <= maxSteps; i++)
+        {
+            int x = p.getX() - (int) Math.round(ux * stepPx * i);
+            int y = p.getY() - (int) Math.round(uy * stepPx * i);
+            // Stop at centre even if we'd overshoot.
+            if ((x - cx) * dx + (y - cy) * dy <= 0)
+            {
+                x = cx; y = cy;
+            }
+            if (!inMinimapOverlay(x, y))
+            {
+                log.debug("minimap overlay clear: ({},{}) → ({},{}) after {} steps",
+                    p.getX(), p.getY(), x, y, i);
+                return new Point(x, y);
+            }
+            if (x == cx && y == cy) break;
+        }
+        // Every step was occluded — return centre. MINIMAP-intent walks
+        // tolerate this; WORLD-intent clicks shouldn't reach here.
+        return new Point(cx, cy);
     }
 
     /** The minimap draw widget for the current layout (fixed / resizable
