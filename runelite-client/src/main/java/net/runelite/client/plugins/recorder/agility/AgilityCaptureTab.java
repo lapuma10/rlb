@@ -5,6 +5,9 @@ import java.awt.Component;
 import java.awt.Dimension;
 import java.awt.GridLayout;
 import java.awt.event.ActionEvent;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.Paths;
 import java.util.ArrayList;
 import java.util.HashSet;
 import java.util.List;
@@ -16,6 +19,7 @@ import javax.swing.JButton;
 import javax.swing.JComboBox;
 import javax.swing.JComponent;
 import javax.swing.JLabel;
+import javax.swing.JOptionPane;
 import javax.swing.JPanel;
 import javax.swing.JSpinner;
 import javax.swing.JTextField;
@@ -26,6 +30,7 @@ import lombok.extern.slf4j.Slf4j;
 import net.runelite.api.coords.WorldPoint;
 import net.runelite.client.callback.ClientThread;
 import net.runelite.client.plugins.recorder.scripts.RooftopAgilityScript.RooftopCourseId;
+import net.runelite.client.plugins.recorder.scripts.RooftopCourseLoader;
 
 @Slf4j
 public final class AgilityCaptureTab extends JPanel
@@ -66,8 +71,9 @@ public final class AgilityCaptureTab extends JPanel
     // Start-prompt timer (5 second)
     private Timer startPromptTimer;
 
-    /** Public hook for Task 14 to inject save-click behavior. */
-    private Runnable saveAction = () -> log.warn("[agility-capture] save not wired");
+    private final CourseJsonWriter writer = new CourseJsonWriter();
+
+    private Runnable saveAction = this::onSaveClicked;
 
     public AgilityCaptureTab(AgilityCaptureSession session, ClientThread clientThread)
     {
@@ -98,11 +104,6 @@ public final class AgilityCaptureTab extends JPanel
 
         setControlsForState(false);     // not running yet
         refreshTimer.start();
-    }
-
-    public void setSaveAction(Runnable action)
-    {
-        this.saveAction = action;
     }
 
     // --- Build sections ---
@@ -347,5 +348,120 @@ public final class AgilityCaptureTab extends JPanel
         // 8. pendingClick == null
         if (m.pendingClick != null) return "click pending — wait";
         return null;
+    }
+
+    // --- Save flow ---
+
+    /** Called on the EDT when the Save button is clicked. */
+    private void onSaveClicked()
+    {
+        CaptureModel m = session.getModel();
+        if (m == null) return;
+
+        // Defensive re-check — the timer may have just enabled the button on stale state.
+        if (firstBlocker(m) != null) return;
+
+        Path target = Paths.get(RooftopCourseLoader.ROOFTOPS_DIR.toString(),
+            m.targetId.name().toLowerCase() + ".json");
+
+        boolean exists = Files.exists(target);
+        String[] options;
+        int defaultOption;
+        if (exists)
+        {
+            options = new String[] { "Overwrite", "Save as .new", "Cancel" };
+            defaultOption = 2;     // safest default
+        }
+        else
+        {
+            options = new String[] { "Save", "Cancel" };
+            defaultOption = 1;
+        }
+
+        int choice = JOptionPane.showOptionDialog(
+            this,
+            buildPreviewText(m, target),
+            "Save Agility Course",
+            JOptionPane.DEFAULT_OPTION,
+            JOptionPane.PLAIN_MESSAGE,
+            null,
+            options,
+            options[defaultOption]);
+
+        if (choice == -1) return;     // dismissed
+        boolean saveAsNew = exists && choice == 1;
+        boolean cancel    = (exists && choice == 2) || (!exists && choice == 1);
+        if (cancel) return;
+
+        final CaptureModel finalM = m;
+        final String baseName = saveAsNew
+            ? m.targetId.name().toLowerCase() + ".new"
+            : m.targetId.name().toLowerCase();
+
+        new Thread(() -> doSaveAndValidate(finalM, baseName), "agility-capture-save").start();
+    }
+
+    private String buildPreviewText(CaptureModel m, Path target)
+    {
+        long minTimeout = Long.MAX_VALUE;
+        long maxTimeout = Long.MIN_VALUE;
+        int warningCount = 0;
+        for (ObstacleObservation o : m.obstacles)
+        {
+            long t = Math.max(4_000L, Math.min(12_000L, Math.round(o.maxClickToXpMs * 1.5)));
+            if (t < minTimeout) minTimeout = t;
+            if (t > maxTimeout) maxTimeout = t;
+            if (o.objectIds.size() > 1) warningCount++;
+            if (o.verbs.size() > 1) warningCount++;
+        }
+        StringBuilder sb = new StringBuilder();
+        sb.append("Ready to save: ").append(m.label).append(" (").append(m.targetId.name()).append(")\n\n");
+        sb.append(m.obstacles.size()).append(" obstacles, observed in ").append(m.cleanMatchingLaps).append(" matching clean laps\n");
+        sb.append(m.validTiles.size()).append(" validTiles\n");
+        sb.append(m.startTiles.size()).append(" startTile(s), ").append(m.approachTiles.size()).append(" approachTiles\n");
+        sb.append("lapEnd: ").append(m.lapEndTile == null ? "(none)" : m.lapEndTile.toString()).append("\n");
+        if (m.obstacles.isEmpty())
+        {
+            sb.append("timeoutMs range: (no obstacles)\n");
+        }
+        else
+        {
+            sb.append("timeoutMs range: ").append(minTimeout).append("–").append(maxTimeout).append(" ms\n");
+        }
+        sb.append(warningCount).append(" warning(s)\n\n");
+        sb.append("Target: ").append(target);
+        return sb.toString();
+    }
+
+    private void doSaveAndValidate(CaptureModel m, String baseName)
+    {
+        try
+        {
+            Path written = writer.writeAs(m, baseName);
+            validateRoundTrip(written, m.targetId);
+            SwingUtilities.invokeLater(() -> saveStatusLabel.setText("Saved ✓  " + written.getFileName()));
+            log.info("[agility-capture] save success {}", written);
+        }
+        catch (Exception ex)
+        {
+            log.error("[agility-capture] save failed", ex);
+            SwingUtilities.invokeLater(() -> saveStatusLabel.setText("Save failed: " + ex.getMessage()));
+        }
+    }
+
+    /** Confirms the just-written file parses + validates via the loader. */
+    private void validateRoundTrip(Path written, RooftopCourseId expectedId)
+    {
+        // RooftopCourseLoader.loadAll() scans the whole rooftops dir, parses
+        // each file, and runs RooftopAgilityScript.validateCourse on each.
+        // Files that fail validation are silently dropped. So if our file is
+        // present in the returned map, both parse + validation passed.
+        var loaded = RooftopCourseLoader.loadAll();
+        if (!loaded.containsKey(expectedId))
+        {
+            throw new IllegalStateException(
+                "Round-trip validation failed: loader did not produce a course for id "
+                + expectedId.name() + " — file may be malformed or fail validateCourse().");
+        }
     }
 }

@@ -55,13 +55,13 @@ import org.slf4j.LoggerFactory;
  *  }</pre>
  *
  *  <p>Tile entries are 3-element JSON arrays of {@code [x, y, plane]}. */
-final class RooftopCourseLoader
+public final class RooftopCourseLoader
 {
     private static final Logger log = LoggerFactory.getLogger(RooftopCourseLoader.class);
 
     /** Directory scanned for {@code *.json} files. Created lazily — if it
      *  doesn't exist, the loader silently returns an empty map. */
-    static final Path ROOFTOPS_DIR =
+    public static final Path ROOFTOPS_DIR =
         Paths.get(RuneLite.RUNELITE_DIR.getAbsolutePath(), "recorder", "rooftops");
 
     private RooftopCourseLoader() {}
@@ -70,7 +70,7 @@ final class RooftopCourseLoader
      *  that fail to parse or fail {@link RooftopAgilityScript#validateCourse}
      *  are logged and skipped — they don't block other files. Returns a
      *  map keyed by the {@code id} field of each file. */
-    static Map<RooftopCourseId, RooftopCourse> loadAll()
+    public static Map<RooftopCourseId, RooftopCourse> loadAll()
     {
         Map<RooftopCourseId, RooftopCourse> out = new EnumMap<>(RooftopCourseId.class);
         if (!Files.isDirectory(ROOFTOPS_DIR))
