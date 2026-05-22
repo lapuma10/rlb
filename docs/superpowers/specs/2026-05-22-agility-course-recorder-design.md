@@ -63,8 +63,10 @@ runelite-client/src/main/java/net/runelite/client/plugins/recorder/agility/
 ```
 
 ~640 LOC across 5 files. Wired into existing `RecorderPlugin` and
-`RecorderPanel` as a new "Agility" tab. Zero modifications to
-`RooftopAgilityScript`, `RooftopCourseLoader`, or any other existing file.
+`RecorderPanel` as a new "Agility" tab. **Zero changes to runtime
+agility behavior or the JSON loader schema.** Small integration edits
+to `RecorderPlugin` and `RecorderPanel` are expected (new subscriber
+registrations + a new tab section).
 
 ## 4. Threading
 
@@ -91,7 +93,7 @@ CaptureModel
   expectedObstacleCount int                  pre-filled from defaults, editable
 
   obstacles            List<ObstacleObservation>   grows monotonically; order = first-success order
-  canonicalSequence    List<Integer>         orderIndex sequence of first clean full lap
+  canonicalSequence    List<ObstacleSignature>     signature-per-stage from first clean full lap
   cleanMatchingLaps    int                   includes the canonical lap itself
 
   approachTiles        Set<WorldPoint>       last 10s of player tiles before first-ever click
@@ -126,6 +128,17 @@ ObstacleObservation
 fields, same semantics) — the rename is purely to signal that the values
 inside have not yet been merged into the saved model. In Java, the same
 class is used; the difference is which collection holds it.
+
+```
+ObstacleSignature
+  objectId             int                   stable per-stage engine id
+  objectTile           WorldPoint            obstacle's world tile (fixed)
+  verb                 String                action verb on the menu entry
+
+  // Equality: all three fields match. Used to detect mismatched/rotated laps
+  // before merging them into the saved model. Computed at the moment of
+  // SUCCESS — see §7.1.
+```
 
 ```
 PendingClick
@@ -214,7 +227,8 @@ Drives:
 ```
 successTile = client.getLocalPlayer().getWorldLocation()
 
-// Each successful click within a lap creates a fresh PerLapObservation.
+// Each successful click within a lap creates a fresh PerLapObservation
+// plus the matching ObstacleSignature used for sequence comparison.
 // Within a single rooftop lap each obstacle is clicked exactly once, so
 // we always append; merging across laps happens in §9.3.
 obs = new PerLapObservation()
@@ -227,6 +241,10 @@ obs.objectTiles.add(pendingClick.objectTile)
 obs.successTiles.add(successTile)
 obs.maxClickToXpMs = now - pendingClick.clickAtMs
 obs.successCount   = 1
+obs.signature      = new ObstacleSignature(
+                         pendingClick.objectId,
+                         pendingClick.objectTile,
+                         pendingClick.verb)
 currentLapObs.append(obs)
 
 // Capture sourceTile before nulling pendingClick — used in state transition below.
@@ -306,18 +324,29 @@ ARMED
       └─ SUCCESS that reaches expectedObstacleCount → LAP_COMPLETE
 
 OFF_COURSE
-  └─ player tile lands in any knownStageTiles AND idle pose ≥ 2 ticks → ARMED
+  └─ canonicalSequence is null (no clean lap yet):
+        next agility click becomes ARMED → IN_LAP (soft reset)
+  └─ canonicalSequence is set:
+        player tile lands in startTiles ∪ approachTiles AND idle pose ≥ 2 ticks → ARMED
   └─ Discard-Lap or Cancel → ARMED
 
 LAP_COMPLETE
   └─ atomic merge (§9.2) → ARMED
 ```
 
+**Why strict re-entry once canonical exists.** Allowing re-entry from
+any `knownStageTiles` would conflict with the "no mid-course start" v1
+rule — a broken lap recovered mid-course would produce a rotated
+sequence. Requiring `startTiles ∪ approachTiles` enforces the same
+discipline as a fresh capture: the next lap restarts from the actual
+course start. Aligned with §16's mid-course-start handling.
+
 **First-lap-broken case** (`canonicalSequence == null` AND
-`state == OFF_COURSE`): there are no `knownStageTiles` to re-enter through.
-HUD displays: *"Lap broken. Walk to course start and click first obstacle
-again."* Re-entry detection: player idle for 2 ticks → next agility click
-becomes the new ARMED → IN_LAP transition (the soft reset).
+`state == OFF_COURSE`): there are no canonical stage tiles to re-enter
+through, and `startTiles` may also be empty if the BROKEN_LAP happened
+on the first click. HUD displays: *"Lap broken. Walk to course start
+and click first obstacle again."* Re-entry detection: the next agility
+click becomes the new ARMED → IN_LAP transition (the soft reset).
 
 **Two-click race**: handled in §6.1 — second click dirties the lap.
 
@@ -347,7 +376,9 @@ on first-ever first SUCCESS of the session:
 ### 9.2 On LAP_COMPLETE
 
 ```
-sequence = currentLapObs.map(orderIndex)
+// Build the signature list for THIS lap. Each entry is the
+// ObstacleSignature stored on the PerLapObservation at §7.1.
+sequence = currentLapObs.map(obs -> obs.signature)
 
 if canonicalSequence == null:
     // Establishing case — this lap is the canonical reference.
@@ -358,7 +389,7 @@ if canonicalSequence == null:
     lapEndTile = currentLapObs.last().successTiles.last()
     hud.info("Canonical sequence established (" + sequence.size() + " obstacles).")
 
-else if sequence == canonicalSequence:
+else if signaturesMatch(sequence, canonicalSequence):
     // Confirming case — merge.
     mergeObsIntoModel(currentLapObs)
     model.validTiles.addAll(currentLapTiles)
@@ -367,13 +398,29 @@ else if sequence == canonicalSequence:
 
 else:
     // Anomaly — discard everything from this lap, including its tiles.
-    hud.warn("Lap sequence mismatch — discarded (expected " +
-              canonicalSequence + ", got " + sequence + ")")
+    hud.warn("Lap sequence mismatch — discarded. " +
+              "First differing index: " + firstDiffIndex(sequence, canonicalSequence))
 
 currentLapTiles.clear()
 currentLapObs.clear()
 state = ARMED
 ```
+
+```
+signaturesMatch(a, b):
+    if a.size() != b.size(): return false
+    for i in 0..a.size():
+        if a[i].objectId   != b[i].objectId:   return false
+        if a[i].objectTile != b[i].objectTile: return false
+        if a[i].verb       != b[i].verb:       return false
+    return true
+```
+
+The comparison is strict: every stage's `(objectId, objectTile, verb)`
+triple must match. This catches both **rotated** laps (mid-course start
+producing `[B, C, D, A]` vs canonical `[A, B, C, D]`) and **disordered**
+laps (manual click-out-of-order producing `[A, C, B, D]`). With the
+previous `[0, 1, 2, 3]`-index comparison, neither would be caught.
 
 ### 9.3 `mergeObsIntoModel`
 
@@ -393,21 +440,21 @@ user picks a course from the dropdown; every field is editable before Start
 
 | Course ID | Label | Level | Obstacles |
 |---|---|---|---|
-| DRAYNOR | Draynor Rooftop | 1 | 7 |
+| DRAYNOR | Draynor Village Rooftop | 1 | 7 |
 | AL_KHARID | Al Kharid Rooftop | 20 | 8 |
-| VARROCK | Varrock Rooftop | 30 | 8 |
-| CANIFIS | Canifis Rooftop | 40 | 10 |
-| FALADOR | Falador Rooftop | 50 | 6 |
+| VARROCK | Varrock Rooftop | 30 | 9 |
+| CANIFIS | Canifis Rooftop | 40 | 8 |
+| FALADOR | Falador Rooftop | 50 | 13 |
 | SEERS | Seers' Village Rooftop | 60 | 6 |
-| POLLNIVNEACH | Pollnivneach Rooftop | 70 | 7 |
-| RELLEKKA | Rellekka Rooftop | 80 | 6 |
-| ARDOUGNE | Ardougne Rooftop | 90 | 10 |
+| POLLNIVNEACH | Pollnivneach Rooftop | 70 | 9 |
+| RELLEKKA | Rellekka Rooftop | 80 | 7 |
+| ARDOUGNE | Ardougne Rooftop | 90 | 7 |
 
-Counts above are best-effort starting values; some are not double-checked
-against the current OSRS Wiki. The user is expected to verify and override
-the count in-panel before pressing Start. The runtime cost of a wrong
-count is one botched capture session — the lap never completes because
-the success-count never matches.
+Verified against the OSRS Wiki summary table at
+`https://oldschool.runescape.wiki/w/Rooftop_Agility_Courses` on
+2026-05-22. The user can still override in-panel before pressing Start
+if the wiki entry changes. Falador is the notable outlier at 13
+obstacles per lap — confirmed on the wiki, not a typo.
 
 ## 11. HUD overlay (in-canvas Swing Overlay)
 
