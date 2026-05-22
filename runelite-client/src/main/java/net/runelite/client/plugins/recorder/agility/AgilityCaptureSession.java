@@ -1,5 +1,7 @@
 package net.runelite.client.plugins.recorder.agility;
 
+import java.util.ArrayList;
+import java.util.List;
 import lombok.extern.slf4j.Slf4j;
 import net.runelite.api.Client;
 import net.runelite.api.MenuAction;
@@ -259,6 +261,96 @@ public class AgilityCaptureSession
 
     private void handleLapComplete()
     {
-        // Task 9 — canonical sequence comparison + merge.
+        List<ObstacleSignature> sequence = new ArrayList<>();
+        for (ObstacleObservation o : model.currentLapObs)
+        {
+            sequence.add(o.signature);
+        }
+
+        if (model.canonicalSequence == null)
+        {
+            model.canonicalSequence = sequence;
+            mergeObsIntoModel(model.currentLapObs);
+            model.validTiles.addAll(model.currentLapTiles);
+            model.cleanMatchingLaps = 1;
+            model.lapEndTile = lastSuccessTile(model.currentLapObs);
+            log.info("[agility-capture] canonical sequence established ({} obstacles)", sequence.size());
+        }
+        else if (signaturesMatch(sequence, model.canonicalSequence))
+        {
+            mergeObsIntoModel(model.currentLapObs);
+            model.validTiles.addAll(model.currentLapTiles);
+            model.cleanMatchingLaps++;
+            log.info("[agility-capture] matching clean lap: {}", model.cleanMatchingLaps);
+        }
+        else
+        {
+            int diff = firstDiffIndex(sequence, model.canonicalSequence);
+            log.warn("[agility-capture] lap sequence mismatch at index {} — discarded", diff);
+        }
+
+        model.currentLapTiles.clear();
+        model.currentLapObs.clear();
+        model.state = LapState.ARMED;
+        model.currentLapDirty = false;
+    }
+
+    private static boolean signaturesMatch(List<ObstacleSignature> a, List<ObstacleSignature> b)
+    {
+        if (a.size() != b.size()) return false;
+        for (int i = 0; i < a.size(); i++)
+        {
+            if (!a.get(i).equals(b.get(i))) return false;
+        }
+        return true;
+    }
+
+    private static int firstDiffIndex(List<ObstacleSignature> a, List<ObstacleSignature> b)
+    {
+        int n = Math.min(a.size(), b.size());
+        for (int i = 0; i < n; i++)
+        {
+            if (!a.get(i).equals(b.get(i))) return i;
+        }
+        return a.size() == b.size() ? -1 : n;       // length mismatch — first extra index
+    }
+
+    private void mergeObsIntoModel(List<ObstacleObservation> lapObs)
+    {
+        for (ObstacleObservation o : lapObs)
+        {
+            ObstacleObservation existing = findOrCreateByOrderIndex(o.orderIndex);
+            existing.objectIds.addAll(o.objectIds);
+            existing.verbs.addAll(o.verbs);
+            existing.objectLabels.addAll(o.objectLabels);
+            existing.stageTiles.addAll(o.stageTiles);
+            existing.objectTiles.addAll(o.objectTiles);
+            existing.successTiles.addAll(o.successTiles);
+            existing.maxClickToXpMs = Math.max(existing.maxClickToXpMs, o.maxClickToXpMs);
+            existing.successCount++;
+            if (existing.signature == null)
+            {
+                existing.signature = o.signature;       // first lap defines it
+            }
+        }
+    }
+
+    private ObstacleObservation findOrCreateByOrderIndex(int orderIndex)
+    {
+        for (ObstacleObservation existing : model.obstacles)
+        {
+            if (existing.orderIndex == orderIndex) return existing;
+        }
+        ObstacleObservation fresh = new ObstacleObservation();
+        fresh.orderIndex = orderIndex;
+        model.obstacles.add(fresh);
+        return fresh;
+    }
+
+    private static WorldPoint lastSuccessTile(List<ObstacleObservation> lapObs)
+    {
+        if (lapObs.isEmpty()) return null;
+        ObstacleObservation last = lapObs.get(lapObs.size() - 1);
+        return last.successTiles.iterator().next();    // exactly one within a single lap
     }
 }
