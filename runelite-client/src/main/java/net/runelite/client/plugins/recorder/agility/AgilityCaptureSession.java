@@ -2,6 +2,9 @@ package net.runelite.client.plugins.recorder.agility;
 
 import lombok.extern.slf4j.Slf4j;
 import net.runelite.api.Client;
+import net.runelite.api.MenuAction;
+import net.runelite.api.MenuEntry;
+import net.runelite.api.Skill;
 import net.runelite.api.events.GameTick;
 import net.runelite.api.events.MenuOptionClicked;
 import net.runelite.api.events.StatChanged;
@@ -52,7 +55,49 @@ public class AgilityCaptureSession
     public void onMenuOptionClicked(MenuOptionClicked e)
     {
         if (!active) return;
-        // Task 6
+
+        // §6.1 — only game-object actions; ignore EXAMINE and everything else
+        MenuEntry entry = e.getMenuEntry();
+        MenuAction type = entry.getType();
+        boolean isObjectClick =
+               type == MenuAction.GAME_OBJECT_FIRST_OPTION
+            || type == MenuAction.GAME_OBJECT_SECOND_OPTION
+            || type == MenuAction.GAME_OBJECT_THIRD_OPTION
+            || type == MenuAction.GAME_OBJECT_FOURTH_OPTION
+            || type == MenuAction.GAME_OBJECT_FIFTH_OPTION;
+        if (!isObjectClick) return;
+
+        // §6.1 — two-click race guard: discard lap and reset
+        if (model.pendingClick != null)
+        {
+            model.currentLapDirty = true;
+            model.currentLapTiles.clear();
+            model.currentLapObs.clear();
+            model.pendingClick = null;
+            model.state = LapState.OFF_COURSE;
+            log.info("[agility-capture] two clicks queued — lap discarded. Walk to start.");
+            return;
+        }
+
+        // Resolve world tile from menu entry (mirrors ClickResolver.java:111-113)
+        int objectId   = entry.getIdentifier();
+        String verb    = entry.getOption();
+        int worldX     = client.getBaseX() + entry.getParam0();
+        int worldY     = client.getBaseY() + entry.getParam1();
+        int plane      = client.getPlane();
+        WorldPoint objectTile = new WorldPoint(worldX, worldY, plane);
+
+        // Capture source tile (player position at click time)
+        if (client.getLocalPlayer() == null) return;
+        WorldPoint sourceTile = client.getLocalPlayer().getWorldLocation();
+
+        // Build PendingClick and store on model
+        long now        = System.currentTimeMillis();
+        long deadlineMs = now + perObjectDeadline(objectId);
+        long xpBefore   = client.getSkillExperience(Skill.AGILITY);
+
+        model.pendingClick = new PendingClick(objectId, verb, objectTile, sourceTile,
+                                               now, deadlineMs, xpBefore);
     }
 
     @Subscribe
@@ -91,5 +136,10 @@ public class AgilityCaptureSession
     private void maybeExpirePendingClick(long now, WorldPoint p)
     {
         // Task 8 — IGNORED / BROKEN_LAP / UNKNOWN classifier.
+    }
+
+    private long perObjectDeadline(int objectId)
+    {
+        return 12_000L;       // default; per-object shrink lands in Task 8
     }
 }
