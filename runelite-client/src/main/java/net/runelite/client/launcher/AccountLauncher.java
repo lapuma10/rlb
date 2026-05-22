@@ -505,6 +505,31 @@ public final class AccountLauncher
         return System.getProperty("os.name").toLowerCase().contains("linux");
     }
 
+    private static boolean isWindows()
+    {
+        return System.getProperty("os.name").toLowerCase().contains("windows");
+    }
+
+    private static Path findWindowsJagexLauncherExe()
+    {
+        String localAppData = System.getenv("LOCALAPPDATA");
+        if (localAppData == null || localAppData.isBlank())
+            localAppData = Path.of(System.getProperty("user.home"), "AppData", "Local").toString();
+        String pf   = System.getenv("ProgramFiles");
+        String pf86 = System.getenv("ProgramFiles(x86)");
+        if (pf == null || pf.isBlank())   pf   = "C:\\Program Files";
+        if (pf86 == null || pf86.isBlank()) pf86 = "C:\\Program Files (x86)";
+
+        Path[] candidates = {
+            Path.of(localAppData, "Jagex Launcher", "JagexLauncher.exe"),
+            Path.of(pf,   "Jagex Launcher", "JagexLauncher.exe"),
+            Path.of(pf86, "Jagex Launcher", "JagexLauncher.exe"),
+        };
+        for (Path p : candidates)
+            if (Files.exists(p)) return p;
+        return candidates[0]; // first candidate, for the error message
+    }
+
     /**
      * Launch the Jagex Launcher with --insecure-write-credentials in scope.
      * Mac uses the bundled .app via {@code open -a}, with launchctl setting
@@ -531,6 +556,23 @@ public final class AccountLauncher
                     "running outside the rlb-capture container?");
             }
             ProcessBuilder pb = new ProcessBuilder("wine", exe);
+            pb.environment().put("RUNELITE_ARGS", INSECURE_FLAG);
+            pb.inheritIO();
+            pb.start();
+            return;
+        }
+        if (isWindows())
+        {
+            String override = System.getenv("JAGEX_LAUNCHER_EXE");
+            Path exe = (override != null && !override.isBlank())
+                ? Path.of(override)
+                : findWindowsJagexLauncherExe();
+            if (!Files.exists(exe))
+            {
+                throw new IOException("Jagex Launcher not found at " + exe +
+                    " - install Jagex Launcher or set JAGEX_LAUNCHER_EXE");
+            }
+            ProcessBuilder pb = new ProcessBuilder(exe.toString());
             pb.environment().put("RUNELITE_ARGS", INSECURE_FLAG);
             pb.inheritIO();
             pb.start();
