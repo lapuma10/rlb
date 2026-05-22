@@ -4,6 +4,7 @@ import lombok.extern.slf4j.Slf4j;
 import net.runelite.api.Client;
 import net.runelite.api.MenuAction;
 import net.runelite.api.MenuEntry;
+import net.runelite.api.ObjectComposition;
 import net.runelite.api.Skill;
 import net.runelite.api.events.GameTick;
 import net.runelite.api.events.MenuOptionClicked;
@@ -104,7 +105,61 @@ public class AgilityCaptureSession
     public void onStatChanged(StatChanged e)
     {
         if (!active) return;
-        // Task 7
+
+        // §7.1 — filter + validate
+        if (e.getSkill() != Skill.AGILITY) return;
+        PendingClick pc = model.pendingClick;
+        if (pc == null) return;
+        if (pc.outcome != ClickOutcome.PENDING) return;
+
+        long now = System.currentTimeMillis();
+        if (now > pc.deadlineMs) return;                  // expired; Task 8 will sweep
+        if (e.getXp() <= pc.xpBefore) return;             // not an XP increase (drain or replay)
+
+        if (client.getLocalPlayer() == null) return;
+        WorldPoint successTile = client.getLocalPlayer().getWorldLocation();
+        WorldPoint sourceTile  = pc.sourceTile;
+
+        // §7.1 — build per-lap observation
+        ObstacleObservation obs = new ObstacleObservation();
+        obs.orderIndex = model.currentLapObs.size();
+        obs.objectIds.add(pc.objectId);
+        obs.verbs.add(pc.verb);
+        obs.objectLabels.add(safeObjectLabel(pc.objectId));
+        obs.stageTiles.add(sourceTile);
+        obs.objectTiles.add(pc.objectTile);
+        obs.successTiles.add(successTile);
+        obs.maxClickToXpMs = now - pc.clickAtMs;
+        obs.successCount   = 1;
+        obs.signature      = new ObstacleSignature(pc.objectId, pc.objectTile, pc.verb);
+        model.currentLapObs.add(obs);
+
+        // Ensure stage + success tiles land in the lap tile buffer (spec §7.1 lines 259-263)
+        model.currentLapTiles.add(sourceTile);
+        model.currentLapTiles.add(successTile);
+
+        pc.outcome = ClickOutcome.SUCCESS;
+        model.pendingClick = null;
+
+        // §7.1 — ARMED → IN_LAP transition; first-ever SUCCESS captures startTile + approachTiles
+        if (model.state == LapState.ARMED)
+        {
+            model.state = LapState.IN_LAP;
+            if (model.startTiles.isEmpty())               // first SUCCESS this session
+            {
+                model.startTiles.add(sourceTile);
+                for (CaptureModel.Sample s : model.approachRing)
+                {
+                    model.approachTiles.add(s.p);
+                }
+            }
+        }
+
+        // §7.1 — lap completion trigger
+        if (model.currentLapObs.size() == model.expectedObstacleCount)
+        {
+            handleLapComplete();
+        }
     }
 
     @Subscribe
@@ -141,5 +196,25 @@ public class AgilityCaptureSession
     private long perObjectDeadline(int objectId)
     {
         return 12_000L;       // default; per-object shrink lands in Task 8
+    }
+
+    private String safeObjectLabel(int objectId)
+    {
+        try
+        {
+            ObjectComposition c = client.getObjectDefinition(objectId);
+            if (c == null) return "";
+            String name = c.getName();
+            return name == null ? "" : name;
+        }
+        catch (Exception ex)
+        {
+            return "";
+        }
+    }
+
+    private void handleLapComplete()
+    {
+        // Task 9 — canonical sequence comparison + merge.
     }
 }
