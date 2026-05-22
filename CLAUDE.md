@@ -1,5 +1,7 @@
 ## Build & run
 
+### macOS (zsh/bash)
+
 ```bash
 JBIN=/opt/homebrew/Cellar/openjdk@17/17.0.19/libexec/openjdk.jdk/Contents/Home/bin/java
 
@@ -22,6 +24,54 @@ $JBIN -ea \
 $JBIN -cp runelite-client/build/libs/client-*.jar \
   net.runelite.client.launcher.AccountLauncher
 ```
+
+### Windows 10/11 (PowerShell)
+
+Prereq: JDK 17 installed. Eclipse Temurin works:
+`https://adoptium.net/temurin/releases/?version=17`. Set `JAVA_HOME` to its
+install dir (e.g. `C:\Program Files\Eclipse Adoptium\jdk-17.0.x.x-hotspot`).
+
+```powershell
+$env:JAVA_HOME = "C:\Program Files\Eclipse Adoptium\jdk-17.0.13.11-hotspot"   # adjust to your install
+$JBIN = "$env:JAVA_HOME\bin\java.exe"
+
+# Compile only
+.\gradlew.bat :client:compileJava
+
+# Full build (shadow jar)
+.\gradlew.bat :client:shadowJar
+
+# Run RuneLite directly (the two com.apple.eawt --add-opens flags emit a
+# benign warning on Windows — leave them; they're no-ops if the package
+# doesn't exist, and removing them would make the launch command diverge
+# from the macOS one).
+& $JBIN -ea `
+  --add-opens java.desktop/com.apple.eawt=ALL-UNNAMED `
+  --add-opens java.desktop/com.apple.eawt.event=ALL-UNNAMED `
+  --add-opens java.base/java.lang=ALL-UNNAMED `
+  -jar (Get-ChildItem runelite-client\build\libs\client-*.jar | Select -First 1).FullName `
+  --developer-mode
+
+# Run the pre-launcher
+& $JBIN -cp (Get-ChildItem runelite-client\build\libs\client-*.jar | Select -First 1).FullName `
+  net.runelite.client.launcher.AccountLauncher
+```
+
+Git Bash users on Windows can run the macOS bash commands as-is (forward
+slashes work, `./gradlew` invokes `gradlew.bat`). Only the `JBIN=` path
+differs — point it at your JDK install:
+`JBIN="/c/Program Files/Eclipse Adoptium/jdk-17.0.13.11-hotspot/bin/java.exe"`.
+
+### Cross-platform notes
+
+- Java code uses `Paths.get(...)` everywhere — no hardcoded path separators.
+- All data files in `data/recorder/` are line-ending-normalized to LF via
+  `.gitattributes`; a Windows checkout won't auto-convert them to CRLF.
+- `OSXFullScreenAdapter` is wrapped in an `OSType.MacOS` check at
+  `ClientUI.java:334` — Windows simply skips it.
+- `AccountLauncher` adds Jagex-account support only on macOS / Linux (see
+  `AccountLauncher.java:518-539`). Windows users use classic accounts via
+  the RuneLite client launch (first command above).
 
 **"rebuild" / "rerun" / "rr" defaults to CLIENT only — never the launcher.**
 When the user says "rebuild" or "rerun" or "rr" (alone, or "rr the client"),
@@ -195,15 +245,24 @@ cannot navigate.
 The repo carries a curated snapshot at `data/recorder/`. **On a fresh PC**:
 
 ```bash
+# macOS / Linux / Git Bash:
 git clone <repo> && cd rlb
 ./scripts/sync-recorder-data.sh
+
+# Windows (PowerShell):
+git clone <repo>; cd rlb
+pwsh -File scripts\sync-recorder-data.ps1
+# Or Windows PowerShell 5.x: powershell -File scripts\sync-recorder-data.ps1
+# First-time-only: Set-ExecutionPolicy -Scope CurrentUser RemoteSigned
 ```
 
 That copies `data/recorder/{trails,rooftops,worldmap}/*` wholesale into
-`~/.runelite/recorder/` and seeds `buy-limits/default.json` +
-`training-plans/default.properties` only if the user has none yet (so
-account-scoped state isn't clobbered). Re-run any time after `git pull`
-brings new data — the script is idempotent.
+`~/.runelite/recorder/` (or `%USERPROFILE%\.runelite\recorder\` on Windows)
+and seeds `buy-limits/default.json` + `training-plans/default.properties`
+only if the user has none yet (so account-scoped state isn't clobbered).
+Re-run any time after `git pull` brings new data — the scripts are
+idempotent. The `.sh` and `.ps1` versions do the same thing; pick whichever
+your shell is comfortable with.
 
 **To carry new data the other direction** (recorded a fresh trail / rooftop
 on PC A → want it on PC B):
