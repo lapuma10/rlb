@@ -33,10 +33,16 @@ After this tool ships, the workflow to add a new rooftop is:
 
 - **Non-rooftop agility content**: Gnome Stronghold, Werewolf, Pyramid,
   Brimhaven, Hallowed Sepulchre. Those need a different data model.
-- **Mid-course start support**: the user must stand at the actual course start
-  before pressing Start. Auto-detecting a mid-course start (which can produce
-  a rotated obstacle sequence) is explicitly deferred — v1 trusts user
-  positioning.
+- **Mid-course start support for capture sessions**: the user must stand at
+  the actual course start before pressing Start in the recorder. Auto-
+  detecting a mid-course start during *capture* (which can produce a
+  rotated canonical obstacle sequence) is explicitly deferred — v1 trusts
+  user positioning. **This restriction applies only to the recorder.**
+  The runtime `RooftopAgilityScript` may still start mid-course if the
+  player is already on a known stage tile; it infers the current stage
+  from `stageByTile` and continues. If the player is outside
+  `validTiles`, the script's existing off-route recovery walks them back
+  to start (unchanged from the runtime's existing behavior).
 - **Marks of grace capture**: deferred to v1.5. The JSON written by v1 has
   no `reachableMarkTiles` entries (or empty arrays); the runtime falls back
   to the no-marks code path until v1.5 lands.
@@ -646,7 +652,7 @@ in the panel as the exception message; the user is offered
 
 | Scenario | Handling |
 |---|---|
-| User starts capture mid-course | Not supported in v1. The 5-second Start prompt instructs the user to stand at the course start. If ignored, the first SUCCESS defines obstacle 0 — a rotated canonical sequence is the user's responsibility to catch. Future enhancement: plane-0 sanity check (see §19). |
+| User starts a **capture session** mid-course | Not supported in v1. The 5-second Start prompt instructs the user to stand at the course start. If ignored, the first SUCCESS defines obstacle 0 — a rotated canonical sequence is the user's responsibility to catch. Future enhancement: plane-0 sanity check (see §19). Note: this constraint applies to **recording new JSON**, not to running an already-captured course — see §2. |
 | Two pending clicks (user spammed) | §6.1: lap dirtied, OFF_COURSE, HUD warns. |
 | Player attacked mid-capture (NPC) | No XP fires → BROKEN_LAP via deadline. Lap discarded. |
 | User alt-tabs mid-lap | No movement, no XP, deadline expires → UNKNOWN → dirty lap. |
@@ -742,4 +748,4 @@ single-line pass criterion. Failure halts the plan; we fix and rerun.
 - **Save gate**: 2 matching clean full laps + per-obstacle invariants + `validTiles.containsAll(allStageTiles)` + post-save `validateCourse` round-trip.
 - **`fallTiles`**: empty in JSON. Runtime off-route branch handles falls.
 - **Marks**: deferred to v1.5.
-- **Mid-course start**: not supported in v1. HUD prompt instructs user to stand at the actual course start.
+- **Mid-course start**: not supported in v1 *for capture sessions* — HUD prompt instructs the user to stand at the course start. Runtime `RooftopAgilityScript` is unaffected and may still start mid-course on a known stage tile.
