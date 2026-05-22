@@ -1,0 +1,56 @@
+{
+  "_comment": "Rooftop agility course template. Copy this file, rename it (e.g. al-kharid.json), and fill in the fields. The loader reads every *.json file in this directory. Files starting with '_' are skipped by convention but the loader does parse them — rename when ready.",
+
+  "id": "AL_KHARID",
+  "_id_help": "Must match a value in RooftopAgilityScript.RooftopCourseId. Currently allowed: DRAYNOR, AL_KHARID, VARROCK, CANIFIS, FALADOR, SEERS, POLLNIVNEACH, RELLEKKA, ARDOUGNE.",
+
+  "label": "Al-Kharid Rooftop",
+  "agilityLevel": 20,
+
+  "scanRadius": 14,
+  "_scanRadius_help": "Optional. Chebyshev radius for the obstacle scene-scan. Default 14. Bump up for courses with widely-spaced obstacles (Pollnivneach, Ardougne).",
+
+  "approachTiles": [
+    [3273, 3195, 0],
+    [3274, 3195, 0],
+    [3273, 3196, 0],
+    [3274, 3196, 0]
+  ],
+  "_approachTiles_help": "Broad zone where the script accepts 'player is ready to start a lap'. Include the spawn tile and a few neighbours.",
+
+  "startTiles": [
+    [3273, 3195, 0]
+  ],
+  "_startTiles_help": "Subset of approachTiles. The single best walk-to target for recovery-walk-to-start. Keep this small (1–3 tiles).",
+
+  "fallTiles": [],
+  "_fallTiles_help": "Optional. Known fall-down tiles (you fail an obstacle and the engine drops you here). Empty is fine — the off-route handler catches falls by elimination.",
+
+  "lapEndTiles": [
+    [3304, 3162, 3]
+  ],
+  "_lapEndTiles_help": "Tile(s) where the LAST obstacle's transport lands the player. For Al-Kharid this is the roof of the bank after the final climb-down.",
+
+  "validTiles": null,
+  "_validTiles_help": "Optional. Union of every stage tile + lapEnd tile. Leave null to auto-compute from obstacles[].stageTiles + lapEndTiles.",
+
+  "obstacles": [
+    {
+      "label": "Rough wall",
+      "objectId": 11633,
+      "action": "Climb-up",
+      "objectTiles": [[3272, 3196, 0]],
+      "stageTiles":  [[3273, 3195, 0], [3274, 3195, 0], [3273, 3196, 0], [3274, 3196, 0]],
+      "timeoutMs": 4000
+    },
+    {
+      "label": "Tightrope",
+      "objectId": 11634,
+      "action": "Cross",
+      "objectTiles": [[3271, 3195, 3]],
+      "stageTiles":  [[3271, 3195, 3], [3272, 3195, 3], [3273, 3195, 3]],
+      "timeoutMs": 6000
+    }
+  ],
+  "_obstacles_help": "Ordered. Each obstacle has: label (display name), objectId (RuneScape game-object ID, see RuneLite dev tools), action (the menu verb — 'Climb-up', 'Cross', 'Balance', 'Jump-up', 'Jump', 'Climb-down', etc.), objectTiles (the world tile(s) the object renders on — advisory, the actual click uses SceneScanner.findObjectTileById), stageTiles (the tiles the player walks through to/from this obstacle), timeoutMs (how long to wait before counting the click as failed; bump for slow animations like Climb-down)."
+}

@@ -179,9 +179,57 @@ you change** — the fixtures tell you what behaviour is expected.
 ```
 ~/.runelite/logs/client.log               current session — tail this
 ~/.runelite/logs/client_YYYY-MM-DD.0.log  prior days (rotated)
-~/.runelite/recorder/trails/*.json        recorded trails (TILE+TRANSPORT)
+~/.runelite/recorder/sessions/<acct>/     per-account capture recordings
+~/.runelite/recorder/inspect/             click-inspector debug dumps
+~/.runelite/recorder/login-state.json     login state (credentials-adjacent)
 ~/.runelite/                              all RuneLite settings + state
 ```
+
+## Portable data — `data/recorder/` + sync script
+
+Everything the bot needs to walk somewhere or run an agility lap lives in
+`~/.runelite/recorder/{trails,rooftops,worldmap,buy-limits,training-plans}/`.
+RuneLite never auto-populates that directory; without the data files the bot
+cannot navigate.
+
+The repo carries a curated snapshot at `data/recorder/`. **On a fresh PC**:
+
+```bash
+git clone <repo> && cd rlb
+./scripts/sync-recorder-data.sh
+```
+
+That copies `data/recorder/{trails,rooftops,worldmap}/*` wholesale into
+`~/.runelite/recorder/` and seeds `buy-limits/default.json` +
+`training-plans/default.properties` only if the user has none yet (so
+account-scoped state isn't clobbered). Re-run any time after `git pull`
+brings new data — the script is idempotent.
+
+**To carry new data the other direction** (recorded a fresh trail / rooftop
+on PC A → want it on PC B):
+
+```bash
+# On PC A, after capture:
+cp -R ~/.runelite/recorder/trails/<new>.json   data/recorder/trails/
+cp -R ~/.runelite/recorder/rooftops/<new>.json data/recorder/rooftops/
+git add data/recorder/ && git commit -m "data: capture <thing>" && git push
+
+# On PC B:
+git pull
+./scripts/sync-recorder-data.sh
+```
+
+The .gitignore in this repo blocks the obvious sensitive files (sessions,
+inspect, login-state, account-hashed buy-limit / training-plan files) from
+ever being staged, but verify with `git status` before committing if you
+copied wholesale subdirs.
+
+**What's NOT in `data/recorder/`** (intentionally):
+- `sessions/<account>/` — per-account gameplay recordings (privacy)
+- `inspect/` — large debug dumps (regenerable)
+- `login-state.json` — credentials-adjacent
+- `buy-limits/<64-hex-hash>.json` — per-account state, regenerable
+- `training-plans/<64-hex-hash>.properties` — per-account, regenerable
 
 ## RuneLite API (`runelite-api/`) — delegate, don't browse
 

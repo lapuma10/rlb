@@ -43,3 +43,19 @@ bin/
 
 ### Docker seed caches (regenerated from ~/.runelite/) ###
 /seed/
+
+### Recorder data (data/recorder/ is portable; per-account/sensitive files are NOT) ###
+# data/recorder/ is the committed snapshot of ~/.runelite/recorder/ minus
+# anything per-account or sensitive. These patterns prevent the sync workflow
+# from accidentally staging account-scoped files. See scripts/sync-recorder-data.sh.
+data/recorder/sessions/
+data/recorder/inspect/
+data/recorder/login-state.json
+data/recorder/widget-dump-*
+# Per-account hashed files (filename is a 64-char hex hash of the account name)
+data/recorder/buy-limits/[0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]*
+data/recorder/training-plans/[0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]*
+# Backup files / atomic-write temp files
+data/recorder/**/*.bak
+data/recorder/**/*.tmp
+data/recorder/**/*.json.tmp
