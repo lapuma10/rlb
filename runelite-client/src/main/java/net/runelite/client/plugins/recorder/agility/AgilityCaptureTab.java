@@ -464,4 +464,12 @@ public final class AgilityCaptureTab extends JPanel
                 + expectedId.name() + " — file may be malformed or fail validateCourse().");
         }
     }
+
+    @Override
+    public void removeNotify()
+    {
+        refreshTimer.stop();
+        if (startPromptTimer != null) startPromptTimer.stop();
+        super.removeNotify();
+    }
 }
