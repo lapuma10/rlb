@@ -25,9 +25,10 @@ import java.util.concurrent.ThreadLocalRandom;
  *  them exactly. */
 public enum PressTiming
 {
-    /** General-purpose: 180..500 / 40..80 / 100..350 ms. Used by
-     *  every {@code clickPress(BUTTON1)} and {@code clickPress(BUTTON3)}
-     *  call site today (~33 sites). */
+    /** General-purpose: 180..500 / 40..80 / 100..350 ms. The default for
+     *  every left- and right-click site that doesn't have a tighter
+     *  pre-verify settle (~33 sites at migration time — every site
+     *  previously using the now-removed {@code clickPress(int)} helper). */
     STANDARD       (180, 500, 40, 80, 100, 350),
     /** Post-verify commit press: pre=0 / 40..80 / 100..350 ms. The
      *  caller already settled the cursor and ran a state-verify

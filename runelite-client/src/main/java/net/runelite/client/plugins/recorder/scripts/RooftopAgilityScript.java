@@ -360,6 +360,23 @@ public final class RooftopAgilityScript
             nextActionAt = now + 600;
             return;
         }
+        // Spam guard: if we just clicked this same stage and nothing has
+        // progressed since (no component change → transport didn't fire,
+        // and isPlayerBusy() above already returned false → no animation
+        // in flight), the click didn't take. Wait for handleObstacleTimeout
+        // to clear lastClickedNode rather than re-dispatching every
+        // 600-1200 ms throttle interval. Without this guard, a press that's
+        // blocked at the dispatcher (dead-zone reject, off-canvas) leaves
+        // the script in a "throttle-bounded spam" loop until timeoutMs
+        // finally elapses — visible as "stage N spam until it climbs".
+        if (lastClickedNode != null
+            && stage == lastClickedStage
+            && now - lastObstacleClickAt < lastClickedNode.timeoutMs
+            && !componentChangedSinceDispatch())
+        {
+            nextActionAt = now + 300;
+            return;
+        }
         clickObstacle(stage, course.nodes.get(stage), now);
     }
 

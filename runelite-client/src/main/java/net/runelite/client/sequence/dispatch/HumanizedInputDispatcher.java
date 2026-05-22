@@ -642,7 +642,7 @@ public class HumanizedInputDispatcher implements InputDispatcher
         if (onMinimap)
         {
             log.info("minimap click → clicking without menu pre-check");
-            clickPress(MouseEvent.BUTTON1);
+            press(MouseEvent.BUTTON1, ClickIntent.MINIMAP, PressTiming.STANDARD);
             return;
         }
 
@@ -671,8 +671,36 @@ public class HumanizedInputDispatcher implements InputDispatcher
             moveCursorTo(mm.getX(), mm.getY());
             SequenceSleep.sleep(client, 30);
             // Don't re-check the menu — minimap clicks never populate it.
+            press(MouseEvent.BUTTON1, ClickIntent.MINIMAP, PressTiming.STANDARD);
+            return;
         }
-        clickPress(MouseEvent.BUTTON1);
+        // Main-view world click. If the dead-zone guard blocks (cursor
+        // ended up in chatbox / side panel / orb / minimap), retry via
+        // the same minimap-fallback shape used when isLeftClickWalk
+        // reported a non-walk top verb.
+        if (press(MouseEvent.BUTTON1, ClickIntent.WORLD, PressTiming.STANDARD))
+        {
+            return;
+        }
+        if (strict)
+        {
+            log.info("strict walk at ({},{}) — press blocked by dead-zone; aborting",
+                pixel.getX(), pixel.getY());
+            return;
+        }
+        log.info("press at ({},{}) blocked by dead-zone — minimap fallback",
+            pixel.getX(), pixel.getY());
+        Point mm = onClient(() -> resolver.resolveMinimapOnly(target));
+        if (mm == null)
+        {
+            lastError.set("press blocked by dead-zone, minimap fallback unavailable");
+            log.warn("minimap fallback unavailable for {} after dead-zone block", target);
+            return;
+        }
+        log.info("minimap fallback → ({},{}) [no menu pre-check]", mm.getX(), mm.getY());
+        moveCursorTo(mm.getX(), mm.getY());
+        SequenceSleep.sleep(client, 30);
+        press(MouseEvent.BUTTON1, ClickIntent.MINIMAP, PressTiming.STANDARD);
     }
 
     private void moveCursorTo(int x, int y) throws InterruptedException
@@ -686,30 +714,7 @@ public class HumanizedInputDispatcher implements InputDispatcher
         }
     }
 
-    /** Click, with humanized pre-/post-click holds. Real cursor traces show
-     *  a 200–700ms settle on the target before pressing and a 100–400ms
-     *  hold after release before the cursor moves again — both are
-     *  conspicuously absent from naïve "moveTo + click" code, which is one
-     *  of the easiest tells for a bot.
-     *
-     *  @deprecated Migrating to {@link #press(int, ClickIntent, PressTiming)}.
-     *  Phase 2 will replace every {@code clickPress(BUTTON1)} site with the
-     *  appropriate {@code press(B1, intent, timing)} call. Do not add new
-     *  callers. */
-    @Deprecated
-    private void clickPress(int button) throws InterruptedException
-    {
-        // Settle on target before pressing. Wider pre-click window than
-        // post-click — humans aim then commit; the post-click "did I get
-        // it?" beat is shorter.
-        SequenceSleep.sleep(client, 180 + rng.nextInt(320));   // 180..500ms
-        input.mousePress(button);
-        SequenceSleep.sleep(client, 40 + rng.nextInt(40));     // 40..80ms button-down
-        input.mouseRelease(button);
-        SequenceSleep.sleep(client, 100 + rng.nextInt(250));   // 100..350ms post-click hold
-    }
-
-    /** The single chokepoint every press should go through. Combines
+    /** The single chokepoint every press goes through. Combines
      *  off-canvas rejection, UI dead-zone rejection (WORLD intent only),
      *  and timing-driven sleeps that mirror humanized cursor traces.
      *  Returns {@code true} when the press fired; {@code false} when a
@@ -731,12 +736,9 @@ public class HumanizedInputDispatcher implements InputDispatcher
      *        hooks and low-level escape hatches.</li>
      *  </ul>
      *
-     *  <p>Phase 1: built but not yet called from existing sites.
-     *  Phase 2 mechanically migrates every press path here and deletes
-     *  the old {@link #clickPress(int)} and direct
-     *  {@code input.mousePress / input.mouseRelease} pairs. After Phase 2
-     *  grep gate: {@code input.mousePress} and {@code input.mouseRelease}
-     *  appear in exactly this one method. */
+     *  <p>Grep invariant: {@code input.mousePress} and
+     *  {@code input.mouseRelease} appear in exactly this one method.
+     *  Any other survivor is a regression. */
     private boolean press(int button, ClickIntent intent, PressTiming timing)
         throws InterruptedException
     {
@@ -976,10 +978,7 @@ public class HumanizedInputDispatcher implements InputDispatcher
                 log.info("npc {} became claimed before left-click — refusing attack", npcIndex);
                 return;
             }
-            input.mousePress(MouseEvent.BUTTON1);
-            SequenceSleep.sleep(client, 40 + rng.nextInt(40));
-            input.mouseRelease(MouseEvent.BUTTON1);
-            SequenceSleep.sleep(client, 100 + rng.nextInt(250));
+            press(MouseEvent.BUTTON1, ClickIntent.WORLD, PressTiming.FAST_COMMIT);
             return;
         }
 
@@ -987,7 +986,7 @@ public class HumanizedInputDispatcher implements InputDispatcher
         // actor under cursor, or `verb` isn't this NPC's default action).
         // Open the context menu and click the matching entry.
         log.info("npc {} not hover-default for '{}' — right-click flow", npcIndex, verb);
-        clickPress(MouseEvent.BUTTON3);
+        press(MouseEvent.BUTTON3, ClickIntent.WORLD, PressTiming.STANDARD);
         SequenceSleep.sleep(client, 120);
         MenuRow row = onClient(() -> findMenuRow(
             e -> VerbMatcher.matches(verb, e.getOption()) && e.getIdentifier() == npcIndex));
@@ -1021,10 +1020,7 @@ public class HumanizedInputDispatcher implements InputDispatcher
             SequenceSleep.sleep(client, 120);
             return;
         }
-        input.mousePress(MouseEvent.BUTTON1);
-        SequenceSleep.sleep(client, 40 + rng.nextInt(40));
-        input.mouseRelease(MouseEvent.BUTTON1);
-        SequenceSleep.sleep(client, 80 + rng.nextInt(180));
+        press(MouseEvent.BUTTON1, ClickIntent.MENU_ROW, PressTiming.MENU_SELECTION);
     }
 
     /** Click target capture for {@link #npcClick}. {@code world} feeds the
@@ -1189,10 +1185,7 @@ public class HumanizedInputDispatcher implements InputDispatcher
             : onClient(() -> isTopMenuVerb(v));
         if (Boolean.TRUE.equals(topMatches))
         {
-            input.mousePress(MouseEvent.BUTTON1);
-            SequenceSleep.sleep(client, 40 + rng.nextInt(40));
-            input.mouseRelease(MouseEvent.BUTTON1);
-            SequenceSleep.sleep(client, 100 + rng.nextInt(250));
+            press(MouseEvent.BUTTON1, ClickIntent.WORLD, PressTiming.FAST_COMMIT);
             return;
         }
         if (isTake)
@@ -1206,7 +1199,7 @@ public class HumanizedInputDispatcher implements InputDispatcher
         // item (e.g. "Light" requires a tinderbox in inventory).
         log.info("ground item {} verb='{}' not at top of menu at {} — right-click flow",
             itemId, v, tile);
-        clickPress(MouseEvent.BUTTON3);
+        press(MouseEvent.BUTTON3, ClickIntent.WORLD, PressTiming.STANDARD);
         SequenceSleep.sleep(client, 120);
         // For "Take": also match item ID so we pick OUR item in a stack.
         // For other verbs: verb match alone is sufficient.
@@ -1223,10 +1216,7 @@ public class HumanizedInputDispatcher implements InputDispatcher
         }
         moveCursorTo(row.x, row.y);
         SequenceSleep.sleep(client, 40 + rng.nextInt(60));
-        input.mousePress(MouseEvent.BUTTON1);
-        SequenceSleep.sleep(client, 40 + rng.nextInt(40));
-        input.mouseRelease(MouseEvent.BUTTON1);
-        SequenceSleep.sleep(client, 80 + rng.nextInt(180));
+        press(MouseEvent.BUTTON1, ClickIntent.MENU_ROW, PressTiming.MENU_SELECTION);
     }
 
     /** Client-thread check: does {@code tile} have a TileItem with id
@@ -1505,13 +1495,13 @@ public class HumanizedInputDispatcher implements InputDispatcher
         {
             log.info("gameObjectClick tracked {} verb='{}' — verb is left-click default, single click",
                 tile, verb);
-            clickPress(MouseEvent.BUTTON1);
+            press(MouseEvent.BUTTON1, ClickIntent.WORLD, PressTiming.STANDARD);
             return true;
         }
         String topLbl = onClient(this::topMenuLabel);
         log.info("gameObjectClick tracked {} verb='{}' not at top (top='{}') — right-click flow",
             tile, verb, topLbl);
-        clickPress(MouseEvent.BUTTON3);
+        press(MouseEvent.BUTTON3, ClickIntent.WORLD, PressTiming.STANDARD);
         SequenceSleep.sleep(client, 120);
         if (selectMenuVerb(verb)) return true;
         String menuDump = onClient(this::fullMenuDump);
@@ -1607,7 +1597,7 @@ public class HumanizedInputDispatcher implements InputDispatcher
             SequenceSleep.sleep(client, 60);
             if (onClient(() -> isTopMenuVerb(verb)))
             {
-                clickPress(MouseEvent.BUTTON1);
+                press(MouseEvent.BUTTON1, ClickIntent.WORLD, PressTiming.STANDARD);
                 return true;
             }
             log.info("  tile-poly fallback ({},{}) — top='{}' (miss)",
@@ -1673,7 +1663,7 @@ public class HumanizedInputDispatcher implements InputDispatcher
             {
                 log.info("  attempt {}/{} ({},{}) — verb at top, left-click",
                     i + 1, maxAttempts, p.getX(), p.getY());
-                clickPress(MouseEvent.BUTTON1);
+                press(MouseEvent.BUTTON1, ClickIntent.WORLD, PressTiming.STANDARD);
                 return true;
             }
             String topLbl = onClient(this::topMenuLabel);
@@ -1698,7 +1688,7 @@ public class HumanizedInputDispatcher implements InputDispatcher
         log.info("  right-click fallback at ({},{})", best.getX(), best.getY());
         moveCursorTo(best.getX(), best.getY());
         SequenceSleep.sleep(client, 60);
-        clickPress(MouseEvent.BUTTON3);
+        press(MouseEvent.BUTTON3, ClickIntent.WORLD, PressTiming.STANDARD);
         SequenceSleep.sleep(client, 120);
         if (selectMenuVerb(verb)) return true;
 
@@ -1772,10 +1762,7 @@ public class HumanizedInputDispatcher implements InputDispatcher
         // the user's eye has already locked onto the option.
         moveCursorTo(row.x, row.y);
         SequenceSleep.sleep(client, 40 + rng.nextInt(60));
-        input.mousePress(MouseEvent.BUTTON1);
-        SequenceSleep.sleep(client, 40 + rng.nextInt(40));
-        input.mouseRelease(MouseEvent.BUTTON1);
-        SequenceSleep.sleep(client, 80 + rng.nextInt(180));
+        press(MouseEvent.BUTTON1, ClickIntent.MENU_ROW, PressTiming.MENU_SELECTION);
         return true;
     }
 
@@ -1896,7 +1883,7 @@ public class HumanizedInputDispatcher implements InputDispatcher
         if (verb == null || verb.isBlank())
         {
             moveCursorTo(x, y);
-            clickPress(MouseEvent.BUTTON1);
+            press(MouseEvent.BUTTON1, ClickIntent.UI, PressTiming.STANDARD);
             return;
         }
         // Verb-aware: hover, check L-click default, fall back to right-click.
@@ -1905,10 +1892,10 @@ public class HumanizedInputDispatcher implements InputDispatcher
         boolean isTop = onClient(() -> isTopMenuVerb(verb));
         if (isTop)
         {
-            clickPress(MouseEvent.BUTTON1);
+            press(MouseEvent.BUTTON1, ClickIntent.UI, PressTiming.STANDARD);
             return;
         }
-        clickPress(MouseEvent.BUTTON3);
+        press(MouseEvent.BUTTON3, ClickIntent.UI, PressTiming.STANDARD);
         SequenceSleep.sleep(client, 120);
         boolean ok = selectMenuVerb(verb);
         if (!ok)
@@ -1923,7 +1910,7 @@ public class HumanizedInputDispatcher implements InputDispatcher
         Point pixel = onClient(() -> resolver.resolveWidget(widgetId));
         if (pixel == null) { lastError.set("widget " + widgetId + " not found"); return; }
         moveCursorTo(pixel.getX(), pixel.getY());
-        clickPress(MouseEvent.BUTTON1);
+        press(MouseEvent.BUTTON1, ClickIntent.UI, PressTiming.STANDARD);
     }
 
     /** Resolve the screen bounds of inventory slot {@code slot}. The visible
@@ -2026,7 +2013,7 @@ public class HumanizedInputDispatcher implements InputDispatcher
         });
         if (Boolean.TRUE.equals(topOk))
         {
-            clickPress(MouseEvent.BUTTON1);
+            press(MouseEvent.BUTTON1, ClickIntent.UI, PressTiming.STANDARD);
             return true;
         }
 
@@ -2036,7 +2023,7 @@ public class HumanizedInputDispatcher implements InputDispatcher
         String topLbl = onClient(this::topMenuLabel);
         log.info("boundsClickVerifiedAction: L-click mismatch (top='{}') — right-click flow for verb='{}' fragments={}",
             topLbl, verb, java.util.Arrays.toString(targetFragments));
-        clickPress(MouseEvent.BUTTON3);
+        press(MouseEvent.BUTTON3, ClickIntent.UI, PressTiming.STANDARD);
         SequenceSleep.sleep(client, 120);
         MenuRow row = onClient(() -> findMenuRow(
             e -> menuEntryMatches(e, verb, targetFragments)));
@@ -2055,10 +2042,7 @@ public class HumanizedInputDispatcher implements InputDispatcher
         }
         moveCursorTo(row.x, row.y);
         SequenceSleep.sleep(client, 40 + rng.nextInt(60));
-        input.mousePress(MouseEvent.BUTTON1);
-        SequenceSleep.sleep(client, 40 + rng.nextInt(40));
-        input.mouseRelease(MouseEvent.BUTTON1);
-        SequenceSleep.sleep(client, 80 + rng.nextInt(180));
+        press(MouseEvent.BUTTON1, ClickIntent.MENU_ROW, PressTiming.MENU_SELECTION);
         return true;
     }
 
@@ -2099,14 +2083,14 @@ public class HumanizedInputDispatcher implements InputDispatcher
         });
         if (Boolean.TRUE.equals(topOk))
         {
-            clickPress(MouseEvent.BUTTON1);
+            press(MouseEvent.BUTTON1, ClickIntent.UI, PressTiming.STANDARD);
             return true;
         }
 
         String topLbl = onClient(this::topMenuLabel);
         log.info("invSlotClickVerifiedOnWorker: L-click mismatch slot={} top='{}' verb='{}' fragments={}",
             slot, topLbl, verb, java.util.Arrays.toString(targetFragments));
-        clickPress(MouseEvent.BUTTON3);
+        press(MouseEvent.BUTTON3, ClickIntent.UI, PressTiming.STANDARD);
         SequenceSleep.sleep(client, 120);
         MenuRow row = onClient(() -> findMenuRow(
             e -> menuEntryMatchesDirectTarget(e, verb, targetFragments)));
@@ -2123,10 +2107,7 @@ public class HumanizedInputDispatcher implements InputDispatcher
         }
         moveCursorTo(row.x, row.y);
         SequenceSleep.sleep(client, 40 + rng.nextInt(60));
-        input.mousePress(MouseEvent.BUTTON1);
-        SequenceSleep.sleep(client, 40 + rng.nextInt(40));
-        input.mouseRelease(MouseEvent.BUTTON1);
-        SequenceSleep.sleep(client, 80 + rng.nextInt(180));
+        press(MouseEvent.BUTTON1, ClickIntent.MENU_ROW, PressTiming.MENU_SELECTION);
         return true;
     }
 
@@ -2167,7 +2148,7 @@ public class HumanizedInputDispatcher implements InputDispatcher
             + rng.nextInt(Math.max(1, bounds.height - 2 * marginY));
         moveCursorTo(x, y);
         SequenceSleep.sleep(client, 40 + rng.nextInt(60));
-        clickPress(MouseEvent.BUTTON1);
+        press(MouseEvent.BUTTON1, ClickIntent.UI, PressTiming.STANDARD);
         return true;
     }
 
@@ -2415,18 +2396,18 @@ public class HumanizedInputDispatcher implements InputDispatcher
         moveCursorTo(x, y);
         if (verb == null || verb.isBlank())
         {
-            clickPress(MouseEvent.BUTTON1);
+            press(MouseEvent.BUTTON1, ClickIntent.UI, PressTiming.STANDARD);
             return;
         }
         SequenceSleep.sleep(client, 60);
         boolean isTop = onClient(() -> isTopMenuVerb(verb));
         if (isTop)
         {
-            clickPress(MouseEvent.BUTTON1);
+            press(MouseEvent.BUTTON1, ClickIntent.UI, PressTiming.STANDARD);
             return;
         }
         log.info("boundsClick: top-verb mismatch for \"{}\" — opening right-click menu", verb);
-        clickPress(MouseEvent.BUTTON3);
+        press(MouseEvent.BUTTON3, ClickIntent.UI, PressTiming.STANDARD);
         SequenceSleep.sleep(client, 120);
         boolean ok = selectMenuVerb(verb);
         if (!ok)
@@ -2472,12 +2453,12 @@ public class HumanizedInputDispatcher implements InputDispatcher
         {
             log.info("widgetVerbClick: widget 0x{} left-click (verb='{}' top='{}')",
                 Integer.toHexString(widgetId), verb, topVerb);
-            clickPress(MouseEvent.BUTTON1);
+            press(MouseEvent.BUTTON1, ClickIntent.UI, PressTiming.STANDARD);
             return;
         }
         log.info("widgetVerbClick: widget 0x{} right-click fallback (wanted='{}' top='{}')",
             Integer.toHexString(widgetId), verb, topVerb);
-        clickPress(MouseEvent.BUTTON3);
+        press(MouseEvent.BUTTON3, ClickIntent.UI, PressTiming.STANDARD);
         SequenceSleep.sleep(client, 120);
         boolean ok = selectMenuVerb(verb);
         if (!ok)
@@ -2529,12 +2510,12 @@ public class HumanizedInputDispatcher implements InputDispatcher
         {
             log.info("widgetAnyVerbClick: widget 0x{} left-click (matched='{}' top='{}')",
                 Integer.toHexString(widgetId), topMatch, topVerb);
-            clickPress(MouseEvent.BUTTON1);
+            press(MouseEvent.BUTTON1, ClickIntent.UI, PressTiming.STANDARD);
             return;
         }
         log.info("widgetAnyVerbClick: widget 0x{} right-click fallback (wanted={} top='{}')",
             Integer.toHexString(widgetId), verbs, topVerb);
-        clickPress(MouseEvent.BUTTON3);
+        press(MouseEvent.BUTTON3, ClickIntent.UI, PressTiming.STANDARD);
         SequenceSleep.sleep(client, 120);
         String[] matched = new String[1];
         MenuRow row = onClient(() -> {
@@ -2558,10 +2539,7 @@ public class HumanizedInputDispatcher implements InputDispatcher
             Integer.toHexString(widgetId), matched[0]);
         moveCursorTo(row.x, row.y);
         SequenceSleep.sleep(client, 40 + rng.nextInt(60));
-        input.mousePress(MouseEvent.BUTTON1);
-        SequenceSleep.sleep(client, 40 + rng.nextInt(40));
-        input.mouseRelease(MouseEvent.BUTTON1);
-        SequenceSleep.sleep(client, 80 + rng.nextInt(180));
+        press(MouseEvent.BUTTON1, ClickIntent.MENU_ROW, PressTiming.MENU_SELECTION);
     }
 
     /** Bounds-based mirror of {@link #widgetAnyVerbClick}: accepts a list
@@ -2609,12 +2587,12 @@ public class HumanizedInputDispatcher implements InputDispatcher
         {
             log.info("boundsAnyVerbClick: left-click (matched='{}' top='{}')",
                 topMatch, topVerb);
-            clickPress(MouseEvent.BUTTON1);
+            press(MouseEvent.BUTTON1, ClickIntent.UI, PressTiming.STANDARD);
             return;
         }
         log.info("boundsAnyVerbClick: right-click fallback (wanted={} top='{}')",
             verbs, topVerb);
-        clickPress(MouseEvent.BUTTON3);
+        press(MouseEvent.BUTTON3, ClickIntent.UI, PressTiming.STANDARD);
         SequenceSleep.sleep(client, 120);
         String[] matched = new String[1];
         MenuRow row = onClient(() -> {
@@ -2636,10 +2614,7 @@ public class HumanizedInputDispatcher implements InputDispatcher
         log.info("boundsAnyVerbClick: menu pick='{}'", matched[0]);
         moveCursorTo(row.x, row.y);
         SequenceSleep.sleep(client, 40 + rng.nextInt(60));
-        input.mousePress(MouseEvent.BUTTON1);
-        SequenceSleep.sleep(client, 40 + rng.nextInt(40));
-        input.mouseRelease(MouseEvent.BUTTON1);
-        SequenceSleep.sleep(client, 80 + rng.nextInt(180));
+        press(MouseEvent.BUTTON1, ClickIntent.MENU_ROW, PressTiming.MENU_SELECTION);
     }
 
     /** Diagnostic snapshot of the current cursor-position top menu entry. Used
@@ -2691,7 +2666,7 @@ public class HumanizedInputDispatcher implements InputDispatcher
     public void clickCanvas(int x, int y) throws InterruptedException
     {
         moveCursorTo(x, y);
-        clickPress(MouseEvent.BUTTON1);
+        press(MouseEvent.BUTTON1, ClickIntent.RAW, PressTiming.STANDARD);
     }
 
     /** Proportional-coordinate overload: xProp and yProp are in [0.0, 1.0]
@@ -2842,10 +2817,10 @@ public class HumanizedInputDispatcher implements InputDispatcher
         boolean isTop = onClient(() -> isTopMenuVerb(verb));
         if (isTop)
         {
-            clickPress(MouseEvent.BUTTON1);
+            press(MouseEvent.BUTTON1, ClickIntent.UI, PressTiming.STANDARD);
             return;
         }
-        clickPress(MouseEvent.BUTTON3);
+        press(MouseEvent.BUTTON3, ClickIntent.UI, PressTiming.STANDARD);
         SequenceSleep.sleep(client, 120);
         boolean ok = selectMenuVerb(verb);
         if (!ok)
@@ -2894,10 +2869,10 @@ public class HumanizedInputDispatcher implements InputDispatcher
         });
         if (topMatch != null)
         {
-            clickPress(MouseEvent.BUTTON1);
+            press(MouseEvent.BUTTON1, ClickIntent.UI, PressTiming.STANDARD);
             return topMatch;
         }
-        clickPress(MouseEvent.BUTTON3);
+        press(MouseEvent.BUTTON3, ClickIntent.UI, PressTiming.STANDARD);
         SequenceSleep.sleep(client, 120);
         // Probe verbs in priority order: first one that appears in the
         // open menu wins.  findMenuRow takes a predicate so each verb
@@ -2920,10 +2895,7 @@ public class HumanizedInputDispatcher implements InputDispatcher
         }
         moveCursorTo(row.x, row.y);
         SequenceSleep.sleep(client, 40 + rng.nextInt(60));
-        input.mousePress(MouseEvent.BUTTON1);
-        SequenceSleep.sleep(client, 40 + rng.nextInt(40));
-        input.mouseRelease(MouseEvent.BUTTON1);
-        SequenceSleep.sleep(client, 80 + rng.nextInt(180));
+        press(MouseEvent.BUTTON1, ClickIntent.MENU_ROW, PressTiming.MENU_SELECTION);
         return matched[0];
     }
 
