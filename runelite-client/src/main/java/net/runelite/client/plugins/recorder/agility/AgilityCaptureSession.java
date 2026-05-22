@@ -7,6 +7,7 @@ import net.runelite.api.events.MenuOptionClicked;
 import net.runelite.api.events.StatChanged;
 import net.runelite.client.eventbus.EventBus;
 import net.runelite.client.eventbus.Subscribe;
+import net.runelite.api.coords.WorldPoint;
 import net.runelite.client.plugins.recorder.scripts.RooftopAgilityScript.RooftopCourseId;
 
 @Slf4j
@@ -65,6 +66,30 @@ public class AgilityCaptureSession
     public void onGameTick(GameTick e)
     {
         if (!active) return;
-        // Task 5
+
+        if (client.getLocalPlayer() == null) return;
+        WorldPoint p = client.getLocalPlayer().getWorldLocation();
+        long now = System.currentTimeMillis();
+
+        if (model.obstacles.isEmpty())
+        {
+            model.approachRing.addLast(new CaptureModel.Sample(now, p));
+            while (!model.approachRing.isEmpty() && now - model.approachRing.peekFirst().t > 10_000L)
+            {
+                model.approachRing.pollFirst();
+            }
+        }
+
+        if (model.state == LapState.IN_LAP)
+        {
+            model.currentLapTiles.add(p);
+        }
+
+        maybeExpirePendingClick(now, p);
+    }
+
+    private void maybeExpirePendingClick(long now, WorldPoint p)
+    {
+        // Task 8 — IGNORED / BROKEN_LAP / UNKNOWN classifier.
     }
 }
