@@ -326,6 +326,11 @@ public final class RecorderPanel extends PluginPanel
         new javax.swing.JCheckBox("Buy supplies at GE (phase 2)", true);
     private final javax.swing.JCheckBox ultraCompostSellBox =
         new javax.swing.JCheckBox("Sell ultracompost at GE (phase 4)", true);
+    // Session target — make at most this many, then DONE. Read on Start and
+    // live-updated when the spinner changes.
+    private final javax.swing.JSpinner ultraCompostTargetSpinner =
+        new javax.swing.JSpinner(new javax.swing.SpinnerNumberModel(500, 1,
+            net.runelite.client.plugins.recorder.scripts.UltraCompostScript.MAX_TARGET_QTY, 50));
     private final JLabel  ultraCompostStatusLabel = new JLabel("Ultra Compost: idle");
     // Pizza script.
     private net.runelite.client.plugins.recorder.scripts.PizzaScript pizzaScript;
@@ -2610,13 +2615,20 @@ public final class RecorderPanel extends PluginPanel
             + "uses ash on supercompost to make ultracompost,<br>"
             + "then sells. Start near GE (Varrock).</html>");
 
+        JPanel targetRow = new JPanel(new java.awt.FlowLayout(java.awt.FlowLayout.LEFT, 4, 0));
+        targetRow.add(new JLabel("Make:"));
+        targetRow.add(ultraCompostTargetSpinner);
+        targetRow.add(new JLabel("then stop"));
+
         desc.setAlignmentX(Component.LEFT_ALIGNMENT);
         buttons.setAlignmentX(Component.LEFT_ALIGNMENT);
         ultraCompostBuyBox.setAlignmentX(Component.LEFT_ALIGNMENT);
         ultraCompostSellBox.setAlignmentX(Component.LEFT_ALIGNMENT);
+        targetRow.setAlignmentX(Component.LEFT_ALIGNMENT);
         ultraCompostStatusLabel.setAlignmentX(Component.LEFT_ALIGNMENT);
         capHeight(ultraCompostBuyBox);
         capHeight(ultraCompostSellBox);
+        capHeight(targetRow);
         capHeight(ultraCompostStatusLabel);
 
         p.add(desc);
@@ -2625,6 +2637,7 @@ public final class RecorderPanel extends PluginPanel
         p.add(Box.createVerticalStrut(4));
         p.add(ultraCompostBuyBox);
         p.add(ultraCompostSellBox);
+        p.add(targetRow);
         p.add(ultraCompostStatusLabel);
         p.add(Box.createVerticalGlue());
 
@@ -2636,6 +2649,10 @@ public final class RecorderPanel extends PluginPanel
         ultraCompostSellBox.addActionListener(e -> {
             if (ultraCompostScript != null) ultraCompostScript.setSellEnabled(ultraCompostSellBox.isSelected());
         });
+        ultraCompostTargetSpinner.addChangeListener(e -> {
+            if (ultraCompostScript != null)
+                ultraCompostScript.setTargetQty(((Number) ultraCompostTargetSpinner.getValue()).intValue());
+        });
         return p;
     }
 
@@ -2646,6 +2663,7 @@ public final class RecorderPanel extends PluginPanel
         {
             script.setBuyEnabled(ultraCompostBuyBox.isSelected());
             script.setSellEnabled(ultraCompostSellBox.isSelected());
+            script.setTargetQty(((Number) ultraCompostTargetSpinner.getValue()).intValue());
         }
     }
 
@@ -2658,6 +2676,7 @@ public final class RecorderPanel extends PluginPanel
         }
         ultraCompostScript.setBuyEnabled(ultraCompostBuyBox.isSelected());
         ultraCompostScript.setSellEnabled(ultraCompostSellBox.isSelected());
+        ultraCompostScript.setTargetQty(((Number) ultraCompostTargetSpinner.getValue()).intValue());
         ultraCompostScript.start();
         ultraCompostStatusLabel.setText("Ultra Compost: starting");
     }

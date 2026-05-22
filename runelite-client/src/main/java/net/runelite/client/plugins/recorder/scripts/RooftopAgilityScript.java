@@ -561,25 +561,43 @@ public final class RooftopAgilityScript
         {
             return (lastClickedStage + 1) % course.nodes.size();
         }
+
+        // Post-success residency on the just-cleared stage's stageTiles.
+        // handleObstacleTimeout's success path nulls lastClickedNode after
+        // promoting lastSuccessfulStage, but the player may still be on a
+        // tile that maps to the cleared stage (Cross destinations sit
+        // inside the same stageTiles group as the approach side). Without
+        // this branch, the `mapped != null` fallback below would re-click
+        // the cleared stage in a loop.
+        if (mapped != null && lastSuccessfulStage != UNKNOWN
+            && mapped == lastSuccessfulStage)
+        {
+            return (lastSuccessfulStage + 1) % course.nodes.size();
+        }
         if (mapped != null) return mapped;
 
-        // Unmapped tile. Two legitimate cases land here:
-        //   1. Transport landing (Climb-up plane=0→3, Climb-down plane=3→1)
-        //      — component changed, advance to next stage.
-        //   2. Walking back to start after a lap (plane=1 ledge, then
-        //      plane=0 courtyard, not on any startTile yet) — no click
-        //      in flight, no advance.
-        // The previous implementation unconditionally fell back to
-        // (lastSuccessfulStage + 1), which is the source of the
-        // Crate→Rough wall cascade: when Crate's click failed at the
-        // dispatcher, clearLastObstacle promoted lastSuccessfulStage=6,
-        // detectCurrentStage returned 0, and findObstacleTile spammed
-        // "Rough wall not on scene" for as long as the player was on
-        // plane=3. Now we require a real transport signal (component
-        // change) before advancing.
+        // Unmapped tile. Three legitimate cases land here:
+        //   1. Transport in flight (click dispatched, player crossing) —
+        //      lastClickedNode set; advance on component change.
+        //   2. Transport just landed on an un-recorded destination
+        //      (Climb-up, Climb-down, far end of a rope) — lastClickedNode
+        //      has been cleared by handleObstacleTimeout's success path
+        //      but lastSuccessfulStage holds the cleared stage; advance.
+        //   3. Walking back to start after a lap — no progression record.
+        //
+        // The previous implementation fell back to (lastSuccessfulStage + 1)
+        // even when {@link #clearLastObstacle} (the failure path) had
+        // promoted it, producing the Crate→Rough wall cascade. That promotion
+        // has been removed: only {@link #clearLastObstacleSuccess} touches
+        // lastSuccessfulStage, so a non-UNKNOWN value here is a real
+        // successful clear and the fallback is safe.
         if (lastClickedNode != null && componentChangedSinceDispatch())
         {
             return (lastClickedStage + 1) % course.nodes.size();
+        }
+        if (lastSuccessfulStage != UNKNOWN)
+        {
+            return (lastSuccessfulStage + 1) % course.nodes.size();
         }
         return UNKNOWN;
     }

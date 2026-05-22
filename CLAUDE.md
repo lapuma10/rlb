@@ -23,6 +23,12 @@ $JBIN -cp runelite-client/build/libs/client-*.jar \
   net.runelite.client.launcher.AccountLauncher
 ```
 
+**"rebuild" / "rerun" / "rr" defaults to CLIENT only — never the launcher.**
+When the user says "rebuild" or "rerun" or "rr" (alone, or "rr the client"),
+they mean: kill the running client process, run `:client:shadowJar`, restart
+the client jar. Leave the AccountLauncher process alone. The user will
+explicitly say "launcher" when they want the launcher rebuilt or restarted.
+
 **Why each flag is required:**
 - `:client:` — the gradle subproject is `client`, not `runelite-client`
 - `-ea` — RuneLite asserts on developer mode and exits with "enable assertions" without it

@@ -70,8 +70,14 @@ public final class UltraCompostScript
     private static final int SELL_PRICE_ULTRACOMPOST = 400;
 
     // ─── Quantities ──────────────────────────────────────────────────────────
-    /** Ultracompost target per buy cycle; 4-hour GE limit checks elsewhere. */
-    private static final int BATCH_QTY  = 500;
+    /** Default session target. Overridable from the panel via
+     *  {@link #setTargetQty(int)}. Caps the buy plan, the sell quantity,
+     *  and the cycle goal — once reached, the script DONEs instead of
+     *  looping. */
+    private static final int DEFAULT_TARGET_QTY = 500;
+    /** Hard upper bound on the panel-settable target. 4-hour GE limits live
+     *  outside this script — anything above ~25k would saturate them anyway. */
+    public  static final int MAX_TARGET_QTY     = 25_000;
     /** Supercompost slots per inventory trip. Ash stacks in 1 slot, so
      *  27 supercompost + 1 ash stack = 28 slots = full inventory. */
     private static final int ULTRA_BATCH = 27;
@@ -124,6 +130,9 @@ public final class UltraCompostScript
     // only loop (drain accumulated bank stock).
     private final AtomicBoolean buyEnabled  = new AtomicBoolean(true);
     private final AtomicBoolean sellEnabled = new AtomicBoolean(true);
+
+    // Session target — make at most this many, then stop.
+    private volatile int targetQty = DEFAULT_TARGET_QTY;
 
     private int superAmt, ashAmt, ultraAmt;
 
@@ -180,6 +189,14 @@ public final class UltraCompostScript
     public void setSellEnabled(boolean v) { sellEnabled.set(v); }
     public boolean isBuyEnabled()  { return buyEnabled.get(); }
     public boolean isSellEnabled() { return sellEnabled.get(); }
+
+    /** Session target — clamped to [1, {@link #MAX_TARGET_QTY}]. Safe to
+     *  flip mid-run; the cycle picks it up on the next CHECKING_BANK tick. */
+    public void setTargetQty(int qty)
+    {
+        this.targetQty = Math.max(1, Math.min(MAX_TARGET_QTY, qty));
+    }
+    public int getTargetQty() { return targetQty; }
 
     public void start()
     {
@@ -293,22 +310,25 @@ public final class UltraCompostScript
 
         State next = null;
 
-        // A: enough ingredients for at least one ultracompost → make.
-        //    Need 1 supercompost + 2 ash minimum.
+        // A: enough ingredients for at least one ultracompost AND we haven't
+        //    hit the session target yet → make. Need 1 supercompost + 2 ash
+        //    minimum. Once ultraAmt >= targetQty we stop crafting even if
+        //    supplies remain; surplus stock falls through to the sell branch
+        //    (capped at targetQty) or to DONE.
         int makable = Math.min(superAmt, ashAmt / 2);
-        if (makable > 0)
+        if (makable > 0 && ultraAmt < targetQty)
         {
             next = State.MAKING_ULTRACOMPOST;
         }
-        // B: can't craft right now, but the cycle goal (BATCH_QTY ultracompost
+        // B: can't craft right now, but the cycle goal (targetQty ultracompost
         //    total) isn't met yet AND buy is enabled. Top up the missing
         //    side (e.g. ash depleted but super still piled in the bank)
         //    instead of bailing out. Without this, a partial run that drains
         //    only ash prematurely DONEs under sell-disabled — leaving coins
         //    + supercompost stranded. Stops buying once ultraAmt has reached
-        //    BATCH_QTY (the cycle goal), so this can't loop forever even
+        //    targetQty (the cycle goal), so this can't loop forever even
         //    with sell off.
-        else if (buyEnabled.get() && ultraAmt < BATCH_QTY)
+        else if (buyEnabled.get() && ultraAmt < targetQty)
         {
             int totalCoins = (int) bank.bankItemAmount(COINS) + inventoryCount(COINS);
             plannedTargetQty   = computeAffordableTarget(totalCoins, superAmt, ashAmt);
@@ -399,13 +419,13 @@ public final class UltraCompostScript
         setState(next);
     }
 
-    /** Largest N in [0, BATCH_QTY] such that buying enough supercompost + ash to
+    /** Largest N in [0, targetQty] such that buying enough supercompost + ash to
      *  bring stocks up to (N supercompost, 2N ash) is affordable.
      *  cost(N) = max(0, N - super) * P_SUPER + max(0, 2N - ash) * P_ASH. */
-    private static int computeAffordableTarget(int coins, int superHave, int ashHave)
+    private int computeAffordableTarget(int coins, int superHave, int ashHave)
     {
         int best = 0;
-        for (int n = 1; n <= BATCH_QTY; n++)
+        for (int n = 1; n <= targetQty; n++)
         {
             long cost = (long) Math.max(0, n - superHave)     * BUY_PRICE_SUPERCOMPOST
                       + (long) Math.max(0, n * 2 - ashHave)   * BUY_PRICE_VOLCANIC_ASH;
@@ -746,6 +766,7 @@ public final class UltraCompostScript
         int  invAsh    = inventoryCount(VOLCANIC_ASH);
         int  totalSuper = (int)(bankSuper + invSuper);
         int  totalAsh   = (int)(bankAsh   + invAsh);
+        int  currentUltra = (int) bank.bankItemAmount(ULTRACOMPOST) + inventoryCount(ULTRACOMPOST);
 
         // Need at least one ultracompost worth: 1 supercompost + 2 ash.
         if (totalSuper <= 0 || totalAsh < 2)
@@ -756,8 +777,21 @@ public final class UltraCompostScript
             return;
         }
 
-        // Crafts achievable this trip = min(super-slots-we-can-fill, ash/2).
-        int superThisTrip = Math.min(ULTRA_BATCH, Math.min(totalSuper, totalAsh / 2));
+        // Session target reached between batches — re-evaluate from
+        // CHECKING_BANK so the FSM picks the sell / done path instead of
+        // queueing another 27-item batch.
+        if (currentUltra >= targetQty)
+        {
+            log.info("ultra-compost: target ({}) reached mid-craft (have {}) — re-checking bank",
+                targetQty, currentUltra);
+            setState(State.CHECKING_BANK);
+            return;
+        }
+
+        // Crafts achievable this trip = min(super-slots-we-can-fill, ash/2),
+        // capped by what's still needed to hit the session target.
+        int remaining = Math.max(0, targetQty - currentUltra);
+        int superThisTrip = Math.min(ULTRA_BATCH, Math.min(totalSuper, Math.min(totalAsh / 2, remaining)));
 
         // 1. Withdraw ash: pull the WHOLE bank stack on first trip and keep
         //    it across batches. Ash stacks (1 inv slot regardless of qty), so
@@ -798,8 +832,21 @@ public final class UltraCompostScript
             long now = System.currentTimeMillis();
             if (now - lastBankActionMs < BANK_PACE_MS) { status.set("craft bank: pacing super"); return; }
             int need = superThisTrip - invSuper;
-            status.set("craft bank: withdraw-all supercompost (need=" + need + ", bank=" + bankSuper + ")");
-            boolean ok = bank.tryWithdrawAll(SUPERCOMPOST);
+            // Full batch (need == ULTRA_BATCH) uses Withdraw-All — fast path,
+            // OSRS caps at inv-free which is exactly ULTRA_BATCH. For partial
+            // final batches we MUST Withdraw-X to avoid over-producing past
+            // the session target.
+            boolean ok;
+            if (need >= ULTRA_BATCH)
+            {
+                status.set("craft bank: withdraw-all supercompost (need=" + need + ", bank=" + bankSuper + ")");
+                ok = bank.tryWithdrawAll(SUPERCOMPOST);
+            }
+            else
+            {
+                status.set("craft bank: withdraw-X supercompost (need=" + need + ", bank=" + bankSuper + ")");
+                ok = bank.tryWithdrawX(SUPERCOMPOST, need);
+            }
             lastBankActionMs = System.currentTimeMillis();
             if (!ok)
             {
@@ -876,8 +923,9 @@ public final class UltraCompostScript
             log.warn("ultra-compost: sell cycle done but GE failed to close, retrying next tick");
             return;
         }
-        log.info("ultra-compost: sell cycle complete, starting new loop");
-        setState(State.CHECKING_BANK);
+        log.info("ultra-compost: sell cycle complete — target ({}) reached, DONE", targetQty);
+        status.set("DONE: sold " + ultraAmt + " ultracompost (target " + targetQty + ")");
+        setState(State.DONE);
     }
 
     private void tickSellBanking() throws InterruptedException
@@ -921,9 +969,11 @@ public final class UltraCompostScript
             setState(State.CHECKING_BANK);
             return;
         }
-        ultraAmt = (int) bankUltra;
+        // Cap sell qty at the session target — never offload more than the
+        // user asked us to produce, even if existing bank stock exceeds it.
+        ultraAmt = (int) Math.min(bankUltra, targetQty);
 
-        status.set("sell bank: withdraw " + ultraAmt + " noted ultracompost");
+        status.set("sell bank: withdraw " + ultraAmt + " noted ultracompost (bank=" + bankUltra + ", target=" + targetQty + ")");
         if (!bank.tryWithdrawAsNoteX(ULTRACOMPOST, ultraAmt))
         {
             if (++bankFailures >= MAX_BANK_FAILURES)

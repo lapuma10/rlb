@@ -81,6 +81,7 @@ import net.runelite.client.plugins.recorder.capture.MouseCapture;
 import net.runelite.client.plugins.recorder.capture.NearbyResolver;
 import net.runelite.client.plugins.recorder.combat.ChickenCombatLoop;
 import net.runelite.client.plugins.recorder.combat.ChickenOverlay;
+import net.runelite.client.plugins.recorder.debug.ChatDebugOverlay;
 import net.runelite.client.plugins.recorder.debug.DebugOverlay;
 import net.runelite.client.plugins.recorder.debug.GeDebugOverlay;
 import net.runelite.client.plugins.recorder.debug.LoginDebugOverlay;
@@ -153,6 +154,7 @@ public class RecorderPlugin extends Plugin
     private CollisionDebugOverlay collisionDebugOverlay;
     private ObjectDebugOverlay objectDebugOverlay;
     private GeDebugOverlay geDebugOverlay;
+    private ChatDebugOverlay chatDebugOverlay;
     private net.runelite.client.plugins.recorder.worldmap.WorldMapMinimapOverlay worldMapMinimapOverlay;
     private TileMarker tileMarker;
     private ChickenCombatLoop chickenLoop;
@@ -249,6 +251,7 @@ public class RecorderPlugin extends Plugin
         collisionDebugOverlay = new CollisionDebugOverlay(client, config);
         objectDebugOverlay = new ObjectDebugOverlay(client, config);
         geDebugOverlay = new GeDebugOverlay(client, config);
+        chatDebugOverlay = new ChatDebugOverlay(client);
         panel.setTransportResolver(new TransportResolver(client));
         tileMarker = new TileMarker(client);
         panel.setDebugOverlay(debugOverlay);
@@ -266,6 +269,7 @@ public class RecorderPlugin extends Plugin
         overlayManager.add(collisionDebugOverlay);
         overlayManager.add(objectDebugOverlay);
         overlayManager.add(geDebugOverlay);
+        overlayManager.add(chatDebugOverlay);
         overlayManager.add(hudOverlay);
 
         // Wire login assistant. We construct a fresh dispatcher here for
@@ -932,6 +936,7 @@ public class RecorderPlugin extends Plugin
         if (collisionDebugOverlay != null) overlayManager.remove(collisionDebugOverlay);
         if (objectDebugOverlay != null) overlayManager.remove(objectDebugOverlay);
         if (geDebugOverlay != null) overlayManager.remove(geDebugOverlay);
+        if (chatDebugOverlay != null) overlayManager.remove(chatDebugOverlay);
         if (worldMapMinimapOverlay != null)
         {
             overlayManager.remove(worldMapMinimapOverlay);
