@@ -7,6 +7,7 @@ import net.runelite.api.Client;
 import net.runelite.api.MenuAction;
 import net.runelite.api.MenuEntry;
 import net.runelite.api.ObjectComposition;
+import net.runelite.api.Player;
 import net.runelite.api.Skill;
 import net.runelite.api.events.GameTick;
 import net.runelite.api.events.MenuOptionClicked;
@@ -23,6 +24,7 @@ public class AgilityCaptureSession
     private final EventBus eventBus;
     private CaptureModel model;        // (re)built on start()
     private boolean active = false;
+    private int idleTicks = 0;
 
     public AgilityCaptureSession(Client client, EventBus eventBus)
     {
@@ -53,6 +55,24 @@ public class AgilityCaptureSession
 
     public boolean isActive() { return active; }
     public CaptureModel getModel() { return model; }
+
+    public void discardCurrentLap()
+    {
+        if (!active) return;
+        model.currentLapTiles.clear();
+        model.currentLapObs.clear();
+        model.pendingClick = null;
+        model.currentLapDirty = true;
+        model.state = LapState.OFF_COURSE;
+        log.info("[agility-capture] current lap discarded by user");
+    }
+
+    public void cancel()
+    {
+        if (!active) return;
+        model.reset();
+        stop();
+    }
 
     @Subscribe
     public void onMenuOptionClicked(MenuOptionClicked e)
@@ -185,6 +205,29 @@ public class AgilityCaptureSession
         if (model.state == LapState.IN_LAP)
         {
             model.currentLapTiles.add(p);
+        }
+
+        // Track consecutive idle ticks for OFF_COURSE strict re-entry.
+        boolean idleNow = isPlayerIdle();
+        idleTicks = idleNow ? idleTicks + 1 : 0;
+
+        if (model.state == LapState.OFF_COURSE)
+        {
+            boolean canReenter;
+            if (model.canonicalSequence == null)
+            {
+                canReenter = true;     // soft reset — no canonical yet
+            }
+            else
+            {
+                boolean onStartOrApproach = model.startTiles.contains(p) || model.approachTiles.contains(p);
+                canReenter = onStartOrApproach && idleTicks >= 2;
+            }
+            if (canReenter)
+            {
+                model.state = LapState.ARMED;
+                log.info("[agility-capture] re-armed for new lap");
+            }
         }
 
         maybeExpirePendingClick(now, p);
@@ -352,5 +395,13 @@ public class AgilityCaptureSession
         if (lapObs.isEmpty()) return null;
         ObstacleObservation last = lapObs.get(lapObs.size() - 1);
         return last.successTiles.iterator().next();    // exactly one within a single lap
+    }
+
+    private boolean isPlayerIdle()
+    {
+        Player p = client.getLocalPlayer();
+        if (p == null) return false;
+        if (p.getAnimation() != -1) return false;
+        return p.getPoseAnimation() == p.getIdlePoseAnimation();
     }
 }
