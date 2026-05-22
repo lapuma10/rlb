@@ -190,12 +190,56 @@ public class AgilityCaptureSession
 
     private void maybeExpirePendingClick(long now, WorldPoint p)
     {
-        // Task 8 — IGNORED / BROKEN_LAP / UNKNOWN classifier.
+        PendingClick pc = model.pendingClick;
+        if (pc == null) return;
+        if (now <= pc.deadlineMs) return;
+
+        if (p.equals(pc.sourceTile))
+        {
+            pc.outcome = ClickOutcome.IGNORED;
+            model.pendingClick = null;
+            return;
+        }
+
+        boolean onRoute =
+               model.startTiles.contains(p)
+            || model.approachTiles.contains(p)
+            || anyKnownStageTile(p);
+
+        pc.outcome = onRoute ? ClickOutcome.UNKNOWN : ClickOutcome.BROKEN_LAP;
+        model.pendingClick = null;
+        model.currentLapDirty = true;
+        model.currentLapTiles.clear();
+        model.currentLapObs.clear();
+        model.state = LapState.OFF_COURSE;
+
+        log.info("[agility-capture] lap broken ({}). Walk to course start.", pc.outcome);
+    }
+
+    private boolean anyKnownStageTile(WorldPoint p)
+    {
+        for (ObstacleObservation o : model.obstacles)
+        {
+            if (o.stageTiles.contains(p)) return true;
+        }
+        for (ObstacleObservation o : model.currentLapObs)
+        {
+            if (o.stageTiles.contains(p)) return true;
+        }
+        return false;
     }
 
     private long perObjectDeadline(int objectId)
     {
-        return 12_000L;       // default; per-object shrink lands in Task 8
+        for (ObstacleObservation o : model.obstacles)
+        {
+            if (o.objectIds.contains(objectId) && o.maxClickToXpMs > 0L)
+            {
+                long shrunk = Math.round(o.maxClickToXpMs * 1.5);
+                return Math.max(8_000L, Math.min(12_000L, shrunk));
+            }
+        }
+        return 12_000L;
     }
 
     private String safeObjectLabel(int objectId)
