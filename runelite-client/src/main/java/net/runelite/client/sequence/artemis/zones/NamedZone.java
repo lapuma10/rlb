@@ -9,14 +9,24 @@ import net.runelite.api.coords.WorldPoint;
  * tile from {@link #tiles()} per the zone's default rotation
  * (UniformWithinRange per spec §7).
  *
- * <p>v1.0 ships the enum entries with stub tile-set bodies; per-zone
- * tile lists land when the first script that depends on
- * {@code walkTo(NamedZone)} migrates (per CowKillerScript in Phase 2
- * for LUMBRIDGE_COW_FIELD, then per script via Phase 6 migrations for
- * the rest). Until then {@code tiles()} returns an empty list —
- * intentional: a caller that tries to walkTo an unpopulated zone gets
- * an immediate empty-route failure rather than silent wrong-place
- * routing.
+ * <p><b>v1.0 placeholder state — read before wiring walkTo:</b> every
+ * enum entry's {@link #tiles()} currently returns an empty list. This
+ * is intentional for the Phase 1A.1 interface scaffold — a caller
+ * that walks to an unpopulated zone gets an immediate empty-route
+ * failure rather than silent wrong-place routing.
+ *
+ * <p><b>Zones needing real tile sets before walkTo(NamedZone) can be
+ * considered implemented</b> (each lands with the dependent script's
+ * migration; do not ship walkTo wiring without these):
+ * <ul>
+ *   <li>{@link #LUMBRIDGE_CASTLE_GROUND_FLOOR} — Phase 1A smoke plan
+ *       per spec §19</li>
+ *   <li>{@link #LUMBRIDGE_COW_FIELD} — CowKillerScript pilot (Phase 2)</li>
+ *   <li>{@link #LUMBRIDGE_BANK} — bank-tier migrations (Phase 5+)</li>
+ *   <li>{@link #LUMBRIDGE_BANK_P2} — bank-tier migrations (Phase 5+)</li>
+ *   <li>{@link #LUMBRIDGE_CHICKEN_PEN} — ChickenFarmV4 (Phase 5)</li>
+ * </ul>
+ * Remaining zones populate per Phase 6 migration order.
  */
 public enum NamedZone
 {

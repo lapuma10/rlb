@@ -80,7 +80,7 @@ import net.runelite.client.sequence.artemis.view.WidgetRef;
 import net.runelite.client.sequence.artemis.view.InvSlot;
 import net.runelite.client.sequence.artemis.view.InventoryView;
 import net.runelite.client.sequence.artemis.view.PlayerState;
-import net.runelite.client.sequence.artemis.session.SessionShape;
+import net.runelite.client.plugins.recorder.session.SessionShape;
 import net.runelite.client.sequence.artemis.session.IdlePolicy;
 import net.runelite.client.sequence.artemis.zones.NamedZone;
 import net.runelite.client.sequence.artemis.outcome.OutcomeCheck;
