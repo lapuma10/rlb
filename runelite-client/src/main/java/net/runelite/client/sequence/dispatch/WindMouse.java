@@ -69,7 +69,6 @@ public final class WindMouse
      *  second half (or vice-versa). Stacks on top of paceFactor. */
     private static final double TEMPO_BREAK_PROB = 0.30;
 
-    public WindMouse() { this(new Random()); }
     public WindMouse(long seed) { this(new Random(seed)); }
     public WindMouse(Random rng) { this.rng = rng; }
 

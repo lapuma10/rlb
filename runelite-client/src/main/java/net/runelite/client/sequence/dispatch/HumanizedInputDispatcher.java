@@ -44,6 +44,7 @@ import net.runelite.api.coords.LocalPoint;
 import net.runelite.api.coords.WorldPoint;
 import net.runelite.api.widgets.Widget;
 import net.runelite.client.callback.ClientThread;
+import net.runelite.client.plugins.recorder.session.AccountRng;
 import net.runelite.client.plugins.recorder.transport.TransportResolver;
 import net.runelite.client.plugins.recorder.transport.VerbMatcher;
 import net.runelite.client.sequence.InputMode;
@@ -78,7 +79,7 @@ public class HumanizedInputDispatcher implements InputDispatcher
     private final CanvasInput input;
     private final PixelResolver resolver;
     private final WindMouse wind;
-    private final Random rng = new Random();
+    private final Random rng;
     private final AtomicBoolean busy = new AtomicBoolean(false);
     private final AtomicReference<String> lastError = new AtomicReference<>(null);
     /** Callback to handle {@link ActionRequest.Kind#PICK_GE_SEARCH_RESULT}
@@ -104,7 +105,9 @@ public class HumanizedInputDispatcher implements InputDispatcher
         this.clientThread = clientThread;
         this.input = new CanvasInput(client);
         this.resolver = new PixelResolver(client);
-        this.wind = new WindMouse();
+        AccountRng accountRng = new AccountRng(client);
+        this.rng = accountRng.forAccount("dispatcher");
+        this.wind = new WindMouse(accountRng.forAccount("windmouse"));
     }
 
     /** Consume and return the last failure reason (get-and-clear). Returns
