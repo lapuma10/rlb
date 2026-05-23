@@ -356,14 +356,18 @@ public final class AccountLauncher
 
         // ---- waiting dialog ----
         JDialog dlg = new JDialog(frame, "Add Jagex Account — " + finalName, true);
-        dlg.setSize(420, 180);
+        dlg.setSize(460, 280);
         dlg.setLocationRelativeTo(frame);
         dlg.setLayout(new BorderLayout(8, 8));
 
         JLabel info = new JLabel(
-            "<html><center>Jagex Launcher is open.<br>" +
-            "Select <b>" + finalName + "</b> and click <b>Play</b>.<br><br>" +
-            "Credentials will be saved automatically.</center></html>",
+            "<html><center>Jagex Launcher is open.<br><br>" +
+            "1. <b>Log in</b> to your Jagex account<br>" +
+            "2. Select character <b>" + finalName + "</b><br>" +
+            "3. Set <b>Game client</b> to <b>RuneLite</b> (required)<br>" +
+            "4. Click <b>Play</b> and let RuneLite finish launching<br><br>" +
+            "Credentials will be captured automatically — you can close<br>" +
+            "the RuneLite window once this dialog updates.</center></html>",
             SwingConstants.CENTER);
         info.setBorder(new EmptyBorder(16, 16, 8, 16));
 

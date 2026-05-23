@@ -623,7 +623,7 @@ for (int attempt = 0; attempt < 24; attempt++) {
 return null;  // NEVER fall back to centroid. Surface failure.
 ```
 
-**BANNED:**
+**BANNED (methods/patterns, NOT the `PixelResolver` class — the class is the right home for the §10-compliant replacement):**
 - `PixelResolver.sampleNearCentroid` (`:957-983`) — 12-px window covers ~6-10% of model. Delete after migration.
 - Fixed-fraction insets (`width/6`, `width/4`, `width/8`). Use 1-2 px absolute.
 - `clickCanvas(b.x + b.width/2, b.y + b.height/2)` — pixel-perfect centre. Use `clickWidget(id)` / `clickBounds(rect)`.
