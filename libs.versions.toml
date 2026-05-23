@@ -23,20 +23,18 @@
 # SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 #
 [versions]
-rs = "235"
 cache = "165"
 
 flatlaf = "3.2.5-rl4"
 guice = "4.1.0"
 lombok = "1.18.30"
 logback = "1.2.9"
-lwjgl = "3.3.6"
+lwjgl = "3.3.2"
 slf4j = "1.7.25"
 antlr = "4.13.1"
 
 
 [libraries]
-rs-vanilla = { module = "net.runelite.rs:vanilla", version.ref = "rs" }
 rs-cache = { module = "net.runelite.rs:cache", version.ref = "cache" }
 
 flatlaf-core = { module = "net.runelite:flatlaf", version.ref = "flatlaf" }
