@@ -10,6 +10,26 @@ package net.runelite.client.sequence.artemis.query;
  * {@link WidgetQuery} carries no rotation field — widget id resolves
  * to one widget by construction.
  *
+ * <p><b>Per-call non-stability — important for Step authors:</b> three
+ * of the four policies consume from the per-account RNG stream on
+ * every pick. That means:
+ * <ul>
+ *   <li>{@link Closest} (with ties), {@link ClosestWithSlack},
+ *       {@link UniformWithinRange} — repeated calls to the same
+ *       {@code find...} method within the same tick may return
+ *       different candidates. This is the intended "variety" behavior.</li>
+ *   <li>{@link SessionSticky} — deterministic per
+ *       {@code (account, stickinessKey)}; always picks the same
+ *       candidate from the same list across repeated calls.</li>
+ * </ul>
+ *
+ * <p><b>Caller guidance:</b> resolve once for the immediate action.
+ * Do NOT loop {@code find...} expecting a stable answer between calls.
+ * Do NOT cache refs long-term — refs carry {@code observedTick} and
+ * become stale (re-resolution per spec §8 fails them); the right
+ * scope is "this Step's onStart through dispatch." If you want
+ * deterministic per-session pinning, use {@link SessionSticky}.
+ *
  * <p>Typed weighted variants (WeightedNpc, WeightedObject) deferred to
  * v1.1+.
  */

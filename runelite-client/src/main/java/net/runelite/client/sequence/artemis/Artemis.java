@@ -38,12 +38,31 @@ public interface Artemis
 {
 	// ── READS — synchronous, return Optional<view-record> ───────────
 
+	/** Pick one NPC matching {@code query}. Applies
+	 *  {@link net.runelite.client.sequence.artemis.query.RotationPolicy}
+	 *  via per-account-seeded RNG — see {@code RotationPolicy} Javadoc
+	 *  for the per-call non-stability caveat (resolve once for the
+	 *  immediate action; refs carry {@code observedTick} and become
+	 *  stale). Returns {@link Optional#empty()} when no match. */
 	Optional<NpcRef> findNpc(NpcQuery query);
 
+	/** Pick one in-world object matching {@code query}. Same rotation
+	 *  + stability semantics as {@link #findNpc}. {@code GameObjRef.name()}
+	 *  may be {@code null} when the object definition could not be
+	 *  resolved (distinct from a literal empty name). */
 	Optional<GameObjRef> findObject(ObjectQuery query);
 
+	/** Pick one ground item matching {@code query}. Same rotation +
+	 *  stability semantics as {@link #findNpc}. {@code GroundItemRef.name()}
+	 *  may be {@code null} when {@code ItemManager} lookup fails. */
 	Optional<GroundItemRef> findItem(ItemQuery query);
 
+	/** Resolve a widget by id (and optional child slot). Honors
+	 *  {@code requireVisible} per spec §6 (walks the parent chain via
+	 *  {@code Widget.isHidden()}). Returns {@link Optional#empty()}
+	 *  when the widget is absent, the child slot is out of range, or
+	 *  {@code requireVisible=true} and the widget (or any ancestor) is
+	 *  hidden. */
 	Optional<WidgetRef> findWidget(WidgetQuery query);
 
 	InventoryView inventory();

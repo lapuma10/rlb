@@ -93,16 +93,21 @@ public final class ArtemisImpl implements Artemis
 
 	// ── READ HELPERS ────────────────────────────────────────────────
 
-	/** Bounded wait for marshaled reads. 30 s tolerates a slow tick
-	 *  but surfaces a genuine engine-stall rather than hanging
-	 *  forever — see QC-2 note. Callers that can't afford this should
-	 *  call from the client thread. */
-	private static final long READ_TIMEOUT_SECONDS = 30L;
+	/** Bounded wait for marshaled reads. 5 s tolerates a slow tick but
+	 *  surfaces a genuine engine-stall loudly rather than hanging
+	 *  callers indefinitely. Typical reads on a healthy client complete
+	 *  in microseconds; if 5 seconds pass without the client-thread
+	 *  queue draining, something is wrong enough that the caller
+	 *  should fail rather than wait. Callers that can't tolerate this
+	 *  surface area should call from the client thread (inline path,
+	 *  no timeout). */
+	private static final long READ_TIMEOUT_SECONDS = 5L;
 
 	/** Run a read on the client thread. Inline when the caller is
 	 *  already on the client thread (saves a marshal hop for engine
 	 *  Step.check() calls); marshals via {@link ClientThread#invoke}
-	 *  otherwise and blocks the caller up to {@link #READ_TIMEOUT_SECONDS}.
+	 *  otherwise and blocks the caller up to {@link #READ_TIMEOUT_SECONDS}
+	 *  (5 seconds — see field Javadoc for rationale).
 	 *
 	 *  <p>Uses {@code Client.isClientThread()} for the inline check
 	 *  rather than a {@code Thread.currentThread() == getClientThread()}
@@ -562,7 +567,10 @@ public final class ArtemisImpl implements Artemis
 		{
 			name = objectName(objectId);
 		}
-		out.add(new Candidate<>(new TileObjectFinding(objectId, name == null ? "" : name, loc, kind), loc));
+		// name may legitimately be null when getObjectDefinition fails —
+		// pass through so callers can distinguish "unknown" (null) from
+		// "literally blank name" (""). Surfaces as GameObjRef.name() == null.
+		out.add(new Candidate<>(new TileObjectFinding(objectId, name, loc, kind), loc));
 	}
 
 	private String objectName(int objectId)
@@ -636,7 +644,10 @@ public final class ArtemisImpl implements Artemis
 							continue;
 						}
 						String name = itemName(ti.getId());
-						out.add(new TileItemFinding(ti.getId(), name == null ? "" : name,
+						// name may legitimately be null when ItemManager
+						// lookup fails — pass through so callers can
+						// distinguish "unknown" from "literally blank".
+						out.add(new TileItemFinding(ti.getId(), name,
 							ti.getQuantity(), tloc));
 					}
 				}
@@ -685,11 +696,13 @@ public final class ArtemisImpl implements Artemis
 
 	private static NpcRef toNpcRef(NPC npc, long observedTick)
 	{
-		String name = npc.getName();
+		// name may legitimately be null when NPC has no defined display
+		// name — pass through so callers can distinguish "unknown" from
+		// "literally blank". Surfaces as NpcRef.name() == null.
 		return new NpcRef(
 			npc.getIndex(),
 			npc.getId(),
-			name == null ? "" : name,
+			npc.getName(),
 			npc.getWorldLocation(),
 			npc.getHealthRatio(),
 			observedTick);
