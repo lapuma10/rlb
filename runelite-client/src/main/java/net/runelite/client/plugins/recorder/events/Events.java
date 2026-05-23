@@ -138,4 +138,25 @@ public final class Events {
                              String mode, String scriptId) implements RecordedEvent {
         @Override public String type() { return "script_mode"; }
     }
+
+    /** Sequence-engine Step lifecycle event. Emitted by
+     *  {@link net.runelite.client.plugins.recorder.RecorderManager#recordStepEvent}
+     *  from the script-facing
+     *  {@link net.runelite.client.plugins.recorder.analyse.StepEvent}
+     *  payload — keeps the persistence shape (seq/tMs/tick + payload)
+     *  separate from the script-side API.
+     *
+     *  <p>Boxed {@link Long} / {@link Integer} on the nullable numeric
+     *  fields so "absent" stays distinguishable from a real zero in
+     *  the on-disk JSON. */
+    public record Step(long seq, long tMs, int tick,
+                       String name, String phase,
+                       String targetType, String targetId, String targetName,
+                       String verb,
+                       Long ticksElapsed,
+                       String diagnosticReason,
+                       Integer clickX, Integer clickY,
+                       String detail) implements RecordedEvent {
+        @Override public String type() { return "step"; }
+    }
 }

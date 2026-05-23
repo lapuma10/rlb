@@ -32,6 +32,7 @@ import net.runelite.client.callback.ClientThread;
 import net.runelite.client.game.ItemManager;
 import net.runelite.client.plugins.recorder.analyse.HtmlViewerGenerator;
 import net.runelite.client.plugins.recorder.analyse.PhaseSegmenter;
+import net.runelite.client.plugins.recorder.analyse.StepEvent;
 import net.runelite.client.plugins.recorder.analyse.SummaryGenerator;
 import net.runelite.client.plugins.recorder.buffer.JsonlGzipWriter;
 import net.runelite.client.plugins.recorder.buffer.RecordingBuffer;
@@ -256,6 +257,28 @@ public final class RecorderManager implements SessionTracker.ScriptModeListener
         if (state != RecorderState.RECORDING || buffer == null) return;
         int tick = client.getTickCount();
         buffer.enqueue((seq, tMs) -> new Events.MarkerDialog(seq, tMs, tick, opened));
+    }
+
+    /** Append a sequence-engine Step lifecycle event to the session
+     *  recording stream. Safe no-op when the recorder is idle / not
+     *  recording, or when {@code ev} is null. Mirrors {@link
+     *  #recordMarker(String)} — the script-facing {@link StepEvent}
+     *  payload is widened with the current tick clock and enqueue-time
+     *  seq/tMs so the persisted {@code Events.Step} keeps the shape of
+     *  every other RecordedEvent. */
+    public synchronized void recordStepEvent(StepEvent ev)
+    {
+        if (state != RecorderState.RECORDING || buffer == null || ev == null) return;
+        int tick = client.getTickCount();
+        buffer.enqueue((seq, tMs) -> new Events.Step(
+            seq, tMs, tick,
+            ev.name(), ev.phase(),
+            ev.targetType(), ev.targetId(), ev.targetName(),
+            ev.verb(),
+            ev.ticksElapsed(),
+            ev.diagnosticReason(),
+            ev.clickX(), ev.clickY(),
+            ev.detail()));
     }
 
     public synchronized void stop(String intentLabel) throws IOException
