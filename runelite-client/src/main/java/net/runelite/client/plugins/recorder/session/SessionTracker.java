@@ -23,6 +23,22 @@ import java.util.function.BooleanSupplier;
 
 @Slf4j
 public class SessionTracker implements ScriptLifecycleListener {
+    /** Callback for downstream consumers (e.g. RecorderManager) that need to
+     *  know when the user's input source flips between "operator at keyboard"
+     *  and "registered script driving the dispatcher". Called on the same
+     *  thread as the underlying transition (event-bus for login/logout,
+     *  poller thread for registered-script transitions, caller thread for
+     *  direct {@link #onScriptStarted}/{@link #onScriptStopped} invocations).
+     *  Implementations MUST NOT block — the tracker swallows any thrown
+     *  exception so a listener fault never propagates back into script
+     *  lifecycle handling. */
+    public interface ScriptModeListener {
+        /** {@code mode} is one of {@code "live"} or {@code "bot_watch"}.
+         *  {@code scriptId} is the script driving inputs, or null if
+         *  {@code mode == "live"}. */
+        void onModeChanged(String mode, @Nullable String scriptId);
+    }
+
     private final Client client;
     private final ClientThread clientThread;
     private final SessionStore sessionStore;
@@ -37,6 +53,7 @@ public class SessionTracker implements ScriptLifecycleListener {
     @Nullable private Timer periodicSaveTimer;
     @Nullable private Timer scriptPollTimer;
     private final CopyOnWriteArrayList<Runnable> sessionStateCallbacks = new CopyOnWriteArrayList<>();
+    @Nullable private volatile ScriptModeListener scriptModeListener;
 
     /** Auto-detected scripts: poll each supplier every second and translate false→true / true→false
      *  into onScriptStarted / onScriptStopped. Lets callers register a script once instead of
@@ -53,6 +70,34 @@ public class SessionTracker implements ScriptLifecycleListener {
 
     public void registerSessionStateCallback(Runnable callback) {
         sessionStateCallbacks.add(callback);
+    }
+
+    /** Wire a {@link ScriptModeListener}. Passing null clears the existing
+     *  listener. Only one listener is supported (the recorder); add a
+     *  list-based dispatch if that ever changes. */
+    public void setScriptModeListener(@Nullable ScriptModeListener listener) {
+        this.scriptModeListener = listener;
+    }
+
+    /** Returns the id of any currently-running registered script, or null if
+     *  none are active. When multiple scripts run concurrently (rare), an
+     *  arbitrary one is returned — callers treating this as "the mode driver"
+     *  accept that ambiguity. Safe to call from any thread. */
+    @Nullable
+    public String activeScriptId() {
+        synchronized (lock) {
+            return activeRuns.isEmpty() ? null : activeRuns.keySet().iterator().next();
+        }
+    }
+
+    private void notifyScriptMode(String mode, @Nullable String scriptId) {
+        ScriptModeListener l = scriptModeListener;
+        if (l == null) return;
+        try {
+            l.onModeChanged(mode, scriptId);
+        } catch (Throwable t) {
+            log.warn("ScriptModeListener threw on mode={} script={}: {}", mode, scriptId, t.toString());
+        }
     }
 
     /** Register a bot script for auto-tracking. The tracker polls {@code isRunning} every second;
@@ -299,6 +344,7 @@ public class SessionTracker implements ScriptLifecycleListener {
 
     @Override
     public void onScriptStarted(String scriptId, String displayName) {
+        boolean fired;
         synchronized (lock) {
             if (currentLoginSession == null) {
                 log.warn("Script started but no login session active: {}", scriptId);
@@ -312,7 +358,9 @@ public class SessionTracker implements ScriptLifecycleListener {
             ScriptRun activeRun = new ScriptRun(scriptId, displayName, startMs, null, null, null);
             activeRuns.put(scriptId, activeRun);
             log.debug("Script started: {} ({})", displayName, scriptId);
+            fired = true;
         }
+        if (fired) notifyScriptMode("bot_watch", scriptId);
         notifyStateChanged();
     }
 
@@ -322,6 +370,8 @@ public class SessionTracker implements ScriptLifecycleListener {
         LocalDate sessionDate;
         LoginSession updatedSession;
         ScriptRun activeRun;
+        String nextMode;
+        String nextScriptId;
         synchronized (lock) {
             if (currentLoginSession == null) {
                 log.warn("Script stopped but no login session active: {}", scriptId);
@@ -355,9 +405,19 @@ public class SessionTracker implements ScriptLifecycleListener {
             sessionDate = currentSessionDate != null ? currentSessionDate : LocalDate.now(ZoneId.systemDefault());
             log.debug("Script stopped: {} ({}), duration: {}ms, count: {}",
                 activeRun.displayName(), scriptId, endMs - activeRun.startMs(), count);
+            // Pick the next mode while holding the lock so concurrent
+            // start/stop calls can't observe an inconsistent snapshot.
+            if (activeRuns.isEmpty()) {
+                nextMode = "live";
+                nextScriptId = null;
+            } else {
+                nextMode = "bot_watch";
+                nextScriptId = activeRuns.keySet().iterator().next();
+            }
         }
         // I/O outside the lock
         sessionStore.upsertSession(accountName, sessionDate, updatedSession);
+        notifyScriptMode(nextMode, nextScriptId);
         notifyStateChanged();
     }
 

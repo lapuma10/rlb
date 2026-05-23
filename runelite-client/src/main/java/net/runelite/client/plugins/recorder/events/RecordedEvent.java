@@ -46,7 +46,8 @@ public sealed interface RecordedEvent permits
     Events.Camera,
     Events.Nearby,
     Events.Marker,
-    Events.MarkerDialog
+    Events.MarkerDialog,
+    Events.ScriptMode
 {
     long seq();
     long tMs();

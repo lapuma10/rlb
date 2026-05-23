@@ -46,4 +46,12 @@ public class MetaJson
 	boolean fixedMode;
 	@Builder.Default Map<String, Long> eventCounts = new LinkedHashMap<>();
 	int markerCount;
+	/** v2: {@code "live"} or {@code "bot_watch"} — last observed mode at finalisation.
+	 *  Null on v1 files; readers MUST treat null as "unknown" and not assume "live". */
+	String mode;
+	/** v2: script id driving inputs at finalisation, or null if {@code mode == "live"}. */
+	String script;
+	/** v2: how the recording ended. {@code "stop"} = explicit stop via panel/hotkey,
+	 *  {@code "abort"} = plugin shutdown drain. Null on v1 files. */
+	String endedReason;
 }

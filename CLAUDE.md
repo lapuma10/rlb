@@ -599,13 +599,51 @@ anywhere, multi-step blocking flows on dispatcher worker) is
 load-bearing — re-read it before any sequence-engine step or
 dispatcher work.
 
+## 10. Click target sampling — uniform on shape, NEVER centroid
+
+Sample uniformly across the target's full shape, 1-2 px edge inset only.
+
+**Shape priority for all clicks:**
+1. `TileObject.getClickbox()` — engine's authoritative hit shape (objects)
+2. `Actor.getConvexHull()` / `GameObject.getConvexHull()` — silhouette (actors, hull fallback)
+3. `Perspective.getCanvasTilePoly(client, scene)` — walk-here only
+
+**Algorithm** — already at `PixelResolver.java:215-245` (tiles) and `:265+` (ground items). Port to NPCs/objects:
+
+```java
+Rectangle bb = shape.getBounds();
+for (int attempt = 0; attempt < 24; attempt++) {
+    int x = bb.x + rng.nextInt(bb.width);
+    int y = bb.y + rng.nextInt(bb.height);
+    if (!shape.contains(x, y)) continue;
+    Point p = new Point(x, y);
+    if (!isOnCanvas(p) || conflictsWithRecent(p) || inWorldDeadZone(x, y)) continue;
+    record(p); return p;
+}
+return null;  // NEVER fall back to centroid. Surface failure.
+```
+
+**BANNED:**
+- `PixelResolver.sampleNearCentroid` (`:957-983`) — 12-px window covers ~6-10% of model. Delete after migration.
+- Fixed-fraction insets (`width/6`, `width/4`, `width/8`). Use 1-2 px absolute.
+- `clickCanvas(b.x + b.width/2, b.y + b.height/2)` — pixel-perfect centre. Use `clickWidget(id)` / `clickBounds(rect)`.
+- Centroid fallback in any resolver. 24-attempt budget exhausted = return null.
+
+**Pre-merge checklist (any "no" = redo):**
+1. Using `getClickbox()` where available?
+2. Uniform rejection, not centroid math?
+3. Edge inset 1-2 px absolute, not a fraction?
+4. Dispatching via `clickWidget(id)` / `clickBounds(rect)`, not `clickCanvas(x,y)`?
+
+Background — why centroid-only existed, why it was wrong: click-pattern register Critical #4.
+
 ---
 
 ## How to use this file
 
 When implementing a new behaviour:
 
-1. **Pick the questions in §1–§8 that apply to your action.**
+1. **Pick the questions in §1–§10 that apply to your action.**
 2. **Answer them in code or comments.** If the answer is "I'll
    verify before dispatching", write the verification call.
 3. **Add a self-test or assertion** for the assumption you're making.

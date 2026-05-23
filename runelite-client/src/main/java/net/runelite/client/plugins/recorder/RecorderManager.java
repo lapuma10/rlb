@@ -46,6 +46,7 @@ import net.runelite.client.plugins.recorder.flush.FlushDaemon;
 import net.runelite.client.plugins.recorder.session.MetaJson;
 import net.runelite.client.plugins.recorder.session.RecordingSession;
 import net.runelite.client.plugins.recorder.session.SessionDirectory;
+import net.runelite.client.plugins.recorder.session.SessionTracker;
 import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -55,15 +56,18 @@ import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Objects;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.TimeUnit;
 import java.util.function.Consumer;
+import java.util.function.Supplier;
+import javax.annotation.Nullable;
 
 /** Owns the recorder's runtime state. start() creates a session, hooks the
  *  buffer onto every capture, starts the flusher. stop() drains, runs analysis,
  *  writes summary + html, renames the session dir. */
 @Slf4j
-public final class RecorderManager
+public final class RecorderManager implements SessionTracker.ScriptModeListener
 {
     private final Client client;
     private final RecorderConfig config;
@@ -80,6 +84,22 @@ public final class RecorderManager
     private FlushDaemon flusher;
     private RecordingSession session;
     private final List<Consumer<RecorderState>> stateListeners = new ArrayList<>();
+
+    /** Source of "what script (if any) is driving inputs right now" — wired
+     *  by {@code RecorderPlugin} to {@link SessionTracker#activeScriptId()}.
+     *  Null when not wired (e.g. unit tests that don't exercise mode tagging),
+     *  in which case {@link #start()} writes an initial {@code mode=live}. */
+    @Nullable private Supplier<String> activeScriptIdSupplier;
+    /** Last mode value we wrote into the buffer this session, used to dedupe
+     *  redundant transitions. Null until {@link #start()} has emitted the
+     *  initial event. Reset by {@link #stop} / {@link #abort}. */
+    @Nullable private String currentMode;
+    /** Last scriptId we wrote into the buffer this session. Reset by stop/abort. */
+    @Nullable private String currentScriptId;
+    /** How the active recording ended — {@code "stop"} for explicit stop,
+     *  {@code "abort"} for shutdown drain. Set as part of the stop/abort
+     *  flow; consumed by {@link #finaliseBundle} for the v2 manifest. */
+    @Nullable private String endedReason;
 
     public RecorderManager(Client client, RecorderConfig config,
                            EventBusCapture eventBus, MouseCapture mouse,
@@ -138,6 +158,46 @@ public final class RecorderManager
 
     public synchronized void onStateChanged(Consumer<RecorderState> l) { stateListeners.add(l); }
 
+    /** Wire the supplier used by {@link #start()} to read the current
+     *  driving-script id. Pass null to clear. Call before {@link #start()}
+     *  so the initial {@code script_mode} event reflects the actual state. */
+    public synchronized void setActiveScriptIdSupplier(@Nullable Supplier<String> supplier)
+    {
+        this.activeScriptIdSupplier = supplier;
+    }
+
+    /** {@link SessionTracker.ScriptModeListener} hook. Enqueues a
+     *  {@code script_mode} event when the mode (or driving script) actually
+     *  changes while recording is active. No-op when idle or when the
+     *  reported state matches the last emitted state.
+     *
+     *  <p>Wrapped in try/catch at the caller; we additionally guard here so
+     *  a faulty mode source never disturbs an in-flight recording. */
+    @Override
+    public synchronized void onModeChanged(String mode, @Nullable String scriptId)
+    {
+        if (state != RecorderState.RECORDING || buffer == null) return;
+        if (Objects.equals(currentMode, mode) && Objects.equals(currentScriptId, scriptId)) return;
+        int tick = safeTickCount();
+        final String capturedMode = mode;
+        final String capturedScript = scriptId;
+        try
+        {
+            buffer.enqueue((seq, tMs) -> new Events.ScriptMode(seq, tMs, tick, capturedMode, capturedScript));
+            currentMode = capturedMode;
+            currentScriptId = capturedScript;
+        }
+        catch (Throwable t)
+        {
+            log.warn("script_mode enqueue failed (mode={} script={}): {}", mode, scriptId, t.toString());
+        }
+    }
+
+    private int safeTickCount()
+    {
+        try { return client.getTickCount(); } catch (Throwable t) { return 0; }
+    }
+
     public synchronized RecordingSession start() throws IOException
     {
         if (state != RecorderState.IDLE) throw new IllegalStateException("recorder not idle");
@@ -153,6 +213,32 @@ public final class RecorderManager
         focus.setBuffer(buffer);
         flusher.start();
         setState(RecorderState.RECORDING);
+        // Reset and emit the initial script_mode event so every recording
+        // begins with a self-describing first event. Supplier may be null in
+        // tests; treat as "live".
+        endedReason = null;
+        currentMode = null;
+        currentScriptId = null;
+        String initialScript = null;
+        if (activeScriptIdSupplier != null)
+        {
+            try { initialScript = activeScriptIdSupplier.get(); }
+            catch (Throwable t) { log.warn("activeScriptIdSupplier threw at start: {}", t.toString()); }
+        }
+        String initialMode = initialScript != null ? "bot_watch" : "live";
+        int tick = safeTickCount();
+        final String mm = initialMode;
+        final String ss = initialScript;
+        try
+        {
+            buffer.enqueue((seq, tMs) -> new Events.ScriptMode(seq, tMs, tick, mm, ss));
+            currentMode = initialMode;
+            currentScriptId = initialScript;
+        }
+        catch (Throwable t)
+        {
+            log.warn("initial script_mode enqueue failed: {}", t.toString());
+        }
         return session;
     }
 
@@ -175,6 +261,7 @@ public final class RecorderManager
     public synchronized void stop(String intentLabel) throws IOException
     {
         if (state != RecorderState.RECORDING) return;
+        endedReason = "stop";
         setState(RecorderState.FINALISING);
         try
         {
@@ -201,6 +288,7 @@ public final class RecorderManager
     public synchronized void abort()
     {
         if (state != RecorderState.RECORDING) return;
+        endedReason = "abort";
         setState(RecorderState.FINALISING);
         try
         {
@@ -233,8 +321,24 @@ public final class RecorderManager
         {
             eventCounts.merge(e.type(), 1L, Long::sum);
         }
+        // Mode + script for the manifest: last script_mode event we saw in
+        // the drained event stream wins. Falls back to the live in-memory
+        // currentMode/currentScriptId (which mirror that event), then to
+        // "live" / null if neither is set (e.g. the supplier was null and
+        // we somehow skipped the initial emit).
+        String finalMode = currentMode;
+        String finalScript = currentScriptId;
+        for (RecordedEvent e : events)
+        {
+            if (e instanceof Events.ScriptMode sm)
+            {
+                finalMode = sm.mode();
+                finalScript = sm.scriptId();
+            }
+        }
+        if (finalMode == null) finalMode = "live";
         MetaJson meta = MetaJson.builder()
-            .schemaVersion(1)
+            .schemaVersion(2)
             .sessionId(session.getSessionId())
             .intentLabel(session.getIntentLabel() == null ? "" : session.getIntentLabel())
             .startedAtUtc(DateTimeFormatter.ISO_INSTANT.format(session.getStartedAt()))
@@ -247,6 +351,9 @@ public final class RecorderManager
             .fixedMode(client.isResized() == false)
             .eventCounts(eventCounts)
             .markerCount((int) events.stream().filter(e -> e instanceof Events.Marker).count())
+            .mode(finalMode)
+            .script(finalScript)
+            .endedReason(endedReason == null ? "stop" : endedReason)
             .build();
         sessions.writeMeta(session, meta);
         Files.writeString(dir.resolve("summary.md"),

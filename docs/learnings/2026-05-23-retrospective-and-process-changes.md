@@ -98,19 +98,27 @@ Exit criteria: each entry IRL-verified on a burner; `Verified-IRL:` field ticked
 
 All four are the same pattern: replace `clickCanvas(b.x + b.width/2, b.y + b.height/2)` with a `clickBounds(rect)` helper that routes through `PixelResolver.sampleNearCentroid` (or equivalent) and respects the recent-click ring buffer. **Same fix shape, four sites.** Could land as one PR with a sweep, since the abstraction is uniform.
 
-### Phase 3 — `PixelResolver` UI-occlusion mask
+### Phase 3 — `PixelResolver` rewrite: ban `sampleNearCentroid`, ship `sampleInsideShape`, add UI-occlusion mask
 
-The structural fix for the agility click-swallow bugs and prevention of the next class of broken behaviour. Touches every script that dispatches world-tile / hull clicks.
+The structural fix for the agility click-swallow bugs, the dead-cluster click pattern on every NPC/object click, and prevention of the next class of broken behaviour. Touches every script that dispatches model-bearing or world-tile clicks. Driven by the locked CLAUDE.md §10 rule and click-pattern register Critical #4 (added 2026-05-23).
 
 | Task | Where | Effort |
 |---|---|---|
+| **Implement `sampleInsideShape(shape, ...)`** as the unified uniform-rejection sampler for `getClickbox()` / `getConvexHull()` / widget rect / tile poly. Modelled on existing `sampleInsidePolygon` (`PixelResolver.java:215-245`) and `resolveGroundItemPixel` (`:265+`) which already implement the correct algorithm for tiles and ground items. **Returns null on 24-attempt budget exhaustion — NEVER falls back to centroid** (per CLAUDE.md §10 forbidden patterns) | `PixelResolver.java` | 1 day |
+| **Migrate `resolveNpc` / `resolveGameObject` / `resolveWallObject` / `resolveDecorativeObject` / etc.** to call `sampleInsideShape` with `getClickbox()` first (objects), `getConvexHull()` fallback (and only path for actors). Each callsite verified against the dispatcher's existing hover-and-verify safety net | `PixelResolver.java`, `HumanizedInputDispatcher.java` resolver fan-out | 1-2 days |
+| **Delete `sampleNearCentroid`** once all callers are migrated. Add a compile-time guard or grep gate so it can't be re-introduced — CLAUDE.md §10 names it banned by name, code should match. | `PixelResolver.java:957-983` | 1 h |
 | Enumerate UI exclusion bounds (world-map orb, chatbox container, minimap inset, sidebar tabs, open dialogs) into a `UiOcclusionMask` | new `sequence/dispatch/UiOcclusionMask.java` | half day |
-| Wire mask into `PixelResolver.sampleNearCentroid` + minimap-pick path | `PixelResolver.java` | 1 day |
-| Add `WARN` log when mask rejects ≥3 samples in a row (script is aiming at an occluded target — surface, don't silently retry) | `PixelResolver.java` | 1-2 h |
+| Wire mask into `sampleInsideShape` + minimap-pick path. Mask rejection counts toward the 24-attempt budget; if budget exhausted with mask-related rejections only, log a specific WARN ("target occluded by UI") before returning null | `PixelResolver.java` | 1 day |
+| Per-session zone weights for actors: per-account RNG-seeded picks 3-5 zone weights (head / upper-body / lower-body / feet) once at construction. Zone-first sampling, then uniform within zone | new `sequence/dispatch/ActorZoneWeights.java`; hook into `sampleInsideShape` for `Actor` targets | 1 day |
+| Replace the existing fixed-fraction inv-slot inset (1/6, `HumanizedInputDispatcher.java:1877-1882`) and widget inset (1/4, `PixelResolver.java:854-879`) with the same 1-2 px absolute edge inset shape; remove the centre-rejection rule. These were Critical / High envelopes that composed with the centroid bug — once #4 is fixed they're the next-layer cleanup | `PixelResolver.java`, `HumanizedInputDispatcher.java` | half day |
 | Agility-specific: extend Draynor `startTiles` to include plane-1 fallback tiles, or have recovery walker do transport-aware path across planes | `RooftopAgilityScript.java:1424` and `:1166-1170` | 1 day |
 | Agility-specific: drop `MAX_OBSTACLE_FAILS` from 6 to 2, escalate to `WARN` + stop | `RooftopAgilityScript.java` (find the constant) | 1 h |
 
-Exit criteria: burner runs RooftopAgilityScript on Draynor for 2 h, zero "no startTile" events, zero retry-storms (fail count caps at ≤2 then surfaces).
+**Exit criteria:**
+- Burner runs RooftopAgilityScript on Draynor for 2 h, zero "no startTile" events, zero retry-storms (fail count caps at ≤2 then surfaces).
+- Heatmap analysis (manual at this stage; Phase 4 dashboard makes it live) of dispatched click pixels on a single NPC/object across 100+ cycles shows coverage across the whole rendered model, not a tight central cluster. Specifically: standard-deviation of click offsets from centroid ≥ ~30% of the model's larger dimension (vs the current ~5% from the ±6 px jitter).
+- Grep `git diff` for any new `sampleNearCentroid` callers — must be zero. Grep for any new `b.x + b.width/2, b.y + b.height/2` clickCanvas patterns — must be zero.
+- CLAUDE.md §10 checklist passes for every modified dispatch site.
 
 ### Phase 4 — Self-monitoring infrastructure (diversity dashboard)
 

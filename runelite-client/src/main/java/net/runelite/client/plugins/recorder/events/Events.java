@@ -126,4 +126,16 @@ public final class Events {
     public record MarkerDialog(long seq, long tMs, int tick, boolean opened) implements RecordedEvent {
         @Override public String type() { return "marker_dialog"; }
     }
+
+    /** Mode tag for the surrounding events: {@code "live"} when inputs come
+     *  from the operator, {@code "bot_watch"} when a registered script is
+     *  driving the dispatcher. Emitted once at the start of every recording
+     *  (with the mode active at that moment), then on every transition while
+     *  the recording is open. {@code scriptId} is the {@link
+     *  net.runelite.client.plugins.recorder.session.SessionTracker} script
+     *  id, or {@code null} when {@code mode == "live"}. */
+    public record ScriptMode(long seq, long tMs, int tick,
+                             String mode, String scriptId) implements RecordedEvent {
+        @Override public String type() { return "script_mode"; }
+    }
 }

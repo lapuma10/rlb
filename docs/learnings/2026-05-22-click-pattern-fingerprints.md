@@ -29,6 +29,15 @@ Severity is relative to anti-cheat detectability: **Critical** = single-pattern 
 - **Found:** 2026-05-22
 - **Fixed:**
 
+### 4. Centroid-only sampling for NPCs and game objects (`sampleNearCentroid`)
+- **Where:** `runelite-client/src/main/java/net/runelite/client/sequence/dispatch/PixelResolver.java:957-983` (`sampleNearCentroid`). Caller fan-out covers every NPC click (`resolveNpc` / combat / bankers / GE clerks) and every game-object click (cooking fires, agility obstacles, gates, stairs, trees) — i.e. **the dominant volume of clicks for every gameplay script we ship.**
+- **Pattern:** Computes the convex hull's bounding-box centroid, then jitters ±`CENTROID_JITTER_PX = 6` (`:941`), retrying up to 12 attempts inside `poly.contains(...)`. Every click on a typical NPC (~30×40 px hull) lands inside the same ~12×12 px window around its centroid → ~6-10% of the visible model surface, every cycle. On a banker (~25×60 px hull) that drops to ~6%. Combined with target-identity invariance (same banker NPC 497 cycles — see `2026-05-23-target-identity-rotation.md` Critical #1) the dispatched pixels form a tight cloud on one model. Heatmappable in a single bank-cycle session.
+- **Why fingerprint:** This is the structural reason 90% of the visible model is never clicked, regardless of how clean the upstream WindMouse path looks. The remaining High / Medium entries in this register (1/6 inv-slot inset, 1/4 widget inset, ±6 px recent-click ring) all *compose with* this entry — they describe the envelope, this describes the centre point. Fix this and the others get a much bigger blast radius for free.
+- **Why it's there in the first place:** Author's comment at `:944-953` cites a real concern — tall thin models (Draynor "Rough wall", Lumbridge stairs) have convex hulls whose corners project to pixels off the visible body, where the engine's hit-test picks "Walk here" on adjacent grass. Valid; over-corrected. The right fix uses three layers the original analysis missed: `getClickbox()` over `getConvexHull()` for game objects (engine's authoritative hit shape — "corner projects to grass" can't happen by construction); hover-and-verify post-cursor-move (the dispatcher already does this — a hull-edge sample that engine-hit-tests to a neighbour gets caught and retried); 1-2 px edge inset for silhouette-edge ambiguity. See CLAUDE.md §10 for the locked rule.
+- **Want:** Replace `sampleNearCentroid` with `sampleInsideShape(shape, ...)` modelled on the existing `sampleInsidePolygon` (`:215-245`) and `resolveGroundItemPixel` (`:265+`) which already do this correctly for tiles and ground items. Prefer `TileObject.getClickbox()` over `getConvexHull()` for game objects. Delete `sampleNearCentroid` once all callers are migrated so it can't be re-introduced. Per-session zone weights (head / upper-body / lower-body / feet, weighted per account from the per-account RNG seed) layer on top once Phase 0 of the retrospective lands.
+- **Found:** 2026-05-23
+- **Fixed:**
+
 ---
 
 ## High

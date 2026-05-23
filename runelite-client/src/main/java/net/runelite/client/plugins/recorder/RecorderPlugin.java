@@ -723,6 +723,15 @@ public class RecorderPlugin extends Plugin
         eventBus.register(sessionTracker);
         panel.setSessionTracker(sessionTracker, sessionStore);
 
+        // Mode tagging: the recorder needs to know which script (if any) is
+        // currently driving inputs so its session manifest + event stream
+        // distinguish live operator sessions from script-driven sessions.
+        // SessionTracker already owns the script-lifecycle source of truth;
+        // wire it both ways — supplier for the initial event in start(),
+        // listener for transitions while a recording is open.
+        manager.setActiveScriptIdSupplier(sessionTracker::activeScriptId);
+        sessionTracker.setScriptModeListener(manager);
+
         eventBus.register(eventCapture);
         mouseManager.registerMouseListener(mouseCapture);
         mouseManager.registerMouseListener(tileMarker);
