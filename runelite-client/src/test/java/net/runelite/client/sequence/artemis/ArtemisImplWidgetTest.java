@@ -38,8 +38,8 @@ public class ArtemisImplWidgetTest
 		java.util.concurrent.atomic.AtomicLong tick = new java.util.concurrent.atomic.AtomicLong(50L);
 		SessionShape session = new SessionShape(tick::get, tick::get, 1_000L);
 		when(client.getTickCount()).thenReturn(50);
-		artemis = new ArtemisImpl(client, ct, new AccountRng(null), session,
-			mock(ItemManager.class), null);
+		artemis = new ArtemisImpl(new ArtemisDeps(client, ct, new AccountRng(null), session,
+			mock(ItemManager.class), null, null, null));
 	}
 
 	@Test

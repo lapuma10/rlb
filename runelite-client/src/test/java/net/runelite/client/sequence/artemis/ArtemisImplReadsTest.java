@@ -61,7 +61,8 @@ public class ArtemisImplReadsTest
 		when(client.isClientThread()).thenReturn(true);
 
 		AccountRng rng = new AccountRng(null);   // → NOT_LOGGED_IN_SEED, deterministic
-		artemis = new ArtemisImpl(client, clientThread, rng, session, itemManager, null);
+		artemis = new ArtemisImpl(new ArtemisDeps(
+			client, clientThread, rng, session, itemManager, null, null, null));
 	}
 
 	// ── inventory() ─────────────────────────────────────────────────

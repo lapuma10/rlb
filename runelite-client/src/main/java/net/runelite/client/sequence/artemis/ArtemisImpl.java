@@ -32,6 +32,7 @@ import net.runelite.client.callback.ClientThread;
 import net.runelite.client.game.ItemManager;
 import net.runelite.client.plugins.recorder.RecorderManager;
 import net.runelite.client.plugins.recorder.analyse.StepEvent;
+import net.runelite.client.plugins.recorder.nav.Navigator;
 import net.runelite.client.plugins.recorder.session.AccountRng;
 import net.runelite.client.plugins.recorder.session.SessionShape;
 import net.runelite.client.sequence.Step;
@@ -59,14 +60,21 @@ import net.runelite.client.sequence.artemis.zones.NamedZone;
 import net.runelite.client.sequence.composite.SequencePlanBuilder;
 
 /**
- * Phase 1A.3 implementation of {@link Artemis}. Read methods marshal to
- * the client thread and apply per-query {@code RotationPolicy} (Phase 1A.2).
- * Action methods {@code click(...)}, {@code take(GroundItemRef)},
+ * Phase 1A.3 / 1A.4a implementation of {@link Artemis}. Read methods
+ * marshal to the client thread and apply per-query {@code RotationPolicy}
+ * (Phase 1A.2). Action methods {@code click(...)}, {@code take(GroundItemRef)},
  * {@code useOn(InvSlot, ...)} return Step subclasses under
  * {@code sequence/activities/script/} (Phase 1A.3).
  * {@code walkTo(...)}, {@code idle(IdlePolicy)}, {@code logout()} and the
  * {@code plan(...)} composition wrapper still throw
- * {@link UnsupportedOperationException} — they land in Phase 1A.4.
+ * {@link UnsupportedOperationException} — they land across the Phase 1A.4
+ * sub-slices (1A.4b idle/logout, 1A.4c/d walkTo, 1A.4e plan).
+ *
+ * <p>Phase 1A.4a introduced {@link ArtemisDeps} as the sole constructor
+ * argument so the surface stays one parameter as new engine pieces land
+ * ({@link Navigator}, {@link LogoutAction}, future additions). Fields
+ * are unpacked into private finals to preserve the hot-path read
+ * pattern.
  *
  * <p>Read methods marshal to the client thread via {@link #readOnClient}
  * (inline if already on client thread, else queued via
@@ -86,7 +94,7 @@ public final class ArtemisImpl implements Artemis
 	private final Client client;
 	private final ClientThread clientThread;
 	private final SessionShape session;
-	private final ItemManager itemManager;
+	@Nullable private final ItemManager itemManager;
 	private final RotationPolicySelector selector;
 	/** StepEvent sink, bound to {@code recorder::recordStepEvent} via
 	 *  the production constructor when a {@link RecorderManager} is
@@ -94,32 +102,35 @@ public final class ArtemisImpl implements Artemis
 	 *  no-arg compatibility constructor) — Step subclasses no-op
 	 *  emission in that case. */
 	@Nullable private final Consumer<StepEvent> stepEventSink;
+	/** Walker contract for {@code walkTo(...)} (Phase 1A.4c/d). Stored
+	 *  in 1A.4a; the throwing stubs ignore it. When walkTo lands, the
+	 *  Step subclass checks this for null and fails loud with a clear
+	 *  diagnostic rather than NPE'ing inside the dispatch path. */
+	@Nullable private final Navigator navigator;
+	/** Logout contract for {@code logout()} (Phase 1A.4b). Same nullable
+	 *  semantics as {@link #navigator} — stub throws in 1A.4a; LogoutStep
+	 *  checks for null when wired. */
+	@Nullable private final LogoutAction logoutAction;
 
-	/** Sole constructor — {@code recorder} is the StepEvent sink
-	 *  (Phase 0A.3 producer hook). Pass {@code null} in unit tests that
-	 *  don't care about lifecycle events; pass the live
-	 *  {@link RecorderManager} in {@code RecorderPlugin} so action Steps
-	 *  emit {@code started}/{@code succeeded}/{@code failed} events into
-	 *  the session JSON.
+	/** Sole constructor — takes a single {@link ArtemisDeps} bundle so
+	 *  the surface doesn't grow with each new engine piece. The deps
+	 *  record's per-field Javadoc documents which fields are nullable
+	 *  and what {@code null} means.
 	 *
-	 *  <p>The single-constructor shape is intentional — Phase 1A.3 QC
-	 *  flagged a 5-arg overload as a YAGNI shim; making {@code recorder}
-	 *  explicit at every callsite (even when {@code null}) makes the
-	 *  recording wiring visible. */
-	public ArtemisImpl(
-		Client client,
-		ClientThread clientThread,
-		AccountRng accountRng,
-		SessionShape session,
-		ItemManager itemManager,
-		@Nullable RecorderManager recorder)
+	 *  <p>The Phase 1A.3 sole-constructor discipline carries forward —
+	 *  if a caller needs new wiring (production: {@code RecorderPlugin};
+	 *  tests: any new fixture), they add the dep to {@link ArtemisDeps}
+	 *  rather than introducing an overload. */
+	public ArtemisImpl(ArtemisDeps deps)
 	{
-		this.client = client;
-		this.clientThread = clientThread;
-		this.session = session;
-		this.itemManager = itemManager;
-		this.selector = new RotationPolicySelector(accountRng.forAccount("artemis-rotation"));
-		this.stepEventSink = recorder == null ? null : recorder::recordStepEvent;
+		this.client = deps.client();
+		this.clientThread = deps.clientThread();
+		this.session = deps.session();
+		this.itemManager = deps.itemManager();
+		this.selector = new RotationPolicySelector(deps.accountRng().forAccount("artemis-rotation"));
+		this.stepEventSink = deps.recorder() == null ? null : deps.recorder()::recordStepEvent;
+		this.navigator = deps.navigator();
+		this.logoutAction = deps.logoutAction();
 	}
 
 	// ── READ HELPERS ────────────────────────────────────────────────
