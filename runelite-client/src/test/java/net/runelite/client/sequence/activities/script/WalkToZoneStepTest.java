@@ -211,6 +211,56 @@ public class WalkToZoneStepTest
 		assertEquals(0, SMOKE_ZONE.plane());
 	}
 
+	// ── 1b. Phase 2A populated cow field ────────────────────────────
+
+	@Test
+	public void cowFieldIsPopulatedInPhase2A()
+	{
+		// Phase 2A populated LUMBRIDGE_COW_FIELD with 220 tiles
+		// (10×22 rectangle). If this assertion fails, either the zone
+		// data regressed or Phase 2A was not applied.
+		List<WorldPoint> tiles = NamedZone.LUMBRIDGE_COW_FIELD.tiles();
+		assertFalse("LUMBRIDGE_COW_FIELD.tiles() must be populated in Phase 2A",
+			tiles.isEmpty());
+		assertEquals("expected 10×22 = 220 tiles", 220, tiles.size());
+	}
+
+	@Test
+	public void cowFieldDoesNotFailEmptyZone() throws Exception
+	{
+		// Phase 2A acceptance: WalkToZoneStep for LUMBRIDGE_COW_FIELD
+		// must NOT emit a REASON_EMPTY_ZONE failure. Verifies the
+		// data-layer population (NamedZoneTest) actually reaches the
+		// step's doPreFlight — i.e. no enum-constant body wiring error
+		// hides the populated tile list from the runtime path.
+		Artemis artemis = artemisWithSession(true);
+		RecordingRecorder rec = new RecordingRecorder();
+		LatchedNavigator nav = new LatchedNavigator();
+		WalkToZoneStep step = newStep(artemis, rec, NamedZone.LUMBRIDGE_COW_FIELD, nav);
+
+		ScopedBlackboard bb = new ScopedBlackboard();
+		MockInputDispatcher disp = new MockInputDispatcher();
+		step.onStart(ctxAtTick(0, bb, disp, snapAt(0, OUT_OF_ZONE)));
+
+		// No EMPTY_ZONE failure recorded — either no failure at all, or
+		// the failure (if any) is not the empty-zone diagnostic.
+		Optional<StepEvent> failed = rec.lastFailed();
+		assertTrue("LUMBRIDGE_COW_FIELD doPreFlight must not emit REASON_EMPTY_ZONE",
+			failed.isEmpty()
+				|| !WalkToZoneStep.REASON_EMPTY_ZONE.equals(failed.get().diagnosticReason()));
+
+		// doPreFlight passed — a chosen tile was picked from the zone.
+		WorldPoint chosen = step.chosenTileForTesting();
+		assertNotNull("doPreFlight should have picked a tile for the populated zone",
+			chosen);
+		assertTrue("chosen tile " + chosen + " must be inside LUMBRIDGE_COW_FIELD.tiles()",
+			NamedZone.LUMBRIDGE_COW_FIELD.tiles().contains(chosen));
+
+		// Drain the navigator so the worker exits cleanly under tearDown.
+		nav.awaitTickEntered();
+		nav.respondWith(NavStatus.RUNNING);
+	}
+
 	// ── 2. EMPTY_ZONE diagnostic ────────────────────────────────────
 
 	@Test

@@ -14,6 +14,12 @@ import net.runelite.api.coords.WorldPoint;
  * <ul>
  *   <li>{@link #LUMBRIDGE_CASTLE_GROUND_FLOOR} — populated (Phase 1A.4d
  *       smoke zone; 81-tile 9×9 rectangle around the castle interior).</li>
+ *   <li>{@link #LUMBRIDGE_COW_FIELD} — populated (Phase 2A; 220-tile
+ *       10×22 rectangle covering the east-of-Lumbridge F2P cow field).
+ *       <b>Bounds are Phase 2 pilot provisional</b> — derived from
+ *       in-game knowledge of the area, NOT confirmed by a recorded trail
+ *       or marker in this session. Operator spot-check expected before
+ *       the pilot session runs (Phase 2D playbook).</li>
  *   <li>All other zones — empty placeholder. {@code WalkToZoneStep} fails
  *       with the {@code EMPTY_ZONE} diagnostic when targeted; the script
  *       migration that needs the zone populates it at that time.</li>
@@ -21,7 +27,6 @@ import net.runelite.api.coords.WorldPoint;
  *
  * <p>Pending populations (with the script that drives the need):
  * <ul>
- *   <li>{@link #LUMBRIDGE_COW_FIELD} — CowKillerScript pilot (Phase 2)</li>
  *   <li>{@link #LUMBRIDGE_BANK} — bank-tier migrations (Phase 5+)</li>
  *   <li>{@link #LUMBRIDGE_BANK_P2} — bank-tier migrations (Phase 5+)</li>
  *   <li>{@link #LUMBRIDGE_CHICKEN_PEN} — ChickenFarmV4 (Phase 5)</li>
@@ -38,7 +43,10 @@ public enum NamedZone
 	LUMBRIDGE_CASTLE_P2(2),
 	LUMBRIDGE_BANK(0),
 	LUMBRIDGE_BANK_P2(2),
-	LUMBRIDGE_COW_FIELD(0),
+	LUMBRIDGE_COW_FIELD(0)
+	{
+		@Override public List<WorldPoint> tiles() { return LUMBRIDGE_COW_FIELD_TILES; }
+	},
 	LUMBRIDGE_CHICKEN_PEN(0),
 	GRAND_EXCHANGE(0),
 	;
@@ -75,6 +83,20 @@ public enum NamedZone
 	 *  exact-center. Phase 1A.4d smoke target. */
 	private static final List<WorldPoint> LUMBRIDGE_CASTLE_GROUND_FLOOR_TILES =
 		buildRect(3217, 3225, 3215, 3223, 0);
+
+	/** 10×22 rectangle covering the east-of-Lumbridge F2P cow field.
+	 *  Bounds: x ∈ [3253, 3262], y ∈ [3253, 3274], plane 0. <b>Phase 2
+	 *  pilot provisional</b> — derived from in-game knowledge of the
+	 *  area, NOT verified by a recorded trail or marker in this session.
+	 *  Conservative on the north edge to avoid intruding into the
+	 *  chicken pen (~y=3294 — north of the cow field in OSRS's
+	 *  higher-Y-equals-north convention) and conservative on the east
+	 *  edge to avoid
+	 *  bleeding into the Al-Kharid path. Operator spot-check expected
+	 *  before the Phase 2D pilot session — adjust bounds in place if the
+	 *  in-game observation disagrees. */
+	private static final List<WorldPoint> LUMBRIDGE_COW_FIELD_TILES =
+		buildRect(3253, 3262, 3253, 3274, 0);
 
 	private static List<WorldPoint> buildRect(int x0, int x1, int y0, int y1, int plane)
 	{

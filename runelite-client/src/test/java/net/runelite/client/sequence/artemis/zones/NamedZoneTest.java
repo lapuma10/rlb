@@ -12,9 +12,13 @@ import static org.junit.Assert.assertTrue;
  * Pins {@link NamedZone}'s contract:
  * <ul>
  *   <li>{@code LUMBRIDGE_CASTLE_GROUND_FLOOR} is populated with the
- *       Phase 1A.4d smoke tile set (81 tiles, 9×9). All other zones
- *       remain empty placeholders — their tile sets land with the
- *       script migration that needs them (Phase 5+).</li>
+ *       Phase 1A.4d smoke tile set (81 tiles, 9×9).</li>
+ *   <li>{@code LUMBRIDGE_COW_FIELD} is populated with the Phase 2A
+ *       pilot-provisional tile set (220 tiles, 10×22 covering the
+ *       east-of-Lumbridge F2P cow field). Bounds are provisional —
+ *       see class Javadoc on {@link NamedZone}.</li>
+ *   <li>All other zones remain empty placeholders — their tile sets
+ *       land with the script migration that needs them (Phase 5+).</li>
  *   <li>The returned tile list is immutable — callers cannot mutate
  *       it to forge a route. This holds for both empty and populated
  *       zones.</li>
@@ -35,14 +39,15 @@ public class NamedZoneTest
 	}
 
 	@Test
-	public void onlyLumbridgeCastleGroundFloorIsPopulatedInPhase1A4d()
+	public void onlyExpectedZonesArePopulated()
 	{
-		// Phase 1A.4d ships LUMBRIDGE_CASTLE_GROUND_FLOOR as the smoke
-		// zone (81 tiles). Every other zone stays empty until the
-		// script migration that needs it populates it. Failing this
-		// test means either (a) someone populated a zone they shouldn't
-		// have in this slice, or (b) LUMBRIDGE_CASTLE_GROUND_FLOOR's
-		// bounds shifted — both are real review-worthy changes.
+		// Phase 1A.4d populated LUMBRIDGE_CASTLE_GROUND_FLOOR (81 tiles).
+		// Phase 2A populated LUMBRIDGE_COW_FIELD (220 tiles).
+		// Every other zone stays empty until the script migration that
+		// needs it populates it. Failing this test means either
+		// (a) someone populated a zone they shouldn't have in their
+		// slice, or (b) the bounds of an expected zone shifted —
+		// both are real review-worthy changes.
 		for (NamedZone z : NamedZone.values())
 		{
 			if (z == NamedZone.LUMBRIDGE_CASTLE_GROUND_FLOOR)
@@ -50,11 +55,44 @@ public class NamedZoneTest
 				assertEquals("LUMBRIDGE_CASTLE_GROUND_FLOOR must have its 81-tile smoke set",
 					81, z.tiles().size());
 			}
+			else if (z == NamedZone.LUMBRIDGE_COW_FIELD)
+			{
+				assertEquals("LUMBRIDGE_COW_FIELD must have its 220-tile Phase 2A pilot set",
+					220, z.tiles().size());
+			}
 			else
 			{
 				assertEquals("v1.0 placeholder: " + z + " must ship empty tiles",
 					0, z.tiles().size());
 			}
+		}
+	}
+
+	@Test
+	public void lumbridgeCowFieldIsPopulatedInPhase2()
+	{
+		// Phase 2A ships LUMBRIDGE_COW_FIELD as a 10×22 rectangle =
+		// 220 tiles. Bounds are Phase 2 pilot provisional — see
+		// NamedZone Javadoc.
+		List<WorldPoint> tiles = NamedZone.LUMBRIDGE_COW_FIELD.tiles();
+		assertEquals("expected 10×22 = 220 tiles", 220, tiles.size());
+		assertEquals(0, NamedZone.LUMBRIDGE_COW_FIELD.plane());
+	}
+
+	@Test
+	public void lumbridgeCowFieldTilesArePlane0AndInsideBounds()
+	{
+		// Every tile must lie on plane 0 and within the declared
+		// rectangle x ∈ [3253, 3262], y ∈ [3253, 3274]. Catches a bounds
+		// typo (e.g. y range silently widened) at test time rather than
+		// at pilot-session time.
+		for (WorldPoint p : NamedZone.LUMBRIDGE_COW_FIELD.tiles())
+		{
+			assertEquals("tile " + p + " must be on plane 0", 0, p.getPlane());
+			assertTrue("tile " + p + " x must be in [3253, 3262]",
+				p.getX() >= 3253 && p.getX() <= 3262);
+			assertTrue("tile " + p + " y must be in [3253, 3274]",
+				p.getY() >= 3253 && p.getY() <= 3274);
 		}
 	}
 
