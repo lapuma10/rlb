@@ -422,6 +422,10 @@ public final class StateDrivenEngine implements SequenceEngine {
             && parent instanceof net.runelite.client.sequence.composite.RepeatStepFrame rsf) {
             return rs.onChildPopped(rsf, status);
         }
+        if (parentStep instanceof net.runelite.client.sequence.composite.DynamicStep ds
+            && parent instanceof net.runelite.client.sequence.composite.DynamicStepFrame dsf) {
+            return ds.onChildPopped(dsf, status, snap, blackboard);
+        }
         return new CompositeStep.FinishWithFailure(
             "unknown composite type " + parentStep.getClass().getSimpleName());
     }
@@ -535,6 +539,41 @@ public final class StateDrivenEngine implements SequenceEngine {
             pushFirstChildIfComposite(child, snap);
             return;
         }
+        if (s instanceof net.runelite.client.sequence.composite.DynamicStep ds
+            && composite instanceof net.runelite.client.sequence.composite.DynamicStepFrame dsf) {
+            // Evaluate the caller-supplied factory exactly once per frame.
+            // Null and exceptions become typed Failed completions on the
+            // DynamicStep frame so the orchestrator surfaces them like any
+            // other Failed (same path as Selector's no-eligible-child at
+            // line 518-521).
+            Step generated;
+            try {
+                generated = ds.factory().get();
+            } catch (RuntimeException ex) {
+                String msg = ex.getMessage() == null ? "" : ex.getMessage();
+                Completion.Failed pf = new Completion.Failed(
+                    "DYNAMIC_FACTORY_THREW:" + ex.getClass().getSimpleName() + ":" + msg);
+                composite.setStatus(pf);
+                telemetry.record(rec(composite, TelemetryRecord.Event.FAILED,
+                    "FinishWithFailure: " + pf.reason()));
+                popAndOrchestrate(composite, pf, snap);
+                return;
+            }
+            if (generated == null) {
+                Completion.Failed pf = new Completion.Failed("DYNAMIC_FACTORY_RETURNED_NULL");
+                composite.setStatus(pf);
+                telemetry.record(rec(composite, TelemetryRecord.Event.FAILED,
+                    "FinishWithFailure: " + pf.reason()));
+                popAndOrchestrate(composite, pf, snap);
+                return;
+            }
+            dsf.setMaterializedChild(generated);
+            StepFrame child = makeFrame(generated, composite.getDepth() + 1);
+            frames.push(child);
+            telemetry.record(rec(child, TelemetryRecord.Event.SELECTED, "dynamic body"));
+            pushFirstChildIfComposite(child, snap);
+            return;
+        }
     }
 
     /** Choose the right StepFrame subclass for a Step. Tasks 17–19 add their
@@ -548,6 +587,9 @@ public final class StateDrivenEngine implements SequenceEngine {
         }
         if (s instanceof net.runelite.client.sequence.composite.RepeatStep rs) {
             return new net.runelite.client.sequence.composite.RepeatStepFrame(rs, depth);
+        }
+        if (s instanceof net.runelite.client.sequence.composite.DynamicStep ds) {
+            return new net.runelite.client.sequence.composite.DynamicStepFrame(ds, depth);
         }
         return new StepFrame(s, depth);
     }
