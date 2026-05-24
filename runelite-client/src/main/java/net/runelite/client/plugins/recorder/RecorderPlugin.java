@@ -280,6 +280,39 @@ public class RecorderPlugin extends Plugin
         // reachable only from code.
 
         panel = new RecorderPanel(manager, client, clientThread);
+        // Phase 2C.1 — wire the cow-killer pilot UI to the existing
+        // launch/stop methods. Both lambdas marshal to the client thread
+        // via clientThread.invoke(...) so launch/stop construction work
+        // (including SessionShape's sessionStartTick capture from
+        // client.getTickCount()) never runs on the EDT. Try/catch lives
+        // inside the marshaled lambda where exceptions actually surface;
+        // the panel's EDT actionListener has its own defensive try/catch
+        // that covers only the scheduling-call itself.
+        panel.setCowKillerPilotControls(
+            () -> clientThread.invoke(() ->
+            {
+                try
+                {
+                    launchCowKillerPilot();
+                }
+                catch (RuntimeException ex)
+                {
+                    log.warn("cow-killer pilot launch threw", ex);
+                }
+            }),
+            () -> clientThread.invoke(() ->
+            {
+                try
+                {
+                    stopCowKillerPilot();
+                }
+                catch (RuntimeException ex)
+                {
+                    log.warn("cow-killer pilot stop threw", ex);
+                }
+            }),
+            this::isCowKillerPilotRunning,
+            config::cowKillerPilotEnabled);
         debugOverlay = new DebugOverlay(client);
         loginDebugOverlay = new LoginDebugOverlay(client);
         chickenOverlay = new ChickenOverlay(client, config);
@@ -951,6 +984,22 @@ public class RecorderPlugin extends Plugin
         pilotDispatcher      = null;
         pilotInputOwnership  = null;
         pilotTickInFlight.set(false);
+    }
+
+    /**
+     * Phase 2C.1 — read-only accessor for the panel UI. Returns whether
+     * a cow-killer pilot run is in flight. Backed by the
+     * {@code pilotSequenceManager != null} field-state invariant from
+     * {@link #launchCowKillerPilot()} / {@link #stopCowKillerPilot()}.
+     *
+     * <p>Callable from any thread (EDT for the panel's 500 ms refresh
+     * tick; client thread elsewhere). Worst-case race is a one-tick
+     * stale boolean — cosmetic only. Does NOT expose {@link SequenceManager}
+     * itself; only the boolean is leaked.
+     */
+    public boolean isCowKillerPilotRunning()
+    {
+        return pilotSequenceManager != null;
     }
 
     /**

@@ -113,6 +113,7 @@ import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
+import java.util.function.BooleanSupplier;
 import java.util.function.Consumer;
 import java.util.function.Supplier;
 import javax.annotation.Nullable;
@@ -246,6 +247,18 @@ public final class RecorderPanel extends PluginPanel
     // V3 — trail-network walker version. Lives next to V2 for direct comparison.
     private final JButton v3StartBtn = new JButton("Start");
     private final JButton v3StopBtn = new JButton("Stop");
+    // ──── Phase 2C.1 — Cow Killer pilot (test-only UI) ────
+    // Test-only launch surface for the Phase 2 Artemis cow-killer pilot.
+    // Wired via setCowKillerPilotControls(...); panel stays threading- and
+    // config-agnostic, holding four lambdas instead of references to the
+    // plugin / RecorderConfig directly.
+    private final JButton cowKillerStartBtn = new JButton("Start Cow Killer (pilot)");
+    private final JButton cowKillerStopBtn  = new JButton("Stop Cow Killer (pilot)");
+    private final JLabel cowKillerStatusLabel = new JLabel("Pilot: disabled in config");
+    @Nullable private Runnable cowKillerLaunch;
+    @Nullable private Runnable cowKillerStop;
+    @Nullable private BooleanSupplier cowKillerIsRunning;
+    @Nullable private BooleanSupplier cowKillerIsConfigEnabled;
     // ──── V3 debug controls (walk-testing) ────
     private final javax.swing.JCheckBox v3DebugStopAfterArrivalCb =
         new javax.swing.JCheckBox("Stop after arrival");
@@ -1733,6 +1746,60 @@ public final class RecorderPanel extends PluginPanel
 
         p.add(v3Box);
 
+        // ── Phase 2C.1 — Cow Killer pilot (test-only) ──
+        // Test-only launch surface for the Phase 2 Artemis cow-killer pilot.
+        // Controls are disabled (not hidden) when config flag is off so they
+        // stay discoverable but inert. Config gates Start ONLY — Stop stays
+        // enabled whenever the pilot is running so the operator can always
+        // halt the pilot via the UI even after toggling the config off.
+        JPanel cowKillerBox = new JPanel();
+        cowKillerBox.setLayout(new BoxLayout(cowKillerBox, BoxLayout.Y_AXIS));
+        cowKillerBox.setBorder(BorderFactory.createTitledBorder("Cow Killer pilot (test)"));
+        cowKillerBox.setBackground(ColorScheme.DARK_GRAY_COLOR);
+        cowKillerStatusLabel.setForeground(java.awt.Color.LIGHT_GRAY);
+        cowKillerBox.add(cowKillerStatusLabel);
+        JPanel cowKillerRow = new JPanel(new FlowLayout(FlowLayout.LEFT, 4, 4));
+        cowKillerRow.setBackground(ColorScheme.DARK_GRAY_COLOR);
+        cowKillerRow.add(cowKillerStartBtn);
+        cowKillerRow.add(cowKillerStopBtn);
+        cowKillerBox.add(cowKillerRow);
+        // Default to disabled; updateCowKillerPilotControls() will refresh
+        // every 500 ms via the existing refreshTimer.
+        cowKillerStartBtn.setEnabled(false);
+        cowKillerStopBtn.setEnabled(false);
+        cowKillerStartBtn.addActionListener(e -> {
+            // The lambda is null pre-wiring; defensive guard avoids NPE
+            // if a panel rebuild fires before setCowKillerPilotControls.
+            if (cowKillerLaunch == null) return;
+            try
+            {
+                // Only catches synchronous exceptions from the marshaling
+                // call itself (e.g. null clientThread). Exceptions thrown
+                // later inside the queued client-thread Runnable land on
+                // that thread — caught by the try/catch inside the
+                // marshaled lambda in RecorderPlugin.startUp() wiring.
+                cowKillerLaunch.run();
+            }
+            catch (RuntimeException ex)
+            {
+                log.warn("cow-killer pilot Start scheduling threw", ex);
+                cowKillerStatusLabel.setText("Pilot: launch failed (see log)");
+            }
+        });
+        cowKillerStopBtn.addActionListener(e -> {
+            if (cowKillerStop == null) return;
+            try
+            {
+                cowKillerStop.run();
+            }
+            catch (RuntimeException ex)
+            {
+                log.warn("cow-killer pilot Stop scheduling threw", ex);
+                cowKillerStatusLabel.setText("Pilot: stop failed (see log)");
+            }
+        });
+        p.add(cowKillerBox);
+
         return p;
     }
 
@@ -1843,6 +1910,81 @@ public final class RecorderPanel extends PluginPanel
             restoreTrainingPanelState();
             updateV3Controls();
         });
+    }
+
+    /**
+     * Wire the Phase 2 cow-killer pilot controls. Plugin calls this once
+     * at {@code startUp}; panel stays threading- and config-agnostic.
+     *
+     * @param launch          invoked when Start is clicked. Plugin wraps
+     *                        the real launch in {@code clientThread.invoke(...)}
+     *                        with a client-thread-side try/catch.
+     * @param stop            invoked when Stop is clicked. Same shape.
+     * @param isRunning       returns {@code pilotSequenceManager != null}.
+     *                        Read every 500 ms by the refresh tick.
+     * @param isConfigEnabled returns {@code config.cowKillerPilotEnabled()}.
+     *                        Gates the Start button only; Stop stays enabled
+     *                        whenever {@code isRunning} returns true so the
+     *                        operator can always halt a running pilot.
+     */
+    public void setCowKillerPilotControls(Runnable launch, Runnable stop,
+        BooleanSupplier isRunning, BooleanSupplier isConfigEnabled)
+    {
+        this.cowKillerLaunch = launch;
+        this.cowKillerStop = stop;
+        this.cowKillerIsRunning = isRunning;
+        this.cowKillerIsConfigEnabled = isConfigEnabled;
+        SwingUtilities.invokeLater(this::updateCowKillerPilotControls);
+    }
+
+    /**
+     * Refresh the cow-killer pilot button enabled-state + status label.
+     * Called from {@link #refresh()} every 500 ms. Safe to call from EDT.
+     *
+     * <p>Rules ({@code config} = config flag, {@code running} = pilot
+     * actually running):
+     * <ul>
+     *   <li>config off, idle      → Start disabled, Stop disabled,
+     *       label "Pilot: disabled in config"</li>
+     *   <li>config on, idle       → Start enabled,  Stop disabled,
+     *       label "Pilot: idle"</li>
+     *   <li>config on, running    → Start disabled, Stop enabled,
+     *       label "Pilot: running"</li>
+     *   <li>config off, running   → Start disabled, Stop enabled,
+     *       label "Pilot: running (config disabled — Stop still
+     *       available)"</li>
+     * </ul>
+     * Config gates Start ONLY. Stop is gated by {@code running} alone so
+     * a config toggle never strands a running pilot.
+     */
+    private void updateCowKillerPilotControls()
+    {
+        if (cowKillerIsRunning == null || cowKillerIsConfigEnabled == null)
+        {
+            // Pre-wiring (panel constructed before plugin startUp finishes
+            // calling setCowKillerPilotControls). Keep defaults.
+            cowKillerStartBtn.setEnabled(false);
+            cowKillerStopBtn.setEnabled(false);
+            return;
+        }
+        boolean configOn = cowKillerIsConfigEnabled.getAsBoolean();
+        boolean running = cowKillerIsRunning.getAsBoolean();
+        cowKillerStartBtn.setEnabled(configOn && !running);
+        cowKillerStopBtn.setEnabled(running);   // NOT gated by config
+        if (running)
+        {
+            cowKillerStatusLabel.setText(configOn
+                ? "Pilot: running"
+                : "Pilot: running (config disabled — Stop still available)");
+        }
+        else if (configOn)
+        {
+            cowKillerStatusLabel.setText("Pilot: idle");
+        }
+        else
+        {
+            cowKillerStatusLabel.setText("Pilot: disabled in config");
+        }
     }
 
     /** Restore the saved training-tab UI selection for the active
@@ -3840,6 +3982,8 @@ public final class RecorderPanel extends PluginPanel
 
     private void refresh()
     {
+        // Phase 2C.1 — cow-killer pilot UI state (cheap; idempotent).
+        updateCowKillerPilotControls();
         // If the user has just logged in (or switched accounts), pull the
         // saved training plan for that account into the panel. Cheap — a
         // no-op when the username hasn't changed since the last call.

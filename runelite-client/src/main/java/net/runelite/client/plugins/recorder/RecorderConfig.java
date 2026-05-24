@@ -501,4 +501,31 @@ public interface RecorderConfig extends Config
 	{
 		return false;
 	}
+
+	// ── Phase 2C.1 — Cow Killer pilot (test) ────────────────────────
+	// Test-only launch surface for the Phase 2 Artemis cow-killer pilot.
+	// Default off. When on, the recorder panel shows Start/Stop controls.
+
+	@ConfigSection(
+		name = "Cow Killer pilot (test)",
+		description = "Phase 2 Artemis cow-killer pilot — test-only launch surface. " +
+			"Do not enable on production accounts.",
+		position = 250,
+		closedByDefault = true
+	)
+	String cowKillerPilotSection = "cowKillerPilot";
+
+	@ConfigItem(
+		keyName = "cowKillerPilotEnabled",
+		name = "Enable Cow Killer pilot (test)",
+		description = "When on, the recorder panel shows Start/Stop controls for the " +
+			"Phase 2 Artemis cow-killer pilot. Pilot is test-only — do not enable " +
+			"on production accounts. Default off.",
+		section = cowKillerPilotSection,
+		position = 0
+	)
+	default boolean cowKillerPilotEnabled()
+	{
+		return false;
+	}
 }
