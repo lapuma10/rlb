@@ -43,6 +43,8 @@ sequence/
     LinearSequence.java        run children in order; fail-fast
     Selector.java              try children until one succeeds
     RepeatStep.java            run body N times (or until failure)
+    DynamicStep.java           materialize child Step at execution time
+    FailStep.java              leaf step: check() always returns Failed(reason)
 
   views/
     InventoryView.java         size, freeSlots, count(itemId)
@@ -218,6 +220,24 @@ approach B" patterns.
 (`times > 0`) or until the body fails (`times == 0`, infinite). Fails
 immediately if the body returns `Failed`. Used to wrap a banking sequence in a
 cooking loop: `new RepeatStep("CookLoop", bankSequence, 0)`.
+
+**`DynamicStep`** (`composite/DynamicStep.java`) materializes its child Step
+at execution time via a caller-supplied `Supplier<Step>`. The bridge between
+synchronous Artemis read methods (which return `Optional<...Ref>`, not Step)
+and Artemis action methods (which need a pre-resolved ref). Engine evaluates
+the factory in `pushFirstChildIfComposite`; a `null` factory result fails the
+frame with `DYNAMIC_FACTORY_RETURNED_NULL`, a thrown exception fails with
+`DYNAMIC_FACTORY_THREW:<class>:<message>`. Per-execution state lives in
+`DynamicStepFrame`, so the same `DynamicStep` instance inside a `RepeatStep`
+gets a fresh child every iteration. Example:
+`DynamicStep.of("find-and-attack", () -> { Optional<NpcRef> n = artemis.findNpc(q);
+return n.isPresent() ? artemis.click(n.get(), "Attack") : FailStep.of("NO_TARGET"); })`.
+
+**`FailStep`** (`composite/FailStep.java`) is a leaf step whose `check()`
+returns `Completion.Failed(reason)` immediately and whose `onFailure(...)`
+returns `Recovery.Abort(reason)`. Definitive failure utility — used by
+`DynamicStep` factories to express "no target found" without reaching into
+engine internals.
 
 ## 9. Telemetry
 
