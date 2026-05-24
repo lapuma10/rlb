@@ -25,8 +25,10 @@
 package net.runelite.client.plugins.recorder;
 
 import com.google.inject.Provides;
+import javax.annotation.Nullable;
 import javax.inject.Inject;
 import java.io.File;
+import java.util.concurrent.atomic.AtomicBoolean;
 import lombok.extern.slf4j.Slf4j;
 import net.runelite.api.Client;
 import net.runelite.api.GameState;
@@ -60,6 +62,7 @@ import net.runelite.client.plugins.recorder.annotator.AnnotatorHudOverlay;
 import net.runelite.client.plugins.recorder.annotator.AreaSelector;
 import net.runelite.client.plugins.recorder.scripts.ChickenFarmV2Script;
 import net.runelite.client.plugins.recorder.scripts.CooksAssistantScript;
+import net.runelite.client.plugins.recorder.scripts.CowKillerScript;
 import net.runelite.client.plugins.recorder.scripts.GrandExchangeScript;
 import net.runelite.client.plugins.recorder.scripts.PieDishScript;
 import net.runelite.client.plugins.recorder.scripts.PizzaScript;
@@ -67,6 +70,7 @@ import net.runelite.client.plugins.recorder.scripts.UltraCompostScript;
 import net.runelite.api.coords.WorldArea;
 import net.runelite.client.plugins.recorder.scripts.LumbridgeBankPenScript;
 import net.runelite.client.plugins.recorder.nav.NavigatorFactory;
+import net.runelite.client.plugins.recorder.nav.v21.V21Navigator;
 import net.runelite.client.plugins.recorder.trail.TrailRecorder;
 import net.runelite.client.plugins.recorder.trail.TrailRegistry;
 import net.runelite.client.plugins.recorder.trail.TrailWalker;
@@ -89,6 +93,7 @@ import net.runelite.client.plugins.recorder.debug.TileMarker;
 import net.runelite.client.plugins.recorder.hotkey.HotkeyHandler;
 import net.runelite.client.plugins.recorder.mining.MiningLoop;
 import net.runelite.client.plugins.recorder.session.AccountRng;
+import net.runelite.client.plugins.recorder.session.RecorderLogoutAction;
 import net.runelite.client.plugins.recorder.session.SessionDirectory;
 import net.runelite.client.plugins.recorder.session.SessionShape;
 import net.runelite.client.plugins.recorder.session.SessionStore;
@@ -98,10 +103,13 @@ import net.runelite.client.plugins.recorder.nav.v2.ObjectDebugOverlay;
 import net.runelite.client.plugins.recorder.nav.v2.V2PathOverlay;
 import net.runelite.client.plugins.recorder.trail.TrailOverlay;
 import net.runelite.client.plugins.recorder.transport.RouteOverlay;
+import net.runelite.client.sequence.SequenceManager;
+import net.runelite.client.sequence.Step;
 import net.runelite.client.sequence.artemis.Artemis;
 import net.runelite.client.sequence.artemis.ArtemisDeps;
 import net.runelite.client.sequence.artemis.ArtemisImpl;
 import net.runelite.client.sequence.dispatch.HumanizedInputDispatcher;
+import net.runelite.client.sequence.internal.ClientObserver;
 import net.runelite.client.sequence.dispatch.InputOwnership;
 import net.runelite.client.sequence.login.CredentialStore;
 import net.runelite.client.sequence.login.EncryptedFileCredentialStore;
@@ -140,13 +148,25 @@ public class RecorderPlugin extends Plugin
     @Inject private ConfigManager configManager;
 
     private RecorderManager manager;
-    /** Phase 2B: Artemis facade for new pilot scripts (Phase 2 cow killer
-     *  first). Constructed once at startUp from existing plugin
-     *  dependencies. Navigator and LogoutAction are left null at 2B —
-     *  walkTo() / logout() will fail loud until a later slice wires
-     *  real implementations. See {@code ArtemisDeps} Javadoc for the
-     *  nullable-field contract. */
-    private Artemis artemis;
+
+    // ── Phase 2B.1.b — Cow-killer pilot launch state. ────────────────
+    // All fields null when no pilot run is active. Assigned only after
+    // CowKillerScript.plan() returns a real Step (i.e. from 2C onward;
+    // 2B.1 plan() throws and the launch aborts before field assignment).
+    // stopCowKillerPilot() nulls them all back. See launchCowKillerPilot()
+    // for the construction order + failure-safety reasoning.
+    /** Owner token for {@link #pilotInputOwnership}; nulled in
+     *  {@code stopCowKillerPilot()} alongside the lease. */
+    static final String PILOT_OWNER_TOKEN = "cow-killer-pilot";
+    @Nullable private SequenceManager pilotSequenceManager;
+    @Nullable private V21Navigator pilotV21Navigator;
+    @Nullable private HumanizedInputDispatcher pilotDispatcher;
+    @Nullable private InputOwnership pilotInputOwnership;
+    /** Re-entry guard mirroring {@code GrandExchangeScript.scheduleEngineTick()}
+     *  at GrandExchangeScript.java:471, 478 — prevents two ticks from
+     *  racing on a slow client tick. */
+    private final AtomicBoolean pilotTickInFlight = new AtomicBoolean(false);
+
     private RecorderPanel panel;
     private NavigationButton navButton;
     private MouseCapture mouseCapture;
@@ -252,35 +272,12 @@ public class RecorderPlugin extends Plugin
         manager = new RecorderManager(client, config, eventCapture,
             mouseCapture, keyCapture, focusCapture, sessions, itemManager, clientThread);
 
-        // Phase 2B Artemis wiring. ArtemisDeps fields:
-        //   client, clientThread       — injected above.
-        //   AccountRng                 — fresh per plugin instance; reads
-        //                                client.getAccountHash() at every
-        //                                seed() call so it tracks login.
-        //   SessionShape               — Long.MAX_VALUE tick budget = no
-        //                                runtime-side gate today. Phase 0B
-        //                                wires the real daily budget + a
-        //                                BreakScheduler-backed last-break
-        //                                supplier.
-        //   itemManager, manager       — already constructed.
-        //   navigator, logoutAction    — null at 2B. walkTo/logout fail
-        //                                loud (WalkStepBase.java:205,
-        //                                LogoutStep.java:107) per the
-        //                                ArtemisDeps nullable contract.
-        //                                Wired in a later slice alongside
-        //                                the pilot's launch path.
-        artemis = new ArtemisImpl(new ArtemisDeps(
-            client,
-            clientThread,
-            new AccountRng(client),
-            new SessionShape(
-                () -> client.getTickCount(),
-                () -> client.getTickCount(),
-                Long.MAX_VALUE),
-            itemManager,
-            manager,
-            null,
-            null));
+        // Phase 2B.1.b — Artemis is no longer constructed at startUp.
+        // The cow-killer pilot builds its own ArtemisImpl + per-run
+        // dependencies inside launchCowKillerPilot(). See that method
+        // for the full per-pilot-run wiring. UI to trigger a launch
+        // lands in 2C.1; in this slice launchCowKillerPilot() is
+        // reachable only from code.
 
         panel = new RecorderPanel(manager, client, clientThread);
         debugOverlay = new DebugOverlay(client);
@@ -809,6 +806,206 @@ public class RecorderPlugin extends Plugin
         log.info("Recorder plugin started");
     }
 
+    // ── Phase 2B.1.b — Cow-killer pilot launch path ─────────────────
+    // No UI surface in this slice. Reachable only from code; UI button +
+    // RecorderConfig flag land in 2C.1, after CowKillerScript.plan()
+    // returns a real Step (today it throws by design).
+
+    /**
+     * Launch the Phase 2 cow-killer pilot. Builds a per-pilot-run
+     * {@link SequenceManager} + {@link ArtemisImpl} + dedicated
+     * {@link V21Navigator} + {@link HumanizedInputDispatcher} +
+     * {@link RecorderLogoutAction}, then asks {@link CowKillerScript} to
+     * compose a {@link Step} via {@code plan()} and starts the engine.
+     *
+     * <p><b>Failure-safe construction order</b>: locals first, then
+     * {@code script.plan()} inside a try/catch — on {@link RuntimeException}
+     * (which {@code plan()} currently throws by design at 2B.1), the
+     * locals are cleaned up and NO plugin field is assigned. Only after
+     * {@code plan()} returns successfully are the {@code pilot*} fields
+     * written. If {@code SequenceManager.run(root)} throws after field
+     * assignment, {@link #stopCowKillerPilot()} runs the full teardown.
+     *
+     * <p>Double-start: refused with a logged warn when
+     * {@code pilotSequenceManager != null}.
+     *
+     * <p>Mirrors the canonical {@code SequenceManager} construction
+     * pattern from {@code GrandExchangeScript.buildGeManager()} at
+     * GrandExchangeScript.java:461-468 — same Observer
+     * ({@code new ClientObserver(client)}), same scheduler hop, same
+     * input-ownership wiring.
+     */
+    void launchCowKillerPilot()
+    {
+        if (pilotSequenceManager != null)
+        {
+            log.warn("cow-killer pilot launch ignored — a run is already in flight");
+            return;
+        }
+
+        // 1. Build all locals first — no field assignment yet.
+        HumanizedInputDispatcher dispatcher =
+            new HumanizedInputDispatcher(client, clientThread);
+        V21Navigator navigator = buildV21Navigator(dispatcher);
+        InputOwnership inputOwnership = new InputOwnership();
+        RecorderLogoutAction logoutAction = new RecorderLogoutAction(client);
+        AccountRng accountRng = new AccountRng(client);
+        // SessionShape: Long.MAX_VALUE = no runtime gate. Acceptable
+        // for the supervised Tier 1 acceptance run (≤30 min, operator
+        // stops manually). Phase 0B wires a real daily tick budget +
+        // BreakScheduler-backed last-break supplier; v1.0-lock 2-hour
+        // signoff blocks on that, not on this slice.
+        SessionShape session = new SessionShape(
+            () -> client.getTickCount(),
+            () -> client.getTickCount(),
+            Long.MAX_VALUE);
+        Artemis artemis = new ArtemisImpl(new ArtemisDeps(
+            client, clientThread,
+            accountRng, session,
+            itemManager, manager,
+            navigator, logoutAction));
+        CowKillerScript script = new CowKillerScript(artemis);
+
+        // 2. plan() is the only throw point in 2B.1. Catch BEFORE any
+        //    field assignment so a failed launch leaves zero state.
+        Step root;
+        try
+        {
+            root = script.plan();
+        }
+        catch (RuntimeException ex)
+        {
+            log.warn("cow-killer pilot launch aborted in plan(): {}: {}",
+                ex.getClass().getSimpleName(), ex.getMessage());
+            cleanupPilotLocals(navigator, inputOwnership, null);
+            return;
+        }
+
+        // 3. plan() succeeded. Build SequenceManager + acquire lease.
+        SequenceManager mgr = SequenceManager.withDefaults();
+        mgr.setObserver(new ClientObserver(client));
+        mgr.setDispatcher(dispatcher);
+        mgr.setScheduler(clientThread::invoke);
+        if (!inputOwnership.tryAcquire(PILOT_OWNER_TOKEN))
+        {
+            log.warn("cow-killer pilot launch aborted — InputOwnership.tryAcquire failed");
+            cleanupPilotLocals(navigator, inputOwnership, null);
+            return;
+        }
+        mgr.setInputOwnership(inputOwnership, PILOT_OWNER_TOKEN);
+
+        // 4. Field assignment AFTER every could-throw call has returned.
+        pilotSequenceManager = mgr;
+        pilotV21Navigator    = navigator;
+        pilotDispatcher      = dispatcher;
+        pilotInputOwnership  = inputOwnership;
+        pilotTickInFlight.set(false);
+
+        // 5. Run. If this throws, fields are assigned → full teardown.
+        try
+        {
+            mgr.run(root);
+        }
+        catch (RuntimeException ex)
+        {
+            log.warn("cow-killer pilot SequenceManager.run() threw: {}: {}",
+                ex.getClass().getSimpleName(), ex.getMessage());
+            stopCowKillerPilot();
+        }
+    }
+
+    /**
+     * Stop any in-flight cow-killer pilot run and release every per-run
+     * resource. Idempotent — no-op when no run is active. Safe to call
+     * from {@link #shutDown()} unconditionally.
+     *
+     * <p>Each cleanup step is wrapped so one failure does not block the
+     * others. Order: stop SequenceManager (so the engine stops calling
+     * {@code nav.tick()}) → cancel V21Navigator state → release the
+     * InputOwnership lease → null all fields.
+     */
+    void stopCowKillerPilot()
+    {
+        if (pilotSequenceManager != null)
+        {
+            try { pilotSequenceManager.stop(); }
+            catch (Throwable t) { log.warn("cow-killer pilot: SequenceManager.stop threw", t); }
+        }
+        if (pilotV21Navigator != null)
+        {
+            try { pilotV21Navigator.cancel(); }
+            catch (Throwable t) { log.warn("cow-killer pilot: V21Navigator.cancel threw", t); }
+        }
+        if (pilotInputOwnership != null)
+        {
+            try { pilotInputOwnership.release(PILOT_OWNER_TOKEN); }
+            catch (Throwable t) { log.warn("cow-killer pilot: InputOwnership.release threw", t); }
+        }
+        // HumanizedInputDispatcher: no explicit close — mirrors the 14
+        // existing dispatcher instances in this file, none of which are
+        // released. Daemon threads die with the JVM; in-flight requests
+        // finish naturally; subsequent dispatches stop because the
+        // SequenceManager has stopped.
+        pilotSequenceManager = null;
+        pilotV21Navigator    = null;
+        pilotDispatcher      = null;
+        pilotInputOwnership  = null;
+        pilotTickInFlight.set(false);
+    }
+
+    /**
+     * Pre-field-assignment cleanup path. Called from
+     * {@link #launchCowKillerPilot()} when {@code script.plan()} or
+     * {@code InputOwnership.tryAcquire(...)} fails — i.e. before any
+     * {@code pilot*} field has been written. Defensive even though
+     * neither resource has been "registered" with anything stateful yet.
+     */
+    private void cleanupPilotLocals(@Nullable V21Navigator nav,
+        @Nullable InputOwnership io,
+        @Nullable String token)
+    {
+        if (nav != null)
+        {
+            try { nav.cancel(); }
+            catch (Throwable t) { log.warn("cow-killer pilot: nav.cancel threw in cleanupLocals", t); }
+        }
+        if (io != null && token != null)
+        {
+            try { io.release(token); }
+            catch (Throwable t) { log.warn("cow-killer pilot: io.release threw in cleanupLocals", t); }
+        }
+    }
+
+    /**
+     * Drive {@code pilotSequenceManager}'s engine forward by one tick.
+     * Scheduled from {@link #onGameTick(GameTick)} via
+     * {@link ClientThread#invokeLater} so {@code engine.advanceTick()}
+     * runs on the client thread — the same pattern
+     * {@code GrandExchangeScript.scheduleEngineTick()} uses at
+     * GrandExchangeScript.java:470-481. The {@link #pilotTickInFlight}
+     * AtomicBoolean is the re-entry guard; a second GameTick that
+     * arrives before the first {@code advanceTick} completes is dropped.
+     */
+    private void advancePilotEngineOnNextClientTick()
+    {
+        if (!pilotTickInFlight.compareAndSet(false, true)) return;
+        clientThread.invokeLater(() ->
+        {
+            try
+            {
+                SequenceManager mgr = pilotSequenceManager;
+                if (mgr != null && mgr.getEngine() != null)
+                {
+                    mgr.getEngine().advanceTick();
+                }
+            }
+            finally
+            {
+                pilotTickInFlight.set(false);
+            }
+        });
+    }
+
     /** Build a per-script v2.1 reactive Navigator. Uses the script's own
      *  dispatcher so its busy flag isn't contended. v2.1 has no shared
      *  planner — each tick reads the live scene/collision via its own
@@ -962,6 +1159,10 @@ public class RecorderPlugin extends Plugin
     @Override
     protected void shutDown()
     {
+        // Phase 2B.1.b — stop any in-flight cow-killer pilot run first
+        // so its engine doesn't tick once we start tearing dependencies
+        // down. No-op when no run is active.
+        stopCowKillerPilot();
         if (sessionTracker != null) {
             eventBus.unregister(sessionTracker);
             sessionTracker.onShutdown();
@@ -1065,6 +1266,14 @@ public class RecorderPlugin extends Plugin
     @Subscribe
     public void onGameTick(GameTick e)
     {
+        // Phase 2B.1.b — drive the cow-killer pilot engine when a run
+        // is active. No-op when pilotSequenceManager == null. Mirrors
+        // GrandExchangeScript.onGameTick + scheduleEngineTick at
+        // GrandExchangeScript.java:386-418, 470-481.
+        if (pilotSequenceManager != null)
+        {
+            advancePilotEngineOnNextClientTick();
+        }
         if (wmConfig == null) return;
         if (++tickCounter % wmConfig.scrapeEveryNTicks != 0) return;
         long now = System.currentTimeMillis();

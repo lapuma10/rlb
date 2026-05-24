@@ -37,17 +37,38 @@
 **Construction shape (in `launchCowKillerPilot()` — pseudocode):**
 
 ```
+// 1. Build all locals first — NOTHING assigned to plugin fields yet.
+HumanizedInputDispatcher dispatcher = new HumanizedInputDispatcher(client, clientThread);
+V21Navigator navigator              = buildV21Navigator(dispatcher);
+RecorderLogoutAction logoutAction   = new RecorderLogoutAction(client);
+// ... (ArtemisDeps + ArtemisImpl + CowKillerScript construction omitted) ...
+
+// 2. plan() is the only throw point in 2B.1. Catch it BEFORE any
+//    field assignment so a failed launch leaves zero pilot state behind.
+Step root;
+try {
+    root = cowKillerScript.plan();
+} catch (RuntimeException ex) {
+    cleanupLocals(navigator, /* inputOwnership */ null, /* token */ null);
+    return;   // fields never assigned; nothing to roll back
+}
+
+// 3. Only after plan() succeeds, build SequenceManager + acquire input
+//    ownership. Verified production pattern from GrandExchangeScript
+//    .buildGeManager() at GrandExchangeScript.java:461-468.
 SequenceManager mgr = SequenceManager.withDefaults();
-mgr.setObserver(observer);          // plugin builds a tick-driven Observer
-mgr.setDispatcher(dispatcher);      // plugin builds a HumanizedInputDispatcher for the pilot
+mgr.setObserver(new ClientObserver(client));   // production Observer; reused, not new
+mgr.setDispatcher(dispatcher);
 mgr.setScheduler(clientThread::invoke);
-// observer + dispatcher + telemetry + planner + blackboard → engine auto-built
-// per SequenceManager.rebuildEngineIfReady() at :99-112
+mgr.setInputOwnership(inputOwnership, "cow-killer-pilot");
+
+// 4. Field assignment is the LAST step before run(); after this point
+//    a thrown exception requires stopCowKillerPilot() teardown.
 pilotSequenceManager = mgr;
-mgr.run(cowKillerScript.plan());    // throws UnsupportedOperationException at 2B.1
-                                    // (intentional — proves the wiring reaches
-                                    // CowKillerScript.plan() before 2C swaps the
-                                    // body); will return Step once 2C lands.
+pilotV21Navigator    = navigator;
+pilotDispatcher      = dispatcher;
+// ...
+mgr.run(root);
 ```
 
 **Observer + Dispatcher concrete choice:** the existing `HumanizedInputDispatcher` instances the plugin builds for ChickenFarmV3 (`RecorderPlugin.java:644-665` area) are per-script. The pilot needs its own dispatcher + observer with non-conflicting `InputOwnership` token to avoid contending with running production scripts. Decision: build a **dedicated pilot-only dispatcher + observer pair** in `launchCowKillerPilot()` using the same helper patterns the V3 script uses.
@@ -117,7 +138,7 @@ CowKillerScript script = new CowKillerScript(artemis);
 // ... SequenceManager construction per §1 ...
 ```
 
-**Cleanup on stop:** `V21Navigator` exposes worker-stop methods (existing — used by V3 stop button). `stopCowKillerPilot()` calls them after `pilotSequenceManager.stop()` to release the navigator's worker thread.
+**Cleanup on stop:** `V21Navigator` does NOT own a worker thread — it is tick-driven via `Navigator.tick(NavRequest)` calls. The cleanup hook is `cancel()` (`V21Navigator.java:1042`), which resets internal state (`activeRequest`, `activeGoal`, `lastPlayerTile`, `stallTicks`, solver state, etc.). `stopCowKillerPilot()` calls `pilotSequenceManager.stop()` FIRST (so the engine stops calling `nav.tick()`), then `pilotV21Navigator.cancel()` to reset state for any subsequent launch.
 
 ---
 
@@ -387,7 +408,7 @@ No code; documentation + operator validation only.
 
 - [x] Plan size within `feedback_compact_plans` 300-700 budget (this is ~580 lines including tables).
 - [x] No full Java sources pasted — pseudocode + behavioral specs only.
-- [x] APIs verified before referencing: `SequenceManager.run(Step)` at `SequenceManager.java:116`; `SequenceManager.stop()` at `:119`; `SequenceManager.setScheduler(...)` at `:114`; `LogoutHelper.tryLogout()` blocking pattern at `LogoutHelper.java:95-107`; `LogoutAction` interface contract at `LogoutAction.java:50-57`; `buildV21Navigator` signature at `RecorderPlugin.java:823`; `RecorderConfig.cowKillerPilotEnabled` does not yet exist (this slice adds it).
+- [x] APIs verified before referencing: `SequenceManager.run(Step)` at `SequenceManager.java:116`; `SequenceManager.stop()` at `:119`; `SequenceManager.setScheduler(...)` at `:114`; `LogoutHelper.tryLogout()` blocking pattern at `LogoutHelper.java:95-107`; `LogoutAction` interface contract at `LogoutAction.java:50-57`; `buildV21Navigator` signature at `RecorderPlugin.java:823`; `V21Navigator.cancel()` at `V21Navigator.java:1042` (no worker thread — tick-driven only); `ClientObserver` single-arg constructor at `ClientObserver.java:76-78` (the production Observer the GE script reuses); canonical SequenceManager construction at `GrandExchangeScript.buildGeManager()` (`GrandExchangeScript.java:461-468`). **`RecorderConfig.cowKillerPilotEnabled` is NOT added in 2B.1 — it lands in 2C.1 after `CowKillerScript.plan()` returns a real Step.**
 - [x] Decision-only — no implementation, no TDD tasks, no Bash commands run as part of the plan itself.
 - [x] Five decisions explicitly answered + grounded in the user's preferred directions.
 - [x] Slicing rationale stated; not arbitrary.
