@@ -44,6 +44,7 @@ import net.runelite.client.sequence.activities.script.LogoutStep;
 import net.runelite.client.sequence.activities.script.TakeGroundItemStep;
 import net.runelite.client.sequence.activities.script.UseOnStep;
 import net.runelite.client.sequence.activities.script.WalkToWorldPointStep;
+import net.runelite.client.sequence.activities.script.WalkToZoneStep;
 import net.runelite.client.sequence.artemis.outcome.OutcomeCheck;
 import net.runelite.client.sequence.artemis.query.ItemQuery;
 import net.runelite.client.sequence.artemis.query.NpcQuery;
@@ -63,16 +64,16 @@ import net.runelite.client.sequence.artemis.zones.NamedZone;
 import net.runelite.client.sequence.composite.SequencePlanBuilder;
 
 /**
- * Phase 1A.3 / 1A.4a / 1A.4b / 1A.4c implementation of {@link Artemis}.
+ * Phase 1A.3 / 1A.4a / 1A.4b / 1A.4c / 1A.4d implementation of {@link Artemis}.
  * Read methods marshal to the client thread and apply per-query
  * {@code RotationPolicy} (Phase 1A.2). Action methods {@code click(...)},
  * {@code take(GroundItemRef)}, {@code useOn(InvSlot, ...)} return Step
  * subclasses under {@code sequence/activities/script/} (Phase 1A.3).
  * {@code idle(IdlePolicy)} and {@code logout()} return maintenance Steps
- * (Phase 1A.4b). {@code walkTo(WorldPoint)} returns a daemon-worker-driven
- * navigation Step (Phase 1A.4c). {@code walkTo(NamedZone)} and {@code
- * plan(...)} still throw {@link UnsupportedOperationException} — they
- * land in 1A.4d (NamedZone) + 1A.4e (plan).
+ * (Phase 1A.4b). {@code walkTo(WorldPoint)} and {@code walkTo(NamedZone)}
+ * return daemon-worker-driven navigation Steps sharing
+ * {@code WalkStepBase} (Phase 1A.4c/d). Only {@code plan(...)} still
+ * throws {@link UnsupportedOperationException} — it lands in 1A.4e.
  *
  * <p>Phase 1A.4a introduced {@link ArtemisDeps} as the sole constructor
  * argument so the surface stays one parameter as new engine pieces land
@@ -401,7 +402,8 @@ public final class ArtemisImpl implements Artemis
 	// ── ACTIONS ─────────────────────────────────────────────────────
 	// click / take / useOn implemented in Phase 1A.3. idle / logout
 	// implemented in Phase 1A.4b. walkTo(WorldPoint) implemented in
-	// Phase 1A.4c. walkTo(NamedZone) and plan(...) still throw.
+	// Phase 1A.4c. walkTo(NamedZone) implemented in Phase 1A.4d.
+	// Only plan(...) still throws.
 
 	@Override
 	public Step walkTo(WorldPoint target)
@@ -409,7 +411,11 @@ public final class ArtemisImpl implements Artemis
 		return new WalkToWorldPointStep(this, stepEventSink, target, navigator);
 	}
 
-	@Override public Step walkTo(NamedZone zone)                  { return notInPhase1A4c("walkTo(NamedZone)"); }
+	@Override
+	public Step walkTo(NamedZone zone)
+	{
+		return new WalkToZoneStep(this, stepEventSink, zone, navigator, selector);
+	}
 
 	@Override
 	public Step click(NpcRef target, String verb)
@@ -498,21 +504,15 @@ public final class ArtemisImpl implements Artemis
 		// via .then(...) come from action methods. The composition wrapper
 		// itself lands in Phase 1A.4e; until then, this throws so plan(...)
 		// chains fail loud rather than silently constructing a broken plan.
-		return notInPhase1A4cBuilder("plan(\"" + name + "\")");
+		return notInPhase1A4dBuilder("plan(\"" + name + "\")");
 	}
 
-	private static Step notInPhase1A4c(String surface)
+	private static SequencePlanBuilder notInPhase1A4dBuilder(String surface)
 	{
 		throw new UnsupportedOperationException(
-			"Artemis." + surface + " lands in Phase 1A.4d — Phase 1A.4c implemented walkTo(WorldPoint) only. "
-				+ "walkTo(NamedZone) follows in 1A.4d (needs NamedZone tile population); "
-				+ "plan(...) follows in 1A.4e.");
-	}
-
-	private static SequencePlanBuilder notInPhase1A4cBuilder(String surface)
-	{
-		throw new UnsupportedOperationException(
-			"Artemis." + surface + " composition wires up in Phase 1A.4e.");
+			"Artemis." + surface + " composition wires up in Phase 1A.4e — "
+				+ "Phase 1A.4d implemented walkTo(NamedZone). plan(...) is the only "
+				+ "remaining stub.");
 	}
 
 	// ── INTERNAL FILTERS / TILE SCANS ───────────────────────────────

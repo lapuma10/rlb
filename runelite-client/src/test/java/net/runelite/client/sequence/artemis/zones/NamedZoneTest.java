@@ -11,12 +11,13 @@ import static org.junit.Assert.assertTrue;
 /**
  * Pins {@link NamedZone}'s contract:
  * <ul>
- *   <li>v1.0 placeholder: every zone's {@code tiles()} returns an
- *       empty list (so unpopulated-zone walkTo fails immediately
- *       rather than routing wrong-place).</li>
+ *   <li>{@code LUMBRIDGE_CASTLE_GROUND_FLOOR} is populated with the
+ *       Phase 1A.4d smoke tile set (81 tiles, 9×9). All other zones
+ *       remain empty placeholders — their tile sets land with the
+ *       script migration that needs them (Phase 5+).</li>
  *   <li>The returned tile list is immutable — callers cannot mutate
- *       it to forge a route. This holds for the v1.0 empty list AND
- *       must hold for any real tile set that lands later.</li>
+ *       it to forge a route. This holds for both empty and populated
+ *       zones.</li>
  *   <li>Every zone declares a plane.</li>
  *   <li>The reconciled v1 set (per spec §9) includes LUMBRIDGE_BANK
  *       and LUMBRIDGE_BANK_P2 — the round-4 reconciliation addition.</li>
@@ -34,15 +35,26 @@ public class NamedZoneTest
 	}
 
 	@Test
-	public void everyZoneTileListIsEmptyInV1Placeholder()
+	public void onlyLumbridgeCastleGroundFloorIsPopulatedInPhase1A4d()
 	{
-		// v1.0 ships empty placeholder tile lists per the NamedZone
-		// class Javadoc + spec §9 reconciliation note. Real tile sets
-		// land before walkTo(NamedZone) is wired in Phase 1A.4.
+		// Phase 1A.4d ships LUMBRIDGE_CASTLE_GROUND_FLOOR as the smoke
+		// zone (81 tiles). Every other zone stays empty until the
+		// script migration that needs it populates it. Failing this
+		// test means either (a) someone populated a zone they shouldn't
+		// have in this slice, or (b) LUMBRIDGE_CASTLE_GROUND_FLOOR's
+		// bounds shifted — both are real review-worthy changes.
 		for (NamedZone z : NamedZone.values())
 		{
-			assertEquals("v1.0 placeholder: " + z + " must ship empty tiles",
-				0, z.tiles().size());
+			if (z == NamedZone.LUMBRIDGE_CASTLE_GROUND_FLOOR)
+			{
+				assertEquals("LUMBRIDGE_CASTLE_GROUND_FLOOR must have its 81-tile smoke set",
+					81, z.tiles().size());
+			}
+			else
+			{
+				assertEquals("v1.0 placeholder: " + z + " must ship empty tiles",
+					0, z.tiles().size());
+			}
 		}
 	}
 

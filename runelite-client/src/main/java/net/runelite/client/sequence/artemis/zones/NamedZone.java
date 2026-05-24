@@ -1,5 +1,6 @@
 package net.runelite.client.sequence.artemis.zones;
 
+import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
 import net.runelite.api.coords.WorldPoint;
@@ -9,18 +10,17 @@ import net.runelite.api.coords.WorldPoint;
  * tile from {@link #tiles()} per the zone's default rotation
  * (UniformWithinRange per spec §7).
  *
- * <p><b>v1.0 placeholder state — read before wiring walkTo:</b> every
- * enum entry's {@link #tiles()} currently returns an empty list. This
- * is intentional for the Phase 1A.1 interface scaffold — a caller
- * that walks to an unpopulated zone gets an immediate empty-route
- * failure rather than silent wrong-place routing.
- *
- * <p><b>Zones needing real tile sets before walkTo(NamedZone) can be
- * considered implemented</b> (each lands with the dependent script's
- * migration; do not ship walkTo wiring without these):
+ * <p><b>Tile population status:</b>
  * <ul>
- *   <li>{@link #LUMBRIDGE_CASTLE_GROUND_FLOOR} — Phase 1A smoke plan
- *       per spec §19</li>
+ *   <li>{@link #LUMBRIDGE_CASTLE_GROUND_FLOOR} — populated (Phase 1A.4d
+ *       smoke zone; 81-tile 9×9 rectangle around the castle interior).</li>
+ *   <li>All other zones — empty placeholder. {@code WalkToZoneStep} fails
+ *       with the {@code EMPTY_ZONE} diagnostic when targeted; the script
+ *       migration that needs the zone populates it at that time.</li>
+ * </ul>
+ *
+ * <p>Pending populations (with the script that drives the need):
+ * <ul>
  *   <li>{@link #LUMBRIDGE_COW_FIELD} — CowKillerScript pilot (Phase 2)</li>
  *   <li>{@link #LUMBRIDGE_BANK} — bank-tier migrations (Phase 5+)</li>
  *   <li>{@link #LUMBRIDGE_BANK_P2} — bank-tier migrations (Phase 5+)</li>
@@ -30,7 +30,10 @@ import net.runelite.api.coords.WorldPoint;
  */
 public enum NamedZone
 {
-	LUMBRIDGE_CASTLE_GROUND_FLOOR(0),
+	LUMBRIDGE_CASTLE_GROUND_FLOOR(0)
+	{
+		@Override public List<WorldPoint> tiles() { return LUMBRIDGE_CASTLE_GROUND_FLOOR_TILES; }
+	},
 	LUMBRIDGE_CASTLE_P1(1),
 	LUMBRIDGE_CASTLE_P2(2),
 	LUMBRIDGE_BANK(0),
@@ -58,5 +61,31 @@ public enum NamedZone
 	public List<WorldPoint> tiles()
 	{
 		return Collections.emptyList();
+	}
+
+	// ── Per-zone tile sets ──────────────────────────────────────────
+	// Populated once at class init via buildRect(...). Static-field
+	// references from enum-constant bodies are safe: the constant's
+	// {@code tiles()} method is called at runtime (after <clinit>
+	// finishes), not during constant construction.
+
+	/** 9×9 rectangle covering the central Lumbridge Castle ground floor.
+	 *  Bounds: x ∈ [3217, 3225], y ∈ [3215, 3223], plane 0. Generous
+	 *  arrival window — favors "any reasonable arrival counts" over
+	 *  exact-center. Phase 1A.4d smoke target. */
+	private static final List<WorldPoint> LUMBRIDGE_CASTLE_GROUND_FLOOR_TILES =
+		buildRect(3217, 3225, 3215, 3223, 0);
+
+	private static List<WorldPoint> buildRect(int x0, int x1, int y0, int y1, int plane)
+	{
+		List<WorldPoint> out = new ArrayList<>((x1 - x0 + 1) * (y1 - y0 + 1));
+		for (int x = x0; x <= x1; x++)
+		{
+			for (int y = y0; y <= y1; y++)
+			{
+				out.add(new WorldPoint(x, y, plane));
+			}
+		}
+		return List.copyOf(out);
 	}
 }
