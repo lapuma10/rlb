@@ -13,15 +13,20 @@ import net.runelite.client.callback.ClientThread;
 import net.runelite.client.game.ItemManager;
 import net.runelite.client.plugins.recorder.session.AccountRng;
 import net.runelite.client.plugins.recorder.session.SessionShape;
+import net.runelite.client.sequence.Step;
 import net.runelite.client.sequence.artemis.view.InvSlot;
 import net.runelite.client.sequence.artemis.view.InventoryView;
 import net.runelite.client.sequence.artemis.view.PlayerState;
+import net.runelite.client.sequence.composite.LinearSequence;
+import net.runelite.client.sequence.composite.SequencePlanBuilder;
+import net.runelite.client.sequence.composite.SequencePlanBuilderImpl;
 import org.junit.Before;
 import org.junit.Test;
 
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertNotNull;
 import static org.junit.Assert.assertSame;
+import static org.junit.Assert.assertTrue;
 import static org.mockito.ArgumentMatchers.anyInt;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.times;
@@ -243,5 +248,20 @@ public class ArtemisImplReadsTest
 		// inventory() + player() run on this thread (we set ourself as
 		// the client thread above) — also no clientThread.invoke.
 		verifyNoInteractions(clientThread);
+	}
+
+	// ── plan(...) wiring (Phase 1A.4e) ──────────────────────────────
+
+	@Test
+	public void planReturnsBuilderThatProducesNamedLinearSequence()
+	{
+		SequencePlanBuilder builder = artemis.plan("smoke-test-plan");
+		assertNotNull(builder);
+		assertTrue("plan(...) must return SequencePlanBuilderImpl",
+			builder instanceof SequencePlanBuilderImpl);
+
+		Step root = builder.root();
+		assertTrue("root() must produce a LinearSequence", root instanceof LinearSequence);
+		assertEquals("smoke-test-plan", ((LinearSequence) root).name());
 	}
 }

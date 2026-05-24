@@ -32,7 +32,8 @@ import net.runelite.client.sequence.composite.SequencePlanBuilder;
  *
  * <p>Phase 1A.1 — interface only. {@code ArtemisImpl} lands in Phase
  * 1A.2; Step subclasses in Phase 1A.3; walk/idle/logout wiring in
- * Phase 1A.4; grep gate in Phase 1B.
+ * Phase 1A.4a-d; composition wrapper in Phase 1A.4e; grep gate in
+ * Phase 1B.
  */
 public interface Artemis
 {

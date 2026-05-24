@@ -7,9 +7,9 @@ import net.runelite.client.sequence.Step;
  * returns one of these; scripts chain {@link #then(Step)} calls; the
  * sequence manager runs {@link #root()} to execute the composed plan.
  *
- * <p>Implementation lands with {@code ArtemisImpl} (Phase 1A.2 — not in
- * this slice). The interface alone exists here so Phase 1A.1's
- * {@code Artemis} interface compiles.
+ * <p>Implementation: {@link SequencePlanBuilderImpl} (Phase 1A.4e).
+ * {@code Artemis.plan(name)} returns one; chain {@code .then(...)}
+ * calls and pass {@code .root()} to {@code SequenceManager.run(...)}.
  */
 public interface SequencePlanBuilder
 {

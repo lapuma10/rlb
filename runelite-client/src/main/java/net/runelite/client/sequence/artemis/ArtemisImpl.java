@@ -62,18 +62,21 @@ import net.runelite.client.sequence.artemis.view.PlayerState;
 import net.runelite.client.sequence.artemis.view.WidgetRef;
 import net.runelite.client.sequence.artemis.zones.NamedZone;
 import net.runelite.client.sequence.composite.SequencePlanBuilder;
+import net.runelite.client.sequence.composite.SequencePlanBuilderImpl;
 
 /**
- * Phase 1A.3 / 1A.4a / 1A.4b / 1A.4c / 1A.4d implementation of {@link Artemis}.
- * Read methods marshal to the client thread and apply per-query
- * {@code RotationPolicy} (Phase 1A.2). Action methods {@code click(...)},
- * {@code take(GroundItemRef)}, {@code useOn(InvSlot, ...)} return Step
- * subclasses under {@code sequence/activities/script/} (Phase 1A.3).
+ * Phase 1A.3 / 1A.4a / 1A.4b / 1A.4c / 1A.4d / 1A.4e implementation of
+ * {@link Artemis}. Read methods marshal to the client thread and apply
+ * per-query {@code RotationPolicy} (Phase 1A.2). Action methods
+ * {@code click(...)}, {@code take(GroundItemRef)},
+ * {@code useOn(InvSlot, ...)} return Step subclasses under
+ * {@code sequence/activities/script/} (Phase 1A.3).
  * {@code idle(IdlePolicy)} and {@code logout()} return maintenance Steps
  * (Phase 1A.4b). {@code walkTo(WorldPoint)} and {@code walkTo(NamedZone)}
  * return daemon-worker-driven navigation Steps sharing
- * {@code WalkStepBase} (Phase 1A.4c/d). Only {@code plan(...)} still
- * throws {@link UnsupportedOperationException} — it lands in 1A.4e.
+ * {@code WalkStepBase} (Phase 1A.4c/d). {@code plan(String)} returns a
+ * {@link SequencePlanBuilderImpl} for {@code .then(...).root()} chains
+ * (Phase 1A.4e).
  *
  * <p>Phase 1A.4a introduced {@link ArtemisDeps} as the sole constructor
  * argument so the surface stays one parameter as new engine pieces land
@@ -500,19 +503,7 @@ public final class ArtemisImpl implements Artemis
 	@Override
 	public SequencePlanBuilder plan(String name)
 	{
-		// Composition scaffold — returns a builder; Step instances added
-		// via .then(...) come from action methods. The composition wrapper
-		// itself lands in Phase 1A.4e; until then, this throws so plan(...)
-		// chains fail loud rather than silently constructing a broken plan.
-		return notInPhase1A4dBuilder("plan(\"" + name + "\")");
-	}
-
-	private static SequencePlanBuilder notInPhase1A4dBuilder(String surface)
-	{
-		throw new UnsupportedOperationException(
-			"Artemis." + surface + " composition wires up in Phase 1A.4e — "
-				+ "Phase 1A.4d implemented walkTo(NamedZone). plan(...) is the only "
-				+ "remaining stub.");
+		return new SequencePlanBuilderImpl(name);
 	}
 
 	// ── INTERNAL FILTERS / TILE SCANS ───────────────────────────────
