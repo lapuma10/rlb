@@ -35,7 +35,7 @@ public class ArtemisImplThreadingTest
 		java.util.concurrent.atomic.AtomicLong tick = new java.util.concurrent.atomic.AtomicLong(0L);
 		SessionShape session = new SessionShape(tick::get, tick::get, 1_000L);
 		return new ArtemisImpl(client, clientThread, new AccountRng(null), session,
-			mock(ItemManager.class));
+			mock(ItemManager.class), null);
 	}
 
 	@Test

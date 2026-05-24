@@ -39,7 +39,7 @@ public class ArtemisImplWidgetTest
 		SessionShape session = new SessionShape(tick::get, tick::get, 1_000L);
 		when(client.getTickCount()).thenReturn(50);
 		artemis = new ArtemisImpl(client, ct, new AccountRng(null), session,
-			mock(ItemManager.class));
+			mock(ItemManager.class), null);
 	}
 
 	@Test

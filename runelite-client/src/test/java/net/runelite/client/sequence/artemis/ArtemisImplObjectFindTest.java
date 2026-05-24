@@ -72,7 +72,7 @@ public class ArtemisImplObjectFindTest
 
 		java.util.concurrent.atomic.AtomicLong tick = new java.util.concurrent.atomic.AtomicLong(42L);
 		SessionShape session = new SessionShape(tick::get, tick::get, 1_000L);
-		return new ArtemisImpl(client, ct, new AccountRng(null), session, mock(ItemManager.class));
+		return new ArtemisImpl(client, ct, new AccountRng(null), session, mock(ItemManager.class), null);
 	}
 
 	@Test

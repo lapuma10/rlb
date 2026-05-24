@@ -7,6 +7,7 @@ import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
+import java.util.function.Consumer;
 import java.util.function.Supplier;
 import lombok.extern.slf4j.Slf4j;
 import net.runelite.api.Client;
@@ -26,11 +27,19 @@ import net.runelite.api.WorldView;
 import net.runelite.api.coords.WorldPoint;
 import net.runelite.api.gameval.InventoryID;
 import net.runelite.api.widgets.Widget;
+import javax.annotation.Nullable;
 import net.runelite.client.callback.ClientThread;
 import net.runelite.client.game.ItemManager;
+import net.runelite.client.plugins.recorder.RecorderManager;
+import net.runelite.client.plugins.recorder.analyse.StepEvent;
 import net.runelite.client.plugins.recorder.session.AccountRng;
 import net.runelite.client.plugins.recorder.session.SessionShape;
 import net.runelite.client.sequence.Step;
+import net.runelite.client.sequence.activities.script.ClickGameObjStep;
+import net.runelite.client.sequence.activities.script.ClickNpcStep;
+import net.runelite.client.sequence.activities.script.ClickWidgetStep;
+import net.runelite.client.sequence.activities.script.TakeGroundItemStep;
+import net.runelite.client.sequence.activities.script.UseOnStep;
 import net.runelite.client.sequence.artemis.outcome.OutcomeCheck;
 import net.runelite.client.sequence.artemis.query.ItemQuery;
 import net.runelite.client.sequence.artemis.query.NpcQuery;
@@ -50,11 +59,14 @@ import net.runelite.client.sequence.artemis.zones.NamedZone;
 import net.runelite.client.sequence.composite.SequencePlanBuilder;
 
 /**
- * Phase 1A.2 implementation of {@link Artemis} — read methods only.
- * Action methods (click / take / useOn / walkTo / idle / logout) and
- * the {@code plan(...)} composition surface beyond a minimal scaffold
- * land in Phase 1A.3 / 1A.4 and throw {@link UnsupportedOperationException}
- * here so the interface compiles without misleading silent no-ops.
+ * Phase 1A.3 implementation of {@link Artemis}. Read methods marshal to
+ * the client thread and apply per-query {@code RotationPolicy} (Phase 1A.2).
+ * Action methods {@code click(...)}, {@code take(GroundItemRef)},
+ * {@code useOn(InvSlot, ...)} return Step subclasses under
+ * {@code sequence/activities/script/} (Phase 1A.3).
+ * {@code walkTo(...)}, {@code idle(IdlePolicy)}, {@code logout()} and the
+ * {@code plan(...)} composition wrapper still throw
+ * {@link UnsupportedOperationException} — they land in Phase 1A.4.
  *
  * <p>Read methods marshal to the client thread via {@link #readOnClient}
  * (inline if already on client thread, else queued via
@@ -76,19 +88,38 @@ public final class ArtemisImpl implements Artemis
 	private final SessionShape session;
 	private final ItemManager itemManager;
 	private final RotationPolicySelector selector;
+	/** StepEvent sink, bound to {@code recorder::recordStepEvent} via
+	 *  the production constructor when a {@link RecorderManager} is
+	 *  provided. {@code null} when no recorder is wired (tests, or the
+	 *  no-arg compatibility constructor) — Step subclasses no-op
+	 *  emission in that case. */
+	@Nullable private final Consumer<StepEvent> stepEventSink;
 
+	/** Sole constructor — {@code recorder} is the StepEvent sink
+	 *  (Phase 0A.3 producer hook). Pass {@code null} in unit tests that
+	 *  don't care about lifecycle events; pass the live
+	 *  {@link RecorderManager} in {@code RecorderPlugin} so action Steps
+	 *  emit {@code started}/{@code succeeded}/{@code failed} events into
+	 *  the session JSON.
+	 *
+	 *  <p>The single-constructor shape is intentional — Phase 1A.3 QC
+	 *  flagged a 5-arg overload as a YAGNI shim; making {@code recorder}
+	 *  explicit at every callsite (even when {@code null}) makes the
+	 *  recording wiring visible. */
 	public ArtemisImpl(
 		Client client,
 		ClientThread clientThread,
 		AccountRng accountRng,
 		SessionShape session,
-		ItemManager itemManager)
+		ItemManager itemManager,
+		@Nullable RecorderManager recorder)
 	{
 		this.client = client;
 		this.clientThread = clientThread;
 		this.session = session;
 		this.itemManager = itemManager;
 		this.selector = new RotationPolicySelector(accountRng.forAccount("artemis-rotation"));
+		this.stepEventSink = recorder == null ? null : recorder::recordStepEvent;
 	}
 
 	// ── READ HELPERS ────────────────────────────────────────────────
@@ -350,23 +381,82 @@ public final class ArtemisImpl implements Artemis
 		return session;
 	}
 
-	// ── ACTIONS — deferred to Phase 1A.3 (Step subclasses) ──────────
+	// ── ACTIONS ─────────────────────────────────────────────────────
+	// click / take / useOn implemented in Phase 1A.3. walkTo / idle /
+	// logout still throw — they land in Phase 1A.4 (walkTo) + the
+	// idle/logout follow-on.
 
-	@Override public Step walkTo(WorldPoint target)               { return notInPhase1A2("walkTo(WorldPoint)"); }
-	@Override public Step walkTo(NamedZone zone)                  { return notInPhase1A2("walkTo(NamedZone)"); }
-	@Override public Step click(NpcRef target, String verb)       { return notInPhase1A2("click(NpcRef, verb)"); }
-	@Override public Step click(GameObjRef target, String verb)   { return notInPhase1A2("click(GameObjRef, verb)"); }
-	@Override public Step click(WidgetRef target, String verb)    { return notInPhase1A2("click(WidgetRef, verb)"); }
-	@Override public Step click(NpcRef t, String v, OutcomeCheck o)     { return notInPhase1A2("click(NpcRef, verb, OutcomeCheck)"); }
-	@Override public Step click(GameObjRef t, String v, OutcomeCheck o) { return notInPhase1A2("click(GameObjRef, verb, OutcomeCheck)"); }
-	@Override public Step click(WidgetRef t, String v, OutcomeCheck o)  { return notInPhase1A2("click(WidgetRef, verb, OutcomeCheck)"); }
-	@Override public Step take(GroundItemRef item)                { return notInPhase1A2("take(GroundItemRef)"); }
-	@Override public Step useOn(InvSlot src, InvSlot tgt)         { return notInPhase1A2("useOn(InvSlot, InvSlot)"); }
-	@Override public Step useOn(InvSlot src, GameObjRef tgt)      { return notInPhase1A2("useOn(InvSlot, GameObjRef)"); }
-	@Override public Step useOn(InvSlot src, NpcRef tgt)          { return notInPhase1A2("useOn(InvSlot, NpcRef)"); }
-	@Override public Step useOn(InvSlot src, WidgetRef tgt)       { return notInPhase1A2("useOn(InvSlot, WidgetRef)"); }
-	@Override public Step idle(IdlePolicy policy)                 { return notInPhase1A2("idle(IdlePolicy)"); }
-	@Override public Step logout()                                { return notInPhase1A2("logout()"); }
+	@Override public Step walkTo(WorldPoint target)               { return notInPhase1A3("walkTo(WorldPoint)"); }
+	@Override public Step walkTo(NamedZone zone)                  { return notInPhase1A3("walkTo(NamedZone)"); }
+
+	@Override
+	public Step click(NpcRef target, String verb)
+	{
+		return new ClickNpcStep(this, stepEventSink, target, verb);
+	}
+
+	@Override
+	public Step click(GameObjRef target, String verb)
+	{
+		return new ClickGameObjStep(this, stepEventSink, target, verb);
+	}
+
+	@Override
+	public Step click(WidgetRef target, String verb)
+	{
+		return new ClickWidgetStep(this, stepEventSink, target, verb);
+	}
+
+	@Override
+	public Step click(NpcRef t, String v, OutcomeCheck o)
+	{
+		return new ClickNpcStep(this, stepEventSink, t, v, o);
+	}
+
+	@Override
+	public Step click(GameObjRef t, String v, OutcomeCheck o)
+	{
+		return new ClickGameObjStep(this, stepEventSink, t, v, o);
+	}
+
+	@Override
+	public Step click(WidgetRef t, String v, OutcomeCheck o)
+	{
+		return new ClickWidgetStep(this, stepEventSink, t, v, o);
+	}
+
+	@Override
+	public Step take(GroundItemRef item)
+	{
+		return new TakeGroundItemStep(this, stepEventSink, item);
+	}
+
+	@Override
+	public Step useOn(InvSlot src, InvSlot tgt)
+	{
+		return UseOnStep.onInvSlot(this, stepEventSink, src, tgt);
+	}
+
+	@Override
+	public Step useOn(InvSlot src, GameObjRef tgt)
+	{
+		return UseOnStep.onGameObj(this, stepEventSink, src, tgt);
+	}
+
+	@Override
+	public Step useOn(InvSlot src, NpcRef tgt)
+	{
+		return UseOnStep.onNpc(this, stepEventSink, src, tgt);
+	}
+
+	@Override
+	public Step useOn(InvSlot src, WidgetRef tgt)
+	{
+		return UseOnStep.onWidget(this, stepEventSink, src, tgt);
+	}
+
+	@Override public Step idle(IdlePolicy policy)                 { return notInPhase1A3("idle(IdlePolicy)"); }
+	@Override public Step logout()                                { return notInPhase1A3("logout()"); }
 
 	// ── COMPOSITION ─────────────────────────────────────────────────
 
@@ -374,23 +464,24 @@ public final class ArtemisImpl implements Artemis
 	public SequencePlanBuilder plan(String name)
 	{
 		// Composition scaffold — returns a builder; Step instances added
-		// via .then(...) come from action methods (deferred to 1A.3).
-		// Real impl will be wired in 1A.3 alongside the first usable
-		// action Step. For 1A.2 we throw to keep behaviour honest.
-		return notInPhase1A2Builder("plan(\"" + name + "\")");
+		// via .then(...) come from action methods. The composition wrapper
+		// itself lands in Phase 1A.4 alongside the walkTo + idle/logout
+		// Steps; until then, this throws so plan(...) chains fail loud
+		// rather than silently constructing a broken plan.
+		return notInPhase1A3Builder("plan(\"" + name + "\")");
 	}
 
-	private static Step notInPhase1A2(String surface)
+	private static Step notInPhase1A3(String surface)
 	{
 		throw new UnsupportedOperationException(
-			"Artemis." + surface + " is a Phase 1A.3 action Step — not implemented in 1A.2. "
-				+ "Phase 1A.2 ships read methods only; action Steps land in 1A.3 (click/take/useOn) and 1A.4 (walkTo/idle/logout).");
+			"Artemis." + surface + " lands in Phase 1A.4 — Phase 1A.3 implemented click/take/useOn only. "
+				+ "walkTo and the idle/logout maintenance Steps follow in the next slice.");
 	}
 
-	private static SequencePlanBuilder notInPhase1A2Builder(String surface)
+	private static SequencePlanBuilder notInPhase1A3Builder(String surface)
 	{
 		throw new UnsupportedOperationException(
-			"Artemis." + surface + " composition is a Phase 1A.3 wiring — not implemented in 1A.2.");
+			"Artemis." + surface + " composition wires up in Phase 1A.4 alongside walkTo / idle / logout.");
 	}
 
 	// ── INTERNAL FILTERS / TILE SCANS ───────────────────────────────
