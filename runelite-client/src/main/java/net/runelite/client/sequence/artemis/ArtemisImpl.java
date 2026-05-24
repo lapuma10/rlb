@@ -39,6 +39,8 @@ import net.runelite.client.sequence.Step;
 import net.runelite.client.sequence.activities.script.ClickGameObjStep;
 import net.runelite.client.sequence.activities.script.ClickNpcStep;
 import net.runelite.client.sequence.activities.script.ClickWidgetStep;
+import net.runelite.client.sequence.activities.script.IdleStep;
+import net.runelite.client.sequence.activities.script.LogoutStep;
 import net.runelite.client.sequence.activities.script.TakeGroundItemStep;
 import net.runelite.client.sequence.activities.script.UseOnStep;
 import net.runelite.client.sequence.artemis.outcome.OutcomeCheck;
@@ -60,15 +62,15 @@ import net.runelite.client.sequence.artemis.zones.NamedZone;
 import net.runelite.client.sequence.composite.SequencePlanBuilder;
 
 /**
- * Phase 1A.3 / 1A.4a implementation of {@link Artemis}. Read methods
- * marshal to the client thread and apply per-query {@code RotationPolicy}
- * (Phase 1A.2). Action methods {@code click(...)}, {@code take(GroundItemRef)},
- * {@code useOn(InvSlot, ...)} return Step subclasses under
- * {@code sequence/activities/script/} (Phase 1A.3).
- * {@code walkTo(...)}, {@code idle(IdlePolicy)}, {@code logout()} and the
- * {@code plan(...)} composition wrapper still throw
- * {@link UnsupportedOperationException} — they land across the Phase 1A.4
- * sub-slices (1A.4b idle/logout, 1A.4c/d walkTo, 1A.4e plan).
+ * Phase 1A.3 / 1A.4a / 1A.4b implementation of {@link Artemis}. Read
+ * methods marshal to the client thread and apply per-query
+ * {@code RotationPolicy} (Phase 1A.2). Action methods {@code click(...)},
+ * {@code take(GroundItemRef)}, {@code useOn(InvSlot, ...)} return Step
+ * subclasses under {@code sequence/activities/script/} (Phase 1A.3).
+ * {@code idle(IdlePolicy)} and {@code logout()} return maintenance Steps
+ * (Phase 1A.4b). {@code walkTo(...)} and the {@code plan(...)}
+ * composition wrapper still throw {@link UnsupportedOperationException}
+ * — they land in 1A.4c/d (walkTo) + 1A.4e (plan).
  *
  * <p>Phase 1A.4a introduced {@link ArtemisDeps} as the sole constructor
  * argument so the surface stays one parameter as new engine pieces land
@@ -95,6 +97,7 @@ public final class ArtemisImpl implements Artemis
 	private final ClientThread clientThread;
 	private final SessionShape session;
 	@Nullable private final ItemManager itemManager;
+	private final AccountRng accountRng;
 	private final RotationPolicySelector selector;
 	/** StepEvent sink, bound to {@code recorder::recordStepEvent} via
 	 *  the production constructor when a {@link RecorderManager} is
@@ -127,7 +130,8 @@ public final class ArtemisImpl implements Artemis
 		this.clientThread = deps.clientThread();
 		this.session = deps.session();
 		this.itemManager = deps.itemManager();
-		this.selector = new RotationPolicySelector(deps.accountRng().forAccount("artemis-rotation"));
+		this.accountRng = deps.accountRng();
+		this.selector = new RotationPolicySelector(accountRng.forAccount("artemis-rotation"));
 		this.stepEventSink = deps.recorder() == null ? null : deps.recorder()::recordStepEvent;
 		this.navigator = deps.navigator();
 		this.logoutAction = deps.logoutAction();
@@ -393,12 +397,11 @@ public final class ArtemisImpl implements Artemis
 	}
 
 	// ── ACTIONS ─────────────────────────────────────────────────────
-	// click / take / useOn implemented in Phase 1A.3. walkTo / idle /
-	// logout still throw — they land in Phase 1A.4 (walkTo) + the
-	// idle/logout follow-on.
+	// click / take / useOn implemented in Phase 1A.3. idle / logout
+	// implemented in Phase 1A.4b. walkTo still throws (1A.4c/d).
 
-	@Override public Step walkTo(WorldPoint target)               { return notInPhase1A3("walkTo(WorldPoint)"); }
-	@Override public Step walkTo(NamedZone zone)                  { return notInPhase1A3("walkTo(NamedZone)"); }
+	@Override public Step walkTo(WorldPoint target)               { return notInPhase1A4b("walkTo(WorldPoint)"); }
+	@Override public Step walkTo(NamedZone zone)                  { return notInPhase1A4b("walkTo(NamedZone)"); }
 
 	@Override
 	public Step click(NpcRef target, String verb)
@@ -466,8 +469,17 @@ public final class ArtemisImpl implements Artemis
 		return UseOnStep.onWidget(this, stepEventSink, src, tgt);
 	}
 
-	@Override public Step idle(IdlePolicy policy)                 { return notInPhase1A3("idle(IdlePolicy)"); }
-	@Override public Step logout()                                { return notInPhase1A3("logout()"); }
+	@Override
+	public Step idle(IdlePolicy policy)
+	{
+		return new IdleStep(this, stepEventSink, policy, accountRng);
+	}
+
+	@Override
+	public Step logout()
+	{
+		return new LogoutStep(this, stepEventSink, client, logoutAction);
+	}
 
 	// ── COMPOSITION ─────────────────────────────────────────────────
 
@@ -476,23 +488,23 @@ public final class ArtemisImpl implements Artemis
 	{
 		// Composition scaffold — returns a builder; Step instances added
 		// via .then(...) come from action methods. The composition wrapper
-		// itself lands in Phase 1A.4 alongside the walkTo + idle/logout
-		// Steps; until then, this throws so plan(...) chains fail loud
-		// rather than silently constructing a broken plan.
-		return notInPhase1A3Builder("plan(\"" + name + "\")");
+		// itself lands in Phase 1A.4e alongside walkTo; until then, this
+		// throws so plan(...) chains fail loud rather than silently
+		// constructing a broken plan.
+		return notInPhase1A4bBuilder("plan(\"" + name + "\")");
 	}
 
-	private static Step notInPhase1A3(String surface)
+	private static Step notInPhase1A4b(String surface)
 	{
 		throw new UnsupportedOperationException(
-			"Artemis." + surface + " lands in Phase 1A.4 — Phase 1A.3 implemented click/take/useOn only. "
-				+ "walkTo and the idle/logout maintenance Steps follow in the next slice.");
+			"Artemis." + surface + " lands in Phase 1A.4c/d — Phase 1A.4b implemented idle + logout. "
+				+ "walkTo + plan(...) follow in the next sub-slices.");
 	}
 
-	private static SequencePlanBuilder notInPhase1A3Builder(String surface)
+	private static SequencePlanBuilder notInPhase1A4bBuilder(String surface)
 	{
 		throw new UnsupportedOperationException(
-			"Artemis." + surface + " composition wires up in Phase 1A.4 alongside walkTo / idle / logout.");
+			"Artemis." + surface + " composition wires up in Phase 1A.4e alongside walkTo.");
 	}
 
 	// ── INTERNAL FILTERS / TILE SCANS ───────────────────────────────
