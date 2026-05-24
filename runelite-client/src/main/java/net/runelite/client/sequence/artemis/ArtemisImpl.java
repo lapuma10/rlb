@@ -43,6 +43,7 @@ import net.runelite.client.sequence.activities.script.IdleStep;
 import net.runelite.client.sequence.activities.script.LogoutStep;
 import net.runelite.client.sequence.activities.script.TakeGroundItemStep;
 import net.runelite.client.sequence.activities.script.UseOnStep;
+import net.runelite.client.sequence.activities.script.WalkToWorldPointStep;
 import net.runelite.client.sequence.artemis.outcome.OutcomeCheck;
 import net.runelite.client.sequence.artemis.query.ItemQuery;
 import net.runelite.client.sequence.artemis.query.NpcQuery;
@@ -62,15 +63,16 @@ import net.runelite.client.sequence.artemis.zones.NamedZone;
 import net.runelite.client.sequence.composite.SequencePlanBuilder;
 
 /**
- * Phase 1A.3 / 1A.4a / 1A.4b implementation of {@link Artemis}. Read
- * methods marshal to the client thread and apply per-query
+ * Phase 1A.3 / 1A.4a / 1A.4b / 1A.4c implementation of {@link Artemis}.
+ * Read methods marshal to the client thread and apply per-query
  * {@code RotationPolicy} (Phase 1A.2). Action methods {@code click(...)},
  * {@code take(GroundItemRef)}, {@code useOn(InvSlot, ...)} return Step
  * subclasses under {@code sequence/activities/script/} (Phase 1A.3).
  * {@code idle(IdlePolicy)} and {@code logout()} return maintenance Steps
- * (Phase 1A.4b). {@code walkTo(...)} and the {@code plan(...)}
- * composition wrapper still throw {@link UnsupportedOperationException}
- * — they land in 1A.4c/d (walkTo) + 1A.4e (plan).
+ * (Phase 1A.4b). {@code walkTo(WorldPoint)} returns a daemon-worker-driven
+ * navigation Step (Phase 1A.4c). {@code walkTo(NamedZone)} and {@code
+ * plan(...)} still throw {@link UnsupportedOperationException} — they
+ * land in 1A.4d (NamedZone) + 1A.4e (plan).
  *
  * <p>Phase 1A.4a introduced {@link ArtemisDeps} as the sole constructor
  * argument so the surface stays one parameter as new engine pieces land
@@ -398,10 +400,16 @@ public final class ArtemisImpl implements Artemis
 
 	// ── ACTIONS ─────────────────────────────────────────────────────
 	// click / take / useOn implemented in Phase 1A.3. idle / logout
-	// implemented in Phase 1A.4b. walkTo still throws (1A.4c/d).
+	// implemented in Phase 1A.4b. walkTo(WorldPoint) implemented in
+	// Phase 1A.4c. walkTo(NamedZone) and plan(...) still throw.
 
-	@Override public Step walkTo(WorldPoint target)               { return notInPhase1A4b("walkTo(WorldPoint)"); }
-	@Override public Step walkTo(NamedZone zone)                  { return notInPhase1A4b("walkTo(NamedZone)"); }
+	@Override
+	public Step walkTo(WorldPoint target)
+	{
+		return new WalkToWorldPointStep(this, stepEventSink, target, navigator);
+	}
+
+	@Override public Step walkTo(NamedZone zone)                  { return notInPhase1A4c("walkTo(NamedZone)"); }
 
 	@Override
 	public Step click(NpcRef target, String verb)
@@ -488,23 +496,23 @@ public final class ArtemisImpl implements Artemis
 	{
 		// Composition scaffold — returns a builder; Step instances added
 		// via .then(...) come from action methods. The composition wrapper
-		// itself lands in Phase 1A.4e alongside walkTo; until then, this
-		// throws so plan(...) chains fail loud rather than silently
-		// constructing a broken plan.
-		return notInPhase1A4bBuilder("plan(\"" + name + "\")");
+		// itself lands in Phase 1A.4e; until then, this throws so plan(...)
+		// chains fail loud rather than silently constructing a broken plan.
+		return notInPhase1A4cBuilder("plan(\"" + name + "\")");
 	}
 
-	private static Step notInPhase1A4b(String surface)
+	private static Step notInPhase1A4c(String surface)
 	{
 		throw new UnsupportedOperationException(
-			"Artemis." + surface + " lands in Phase 1A.4c/d — Phase 1A.4b implemented idle + logout. "
-				+ "walkTo + plan(...) follow in the next sub-slices.");
+			"Artemis." + surface + " lands in Phase 1A.4d — Phase 1A.4c implemented walkTo(WorldPoint) only. "
+				+ "walkTo(NamedZone) follows in 1A.4d (needs NamedZone tile population); "
+				+ "plan(...) follows in 1A.4e.");
 	}
 
-	private static SequencePlanBuilder notInPhase1A4bBuilder(String surface)
+	private static SequencePlanBuilder notInPhase1A4cBuilder(String surface)
 	{
 		throw new UnsupportedOperationException(
-			"Artemis." + surface + " composition wires up in Phase 1A.4e alongside walkTo.");
+			"Artemis." + surface + " composition wires up in Phase 1A.4e.");
 	}
 
 	// ── INTERNAL FILTERS / TILE SCANS ───────────────────────────────
