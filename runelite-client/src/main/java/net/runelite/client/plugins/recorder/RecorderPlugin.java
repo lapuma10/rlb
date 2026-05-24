@@ -88,7 +88,9 @@ import net.runelite.client.plugins.recorder.debug.LoginDebugOverlay;
 import net.runelite.client.plugins.recorder.debug.TileMarker;
 import net.runelite.client.plugins.recorder.hotkey.HotkeyHandler;
 import net.runelite.client.plugins.recorder.mining.MiningLoop;
+import net.runelite.client.plugins.recorder.session.AccountRng;
 import net.runelite.client.plugins.recorder.session.SessionDirectory;
+import net.runelite.client.plugins.recorder.session.SessionShape;
 import net.runelite.client.plugins.recorder.session.SessionStore;
 import net.runelite.client.plugins.recorder.session.SessionTracker;
 import net.runelite.client.plugins.recorder.nav.v2.CollisionDebugOverlay;
@@ -96,6 +98,9 @@ import net.runelite.client.plugins.recorder.nav.v2.ObjectDebugOverlay;
 import net.runelite.client.plugins.recorder.nav.v2.V2PathOverlay;
 import net.runelite.client.plugins.recorder.trail.TrailOverlay;
 import net.runelite.client.plugins.recorder.transport.RouteOverlay;
+import net.runelite.client.sequence.artemis.Artemis;
+import net.runelite.client.sequence.artemis.ArtemisDeps;
+import net.runelite.client.sequence.artemis.ArtemisImpl;
 import net.runelite.client.sequence.dispatch.HumanizedInputDispatcher;
 import net.runelite.client.sequence.dispatch.InputOwnership;
 import net.runelite.client.sequence.login.CredentialStore;
@@ -135,6 +140,13 @@ public class RecorderPlugin extends Plugin
     @Inject private ConfigManager configManager;
 
     private RecorderManager manager;
+    /** Phase 2B: Artemis facade for new pilot scripts (Phase 2 cow killer
+     *  first). Constructed once at startUp from existing plugin
+     *  dependencies. Navigator and LogoutAction are left null at 2B —
+     *  walkTo() / logout() will fail loud until a later slice wires
+     *  real implementations. See {@code ArtemisDeps} Javadoc for the
+     *  nullable-field contract. */
+    private Artemis artemis;
     private RecorderPanel panel;
     private NavigationButton navButton;
     private MouseCapture mouseCapture;
@@ -239,6 +251,37 @@ public class RecorderPlugin extends Plugin
 
         manager = new RecorderManager(client, config, eventCapture,
             mouseCapture, keyCapture, focusCapture, sessions, itemManager, clientThread);
+
+        // Phase 2B Artemis wiring. ArtemisDeps fields:
+        //   client, clientThread       — injected above.
+        //   AccountRng                 — fresh per plugin instance; reads
+        //                                client.getAccountHash() at every
+        //                                seed() call so it tracks login.
+        //   SessionShape               — Long.MAX_VALUE tick budget = no
+        //                                runtime-side gate today. Phase 0B
+        //                                wires the real daily budget + a
+        //                                BreakScheduler-backed last-break
+        //                                supplier.
+        //   itemManager, manager       — already constructed.
+        //   navigator, logoutAction    — null at 2B. walkTo/logout fail
+        //                                loud (WalkStepBase.java:205,
+        //                                LogoutStep.java:107) per the
+        //                                ArtemisDeps nullable contract.
+        //                                Wired in a later slice alongside
+        //                                the pilot's launch path.
+        artemis = new ArtemisImpl(new ArtemisDeps(
+            client,
+            clientThread,
+            new AccountRng(client),
+            new SessionShape(
+                () -> client.getTickCount(),
+                () -> client.getTickCount(),
+                Long.MAX_VALUE),
+            itemManager,
+            manager,
+            null,
+            null));
+
         panel = new RecorderPanel(manager, client, clientThread);
         debugOverlay = new DebugOverlay(client);
         loginDebugOverlay = new LoginDebugOverlay(client);
