@@ -139,12 +139,19 @@ public final class PixelResolver
         }
 
         Point minimap = Perspective.localToMinimap(client, scene);
-        if (minimap == null) return null;   // beyond minimap radius — waypoint upstream
+        if (minimap == null)
+        {
+            // Phase 1A.4d.2: target is beyond Perspective's radial visibility.
+            // Project to disc rim in the target's bearing instead of giving
+            // up — the bot should still walk toward distant targets via the
+            // maximum reasonable minimap step.
+            minimap = projectFarTargetToRim(target, here);
+        }
         // Perspective.localToMinimap only checks the radial distance; the
         // resulting pixel can land in the corner gap between the visible
         // circle and the rectangular widget bounds, where the engine returns
         // 'Cancel' on click. Clamp into the disc so the click is on the map.
-        minimap = clampToMinimapDisc(minimap);
+        if (minimap != null) minimap = clampToMinimapDisc(minimap);
 
         // Bias toward main view at short distances, minimap at long. Add a
         // 25% randomness band so the agent doesn't always pick the same
@@ -158,10 +165,18 @@ public final class PixelResolver
             // candidate inside the tile polygon hit an NPC/player.
         }
 
+        // Phase 1A.4d.2: minimap may have been null'd by projectFarTargetToRim
+        // (extreme zoom edge case) or by clampToMinimapDisc's angular-search
+        // exhaustion (every rim candidate around the bearing was occluded).
+        // Either way, no valid minimap pixel exists — return null and let
+        // walkClick skip the dispatch (WalkStepBase Aborts cleanly per 1A.4d.1).
+        if (minimap == null) return null;
+
         // Polar jitter on a small ring so consecutive minimap clicks vary,
         // with the recent-history rejection still in play. Re-clamp because
         // jitter of up to 2px can push an edge pixel back outside the disc.
         Point p = clampToMinimapDisc(ringJitter(minimap, 1, 2));
+        if (p == null) return null;
         record(p);
         return p;
     }
@@ -187,9 +202,16 @@ public final class PixelResolver
             scene = new LocalPoint(sx, sy, client.getTopLevelWorldView().getId());
         }
         Point mm = Perspective.localToMinimap(client, scene);
-        if (mm == null) return null;
+        if (mm == null)
+        {
+            // Phase 1A.4d.2: parallel handling to resolveWalkTarget.
+            mm = projectFarTargetToRim(target, here);
+            if (mm == null) return null;
+        }
         mm = clampToMinimapDisc(mm);
+        if (mm == null) return null;
         Point p = clampToMinimapDisc(ringJitter(mm, 1, 2));
+        if (p == null) return null;
         record(p);
         return p;
     }
@@ -1073,12 +1095,21 @@ public final class PixelResolver
      *  <p>After the disc clamp, the result is re-checked against the
      *  minimap-overlay dead-zones (orbs, world-map button, compass, wiki).
      *  These sit visually on top of the minimap and steal clicks even
-     *  though the pixel is technically inside the inscribed circle — the
-     *  exact bug behind the lap-end → Rough Wall recovery walk opening
-     *  the world map. If the pixel hits an overlay, we pull it inward
-     *  along its radial vector by 4-px increments until it clears, all
-     *  the way to the disc centre if necessary. The centre is virtually
-     *  never overlay-occluded; the orbs cluster on the rim. */
+     *  though the pixel is technically inside the inscribed circle. If
+     *  the pixel hits an overlay, {@link #pullOffMinimapOverlay} searches
+     *  angular offsets at the SAME radius around the bearing
+     *  ({@code ±10°, ±20°, ±30°, ±45°}) for a clear spot. If every
+     *  angular candidate is occluded, the result is {@code null}.
+     *
+     *  <p><b>Phase 1A.4d.2 invariant:</b> disc centre is NEVER returned
+     *  for a non-self walk target. Minimap clicks at centre map to the
+     *  player's own tile (silent walk-to-self no-op in OSRS). The
+     *  original Phase 1 design walked radially inward toward the centre
+     *  and returned the centre as a fallback, which routinely collapsed
+     *  long-walk projections to a no-op pixel — Run 04 F-E1
+     *  ({@code docs/learnings/2026-05-25-artemis-tier1-run-04.md},
+     *  plan {@code docs/superpowers/plans/
+     *  2026-05-25-artemis-phase-1a4d2-pixelresolver-minimap-disc-edge.md}). */
     private Point clampToMinimapDisc(Point p)
     {
         if (p == null) return null;
@@ -1117,50 +1148,125 @@ public final class PixelResolver
         return pullOffMinimapOverlay(clamped, cx, cy);
     }
 
-    /** Step the point inward toward the disc centre in 4-px increments
-     *  until it no longer hits any minimap-overlay dead-zone (orbs,
-     *  world-map button, compass, wiki). Returns the original point
-     *  if it's already clear; returns the centre if every step along
-     *  the radial vector was occluded (vanishingly rare — the disc
-     *  centre is empty space on every layout). */
+    /** Find a click-safe minimap pixel near {@code p}, preserving the
+     *  bearing from the disc centre. If {@code p} is already overlay-clear,
+     *  returns it unchanged. Otherwise searches angular offsets at the
+     *  SAME radius around the bearing — {@code ±10°, ±20°, ±30°, ±45°},
+     *  smallest deviation first — and returns the first clear candidate.
+     *  Returns {@code null} when every angular candidate is occluded.
+     *
+     *  <p><b>Phase 1A.4d.2 invariant:</b> never returns the disc centre.
+     *  Minimap clicks at centre map to the player's own tile in minimap
+     *  coords (silent walk-to-self no-op in OSRS), so returning centre
+     *  as a "tolerable" fallback — the original Phase 1 design — broke
+     *  long-distance walks (Run 04 F-E1). Caller's null handling
+     *  ({@code resolveWalkTarget} / {@code walkClick}) is the correct
+     *  failure path: skip the dispatch, let WalkStepBase STUCK + Abort
+     *  per Phase 1A.4d.1. */
     private Point pullOffMinimapOverlay(Point p, int cx, int cy)
     {
         if (p == null) return null;
-        if (!inMinimapOverlay(p.getX(), p.getY())) return p;
+        if (!inMinimapOverlay(p.getX(), p.getY())) return p;   // direct path
+
         int dx = p.getX() - cx;
         int dy = p.getY() - cy;
-        double len = Math.sqrt((double) dx * dx + (double) dy * dy);
-        if (len < 1.0)
+        double r = Math.sqrt((double) dx * dx + (double) dy * dy);
+        if (r < 1.0)
         {
-            // Already at centre and somehow occluded — return as-is;
-            // press primitive will block under WORLD intent but MINIMAP
-            // intent walks won't (which is what we wanted).
-            return p;
+            // Defensive: input is at disc centre. Centre maps to the
+            // player's own tile in minimap coords — never a valid walk
+            // target. Return null instead of returning centre.
+            return null;
         }
-        double ux = dx / len;
-        double uy = dy / len;
-        final int stepPx = 4;
-        final int maxSteps = (int) Math.ceil(len / stepPx) + 1;
-        for (int i = 1; i <= maxSteps; i++)
+
+        double bearing = Math.atan2(dy, dx);
+        // Smallest angular deviation first. Symmetric around the original
+        // bearing so the chosen direction stays close to the target.
+        final int[] OFFSETS_DEG = {10, -10, 20, -20, 30, -30, 45, -45};
+        for (int offDeg : OFFSETS_DEG)
         {
-            int x = p.getX() - (int) Math.round(ux * stepPx * i);
-            int y = p.getY() - (int) Math.round(uy * stepPx * i);
-            // Stop at centre even if we'd overshoot.
-            if ((x - cx) * dx + (y - cy) * dy <= 0)
-            {
-                x = cx; y = cy;
-            }
+            double off = Math.toRadians(offDeg);
+            int x = cx + (int) Math.round(r * Math.cos(bearing + off));
+            int y = cy + (int) Math.round(r * Math.sin(bearing + off));
             if (!inMinimapOverlay(x, y))
             {
-                log.debug("minimap overlay clear: ({},{}) → ({},{}) after {} steps",
-                    p.getX(), p.getY(), x, y, i);
+                log.info("minimap angular fallback: bearing={}° offset={}° → disc-rel ({},{})",
+                    Math.round(Math.toDegrees(bearing)), offDeg, x - cx, y - cy);
                 return new Point(x, y);
             }
-            if (x == cx && y == cy) break;
         }
-        // Every step was occluded — return centre. MINIMAP-intent walks
-        // tolerate this; WORLD-intent clicks shouldn't reach here.
-        return new Point(cx, cy);
+
+        // Every candidate around the bearing is blocked. Return null —
+        // the dispatcher's walkClick handles null with "not resolvable"
+        // and skips the dispatch (WalkStepBase Aborts cleanly via
+        // Phase 1A.4d.1). Disc centre is NEVER returned for non-self
+        // targets — Phase 1A.4d.2 invariant.
+        log.info("minimap rim fully blocked at bearing {}° (radius {}) — returning null",
+            Math.round(Math.toDegrees(bearing)), Math.round(r));
+        return null;
+    }
+
+    /** Phase 1A.4d.2: project a far target (beyond
+     *  {@link Perspective#localToMinimap}'s radial visibility) to a
+     *  point on the minimap disc rim in the target's bearing. Used by
+     *  {@link #resolveWalkTarget} / {@link #resolveMinimapOnly} when
+     *  the standard projection returns {@code null} (very long walks
+     *  / heavily zoomed minimap).
+     *
+     *  <p>Approach: project a closer in-range point (5 tiles toward the
+     *  target) via the standard {@code Perspective.localToMinimap} call.
+     *  Use that pixel's disc-relative bearing to project to the rim at
+     *  the disc radius. This reuses RuneLite's existing minimap-rotation
+     *  math instead of reimplementing it.
+     *
+     *  <p>Returns {@code null} when the closer-point projection itself
+     *  fails (extreme zoom edge case) or the minimap widget is
+     *  unavailable. */
+    @Nullable
+    private Point projectFarTargetToRim(WorldPoint target, WorldPoint here)
+    {
+        int dxW = target.getX() - here.getX();
+        int dyW = target.getY() - here.getY();
+        double distW = Math.hypot(dxW, dyW);
+        if (distW < 1.0) return null;
+
+        Player local = client.getLocalPlayer();
+        if (local == null) return null;
+        LocalPoint hereLocal = local.getLocalLocation();
+        if (hereLocal == null) return null;
+
+        // Closer point: 5 tiles in the target's direction.
+        double scale = 5.0 / distW;
+        int closerX = hereLocal.getX() + (int) Math.round(dxW * scale * Perspective.LOCAL_TILE_SIZE);
+        int closerY = hereLocal.getY() + (int) Math.round(dyW * scale * Perspective.LOCAL_TILE_SIZE);
+        LocalPoint closerScene = new LocalPoint(closerX, closerY,
+            client.getTopLevelWorldView().getId());
+        Point closerPx = Perspective.localToMinimap(client, closerScene);
+        if (closerPx == null) return null;   // 5 tiles itself outside range (extreme zoom)
+
+        // Use the closer-point pixel's disc-relative bearing to project
+        // to the rim. Bearing in screen coords is the same whether the
+        // minimap is north-up or rotated, because Perspective.localToMinimap
+        // already applied the rotation.
+        Widget w = minimapWidget();
+        if (w == null || w.isHidden()) return null;
+        Rectangle b = w.getBounds();
+        if (b == null || b.width < 8 || b.height < 8) return null;
+        int cx = b.x + b.width / 2;
+        int cy = b.y + b.height / 2;
+        int r = Math.min(b.width, b.height) / 2 - 4;
+        if (r < 4) return null;
+
+        int bx = closerPx.getX() - cx;
+        int by = closerPx.getY() - cy;
+        if (bx == 0 && by == 0) return null;   // closer point projects to centre (degenerate)
+        double bearing = Math.atan2(by, bx);
+        Point rim = new Point(
+            cx + (int) Math.round(r * Math.cos(bearing)),
+            cy + (int) Math.round(r * Math.sin(bearing)));
+        log.info("far-target rim projection: target {} bearing {}° → ({},{})",
+            target, Math.round(Math.toDegrees(bearing)), rim.getX(), rim.getY());
+        return rim;
     }
 
     /** The minimap draw widget for the current layout (fixed / resizable
