@@ -309,8 +309,9 @@ ROUTE PER PHASE 2D §10:
   - F2b (dying-cow) → 2C.x.1 still expected to be verified after
                       1A.4d.1 lands.
 
-NEXT: plan and implement Phase 1A.4d.1 (WalkStep retry +
-premature-STUCK fix). After it lands + rebuild + restart, run
-Tier 1 Run 04. Run 04 will be the first run that can fully
-evaluate 2C.x.1.
+NEXT: Phase 1A.4d.1 (WalkStep retry + premature-STUCK fix)
+planned and implemented — see
+docs/superpowers/plans/2026-05-25-artemis-phase-1a4d1-walkstep-retry-fix.md.
+After 1A.4d.1 lands + rebuild + restart, run Tier 1 Run 04.
+Run 04 will be the first run that can fully evaluate 2C.x.1.
 ```

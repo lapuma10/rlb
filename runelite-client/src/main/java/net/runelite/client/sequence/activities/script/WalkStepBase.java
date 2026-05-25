@@ -63,8 +63,19 @@ import net.runelite.client.sequence.blackboard.Blackboard;
  * {@link #REASON_NAVIGATOR_EXCEPTION}, plus the inherited
  * {@code REASON_TIMEOUT} from {@link ArtemisActionStep}. Subclasses may
  * surface additional codes via {@link #doPreFlight} (e.g.
- * {@code EMPTY_ZONE}); the {@link #onFailure} switch maps any unknown
- * code to {@link Recovery.Abort} by default.
+ * {@code EMPTY_ZONE}); the {@link #onFailure} switch maps every
+ * failure to {@link Recovery.Abort}.
+ *
+ * <p><b>Phase 1A.4d.1 — no Recovery.Retry from this Step.</b> The
+ * original Phase 1A.4d code returned {@link Recovery.Retry} for
+ * {@code STUCK} / {@code TIMEOUT} / {@code NAVIGATOR_FAILED}, but that
+ * contradicted the single-use guard: the engine's Retry path
+ * ({@code StateDrivenEngine.applyRecovery}) re-fires {@code onStart}
+ * on the SAME Step instance, which trips
+ * {@link IllegalStateException} at re-entry. Run 03 F-D1 exposed this
+ * explicitly. Walk retries are now caller responsibility — build them
+ * via a parent composite that constructs a fresh
+ * {@link Artemis#walkTo} Step per attempt.
  *
  * <p>Package-private — scripts never see this type; they get a {@link
  * net.runelite.client.sequence.Step} from {@link Artemis#walkTo}.
@@ -90,7 +101,12 @@ abstract class WalkStepBase extends ArtemisActionStep
 	protected static final int ARRIVAL_DEBOUNCE_TICKS = 2;
 
 	/** Player location unchanged for this many consecutive ticks → STUCK.
-	 *  ~3.6 s — tolerates ladders/gates, catches real stalls. */
+	 *  ~3.6 s — tolerates ladders/gates, catches real stalls. Gated by
+	 *  {@link #workerEverRunning} (Phase 1A.4d.1) so the counter only
+	 *  runs once the navigator has actually started driving the
+	 *  player — otherwise the dispatcher's pre-walk humanized cursor +
+	 *  minimap click chain (often ~3 s on long walks) would fire
+	 *  STUCK before the player could have moved at all. */
 	private static final int STUCK_THRESHOLD_TICKS = 6;
 
 	// ── Shared diagnostic codes ─────────────────────────────────────
@@ -124,10 +140,20 @@ abstract class WalkStepBase extends ArtemisActionStep
 	 *  Throwable.toString() for exceptions, descriptor for deadline. */
 	@Nullable private volatile String workerFailureDetail = null;
 
-	/** True once the worker has observed at least one RUNNING status.
-	 *  Distinguishes NO_ROUTE (first tick FAILED) from NAVIGATOR_FAILED
-	 *  (mid-route failure). Worker-thread-local; never crossed. */
-	private boolean workerHadRunning = false;
+	/** True once the worker has observed at least one
+	 *  {@link NavStatus#RUNNING} status. Two consumers (Phase 1A.4d.1):
+	 *  <ul>
+	 *    <li>Worker thread: distinguishes {@code NO_ROUTE} (first tick
+	 *        FAILED) from {@code NAVIGATOR_FAILED} (mid-route failure)
+	 *        when assigning {@link #workerFailureCode}.</li>
+	 *    <li>Client thread ({@link #doCheck}): gates the stuck counter
+	 *        so STUCK can't fire before the navigator has actually
+	 *        started running.</li>
+	 *  </ul>
+	 *  {@code volatile} because the writer is the daemon worker and one
+	 *  of the readers is the client thread. JLS §17.4.4 publishes the
+	 *  worker's "I started running" observation across threads. */
+	private volatile boolean workerEverRunning = false;
 
 	/** Signal to the worker to exit. Worker polls every iteration and
 	 *  inside the catch handler for the sleep. */
@@ -182,10 +208,11 @@ abstract class WalkStepBase extends ArtemisActionStep
 
 	// ── Test-only accessors (package-private) ───────────────────────
 
-	final NavStatus lastStatusForTesting()         { return lastStatus; }
-	@Nullable final String failureCodeForTesting() { return workerFailureCode; }
-	final boolean workerAliveForTesting()          { Thread w = worker; return w != null && w.isAlive(); }
-	final boolean stopFlagForTesting()             { return stopFlag; }
+	final NavStatus lastStatusForTesting()             { return lastStatus; }
+	@Nullable final String failureCodeForTesting()     { return workerFailureCode; }
+	final boolean workerAliveForTesting()              { Thread w = worker; return w != null && w.isAlive(); }
+	final boolean stopFlagForTesting()                 { return stopFlag; }
+	final boolean workerEverRunningForTesting()        { return workerEverRunning; }
 
 	// ── Lifecycle (final — subclasses extend via hooks above) ───────
 
@@ -272,7 +299,7 @@ abstract class WalkStepBase extends ArtemisActionStep
 
 			if (s == NavStatus.RUNNING)
 			{
-				workerHadRunning = true;
+				workerEverRunning = true;
 			}
 
 			if (s == NavStatus.ARRIVED)
@@ -283,7 +310,7 @@ abstract class WalkStepBase extends ArtemisActionStep
 			}
 			if (s == NavStatus.FAILED)
 			{
-				workerFailureCode = workerHadRunning ? REASON_NAVIGATOR_FAILED : REASON_NO_ROUTE;
+				workerFailureCode = workerEverRunning ? REASON_NAVIGATOR_FAILED : REASON_NO_ROUTE;
 				lastStatus = s;
 				log.warn("walk: {} worker observed FAILED → {}", name(), workerFailureCode);
 				return;
@@ -353,7 +380,20 @@ abstract class WalkStepBase extends ArtemisActionStep
 		// 3. Stuck detection — skipped when {@code here} is null (login
 		//    transitions). Counting null-snapshots as "unchanged" would
 		//    fire spurious STUCK during login.
-		if (here != null)
+		//
+		//    Phase 1A.4d.1: ALSO skipped while {@link #workerEverRunning}
+		//    is false. The dispatcher's pre-walk humanized cursor +
+		//    minimap click chain typically takes ~3 s on long walks —
+		//    during that window the player cannot have moved yet (the
+		//    click hasn't even landed). Counting "unchanged" against the
+		//    6-tick threshold (~3.6 s) under those conditions fired
+		//    spurious STUCK and propagated up through the broken
+		//    Recovery.Retry contract to {@link IllegalStateException}
+		//    at re-entry. Gating on the worker's first
+		//    {@code NavStatus.RUNNING} observation makes the 6-tick
+		//    constant's semantics actually true: "location unchanged
+		//    while we were supposed to be walking."
+		if (here != null && workerEverRunning)
 		{
 			boolean locUnchanged = locEquals(here, lastObservedLoc);
 			if (locUnchanged)
@@ -392,14 +432,14 @@ abstract class WalkStepBase extends ArtemisActionStep
 		// the worker so a still-looping navigator.tick doesn't outlive
 		// the Step's engine view.
 		stopWorker("step onFailure: " + reason);
-		// Retry only for the three transient codes. ANY OTHER reason —
-		// including subclass-defined ABORT codes like EMPTY_ZONE — falls
-		// through to Abort. Safe default.
-		return switch (reason)
-		{
-			case REASON_STUCK, REASON_TIMEOUT, REASON_NAVIGATOR_FAILED -> new Recovery.Retry(2);
-			default -> new Recovery.Abort(reason);
-		};
+		// Phase 1A.4d.1: ALL walk failures Abort. WalkStep is single-use
+		// (see {@link #doStart} guard); the engine's Recovery.Retry path
+		// re-fires onStart on the SAME Step instance, which would trip
+		// the guard with IllegalStateException (Run 03 F-D1). Future
+		// walk retries must be built by a parent composite that
+		// constructs a fresh {@link Artemis#walkTo} Step per attempt —
+		// not by reusing this one.
+		return new Recovery.Abort(reason);
 	}
 
 	/** Idempotent. Sets {@link #stopFlag} and interrupts the worker so it

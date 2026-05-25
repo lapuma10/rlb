@@ -341,6 +341,14 @@ public class WalkToWorldPointStepTest
 		nav.awaitTickEntered();
 		nav.respondWith(NavStatus.RUNNING);
 
+		// Phase 1A.4d.1: stuck counter is gated on workerEverRunning.
+		// Wait for the worker to observe RUNNING and publish the
+		// volatile flag before counting ticks — otherwise the race
+		// between respondWith() and the worker's write would make
+		// "STUCK at exactly tick 6" assertion flaky.
+		awaitCondition(step::workerEverRunningForTesting, 1000,
+			"workerEverRunning=true after NavStatus.RUNNING");
+
 		// Ticks 1..5: stuck counter increments but below threshold (6)
 		for (int t = 1; t <= 5; t++)
 		{
@@ -353,6 +361,50 @@ public class WalkToWorldPointStepTest
 		StepEvent failed = rec.lastFailed().orElseThrow();
 		assertEquals(WalkToWorldPointStep.REASON_STUCK, failed.diagnosticReason());
 		assertTrue("stopWorker must have been called on STUCK",
+			step.stopFlagForTesting());
+	}
+
+	@Test
+	public void stuckCounter_doesNotIncrement_beforeWorkerEverRunning() throws Exception
+	{
+		// Phase 1A.4d.1 gate: stuck counter must NOT fire while the
+		// worker has been spawned but has not yet observed RUNNING.
+		// This is the Run 03 F-D1 fix — long walks where the
+		// dispatcher's humanized cursor + minimap click chain takes
+		// 3+ seconds before the player physically moves used to fire
+		// STUCK before the click had even landed.
+		Artemis artemis = artemisWithSession(true);
+		RecordingRecorder rec = new RecordingRecorder();
+		LatchedNavigator nav = new LatchedNavigator();
+		WalkToWorldPointStep step = newStep(artemis, rec, nav);
+
+		ScopedBlackboard bb = new ScopedBlackboard();
+		MockInputDispatcher disp = new MockInputDispatcher();
+		WorldPoint frozen = new WorldPoint(3100, 3100, 0);
+		step.onStart(ctxAtTick(0, bb, disp, snapAt(0, frozen)));
+		nav.awaitTickEntered();
+
+		// Deliberately respond with IDLE — the worker observes IDLE,
+		// loops back to nav.tick(), and blocks waiting for the next
+		// response. workerEverRunning stays false the entire time.
+		nav.respondWith(NavStatus.IDLE);
+		// Second awaitTickEntered confirms the worker processed IDLE
+		// and looped back; if it had received RUNNING the flag would
+		// be set by now.
+		nav.awaitTickEntered();
+		assertFalse("workerEverRunning must remain false when only IDLE has been seen",
+			step.workerEverRunningForTesting());
+
+		// Advance well past STUCK_THRESHOLD_TICKS (6) with location
+		// frozen. Under the old code, STUCK would have fired at tick 6.
+		// With the gate, it must NOT.
+		for (int t = 1; t <= 20; t++)
+		{
+			Completion c = step.check(snapAt(t, frozen), bb);
+			assertEquals("tick " + t + " must stay RUNNING — workerEverRunning gate not yet released",
+				Completion.RUNNING, c);
+		}
+		assertFalse("stopWorker must NOT have been called — gate never released",
 			step.stopFlagForTesting());
 	}
 
@@ -459,7 +511,7 @@ public class WalkToWorldPointStepTest
 		assertNotNull(succeeded.ticksElapsed());
 	}
 
-	// ── 10. onFailure recovery mapping ──────────────────────────────
+	// ── 10. onFailure recovery mapping (Phase 1A.4d.1) ─────────────
 
 	@Test
 	public void onFailureMapsDiagnosticsCorrectly()
@@ -470,29 +522,29 @@ public class WalkToWorldPointStepTest
 		WorldSnapshot snap = snapAt(0, OUT_OF_RANGE);
 		ScopedBlackboard bb = new ScopedBlackboard();
 
-		// Retry(2): STUCK, TIMEOUT, NAVIGATOR_FAILED
+		// Phase 1A.4d.1: ALL walk failures Abort. The original Phase
+		// 1A.4d code returned Recovery.Retry(2) for STUCK / TIMEOUT /
+		// NAVIGATOR_FAILED, but that contradicted the single-use guard
+		// (engine's Retry path re-fires onStart on the same Step
+		// instance → IllegalStateException). Run 03 F-D1 exposed it.
+		// Walk retries are now caller responsibility.
 		for (String r : new String[] {
 			WalkToWorldPointStep.REASON_STUCK,
 			"TIMEOUT",
-			WalkToWorldPointStep.REASON_NAVIGATOR_FAILED })
-		{
-			Failure f = (r.equals("TIMEOUT"))
-				? Failure.fromDiagnostic(new DiagnosticReason.ActionTimedOut("Walk", 60), 60)
-				: Failure.fromDiagnostic(new DiagnosticReason.Unknown(r), 5);
-			Recovery rec = step.onFailure(f, snap, bb);
-			assertTrue("expected Retry for " + r + " but got " + rec, rec instanceof Recovery.Retry);
-			assertEquals(2, ((Recovery.Retry) rec).maxAttempts());
-		}
-
-		// Abort: NAVIGATOR_MISSING, NO_ROUTE, NAVIGATOR_EXCEPTION
-		for (String r : new String[] {
+			WalkToWorldPointStep.REASON_NAVIGATOR_FAILED,
 			WalkToWorldPointStep.REASON_NAVIGATOR_MISSING,
 			WalkToWorldPointStep.REASON_NO_ROUTE,
 			WalkToWorldPointStep.REASON_NAVIGATOR_EXCEPTION })
 		{
-			Failure f = Failure.fromDiagnostic(new DiagnosticReason.Unknown(r), 0);
+			Failure f = (r.equals("TIMEOUT"))
+				? Failure.fromDiagnostic(new DiagnosticReason.ActionTimedOut("Walk", 60), 60)
+				: Failure.fromDiagnostic(new DiagnosticReason.Unknown(r), 0);
 			Recovery rec = step.onFailure(f, snap, bb);
-			assertTrue("expected Abort for " + r + " but got " + rec, rec instanceof Recovery.Abort);
+			assertTrue("expected Abort for " + r + " but got " + rec,
+				rec instanceof Recovery.Abort);
+			// Regression guard for Run 03 F-D1: must never return Retry.
+			assertFalse(r + " must not return Retry (Phase 1A.4d.1)",
+				rec instanceof Recovery.Retry);
 		}
 	}
 

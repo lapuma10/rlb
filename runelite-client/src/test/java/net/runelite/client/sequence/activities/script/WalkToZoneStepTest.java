@@ -474,7 +474,7 @@ public class WalkToZoneStepTest
 		assertNotNull(succeeded.ticksElapsed());
 	}
 
-	// ── 11. Recovery mapping (including EMPTY_ZONE → Abort) ─────────
+	// ── 11. Recovery mapping (Phase 1A.4d.1: every reason → Abort) ──
 
 	@Test
 	public void onFailureMapsAllDiagnosticsCorrectly()
@@ -485,30 +485,32 @@ public class WalkToZoneStepTest
 		WorldSnapshot snap = snapAt(0, OUT_OF_ZONE);
 		ScopedBlackboard bb = new ScopedBlackboard();
 
-		// Retry(2): STUCK, TIMEOUT, NAVIGATOR_FAILED
+		// Phase 1A.4d.1: ALL walk failures Abort. The original Phase
+		// 1A.4d code returned Recovery.Retry(2) for STUCK / TIMEOUT /
+		// NAVIGATOR_FAILED, but that contradicted the single-use guard
+		// (engine's Retry path re-fires onStart on the same Step
+		// instance → IllegalStateException). Run 03 F-D1 exposed it.
+		// Walk retries are now caller responsibility via a parent
+		// composite that constructs a fresh artemis.walkTo(...) Step
+		// per attempt.
 		for (String r : new String[] {
 			WalkStepBase.REASON_STUCK,
 			"TIMEOUT",
-			WalkStepBase.REASON_NAVIGATOR_FAILED })
-		{
-			Failure f = (r.equals("TIMEOUT"))
-				? Failure.fromDiagnostic(new DiagnosticReason.ActionTimedOut("Walk", 60), 60)
-				: Failure.fromDiagnostic(new DiagnosticReason.Unknown(r), 5);
-			Recovery rec = step.onFailure(f, snap, bb);
-			assertTrue("expected Retry for " + r, rec instanceof Recovery.Retry);
-			assertEquals(2, ((Recovery.Retry) rec).maxAttempts());
-		}
-
-		// Abort: NAVIGATOR_MISSING, NO_ROUTE, NAVIGATOR_EXCEPTION, EMPTY_ZONE
-		for (String r : new String[] {
+			WalkStepBase.REASON_NAVIGATOR_FAILED,
 			WalkStepBase.REASON_NAVIGATOR_MISSING,
 			WalkStepBase.REASON_NO_ROUTE,
 			WalkStepBase.REASON_NAVIGATOR_EXCEPTION,
 			WalkToZoneStep.REASON_EMPTY_ZONE })
 		{
-			Failure f = Failure.fromDiagnostic(new DiagnosticReason.Unknown(r), 0);
+			Failure f = (r.equals("TIMEOUT"))
+				? Failure.fromDiagnostic(new DiagnosticReason.ActionTimedOut("Walk", 60), 60)
+				: Failure.fromDiagnostic(new DiagnosticReason.Unknown(r), 0);
 			Recovery rec = step.onFailure(f, snap, bb);
-			assertTrue("expected Abort for " + r, rec instanceof Recovery.Abort);
+			assertTrue("expected Abort for " + r + " but got " + rec,
+				rec instanceof Recovery.Abort);
+			// Regression guard for Run 03 F-D1: must never return Retry.
+			assertFalse(r + " must not return Retry (Phase 1A.4d.1)",
+				rec instanceof Recovery.Retry);
 		}
 	}
 }
