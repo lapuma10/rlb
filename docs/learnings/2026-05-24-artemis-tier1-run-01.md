@@ -243,7 +243,7 @@ ROUTE PER PHASE 2D §10:
                      enqueue, or dispatcher.isBusy() poll in
                      ClickNpcStep.onStart)
 
-NEXT: plan Phase 2C.x loop-tolerance fix (NOT to be coded in the
-same turn as planning). After 2C.x lands + rebuild + restart, re-run
-Tier 1 as Run 02.
+NEXT: Phase 2C.x loop-tolerance fix planned and implemented —
+see docs/superpowers/plans/2026-05-24-artemis-phase-2cx-loop-tolerance.md.
+After 2C.x lands + rebuild + restart, re-run Tier 1 as Run 02.
 ```

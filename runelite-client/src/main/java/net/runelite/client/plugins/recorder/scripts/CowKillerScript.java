@@ -21,14 +21,19 @@ import net.runelite.client.sequence.composite.Selector;
  * the Artemis v1.0 surface only — no engine bypass, no allow-list rows
  * in the Phase 1B grep gate.
  *
- * <p><b>Plan shape</b> (Phase 2C):
+ * <p><b>Plan shape</b> (Phase 2C + 2C.x loop-tolerance):
  * <pre>{@code
  * LinearSequence("cow-killer-v1")
  *  ├─ walkTo(NamedZone.LUMBRIDGE_COW_FIELD)
+ *  ├─ idle(SHORT_IDLE)                            // 2C.x post-walk settle (F3)
  *  └─ Selector("cow-killer-after-walk")
  *       ├─ RepeatStep("cow-killer-loop", body=DynamicStep, times=0)
  *       │    body: 4-branch supplier — see plan() for details
- *       └─ logout()
+ *       │    Branch 3 cow-found returns:
+ *       │      Selector("attack-or-retry")         // 2C.x (F1+F2)
+ *       │        ├─ click(cow, "Attack")
+ *       │        └─ idle(SHORT_IDLE)
+ *       └─ logout()                               // reached only on SESSION_EXHAUSTED
  * }</pre>
  *
  * <p><b>Supplier branches</b> (order matters — Branch 0 must run first):
@@ -47,12 +52,22 @@ import net.runelite.client.sequence.composite.Selector;
  *       {@code artemis.idle(SHORT_IDLE)}. Cows respawn; other players
  *       may be holding ours; tick-timing reads can miss. Yield and
  *       retry — empty reads are not a terminal failure.</li>
- *   <li><b>Engage.</b> {@code artemis.click(cow, "Attack")} — base
- *       2-arg overload, no {@link
+ *   <li><b>Engage.</b> {@code Selector("attack-or-retry")} wrapping
+ *       {@code artemis.click(cow, "Attack")} (option 0, base 2-arg
+ *       overload — no {@link
  *       net.runelite.client.sequence.artemis.outcome.OutcomeCheck}
  *       because {@code InteractingWithMe} / {@code TargetAnimChanged}
- *       evaluate to {@code OUTCOME_NOT_SUPPORTED_V1} in v1
- *       ({@code OutcomeChecks.java:87-91}).</li>
+ *       evaluate to {@code OUTCOME_NOT_SUPPORTED_V1} in v1,
+ *       {@code OutcomeChecks.java:87-91}) and
+ *       {@code artemis.idle(SHORT_IDLE)} (option 1). <b>Phase 2C.x:</b>
+ *       hard {@code ClickNpcStep} failures (STALE_REF /
+ *       TARGET_NOT_FOUND / ActionTimedOut) fall through to idle, so
+ *       the iteration Succeeds and {@link RepeatStep} keeps iterating
+ *       instead of propagating Failed up to the outer Selector's
+ *       logout fallback. See {@code docs/learnings/
+ *       2026-05-24-artemis-tier1-run-01.md} F1+F2 and
+ *       {@code docs/superpowers/plans/
+ *       2026-05-24-artemis-phase-2cx-loop-tolerance.md}.</li>
  * </ol>
  *
  * <p><b>Termination today (2C):</b> {@code SessionShape(Long.MAX_VALUE)}
@@ -99,6 +114,11 @@ public final class CowKillerScript
 		{
 			// Branch 0 — session terminator. MUST run first; see class
 			// Javadoc for the IdleStep-bypasses-session-gate rationale.
+			// Phase 2C.x: this branch MUST return FailStep DIRECTLY —
+			// never wrap in a Selector — so Failed propagates intact up
+			// through DynamicStep → RepeatStep → outer Selector and
+			// triggers artemis.logout(). Branch 3's attack-or-retry
+			// Selector wraps ONLY the click; SESSION_EXHAUSTED stays bare.
 			if (!artemis.session().shouldContinue())
 			{
 				return FailStep.of("SESSION_EXHAUSTED");
@@ -115,8 +135,16 @@ public final class CowKillerScript
 			{
 				return artemis.idle(SHORT_IDLE);
 			}
-			// Branch 3 — engage. Base 2-arg click overload.
-			return artemis.click(cow.get(), "Attack");
+			// Branch 3 — engage. Phase 2C.x: wrap the click in an
+			// attack-or-retry Selector so transient ClickNpcStep
+			// failures (STALE_REF / TARGET_NOT_FOUND / ActionTimedOut)
+			// fall through to a short idle. The iteration then Succeeds
+			// and RepeatStep keeps iterating, instead of propagating
+			// Failed up to the outer Selector → logout. Base 2-arg
+			// click overload only — no OutcomeCheck in v1.
+			return new Selector("attack-or-retry")
+				.option(artemis.click(cow.get(), "Attack"))
+				.option(artemis.idle(SHORT_IDLE));
 		});
 
 		Selector afterWalk = new Selector("cow-killer-after-walk")
@@ -125,6 +153,7 @@ public final class CowKillerScript
 
 		return new LinearSequence("cow-killer-v1")
 			.then(artemis.walkTo(NamedZone.LUMBRIDGE_COW_FIELD))
+			.then(artemis.idle(SHORT_IDLE))   // 2C.x: post-walk settle (F3)
 			.then(afterWalk);
 	}
 }
