@@ -536,6 +536,16 @@ public final class ArtemisImpl implements Artemis
 		{
 			return false;
 		}
+		// Phase 2C.x.1: skip NPCs in their death animation. Run 02 F2b
+		// showed the cow-killer pilot kept selecting cows during the
+		// ~5-10s death-anim window because name + interacting filters
+		// still passed. Actor.isDead() is the engine-canonical signal;
+		// universal-by-default for v1 — no normal script targets a dying
+		// NPC. See docs/superpowers/plans/2026-05-25-artemis-phase-2cx1-dead-npc-filter.md.
+		if (npc.isDead())
+		{
+			return false;
+		}
 		if (q.requireUnengaged())
 		{
 			net.runelite.api.Actor engaged = npc.getInteracting();

@@ -301,6 +301,7 @@ ROUTE PER PHASE 2D §10:
   - Loot / drop-wait / inventory-full termination remain
     DEFERRED until target-state model is stable.
 
-NEXT: plan and implement Phase 2C.x.1 (dead-NPC filter),
-rebuild + restart, run Tier 1 Run 03.
+NEXT: Phase 2C.x.1 (dead-NPC filter) planned and implemented —
+see docs/superpowers/plans/2026-05-25-artemis-phase-2cx1-dead-npc-filter.md.
+After 2C.x.1 lands + rebuild + restart, run Tier 1 Run 03.
 ```
